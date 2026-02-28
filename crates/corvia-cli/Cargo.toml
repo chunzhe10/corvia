@@ -1,0 +1,53 @@
+[package]
+name = "corvia"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+description = "CLI for the Corvia organizational reasoning memory system"
+keywords = ["ai-agents", "knowledge-graph", "cli", "memory", "developer-tools"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "corvia"
+path = "src/main.rs"
+
+[dependencies]
+corvia-common.workspace = true
+corvia-kernel.workspace = true
+uuid.workspace = true
+corvia-server.workspace = true
+corvia-adapter-git = { path = "../../../corvia-adapter-git" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap = { version = "4", features = ["derive"] }
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+git2 = "0.20"
+
+[dev-dependencies]
+tempfile = "3"
+async-trait = "0.1"
+
+[[test]]
+name = "e2e_test"
+path = "../../tests/integration/e2e_test.rs"
+
+[[test]]
+name = "agent_e2e_test"
+path = "../../tests/integration/agent_e2e_test.rs"
+
+[[test]]
+name = "workspace_e2e_test"
+path = "../../tests/integration/workspace_e2e_test.rs"
+
+[[test]]
+name = "m3_e2e_test"
+path = "../../tests/integration/m3_e2e_test.rs"

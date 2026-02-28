@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/corvia-common",
+    "crates/corvia-kernel",
+    "crates/corvia-server",
+    "crates/corvia-cli",
+]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+repository = "https://github.com/corvia/corvia"
+homepage = "https://github.com/corvia/corvia"
+rust-version = "1.85"
+
+[workspace.dependencies]
+corvia-common = { path = "crates/corvia-common" }
+corvia-kernel = { path = "crates/corvia-kernel" }
+corvia-server = { path = "crates/corvia-server" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

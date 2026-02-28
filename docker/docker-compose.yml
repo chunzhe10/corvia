@@ -1,0 +1,13 @@
+services:
+  surrealdb:
+    image: surrealdb/surrealdb:v3
+    container_name: corvia-surrealdb
+    command: start --log=info --user root --pass root
+    ports:
+      - "8000:8000"
+    volumes:
+      - corvia-surreal-data:/data
+    restart: unless-stopped
+
+volumes:
+  corvia-surreal-data:

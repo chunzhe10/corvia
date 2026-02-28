@@ -1,0 +1,21 @@
+[package]
+name = "corvia-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+description = "Shared types, configuration, errors, and namespace model for the Corvia knowledge system"
+keywords = ["ai-agents", "knowledge-graph", "memory", "types"]
+categories = ["data-structures", "development-tools"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
+toml = "0.8"
+anyhow.workspace = true
