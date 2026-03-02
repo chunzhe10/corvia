@@ -81,6 +81,7 @@ pub mod rag_types;
 pub mod chunking_strategy;
 pub mod grpc_engine;
 pub mod grpc_chat;
+pub mod inference_provisioner;
 
 use corvia_common::config::{CorviaConfig, InferenceProvider, StoreType};
 use corvia_common::errors::Result;
