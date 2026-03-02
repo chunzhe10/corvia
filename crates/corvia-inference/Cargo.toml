@@ -1,0 +1,20 @@
+[package]
+name = "corvia-inference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "corvia-inference"
+path = "src/main.rs"
+
+[dependencies]
+corvia-proto.workspace = true
+tonic.workspace = true
+prost = "0.13"
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap = { version = "4", features = ["derive"] }
+serde.workspace = true
+serde_json.workspace = true

@@ -6,6 +6,7 @@ members = [
     "crates/corvia-server",
     "crates/corvia-cli",
     "crates/corvia-proto",
+    "crates/corvia-inference",
 ]
 
 [workspace.package]
