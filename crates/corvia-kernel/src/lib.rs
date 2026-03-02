@@ -71,6 +71,7 @@ pub mod agent_writer;
 pub mod merge_queue;
 pub mod commit_pipeline;
 pub mod merge_worker;
+pub mod ollama_chat;
 pub mod context_builder;
 pub mod agent_coordinator;
 pub mod graph_store;

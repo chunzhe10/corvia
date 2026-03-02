@@ -1,21 +1,21 @@
 use corvia_common::agent_types::{EntryStatus, MergeQueueEntry};
 use corvia_common::config::MergeConfig;
 use corvia_common::errors::{CorviaError, Result};
-use corvia_common::types::KnowledgeEntry;
+use corvia_common::types::{ChatMessage, KnowledgeEntry};
 use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::merge_queue::MergeQueue;
 use crate::session_manager::SessionManager;
 use crate::staging::StagingManager;
-use crate::traits::{InferenceEngine, QueryableStore};
+use crate::traits::{ChatEngine, InferenceEngine, QueryableStore};
 
 /// Merge worker that processes the merge queue.
 ///
 /// For each queued entry:
 /// 1. Detect conflict: search for similar Merged entries in the same scope
 /// 2. No conflict → auto-merge (move staging file to knowledge/, update status)
-/// 3. Conflict → LLM merge via Ollama `/api/chat`, re-embed, replace both entries
+/// 3. Conflict → LLM merge via ChatEngine trait, re-embed, replace both entries
 /// 4. On failure → retry with exponential backoff, mark Rejected after max retries
 pub struct MergeWorker {
     store: Arc<dyn QueryableStore>,
@@ -24,7 +24,7 @@ pub struct MergeWorker {
     staging: Arc<StagingManager>,
     session_mgr: Arc<SessionManager>,
     merge_config: MergeConfig,
-    ollama_url: String,
+    chat_engine: Arc<dyn ChatEngine>,
 }
 
 impl MergeWorker {
@@ -35,7 +35,7 @@ impl MergeWorker {
         staging: Arc<StagingManager>,
         session_mgr: Arc<SessionManager>,
         merge_config: MergeConfig,
-        ollama_url: String,
+        chat_engine: Arc<dyn ChatEngine>,
     ) -> Self {
         Self {
             store,
@@ -44,7 +44,7 @@ impl MergeWorker {
             staging,
             session_mgr,
             merge_config,
-            ollama_url,
+            chat_engine,
         }
     }
 
@@ -168,7 +168,7 @@ impl MergeWorker {
         Ok(())
     }
 
-    /// LLM merge: call Ollama `/api/chat` to merge two conflicting entries.
+    /// LLM merge: use ChatEngine to merge two conflicting entries.
     async fn llm_merge(
         &self,
         new_entry: &KnowledgeEntry,
@@ -183,38 +183,8 @@ impl MergeWorker {
             existing.content, new_entry.content
         );
 
-        let request_body = serde_json::json!({
-            "model": self.merge_config.model,
-            "messages": [
-                { "role": "user", "content": prompt }
-            ],
-            "stream": false
-        });
-
-        let client = reqwest::Client::new();
-        let response = client
-            .post(format!("{}/api/chat", self.ollama_url))
-            .json(&request_body)
-            .timeout(std::time::Duration::from_secs(60))
-            .send()
-            .await
-            .map_err(|e| CorviaError::Agent(format!("LLM merge request failed: {e}")))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(CorviaError::Agent(format!(
-                "LLM merge failed with status {status}: {body}"
-            )));
-        }
-
-        let body: serde_json::Value = response.json().await
-            .map_err(|e| CorviaError::Agent(format!("Failed to parse LLM response: {e}")))?;
-
-        let merged_content = body["message"]["content"]
-            .as_str()
-            .ok_or_else(|| CorviaError::Agent("LLM response missing message.content".into()))?
-            .to_string();
+        let messages = vec![ChatMessage::user(prompt)];
+        let merged_content = self.chat_engine.chat(&messages, &self.merge_config.model).await?;
 
         // Re-embed the merged content
         let embedding = self.engine.embed(&merged_content).await?;
@@ -281,6 +251,22 @@ mod tests {
         fn dimensions(&self) -> usize { 3 }
     }
 
+    struct MockChatEngine;
+    #[async_trait::async_trait]
+    impl crate::traits::ChatEngine for MockChatEngine {
+        async fn chat(&self, messages: &[corvia_common::types::ChatMessage], _model: &str) -> corvia_common::errors::Result<String> {
+            Ok(format!("merged: {}", messages.last().map(|m| m.content.as_str()).unwrap_or("")))
+        }
+    }
+
+    struct FailingChatEngine;
+    #[async_trait::async_trait]
+    impl crate::traits::ChatEngine for FailingChatEngine {
+        async fn chat(&self, _messages: &[corvia_common::types::ChatMessage], _model: &str) -> corvia_common::errors::Result<String> {
+            Err(corvia_common::errors::CorviaError::Agent("Mock failure".into()))
+        }
+    }
+
     fn setup(dir: &std::path::Path) -> (MergeWorker, Arc<dyn QueryableStore>, Arc<MergeQueue>, Arc<SessionManager>) {
         let db = std::sync::Arc::new(
             redb::Database::create(dir.join("coordination.redb")).unwrap()
@@ -291,6 +277,7 @@ mod tests {
         let staging = Arc::new(StagingManager::new(dir));
         let session_mgr = Arc::new(SessionManager::from_db(db).unwrap());
         let config = MergeConfig::default();
+        let chat_engine = Arc::new(MockChatEngine) as Arc<dyn ChatEngine>;
 
         let worker = MergeWorker::new(
             store.clone(),
@@ -299,7 +286,7 @@ mod tests {
             staging,
             session_mgr.clone(),
             config,
-            "http://127.0.0.1:11434".into(), // won't be called for non-conflict tests
+            chat_engine,
         );
 
         (worker, store, queue, session_mgr)
@@ -367,7 +354,7 @@ mod tests {
     #[tokio::test]
     async fn test_failed_merge_retries() {
         let dir = tempfile::tempdir().unwrap();
-        // Use an unreachable LLM URL
+        // Use a FailingChatEngine to simulate LLM failures
         let db = std::sync::Arc::new(
             redb::Database::create(dir.path().join("coordination.redb")).unwrap()
         );
@@ -377,11 +364,12 @@ mod tests {
         let staging = Arc::new(StagingManager::new(dir.path()));
         let session_mgr = Arc::new(SessionManager::from_db(db).unwrap());
         let config = MergeConfig::default();
+        let chat_engine = Arc::new(FailingChatEngine) as Arc<dyn ChatEngine>;
 
         let worker = MergeWorker::new(
             store.clone(), engine, queue.clone(), staging, session_mgr.clone(),
             config,
-            "http://127.0.0.1:99999".into(), // unreachable
+            chat_engine,
         );
         store.init_schema().await.unwrap();
 

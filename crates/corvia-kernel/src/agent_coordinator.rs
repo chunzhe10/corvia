@@ -14,7 +14,7 @@ use crate::merge_queue::MergeQueue;
 use crate::merge_worker::MergeWorker;
 use crate::session_manager::SessionManager;
 use crate::staging::StagingManager;
-use crate::traits::{InferenceEngine, QueryableStore};
+use crate::traits::{ChatEngine, InferenceEngine, QueryableStore};
 
 /// Response from `connect()` — shows the agent's active and recoverable sessions.
 #[derive(Debug, Clone)]
@@ -56,7 +56,7 @@ impl AgentCoordinator {
         data_dir: &Path,
         lifecycle_config: AgentLifecycleConfig,
         merge_config: MergeConfig,
-        ollama_url: String,
+        chat_engine: Arc<dyn ChatEngine>,
     ) -> Result<Self> {
         // Open or create the shared coordination database
         let registry = AgentRegistry::open(data_dir)?;
@@ -86,7 +86,7 @@ impl AgentCoordinator {
             staging.clone(),
             sessions.clone(),
             merge_config,
-            ollama_url,
+            chat_engine,
         ));
 
         let context = Arc::new(ContextBuilder::new(store, engine));
@@ -365,10 +365,19 @@ mod tests {
         fn dimensions(&self) -> usize { 3 }
     }
 
+    struct MockChatEngine;
+    #[async_trait::async_trait]
+    impl crate::traits::ChatEngine for MockChatEngine {
+        async fn chat(&self, messages: &[corvia_common::types::ChatMessage], _model: &str) -> corvia_common::errors::Result<String> {
+            Ok(format!("merged: {}", messages.last().map(|m| m.content.as_str()).unwrap_or("")))
+        }
+    }
+
     async fn setup_coordinator(dir: &Path) -> AgentCoordinator {
         let store = Arc::new(LiteStore::open(dir, 3).unwrap()) as Arc<dyn QueryableStore>;
         let engine = Arc::new(MockEngine) as Arc<dyn InferenceEngine>;
         store.init_schema().await.unwrap();
+        let chat_engine = Arc::new(MockChatEngine) as Arc<dyn ChatEngine>;
 
         AgentCoordinator::new(
             store,
@@ -376,7 +385,7 @@ mod tests {
             dir,
             AgentLifecycleConfig::default(),
             MergeConfig::default(),
-            "http://127.0.0.1:11434".into(),
+            chat_engine,
         ).unwrap()
     }
 
@@ -500,11 +509,12 @@ mod tests {
         let mut lifecycle_config = AgentLifecycleConfig::default();
         lifecycle_config.gc_orphan_after_secs = 0; // Instant orphan cleanup
 
+        let chat_engine = Arc::new(MockChatEngine) as Arc<dyn ChatEngine>;
         let coord = AgentCoordinator::new(
             store, engine, dir.path(),
             lifecycle_config,
             MergeConfig::default(),
-            "http://127.0.0.1:11434".into(),
+            chat_engine,
         ).unwrap();
 
         let identity = AgentIdentity::Registered {

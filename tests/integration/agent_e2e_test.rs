@@ -9,7 +9,7 @@ use corvia_common::agent_types::*;
 use corvia_common::config::{AgentLifecycleConfig, MergeConfig};
 use corvia_kernel::agent_coordinator::AgentCoordinator;
 use corvia_kernel::lite_store::LiteStore;
-use corvia_kernel::traits::{InferenceEngine, QueryableStore};
+use corvia_kernel::traits::{ChatEngine, InferenceEngine, QueryableStore};
 use std::sync::Arc;
 
 struct MockEngine;
@@ -24,10 +24,19 @@ impl InferenceEngine for MockEngine {
     fn dimensions(&self) -> usize { 3 }
 }
 
+struct MockChatEngine;
+#[async_trait]
+impl ChatEngine for MockChatEngine {
+    async fn chat(&self, messages: &[corvia_common::types::ChatMessage], _model: &str) -> corvia_common::errors::Result<String> {
+        Ok(format!("merged: {}", messages.last().map(|m| m.content.as_str()).unwrap_or("")))
+    }
+}
+
 async fn setup_coordinator(dir: &std::path::Path) -> (AgentCoordinator, Arc<dyn QueryableStore>) {
     let store = Arc::new(LiteStore::open(dir, 3).unwrap()) as Arc<dyn QueryableStore>;
     store.init_schema().await.unwrap();
     let engine = Arc::new(MockEngine) as Arc<dyn InferenceEngine>;
+    let chat_engine = Arc::new(MockChatEngine) as Arc<dyn ChatEngine>;
 
     let coord = AgentCoordinator::new(
         store.clone(),
@@ -41,7 +50,7 @@ async fn setup_coordinator(dir: &std::path::Path) -> (AgentCoordinator, Arc<dyn 
             max_retries: 3,
             ..Default::default()
         },
-        "http://localhost:11434".into(),
+        chat_engine,
     ).unwrap();
 
     (coord, store)

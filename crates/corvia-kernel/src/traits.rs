@@ -115,11 +115,15 @@ pub trait GraphStore: Send + Sync {
     async fn remove_edges(&self, entry_id: &uuid::Uuid) -> Result<()>;
 }
 
-/// Chat message for generation requests.
-#[derive(Debug, Clone)]
-pub struct ChatMessage {
-    pub role: String,    // "system", "user", "assistant"
-    pub content: String,
+// Re-export ChatMessage from corvia-common for backward compatibility.
+pub use corvia_common::types::ChatMessage;
+
+/// Chat/reasoning provider for LLM inference (D60).
+/// Used by MergeWorker for conflict resolution.
+#[async_trait]
+pub trait ChatEngine: Send + Sync {
+    /// Send messages to a chat model and return the response text.
+    async fn chat(&self, messages: &[ChatMessage], model: &str) -> Result<String>;
 }
 
 /// Result from a GenerationEngine call.

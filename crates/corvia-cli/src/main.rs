@@ -345,13 +345,16 @@ async fn cmd_serve(mcp: bool) -> Result<()> {
 
     // Construct AgentCoordinator
     let data_dir = std::path::Path::new(&config.storage.data_dir);
+    let chat_engine: std::sync::Arc<dyn corvia_kernel::traits::ChatEngine> = std::sync::Arc::new(
+        corvia_kernel::ollama_chat::OllamaChatEngine::new(&config.embedding.url)
+    );
     let coordinator = match AgentCoordinator::new(
         store.clone(),
         engine.clone(),
         data_dir,
         config.agent_lifecycle.clone(),
         config.merge.clone(),
-        config.embedding.url.clone(),
+        chat_engine,
     ) {
         Ok(c) => {
             println!("Agent coordination: enabled");
