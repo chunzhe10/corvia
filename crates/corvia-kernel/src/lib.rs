@@ -96,6 +96,7 @@ pub fn create_engine(config: &CorviaConfig) -> Box<dyn traits::InferenceEngine> 
             &config.embedding.model,
             config.embedding.dimensions,
         )),
+        InferenceProvider::Corvia => todo!("M3.1: GrpcInferenceEngine"),
     }
 }
 

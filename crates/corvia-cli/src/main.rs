@@ -467,6 +467,7 @@ async fn cmd_status() -> Result<()> {
                 match config.embedding.provider {
                     corvia_common::config::InferenceProvider::Ollama => "Ollama",
                     corvia_common::config::InferenceProvider::Vllm => "vLLM",
+                    corvia_common::config::InferenceProvider::Corvia => "Corvia",
                 },
                 config.embedding.url);
 

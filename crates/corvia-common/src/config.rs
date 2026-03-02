@@ -16,6 +16,7 @@ pub enum InferenceProvider {
     #[default]
     Ollama,
     Vllm,
+    Corvia,
 }
 
 fn default_repos_dir() -> String {
@@ -144,6 +145,9 @@ impl Default for AgentLifecycleConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MergeConfig {
+    /// Inference provider for merge LLM calls.
+    #[serde(default)]
+    pub provider: InferenceProvider,
     /// Chat model for LLM-assisted merge (Ollama).
     #[serde(default = "default_merge_model")]
     pub model: String,
@@ -162,6 +166,7 @@ fn default_max_retries() -> u32 { 3 }
 impl Default for MergeConfig {
     fn default() -> Self {
         Self {
+            provider: InferenceProvider::Ollama,
             model: default_merge_model(),
             similarity_threshold: default_similarity_threshold(),
             max_retries: default_max_retries(),
@@ -671,6 +676,14 @@ port = 8020
         let loaded: CorviaConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(loaded.chunking.max_tokens, 1024);
         assert_eq!(loaded.chunking.overlap_tokens, 128);
+    }
+
+    #[test]
+    fn test_inference_provider_corvia_serde() {
+        let json = serde_json::to_string(&InferenceProvider::Corvia).unwrap();
+        assert_eq!(json, "\"corvia\"");
+        let parsed: InferenceProvider = serde_json::from_str("\"corvia\"").unwrap();
+        assert_eq!(parsed, InferenceProvider::Corvia);
     }
 
     #[test]
