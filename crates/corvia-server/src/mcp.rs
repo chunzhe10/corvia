@@ -130,6 +130,34 @@ fn tool_definitions() -> Vec<Value> {
                 "properties": {}
             }
         }),
+        json!({
+            "name": "corvia_context",
+            "description": "Retrieve and assemble organizational knowledge context for a query (no generation)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "The search query" },
+                    "scope_id": { "type": "string", "description": "Scope to search within" },
+                    "limit": { "type": "integer", "description": "Maximum sources (default 10)" },
+                    "expand_graph": { "type": "boolean", "description": "Follow graph edges (default true)" }
+                },
+                "required": ["query", "scope_id"]
+            }
+        }),
+        json!({
+            "name": "corvia_ask",
+            "description": "Ask a question and get an AI-generated answer from organizational knowledge (full RAG)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "The question to answer" },
+                    "scope_id": { "type": "string", "description": "Scope to search within" },
+                    "limit": { "type": "integer", "description": "Maximum sources (default 10)" },
+                    "expand_graph": { "type": "boolean", "description": "Follow graph edges (default true)" }
+                },
+                "required": ["query", "scope_id"]
+            }
+        }),
     ]
 }
 
@@ -212,6 +240,8 @@ async fn handle_tools_call(
         "corvia_graph" => tool_corvia_graph(state, &arguments).await,
         "corvia_reason" => tool_corvia_reason(state, &arguments).await,
         "corvia_agent_status" => tool_corvia_agent_status(state, agent_id),
+        "corvia_context" => tool_corvia_context(state, &arguments).await,
+        "corvia_ask" => tool_corvia_ask(state, &arguments).await,
         other => Err((METHOD_NOT_FOUND, format!("Unknown tool: {other}"))),
     }
 }
@@ -229,6 +259,37 @@ async fn tool_corvia_search(
         .ok_or((INVALID_PARAMS, "Missing 'scope_id' parameter".into()))?;
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
+    // Route through RAG pipeline if available (fixes ContextBuilder bypass)
+    if let Some(rag) = &state.rag {
+        let opts = corvia_kernel::rag_types::RetrievalOpts {
+            limit,
+            expand_graph: false, // backward compat: pure vector for search
+            ..Default::default()
+        };
+        let response = rag.context(query, scope_id, Some(opts)).await
+            .map_err(|e| (INTERNAL_ERROR, format!("Search failed: {e}")))?;
+
+        let items: Vec<Value> = response.context.sources.iter().map(|r| {
+            json!({
+                "content": r.entry.content,
+                "score": r.score,
+                "source_file": r.entry.metadata.source_file,
+                "language": r.entry.metadata.language,
+            })
+        }).collect();
+
+        return Ok(json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::to_string_pretty(&json!({
+                    "results": items,
+                    "count": items.len()
+                })).unwrap()
+            }]
+        }));
+    }
+
+    // Fallback: raw store search
     let embedding = state.engine.embed(query).await
         .map_err(|e| (INTERNAL_ERROR, format!("Embedding failed: {e}")))?;
 
@@ -517,6 +578,93 @@ fn tool_corvia_agent_status(
     }
 }
 
+async fn tool_corvia_context(
+    state: &AppState,
+    args: &Value,
+) -> Result<Value, (i32, String)> {
+    let query = args.get("query").and_then(|v| v.as_str())
+        .ok_or((INVALID_PARAMS, "Missing 'query' parameter".into()))?;
+    let scope_id = args.get("scope_id").and_then(|v| v.as_str())
+        .ok_or((INVALID_PARAMS, "Missing 'scope_id' parameter".into()))?;
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let expand_graph = args.get("expand_graph").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    let rag = state.rag.as_ref()
+        .ok_or((INTERNAL_ERROR, "RAG pipeline not configured".into()))?;
+
+    let opts = corvia_kernel::rag_types::RetrievalOpts {
+        limit,
+        expand_graph,
+        ..Default::default()
+    };
+
+    let response = rag.context(query, scope_id, Some(opts)).await
+        .map_err(|e| (INTERNAL_ERROR, format!("RAG failed: {e}")))?;
+
+    let sources: Vec<Value> = response.context.sources.iter().map(|r| {
+        json!({
+            "content": r.entry.content,
+            "score": r.score,
+            "source_file": r.entry.metadata.source_file,
+            "language": r.entry.metadata.language,
+        })
+    }).collect();
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(&json!({
+                "context": response.context.context,
+                "sources": sources,
+                "trace": response.trace,
+            })).unwrap()
+        }]
+    }))
+}
+
+async fn tool_corvia_ask(
+    state: &AppState,
+    args: &Value,
+) -> Result<Value, (i32, String)> {
+    let query = args.get("query").and_then(|v| v.as_str())
+        .ok_or((INVALID_PARAMS, "Missing 'query' parameter".into()))?;
+    let scope_id = args.get("scope_id").and_then(|v| v.as_str())
+        .ok_or((INVALID_PARAMS, "Missing 'scope_id' parameter".into()))?;
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let expand_graph = args.get("expand_graph").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    let rag = state.rag.as_ref()
+        .ok_or((INTERNAL_ERROR, "RAG pipeline not configured".into()))?;
+
+    let opts = corvia_kernel::rag_types::RetrievalOpts {
+        limit,
+        expand_graph,
+        ..Default::default()
+    };
+
+    let response = rag.ask(query, scope_id, Some(opts)).await
+        .map_err(|e| (INTERNAL_ERROR, format!("RAG failed: {e}")))?;
+
+    let sources: Vec<Value> = response.context.sources.iter().map(|r| {
+        json!({
+            "content": r.entry.content,
+            "score": r.score,
+            "source_file": r.entry.metadata.source_file,
+        })
+    }).collect();
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(&json!({
+                "answer": response.answer,
+                "sources": sources,
+                "trace": response.trace,
+            })).unwrap()
+        }]
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,7 +712,7 @@ mod tests {
     async fn test_tools_list() {
         let result = handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 8);
 
         let names: Vec<&str> = tools.iter()
             .map(|t| t["name"].as_str().unwrap())
@@ -575,6 +723,8 @@ mod tests {
         assert!(names.contains(&"corvia_graph"));
         assert!(names.contains(&"corvia_reason"));
         assert!(names.contains(&"corvia_agent_status"));
+        assert!(names.contains(&"corvia_context"));
+        assert!(names.contains(&"corvia_ask"));
     }
 
     #[tokio::test]
