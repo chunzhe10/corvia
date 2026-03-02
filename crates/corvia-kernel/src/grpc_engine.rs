@@ -35,8 +35,14 @@ impl GrpcInferenceEngine {
 
     fn truncate(text: &str) -> String {
         if text.len() > MAX_EMBED_CHARS {
-            warn!("Truncating input from {} to {} chars", text.len(), MAX_EMBED_CHARS);
-            text[..MAX_EMBED_CHARS].to_string()
+            warn!("Truncating input from {} to {} bytes", text.len(), MAX_EMBED_CHARS);
+            // Find the last char boundary at or before MAX_EMBED_CHARS to avoid
+            // panicking on multi-byte UTF-8 (e.g. CJK, emoji).
+            let mut end = MAX_EMBED_CHARS;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text[..end].to_string()
         } else {
             text.to_string()
         }
@@ -96,5 +102,16 @@ mod tests {
         let text = "a".repeat(5000);
         let truncated = GrpcInferenceEngine::truncate(&text);
         assert_eq!(truncated.len(), MAX_EMBED_CHARS);
+    }
+
+    #[test]
+    fn test_truncate_multibyte_utf8() {
+        // Each CJK character is 3 bytes. Build a string where the byte limit
+        // falls in the middle of a character — must not panic.
+        let text = "\u{4e16}".repeat(2000); // 6000 bytes of 3-byte chars
+        let truncated = GrpcInferenceEngine::truncate(&text);
+        assert!(truncated.len() <= MAX_EMBED_CHARS);
+        // Must be a multiple of 3 (each char is 3 bytes) — proves we didn't split mid-char
+        assert_eq!(truncated.len() % 3, 0);
     }
 }

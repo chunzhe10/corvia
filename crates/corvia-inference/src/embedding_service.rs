@@ -2,7 +2,6 @@ use corvia_proto::embedding_service_server::EmbeddingService;
 use corvia_proto::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 
 /// A loaded embedding model with its enum variant for metadata lookups.
@@ -11,20 +10,22 @@ struct LoadedModel {
     variant: fastembed::EmbeddingModel,
 }
 
+#[derive(Clone)]
 pub struct EmbeddingServiceImpl {
-    // Mutex because fastembed's embed() requires &mut self
-    models: Arc<Mutex<HashMap<String, LoadedModel>>>,
+    // std::sync::Mutex (not tokio) so we can hold the lock inside spawn_blocking.
+    // fastembed's embed() is CPU-bound and requires &mut self.
+    models: Arc<std::sync::Mutex<HashMap<String, LoadedModel>>>,
 }
 
 impl EmbeddingServiceImpl {
     pub fn new() -> Self {
         Self {
-            models: Arc::new(Mutex::new(HashMap::new())),
+            models: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
     /// Resolve a model name to a fastembed EmbeddingModel enum variant.
-    fn resolve_model(name: &str) -> Result<fastembed::EmbeddingModel, Status> {
+    pub fn resolve_model(name: &str) -> Result<fastembed::EmbeddingModel, Status> {
         match name {
             "nomic-embed-text-v1.5" | "nomic-ai/nomic-embed-text-v1.5" => {
                 Ok(fastembed::EmbeddingModel::NomicEmbedTextV15)
@@ -52,7 +53,6 @@ impl EmbeddingServiceImpl {
         let name_owned = name.to_string();
         tracing::info!(model = %name_owned, "Loading embedding model...");
 
-        // Clone the enum for the blocking closure (it must be Copy/Clone)
         let model_enum_for_spawn = model_enum.clone();
         let engine = tokio::task::spawn_blocking(move || {
             fastembed::TextEmbedding::try_new(
@@ -64,13 +64,16 @@ impl EmbeddingServiceImpl {
         .map_err(|e| Status::internal(format!("Spawn failed: {e}")))?
         .map_err(|e| Status::internal(format!("Model load failed: {e}")))?;
 
-        self.models.lock().await.insert(
-            name_owned.clone(),
-            LoadedModel {
-                engine,
-                variant: model_enum,
-            },
-        );
+        self.models
+            .lock()
+            .map_err(|e| Status::internal(format!("Lock poisoned: {e}")))?
+            .insert(
+                name_owned.clone(),
+                LoadedModel {
+                    engine,
+                    variant: model_enum,
+                },
+            );
         tracing::info!(model = %name_owned, "Embedding model loaded");
         Ok(())
     }
@@ -80,23 +83,35 @@ impl EmbeddingServiceImpl {
 impl EmbeddingService for EmbeddingServiceImpl {
     async fn embed(&self, req: Request<EmbedRequest>) -> Result<Response<EmbedResponse>, Status> {
         let req = req.into_inner();
-        let mut models = self.models.lock().await;
-        let loaded = models
-            .get_mut(&req.model)
-            .ok_or_else(|| Status::not_found(format!("Model '{}' not loaded", req.model)))?;
+        let models = self.models.clone();
+        let model_name = req.model;
+        let text = req.text;
 
-        let texts = vec![req.text.as_str()];
-        let embeddings = loaded
-            .engine
-            .embed(texts, None)
-            .map_err(|e| Status::internal(format!("Embed failed: {e}")))?;
+        // Run the CPU-intensive ONNX inference on a blocking thread
+        let embedding = tokio::task::spawn_blocking(move || {
+            let mut guard = models
+                .lock()
+                .map_err(|e| Status::internal(format!("Lock poisoned: {e}")))?;
+            let loaded = guard
+                .get_mut(&model_name)
+                .ok_or_else(|| Status::not_found(format!("Model '{model_name}' not loaded")))?;
 
-        let embedding = embeddings
-            .into_iter()
-            .next()
-            .ok_or_else(|| Status::internal("Empty embedding result"))?;
+            let texts = vec![text.as_str()];
+            let embeddings = loaded
+                .engine
+                .embed(texts, None)
+                .map_err(|e| Status::internal(format!("Embed failed: {e}")))?;
+
+            embeddings
+                .into_iter()
+                .next()
+                .ok_or_else(|| Status::internal("Empty embedding result"))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Spawn failed: {e}")))?
+        ?;
+
         let dimensions = embedding.len() as u32;
-
         Ok(Response::new(EmbedResponse {
             embedding,
             dimensions,
@@ -108,16 +123,28 @@ impl EmbeddingService for EmbeddingServiceImpl {
         req: Request<EmbedBatchRequest>,
     ) -> Result<Response<EmbedBatchResponse>, Status> {
         let req = req.into_inner();
-        let mut models = self.models.lock().await;
-        let loaded = models
-            .get_mut(&req.model)
-            .ok_or_else(|| Status::not_found(format!("Model '{}' not loaded", req.model)))?;
+        let models = self.models.clone();
+        let model_name = req.model;
+        let texts = req.texts;
 
-        let text_refs: Vec<&str> = req.texts.iter().map(|s| s.as_str()).collect();
-        let embeddings_raw = loaded
-            .engine
-            .embed(text_refs, None)
-            .map_err(|e| Status::internal(format!("EmbedBatch failed: {e}")))?;
+        // Run the CPU-intensive ONNX inference on a blocking thread
+        let embeddings_raw = tokio::task::spawn_blocking(move || {
+            let mut guard = models
+                .lock()
+                .map_err(|e| Status::internal(format!("Lock poisoned: {e}")))?;
+            let loaded = guard
+                .get_mut(&model_name)
+                .ok_or_else(|| Status::not_found(format!("Model '{model_name}' not loaded")))?;
+
+            let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+            loaded
+                .engine
+                .embed(text_refs, None)
+                .map_err(|e| Status::internal(format!("EmbedBatch failed: {e}")))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Spawn failed: {e}")))?
+        ?;
 
         let embeddings = embeddings_raw
             .into_iter()
@@ -136,10 +163,12 @@ impl EmbeddingService for EmbeddingServiceImpl {
         req: Request<ModelInfoRequest>,
     ) -> Result<Response<ModelInfoResponse>, Status> {
         let name = req.into_inner().model;
-        let models = self.models.lock().await;
+        let models = self
+            .models
+            .lock()
+            .map_err(|e| Status::internal(format!("Lock poisoned: {e}")))?;
         let loaded = models.contains_key(&name);
 
-        // Get actual dimensions from model metadata via the static get_model_info
         let dimensions = if let Some(entry) = models.get(&name) {
             fastembed::TextEmbedding::get_model_info(&entry.variant)
                 .map(|info| info.dim as u32)

@@ -8,13 +8,13 @@ use tonic::{Request, Response, Status};
 /// Stub ChatService implementation.
 /// Currently returns stub responses for actual model inference.
 /// The candle GGUF backend will be implemented in a future task.
+#[derive(Clone)]
 pub struct ChatServiceImpl {
     models: Arc<RwLock<HashMap<String, ChatModelEntry>>>,
 }
 
 struct ChatModelEntry {
-    name: String,
-    loaded: bool,
+    _name: String,
 }
 
 impl ChatServiceImpl {
@@ -35,8 +35,7 @@ impl ChatServiceImpl {
         models.insert(
             name.to_string(),
             ChatModelEntry {
-                name: name.to_string(),
-                loaded: true,
+                _name: name.to_string(),
             },
         );
         tracing::info!(model = %name, "Chat model registered (stub — no real inference yet)");

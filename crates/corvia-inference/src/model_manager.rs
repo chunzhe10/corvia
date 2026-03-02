@@ -5,6 +5,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 
+use crate::chat_service::ChatServiceImpl;
+use crate::embedding_service::EmbeddingServiceImpl;
+
 #[derive(Clone)]
 pub struct ModelEntry {
     pub name: String,
@@ -13,13 +16,20 @@ pub struct ModelEntry {
 }
 
 pub struct ModelManagerService {
-    pub models: Arc<RwLock<HashMap<String, ModelEntry>>>,
+    /// Registry tracking all loaded models (for health/list).
+    models: Arc<RwLock<HashMap<String, ModelEntry>>>,
+    /// Delegates embedding model loads to the actual EmbeddingService.
+    embed_svc: EmbeddingServiceImpl,
+    /// Delegates chat model loads to the actual ChatService.
+    chat_svc: ChatServiceImpl,
 }
 
 impl ModelManagerService {
-    pub fn new() -> Self {
+    pub fn new(embed_svc: EmbeddingServiceImpl, chat_svc: ChatServiceImpl) -> Self {
         Self {
             models: Arc::new(RwLock::new(HashMap::new())),
+            embed_svc,
+            chat_svc,
         }
     }
 }
@@ -60,19 +70,37 @@ impl ModelManager for ModelManagerService {
     ) -> Result<Response<LoadModelResponse>, Status> {
         let req = req.into_inner();
         tracing::info!(model = %req.name, model_type = %req.model_type, "load_model requested");
-        let mut models = self.models.write().await;
-        models.insert(
-            req.name.clone(),
-            ModelEntry {
-                name: req.name,
-                model_type: req.model_type,
-                loaded: true,
-            },
-        );
-        Ok(Response::new(LoadModelResponse {
-            success: true,
-            error: String::new(),
-        }))
+
+        // Delegate to the appropriate service based on model_type
+        let result = match req.model_type.as_str() {
+            "embedding" => self.embed_svc.load_model(&req.name).await,
+            "chat" => self.chat_svc.load_model(&req.name).await,
+            other => Err(Status::invalid_argument(format!(
+                "Unknown model_type: '{other}'. Expected 'embedding' or 'chat'."
+            ))),
+        };
+
+        match result {
+            Ok(()) => {
+                let mut models = self.models.write().await;
+                models.insert(
+                    req.name.clone(),
+                    ModelEntry {
+                        name: req.name,
+                        model_type: req.model_type,
+                        loaded: true,
+                    },
+                );
+                Ok(Response::new(LoadModelResponse {
+                    success: true,
+                    error: String::new(),
+                }))
+            }
+            Err(status) => Ok(Response::new(LoadModelResponse {
+                success: false,
+                error: status.message().to_string(),
+            })),
+        }
     }
 
     async fn unload_model(

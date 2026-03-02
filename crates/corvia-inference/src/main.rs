@@ -40,9 +40,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Serve { port } => {
             let addr = format!("0.0.0.0:{port}").parse()?;
-            let model_mgr = model_manager::ModelManagerService::new();
             let embed_svc = embedding_service::EmbeddingServiceImpl::new();
             let chat_svc = chat_service::ChatServiceImpl::new();
+            let model_mgr = model_manager::ModelManagerService::new(
+                embed_svc.clone(),
+                chat_svc.clone(),
+            );
 
             tracing::info!("corvia-inference listening on {addr}");
 
