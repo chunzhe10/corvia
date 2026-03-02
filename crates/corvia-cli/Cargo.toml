@@ -35,6 +35,9 @@ git2 = "0.20"
 [dev-dependencies]
 tempfile = "3"
 async-trait = "0.1"
+corvia-proto.workspace = true
+tonic = "0.12"
+tokio-stream = "0.1"
 
 [[test]]
 name = "e2e_test"
@@ -51,3 +54,7 @@ path = "../../tests/integration/workspace_e2e_test.rs"
 [[test]]
 name = "m3_e2e_test"
 path = "../../tests/integration/m3_e2e_test.rs"
+
+[[test]]
+name = "grpc_inference_test"
+path = "../../tests/integration/grpc_inference_test.rs"
