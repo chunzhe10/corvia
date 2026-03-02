@@ -58,3 +58,7 @@ path = "../../tests/integration/m3_e2e_test.rs"
 [[test]]
 name = "grpc_inference_test"
 path = "../../tests/integration/grpc_inference_test.rs"
+
+[[test]]
+name = "rag_e2e_test"
+path = "../../tests/integration/rag_e2e_test.rs"
