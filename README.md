@@ -24,13 +24,14 @@
 
 ## What is corvia?
 
-AI agents are getting memory — Claude has CLAUDE.md, Cursor has rules files, Copilot has
-memory. But these are *personal notes*: flat files, one repo, no relationships, no history.
-They help one developer in one session. They don't help your *organization* learn.
+AI agents are starting to develop memory — CLAUDE.md, Cursor rules, Copilot memory are all
+early steps in this direction. These work well for individual developers in individual
+sessions. corvia explores what happens when that memory becomes *organizational* — shared
+across agents, tracked over time, connected as a graph.
 
-corvia is an open-source knowledge layer that gives AI agents **organizational memory** —
-knowledge that spans repositories, tracks relationships as a graph, evolves over time, and
-stays consistent when multiple agents write concurrently.
+corvia is an open-source knowledge layer (written in Rust) that gives AI agents
+**organizational memory** — knowledge that spans repositories, evolves over time, and stays
+consistent when multiple agents write concurrently.
 
 ```
 Personal memory:        "use tabs not spaces" in this project
