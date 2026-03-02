@@ -80,6 +80,7 @@ pub mod token_estimator;
 pub mod rag_types;
 pub mod retriever;
 pub mod augmenter;
+pub mod rag_pipeline;
 pub mod chunking_strategy;
 pub mod grpc_engine;
 pub mod grpc_chat;
