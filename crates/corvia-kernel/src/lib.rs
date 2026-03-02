@@ -83,6 +83,7 @@ pub mod augmenter;
 pub mod rag_pipeline;
 pub mod chunking_strategy;
 pub mod chunking_fallback;
+pub mod chunking_pipeline;
 pub mod grpc_engine;
 pub mod grpc_chat;
 pub mod inference_provisioner;
