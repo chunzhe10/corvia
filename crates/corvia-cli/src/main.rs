@@ -391,8 +391,19 @@ async fn cmd_serve(mcp: bool) -> Result<()> {
         }
     };
 
+    // Construct RAG pipeline — auto-selects retriever based on graph availability.
+    // generator: None until a GenerationEngine adapter is wired (ask mode unavailable).
+    let rag = Arc::new(corvia_kernel::create_rag_pipeline(
+        store.clone(),
+        engine.clone(),
+        Some(graph.clone()),
+        None, // GenerationEngine: wired when M3.1 adapter lands
+        &config,
+    ));
+    println!("RAG pipeline: enabled (retriever: {})", rag.retriever_name());
+
     let data_dir = std::path::PathBuf::from(&config.storage.data_dir);
-    let state = Arc::new(corvia_server::rest::AppState { store, engine, coordinator, graph, temporal, data_dir, rag: None });
+    let state = Arc::new(corvia_server::rest::AppState { store, engine, coordinator, graph, temporal, data_dir, rag: Some(rag) });
     let mut app = corvia_server::rest::router(state.clone());
 
     if mcp {
