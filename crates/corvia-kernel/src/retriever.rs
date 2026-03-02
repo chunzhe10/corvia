@@ -20,6 +20,40 @@ use tracing::info;
 use crate::rag_types::{RetrievalMetrics, RetrievalOpts, RetrievalResult};
 use crate::traits::{GraphStore, InferenceEngine, QueryableStore};
 
+/// Check RBAC scope access. Returns `Some(empty result)` if denied, `None` if allowed.
+///
+/// Only `ReadWrite { scopes }` agents are scope-restricted. `ReadOnly` and `Admin`
+/// have no scope restriction by design (D19/D44).
+fn check_rbac_scope(
+    opts: &RetrievalOpts,
+    scope_id: &str,
+    retriever_name: &str,
+    start: &Instant,
+) -> Option<RetrievalResult> {
+    if let Some(ref perms) = opts.permissions {
+        if let AgentPermission::ReadWrite { scopes } = perms {
+            if !scopes.iter().any(|s| s == scope_id || s == "*") {
+                info!(
+                    retriever = retriever_name,
+                    scope_id,
+                    "RBAC denied: agent lacks scope access"
+                );
+                return Some(RetrievalResult {
+                    results: Vec::new(),
+                    metrics: RetrievalMetrics {
+                        latency_ms: start.elapsed().as_millis() as u64,
+                        vector_results: 0,
+                        graph_expanded: 0,
+                        post_filter_count: 0,
+                        retriever_name: retriever_name.to_string(),
+                    },
+                });
+            }
+        }
+    }
+    None
+}
+
 /// First stage of the RAG pipeline: query -> ranked results.
 ///
 /// Implementations must be Send + Sync so they can be shared across
@@ -55,7 +89,7 @@ impl VectorRetriever {
 #[async_trait]
 impl Retriever for VectorRetriever {
     fn name(&self) -> &str {
-        "VectorRetriever"
+        "vector"
     }
 
     async fn retrieve(
@@ -66,27 +100,8 @@ impl Retriever for VectorRetriever {
     ) -> Result<RetrievalResult> {
         let start = Instant::now();
 
-        // RBAC scope check: if agent has ReadWrite with explicit scopes, verify access.
-        if let Some(ref perms) = opts.permissions {
-            if let AgentPermission::ReadWrite { scopes } = perms {
-                if !scopes.iter().any(|s| s == scope_id || s == "*") {
-                    info!(
-                        retriever = self.name(),
-                        scope_id,
-                        "RBAC denied: agent lacks scope access"
-                    );
-                    return Ok(RetrievalResult {
-                        results: Vec::new(),
-                        metrics: RetrievalMetrics {
-                            latency_ms: start.elapsed().as_millis() as u64,
-                            vector_results: 0,
-                            graph_expanded: 0,
-                            post_filter_count: 0,
-                            retriever_name: self.name().to_string(),
-                        },
-                    });
-                }
-            }
+        if let Some(denied) = check_rbac_scope(opts, scope_id, self.name(), &start) {
+            return Ok(denied);
         }
 
         // Embed the query.
@@ -210,27 +225,8 @@ impl Retriever for GraphExpandRetriever {
     ) -> Result<RetrievalResult> {
         let start = Instant::now();
 
-        // RBAC scope check: if agent has ReadWrite with explicit scopes, verify access.
-        if let Some(ref perms) = opts.permissions {
-            if let AgentPermission::ReadWrite { scopes } = perms {
-                if !scopes.iter().any(|s| s == scope_id || s == "*") {
-                    info!(
-                        retriever = self.name(),
-                        scope_id,
-                        "RBAC denied: agent lacks scope access"
-                    );
-                    return Ok(RetrievalResult {
-                        results: Vec::new(),
-                        metrics: RetrievalMetrics {
-                            latency_ms: start.elapsed().as_millis() as u64,
-                            vector_results: 0,
-                            graph_expanded: 0,
-                            post_filter_count: 0,
-                            retriever_name: self.name().to_string(),
-                        },
-                    });
-                }
-            }
+        if let Some(denied) = check_rbac_scope(opts, scope_id, self.name(), &start) {
+            return Ok(denied);
         }
 
         // Embed the query.
@@ -431,7 +427,7 @@ mod tests {
         // HNSW approximate recall is unreliable at small N — use >= assertions.
         assert!(result.results.len() >= 2, "expected at least 2 results, got {}", result.results.len());
         assert!(result.results.len() <= 5, "should respect limit");
-        assert_eq!(result.metrics.retriever_name, "VectorRetriever");
+        assert_eq!(result.metrics.retriever_name, "vector");
         assert!(result.metrics.vector_results >= 2);
         assert!(result.metrics.post_filter_count >= 2);
         assert_eq!(result.metrics.graph_expanded, 0);

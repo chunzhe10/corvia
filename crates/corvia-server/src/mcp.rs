@@ -57,6 +57,9 @@ impl JsonRpcResponse {
 const METHOD_NOT_FOUND: i32 = -32601;
 const INVALID_PARAMS: i32 = -32602;
 const INTERNAL_ERROR: i32 = -32603;
+/// Service unavailable (optional component not configured).
+/// Uses -32000 from the JSON-RPC implementation-defined server error range (-32000..-32099).
+const SERVICE_UNAVAILABLE: i32 = -32000;
 
 // --- MCP tool definitions ---
 
@@ -590,7 +593,7 @@ async fn tool_corvia_context(
     let expand_graph = args.get("expand_graph").and_then(|v| v.as_bool()).unwrap_or(true);
 
     let rag = state.rag.as_ref()
-        .ok_or((INTERNAL_ERROR, "RAG pipeline not configured".into()))?;
+        .ok_or((SERVICE_UNAVAILABLE, "RAG pipeline not configured".into()))?;
 
     let opts = corvia_kernel::rag_types::RetrievalOpts {
         limit,
@@ -634,7 +637,7 @@ async fn tool_corvia_ask(
     let expand_graph = args.get("expand_graph").and_then(|v| v.as_bool()).unwrap_or(true);
 
     let rag = state.rag.as_ref()
-        .ok_or((INTERNAL_ERROR, "RAG pipeline not configured".into()))?;
+        .ok_or((SERVICE_UNAVAILABLE, "RAG pipeline not configured".into()))?;
 
     let opts = corvia_kernel::rag_types::RetrievalOpts {
         limit,
@@ -921,6 +924,59 @@ mod tests {
         let result = tool_corvia_agent_status(&state, Some("test-agent")).unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("not enabled"));
+    }
+
+    /// When AppState has rag: Some(...), corvia_search should route through RAG.
+    #[tokio::test]
+    async fn test_corvia_search_routes_through_rag() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+
+        let engine = Arc::new(MockEngine) as Arc<dyn InferenceEngine>;
+
+        // Insert entries with embeddings and Merged status for visibility.
+        for i in 0..10 {
+            let mut entry = corvia_common::types::KnowledgeEntry::new(
+                format!("rag-routed item {i}"),
+                "rag-scope".into(),
+                "v1".into(),
+            );
+            entry.embedding = Some(vec![1.0, (i as f32) * 0.001, 0.0]);
+            entry.entry_status = corvia_common::agent_types::EntryStatus::Merged;
+            store.insert(&entry).await.unwrap();
+        }
+
+        // Build a RAG pipeline and inject into AppState.
+        let config = corvia_common::config::CorviaConfig::default();
+        let rag = Arc::new(corvia_kernel::create_rag_pipeline(
+            store.clone() as Arc<dyn QueryableStore>,
+            engine.clone(),
+            None,
+            None,
+            &config,
+        ));
+
+        let state = Arc::new(AppState {
+            store: store.clone() as Arc<dyn QueryableStore>,
+            engine,
+            coordinator: None,
+            graph: store.clone() as Arc<dyn GraphStore>,
+            temporal: store as Arc<dyn TemporalStore>,
+            data_dir: dir.path().to_path_buf(),
+            rag: Some(rag),
+        });
+
+        let args = json!({ "query": "rag-routed", "scope_id": "rag-scope", "limit": 5 });
+        let result = tool_corvia_search(&state, &args, None).await.unwrap();
+
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        // RAG-routed search should still return results.
+        assert!(
+            parsed["count"].as_u64().unwrap() >= 1,
+            "RAG-routed search should return results, got: {text}"
+        );
     }
 
     #[tokio::test]

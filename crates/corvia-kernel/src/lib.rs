@@ -240,7 +240,13 @@ pub fn create_rag_pipeline(
         )),
         None => Arc::new(retriever::VectorRetriever::new(store.clone(), engine.clone())),
     };
-    let aug: Arc<dyn augmenter::Augmenter> = Arc::new(augmenter::StructuredAugmenter::new());
+    let aug: Arc<dyn augmenter::Augmenter> = if config.rag.system_prompt.is_empty() {
+        Arc::new(augmenter::StructuredAugmenter::new())
+    } else {
+        Arc::new(augmenter::StructuredAugmenter::with_system_prompt(
+            config.rag.system_prompt.clone(),
+        ))
+    };
     rag_pipeline::RagPipeline::new(ret, aug, generator, config.rag.clone())
 }
 
@@ -310,7 +316,7 @@ mod tests {
         );
 
         let pipeline = create_rag_pipeline(store, engine, None, None, &config);
-        assert_eq!(pipeline.retriever_name(), "VectorRetriever");
+        assert_eq!(pipeline.retriever_name(), "vector");
     }
 
     #[tokio::test]

@@ -209,6 +209,9 @@ mod tests {
 
     #[async_trait]
     impl GenerationEngine for MockGenerator {
+        fn name(&self) -> &str {
+            "mock"
+        }
         async fn generate(
             &self,
             _system: &str,
@@ -288,11 +291,11 @@ mod tests {
         );
         assert_eq!(
             pipeline.retriever_name(),
-            "VectorRetriever",
+            "vector",
             "retriever name should be VectorRetriever"
         );
         assert_eq!(
-            resp.context.metrics.augmenter_name, "StructuredAugmenter",
+            resp.context.metrics.augmenter_name, "structured",
             "augmenter name should be StructuredAugmenter"
         );
     }

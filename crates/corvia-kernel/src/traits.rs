@@ -142,6 +142,9 @@ pub struct GenerationResult {
 /// OllamaChatEngine (HTTP), GrpcVllmChatEngine (vLLM).
 #[async_trait]
 pub trait GenerationEngine: Send + Sync {
+    /// Human-readable name for metrics attribution (D62).
+    fn name(&self) -> &str;
+
     /// Generate a text response from a system prompt and user message.
     async fn generate(
         &self,

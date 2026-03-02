@@ -82,7 +82,7 @@ impl Default for StructuredAugmenter {
 
 impl Augmenter for StructuredAugmenter {
     fn name(&self) -> &str {
-        "StructuredAugmenter"
+        "structured"
     }
 
     fn augment(
@@ -253,7 +253,7 @@ mod tests {
         // Verify metrics.
         assert_eq!(ctx.metrics.sources_included, 2);
         assert_eq!(ctx.metrics.sources_truncated, 0);
-        assert_eq!(ctx.metrics.augmenter_name, "StructuredAugmenter");
+        assert_eq!(ctx.metrics.augmenter_name, "structured");
         assert!(ctx.metrics.token_estimate > 0);
         assert!(ctx.metrics.token_budget > 0);
     }

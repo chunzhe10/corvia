@@ -70,7 +70,7 @@ async fn test_rag_pipeline_context_mode_e2e() {
     );
 
     // Without graph, should use VectorRetriever.
-    assert_eq!(pipeline.retriever_name(), "VectorRetriever");
+    assert_eq!(pipeline.retriever_name(), "vector");
 
     // Test context() mode.
     let response = pipeline
@@ -88,7 +88,7 @@ async fn test_rag_pipeline_context_mode_e2e() {
         "context should have citation markers"
     );
     assert_eq!(
-        response.trace.retrieval.retriever_name, "VectorRetriever",
+        response.trace.retrieval.retriever_name, "vector",
         "trace should record retriever name"
     );
     assert!(
