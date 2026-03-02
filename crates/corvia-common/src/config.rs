@@ -62,6 +62,10 @@ pub struct CorviaConfig {
     pub workspace: Option<WorkspaceConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ReasoningConfig>,
+    #[serde(default)]
+    pub rag: RagConfig,
+    #[serde(default)]
+    pub chunking: ChunkingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +169,72 @@ impl Default for MergeConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RagConfig {
+    #[serde(default = "default_rag_limit")]
+    pub default_limit: usize,
+    #[serde(default = "default_graph_expand")]
+    pub graph_expand: bool,
+    #[serde(default = "default_graph_depth")]
+    pub graph_depth: usize,
+    #[serde(default = "default_graph_alpha")]
+    pub graph_alpha: f32,
+    #[serde(default = "default_reserve_for_answer")]
+    pub reserve_for_answer: f32,
+    #[serde(default)]
+    pub max_context_tokens: usize,
+    #[serde(default)]
+    pub system_prompt: String,
+}
+
+fn default_rag_limit() -> usize { 10 }
+fn default_graph_expand() -> bool { true }
+fn default_graph_depth() -> usize { 2 }
+fn default_graph_alpha() -> f32 { 0.3 }
+fn default_reserve_for_answer() -> f32 { 0.2 }
+
+impl Default for RagConfig {
+    fn default() -> Self {
+        Self {
+            default_limit: default_rag_limit(),
+            graph_expand: default_graph_expand(),
+            graph_depth: default_graph_depth(),
+            graph_alpha: default_graph_alpha(),
+            reserve_for_answer: default_reserve_for_answer(),
+            max_context_tokens: 0,
+            system_prompt: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkingConfig {
+    #[serde(default = "default_max_chunk_tokens")]
+    pub max_tokens: usize,
+    #[serde(default = "default_min_chunk_tokens")]
+    pub min_tokens: usize,
+    #[serde(default = "default_overlap_tokens")]
+    pub overlap_tokens: usize,
+    #[serde(default = "default_chunking_strategy")]
+    pub strategy: String,
+}
+
+fn default_max_chunk_tokens() -> usize { 512 }
+fn default_min_chunk_tokens() -> usize { 32 }
+fn default_overlap_tokens() -> usize { 64 }
+fn default_chunking_strategy() -> String { "auto".into() }
+
+impl Default for ChunkingConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens: default_max_chunk_tokens(),
+            min_tokens: default_min_chunk_tokens(),
+            overlap_tokens: default_overlap_tokens(),
+            strategy: default_chunking_strategy(),
+        }
+    }
+}
+
 impl Default for CorviaConfig {
     fn default() -> Self {
         Self {
@@ -195,6 +265,8 @@ impl Default for CorviaConfig {
             merge: MergeConfig::default(),
             workspace: None,
             reasoning: None,
+            rag: RagConfig::default(),
+            chunking: ChunkingConfig::default(),
         }
     }
 }
@@ -556,5 +628,74 @@ port = 8020
 "#;
         let config: CorviaConfig = toml::from_str(toml_str).unwrap();
         assert!(config.reasoning.is_none(), "missing [reasoning] section should parse as None");
+    }
+
+    #[test]
+    fn test_rag_config_defaults() {
+        let config = RagConfig::default();
+        assert_eq!(config.default_limit, 10);
+        assert!(config.graph_expand);
+        assert_eq!(config.graph_depth, 2);
+        assert!((config.graph_alpha - 0.3).abs() < f32::EPSILON);
+        assert!((config.reserve_for_answer - 0.2).abs() < f32::EPSILON);
+        assert_eq!(config.max_context_tokens, 0);
+        assert!(config.system_prompt.is_empty());
+    }
+
+    #[test]
+    fn test_chunking_config_defaults() {
+        let config = ChunkingConfig::default();
+        assert_eq!(config.max_tokens, 512);
+        assert_eq!(config.min_tokens, 32);
+        assert_eq!(config.overlap_tokens, 64);
+        assert_eq!(config.strategy, "auto");
+    }
+
+    #[test]
+    fn test_rag_config_roundtrip() {
+        let mut config = CorviaConfig::default();
+        config.rag.default_limit = 20;
+        config.rag.graph_alpha = 0.5;
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let loaded: CorviaConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(loaded.rag.default_limit, 20);
+        assert!((loaded.rag.graph_alpha - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_chunking_config_roundtrip() {
+        let mut config = CorviaConfig::default();
+        config.chunking.max_tokens = 1024;
+        config.chunking.overlap_tokens = 128;
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let loaded: CorviaConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(loaded.chunking.max_tokens, 1024);
+        assert_eq!(loaded.chunking.overlap_tokens, 128);
+    }
+
+    #[test]
+    fn test_existing_config_without_rag_or_chunking_still_parses() {
+        let toml_str = r#"
+[project]
+name = "test"
+scope_id = "test"
+
+[storage]
+store_type = "lite"
+data_dir = ".corvia"
+
+[embedding]
+provider = "ollama"
+model = "nomic-embed-text"
+url = "http://127.0.0.1:11434"
+dimensions = 768
+
+[server]
+host = "127.0.0.1"
+port = 8020
+"#;
+        let config: CorviaConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.rag.default_limit, 10);
+        assert_eq!(config.chunking.max_tokens, 512);
     }
 }
