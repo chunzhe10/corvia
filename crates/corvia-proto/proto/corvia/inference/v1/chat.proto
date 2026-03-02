@@ -1,0 +1,32 @@
+syntax = "proto3";
+package corvia.inference.v1;
+
+service ChatService {
+  rpc Chat(ChatRequest) returns (ChatResponse);
+  rpc ChatStream(ChatRequest) returns (stream ChatChunk);
+}
+
+message ChatMessage {
+  string role = 1;
+  string content = 2;
+}
+
+message ChatRequest {
+  string model = 1;
+  repeated ChatMessage messages = 2;
+  float temperature = 3;
+  uint32 max_tokens = 4;
+}
+
+message ChatResponse {
+  ChatMessage message = 1;
+  uint32 prompt_tokens = 2;
+  uint32 completion_tokens = 3;
+}
+
+message ChatChunk {
+  string delta = 1;
+  bool done = 2;
+  uint32 prompt_tokens = 3;
+  uint32 completion_tokens = 4;
+}

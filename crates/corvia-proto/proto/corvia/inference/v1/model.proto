@@ -1,0 +1,39 @@
+syntax = "proto3";
+package corvia.inference.v1;
+
+service ModelManager {
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+  rpc LoadModel(LoadModelRequest) returns (LoadModelResponse);
+  rpc UnloadModel(UnloadModelRequest) returns (UnloadModelResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message ListModelsRequest {}
+message ListModelsResponse {
+  repeated ModelStatus models = 1;
+}
+
+message ModelStatus {
+  string name = 1;
+  string model_type = 2;
+  bool loaded = 3;
+  uint64 memory_bytes = 4;
+}
+
+message LoadModelRequest {
+  string name = 1;
+  string model_type = 2;
+}
+message LoadModelResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message UnloadModelRequest { string name = 1; }
+message UnloadModelResponse { bool success = 1; }
+
+message HealthRequest {}
+message HealthResponse {
+  bool healthy = 1;
+  uint32 models_loaded = 2;
+}
