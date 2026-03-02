@@ -114,3 +114,69 @@ pub trait GraphStore: Send + Sync {
     /// Delete all edges involving an entry.
     async fn remove_edges(&self, entry_id: &uuid::Uuid) -> Result<()>;
 }
+
+/// Chat message for generation requests.
+#[derive(Debug, Clone)]
+pub struct ChatMessage {
+    pub role: String,    // "system", "user", "assistant"
+    pub content: String,
+}
+
+/// Result from a GenerationEngine call.
+#[derive(Debug, Clone)]
+pub struct GenerationResult {
+    pub text: String,
+    pub model: String,
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+}
+
+/// Text generation engine for RAG answers and LLM-assisted merge (D63).
+///
+/// Wire protocol name (`ChatService` in proto) is separate from this
+/// Rust capability trait. Implementations: GrpcChatEngine (corvia-inference),
+/// OllamaChatEngine (HTTP), GrpcVllmChatEngine (vLLM).
+#[async_trait]
+pub trait GenerationEngine: Send + Sync {
+    /// Generate a text response from a system prompt and user message.
+    async fn generate(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+    ) -> Result<GenerationResult>;
+
+    /// Return the model's context window size in tokens.
+    fn context_window(&self) -> usize;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Compile-time test: verify trait is object-safe
+    fn _assert_generation_engine_object_safe(_: &dyn GenerationEngine) {}
+
+    #[test]
+    fn test_chat_message_construction() {
+        let msg = ChatMessage {
+            role: "user".into(),
+            content: "hello".into(),
+        };
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.content, "hello");
+    }
+
+    #[test]
+    fn test_generation_result_construction() {
+        let result = GenerationResult {
+            text: "answer".into(),
+            model: "test-model".into(),
+            input_tokens: 100,
+            output_tokens: 50,
+        };
+        assert_eq!(result.text, "answer");
+        assert_eq!(result.model, "test-model");
+        assert_eq!(result.input_tokens, 100);
+        assert_eq!(result.output_tokens, 50);
+    }
+}
