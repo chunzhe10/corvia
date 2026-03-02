@@ -80,6 +80,7 @@ pub mod token_estimator;
 pub mod rag_types;
 pub mod chunking_strategy;
 pub mod grpc_engine;
+pub mod grpc_chat;
 
 use corvia_common::config::{CorviaConfig, InferenceProvider, StoreType};
 use corvia_common::errors::Result;
