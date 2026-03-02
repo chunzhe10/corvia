@@ -129,6 +129,35 @@ impl ChunkingPipeline {
         }
     }
 
+    /// Create a pipeline pre-loaded with all kernel default strategies.
+    ///
+    /// Registers [`FallbackChunker`], [`MarkdownChunker`], [`ConfigChunker`],
+    /// and [`PdfChunker`] with the [`FormatRegistry`], using
+    /// [`CharDivFourEstimator`] for token estimation.
+    pub fn with_kernel_defaults(config: ChunkingConfig) -> Self {
+        let fallback = Arc::new(crate::chunking_fallback::FallbackChunker::new(config.max_tokens));
+        let mut registry = FormatRegistry::new(fallback);
+
+        let md = Arc::new(crate::chunking_markdown::MarkdownChunker::new());
+        for ext in md.supported_extensions() {
+            registry.register_default(ext, md.clone());
+        }
+
+        let cfg_chunker = Arc::new(crate::chunking_config_fmt::ConfigChunker::new());
+        for ext in cfg_chunker.supported_extensions() {
+            registry.register_default(ext, cfg_chunker.clone());
+        }
+
+        let pdf = Arc::new(crate::chunking_pdf::PdfChunker::new());
+        for ext in pdf.supported_extensions() {
+            registry.register_default(ext, pdf.clone());
+        }
+
+        let estimator = Arc::new(crate::token_estimator::CharDivFourEstimator)
+            as Arc<dyn crate::token_estimator::TokenEstimator>;
+        Self::new(registry, estimator, config)
+    }
+
     /// Mutable access to the format registry for adapter registration.
     pub fn registry_mut(&mut self) -> &mut FormatRegistry {
         &mut self.registry
@@ -715,5 +744,53 @@ mod tests {
         assert!(!info.was_split, "small chunk should not be split");
         assert!(!info.was_merged, "single chunk should not be merged");
         assert_eq!(info.overlap_tokens, 0);
+    }
+
+    // -- with_kernel_defaults tests ----------------------------------------
+
+    fn default_config() -> ChunkingConfig {
+        ChunkingConfig {
+            max_tokens: 512,
+            min_tokens: 32,
+            overlap_tokens: 0,
+            strategy: "auto".into(),
+        }
+    }
+
+    #[test]
+    fn test_with_kernel_defaults_routes_md() {
+        let config = default_config();
+        let pipeline = ChunkingPipeline::with_kernel_defaults(config);
+        // Use different heading depths so merge_small won't combine them
+        // (they have different merge groups: h1 vs h2).
+        let source = "# Hello\n\nWorld.\n\n## Goodbye\n\nSee you.";
+        let meta = test_meta("md");
+        let chunks = pipeline.process(source, &meta).unwrap();
+        assert!(
+            chunks.len() >= 2,
+            "expected >= 2 chunks, got {} (different heading depths should prevent merging)",
+            chunks.len()
+        );
+        assert_eq!(chunks[0].processing.strategy_name, "markdown");
+    }
+
+    #[test]
+    fn test_with_kernel_defaults_routes_toml() {
+        let config = default_config();
+        let pipeline = ChunkingPipeline::with_kernel_defaults(config);
+        let source = "[package]\nname = \"test\"\n\n[deps]\nserde = \"1\"\n";
+        let meta = test_meta("toml");
+        let chunks = pipeline.process(source, &meta).unwrap();
+        assert_eq!(chunks[0].processing.strategy_name, "config");
+    }
+
+    #[test]
+    fn test_with_kernel_defaults_routes_unknown_to_fallback() {
+        let config = default_config();
+        let pipeline = ChunkingPipeline::with_kernel_defaults(config);
+        let source = "some random content";
+        let meta = test_meta("xyz");
+        let chunks = pipeline.process(source, &meta).unwrap();
+        assert_eq!(chunks[0].processing.strategy_name, "fallback");
     }
 }
