@@ -21,6 +21,7 @@ pub struct AppState {
     pub graph: Arc<dyn GraphStore>,
     pub temporal: Arc<dyn TemporalStore>,
     pub data_dir: std::path::PathBuf,
+    pub rag: Option<Arc<corvia_kernel::rag_pipeline::RagPipeline>>,
 }
 
 // --- Existing memory types ---
@@ -75,6 +76,23 @@ impl From<SearchResult> for SearchResultDto {
             end_line: r.entry.metadata.end_line,
         }
     }
+}
+
+// --- RAG types ---
+
+#[derive(Deserialize)]
+pub struct RagRequest {
+    pub query: String,
+    pub scope_id: String,
+    pub limit: Option<usize>,
+    pub expand_graph: Option<bool>,
+}
+
+#[derive(Serialize)]
+pub struct RagResponseDto {
+    pub answer: Option<String>,
+    pub sources: Vec<SearchResultDto>,
+    pub trace: corvia_kernel::rag_types::PipelineTrace,
 }
 
 // --- Agent coordination types ---
@@ -248,6 +266,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/evolution", get(evolution))
         .route("/v1/edges", post(create_edge))
         .route("/v1/reason", post(reason))
+        // RAG endpoints
+        .route("/v1/context", post(rag_context))
+        .route("/v1/ask", post(rag_ask))
         .route("/health", get(health))
         .with_state(state)
 }
@@ -299,6 +320,22 @@ async fn search_memories(
 ) -> std::result::Result<Json<SearchResponse>, (StatusCode, String)> {
     let limit = req.limit.unwrap_or(10);
 
+    // Route through RAG pipeline if available (fixes ContextBuilder bypass bug)
+    if let Some(rag) = &state.rag {
+        let opts = corvia_kernel::rag_types::RetrievalOpts {
+            limit,
+            expand_graph: false, // backward compat: pure vector for search endpoint
+            ..Default::default()
+        };
+        let response = rag.context(&req.query, &req.scope_id, Some(opts)).await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Search failed: {e}")))?;
+
+        let results: Vec<SearchResultDto> = response.context.sources.into_iter().map(Into::into).collect();
+        let count = results.len();
+        return Ok(Json(SearchResponse { results, count }));
+    }
+
+    // Fallback: raw store search (no RAG pipeline configured)
     let query_embedding = state.engine.embed(&req.query).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Embedding failed: {e}")))?;
 
@@ -309,6 +346,54 @@ async fn search_memories(
     let results: Vec<SearchResultDto> = results.into_iter().map(Into::into).collect();
 
     Ok(Json(SearchResponse { results, count }))
+}
+
+// --- RAG handlers ---
+
+async fn rag_context(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RagRequest>,
+) -> std::result::Result<Json<RagResponseDto>, (StatusCode, String)> {
+    let rag = state.rag.as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "RAG pipeline not configured".into()))?;
+
+    let opts = corvia_kernel::rag_types::RetrievalOpts {
+        limit: req.limit.unwrap_or(10),
+        expand_graph: req.expand_graph.unwrap_or(true),
+        ..Default::default()
+    };
+
+    let response = rag.context(&req.query, &req.scope_id, Some(opts)).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("RAG failed: {e}")))?;
+
+    Ok(Json(RagResponseDto {
+        answer: response.answer,
+        sources: response.context.sources.into_iter().map(Into::into).collect(),
+        trace: response.trace,
+    }))
+}
+
+async fn rag_ask(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RagRequest>,
+) -> std::result::Result<Json<RagResponseDto>, (StatusCode, String)> {
+    let rag = state.rag.as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "RAG pipeline not configured".into()))?;
+
+    let opts = corvia_kernel::rag_types::RetrievalOpts {
+        limit: req.limit.unwrap_or(10),
+        expand_graph: req.expand_graph.unwrap_or(true),
+        ..Default::default()
+    };
+
+    let response = rag.ask(&req.query, &req.scope_id, Some(opts)).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("RAG failed: {e}")))?;
+
+    Ok(Json(RagResponseDto {
+        answer: response.answer,
+        sources: response.context.sources.into_iter().map(Into::into).collect(),
+        trace: response.trace,
+    }))
 }
 
 // --- Agent coordination handlers ---

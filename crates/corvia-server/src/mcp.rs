@@ -546,6 +546,7 @@ mod tests {
             graph: store.clone() as Arc<dyn GraphStore>,
             temporal: store as Arc<dyn TemporalStore>,
             data_dir: dir.to_path_buf(),
+            rag: None,
         })
     }
 

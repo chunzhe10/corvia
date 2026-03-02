@@ -392,7 +392,7 @@ async fn cmd_serve(mcp: bool) -> Result<()> {
     };
 
     let data_dir = std::path::PathBuf::from(&config.storage.data_dir);
-    let state = Arc::new(corvia_server::rest::AppState { store, engine, coordinator, graph, temporal, data_dir });
+    let state = Arc::new(corvia_server::rest::AppState { store, engine, coordinator, graph, temporal, data_dir, rag: None });
     let mut app = corvia_server::rest::router(state.clone());
 
     if mcp {
