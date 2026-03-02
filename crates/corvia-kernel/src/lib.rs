@@ -79,6 +79,7 @@ pub mod reasoner;
 pub mod token_estimator;
 pub mod rag_types;
 pub mod chunking_strategy;
+pub mod grpc_engine;
 
 use corvia_common::config::{CorviaConfig, InferenceProvider, StoreType};
 use corvia_common::errors::Result;
@@ -97,7 +98,11 @@ pub fn create_engine(config: &CorviaConfig) -> Box<dyn traits::InferenceEngine> 
             &config.embedding.model,
             config.embedding.dimensions,
         )),
-        InferenceProvider::Corvia => todo!("M3.1: GrpcInferenceEngine"),
+        InferenceProvider::Corvia => Box::new(grpc_engine::GrpcInferenceEngine::new(
+            &config.embedding.url,
+            &config.embedding.model,
+            config.embedding.dimensions,
+        )),
     }
 }
 

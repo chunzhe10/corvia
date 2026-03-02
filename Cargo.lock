@@ -869,6 +869,7 @@ dependencies = [
  "bollard",
  "chrono",
  "corvia-common",
+ "corvia-proto",
  "futures-util",
  "hnsw_rs",
  "petgraph",
@@ -881,6 +882,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml",
+ "tonic 0.12.3",
  "tracing",
  "uuid",
 ]

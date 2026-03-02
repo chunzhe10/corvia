@@ -13,6 +13,8 @@ categories = ["database-implementations", "data-structures"]
 
 [dependencies]
 corvia-common.workspace = true
+corvia-proto.workspace = true
+tonic = "0.12"
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
