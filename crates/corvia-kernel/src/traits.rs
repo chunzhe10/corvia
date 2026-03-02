@@ -39,16 +39,25 @@ pub trait InferenceEngine: Send + Sync {
     fn dimensions(&self) -> usize;
 }
 
-/// Ingestion adapter for domain-specific sources (D11, Section 4).
-/// Git/code adapter is the first implementation.
+/// Ingestion adapter for domain-specific sources (D11/D69).
+///
+/// D69 clean break: adapters return raw [`SourceFile`]s and register
+/// [`ChunkingStrategy`]s. The kernel's [`ChunkingPipeline`] handles
+/// splitting, merging, and token budget enforcement.
 #[async_trait]
 pub trait IngestionAdapter: Send + Sync {
     /// Domain name (e.g., "git", "general").
     fn domain(&self) -> &str;
 
-    /// Ingest a source and return knowledge entries (without embeddings).
-    /// Embeddings are added by the kernel after ingestion.
-    async fn ingest(&self, source_path: &str) -> Result<Vec<KnowledgeEntry>>;
+    /// Register chunking strategies this adapter provides.
+    /// Called once during pipeline setup. The adapter registers
+    /// its strategies (e.g., AstChunker) as overrides in the registry.
+    fn register_chunking(&self, registry: &mut crate::chunking_pipeline::FormatRegistry);
+
+    /// Return raw source files for the kernel's ChunkingPipeline.
+    /// Files are returned as-is (content + metadata); the pipeline
+    /// handles all chunking, embedding, and storage.
+    async fn ingest_sources(&self, source_path: &str) -> Result<Vec<crate::chunking_strategy::SourceFile>>;
 }
 
 /// Temporal query interface for bi-temporal knowledge (D38).
@@ -160,8 +169,9 @@ pub trait GenerationEngine: Send + Sync {
 mod tests {
     use super::*;
 
-    // Compile-time test: verify trait is object-safe
+    // Compile-time test: verify traits are object-safe
     fn _assert_generation_engine_object_safe(_: &dyn GenerationEngine) {}
+    fn _assert_ingestion_adapter_object_safe(_: &dyn IngestionAdapter) {}
 
     #[test]
     fn test_chat_message_construction() {

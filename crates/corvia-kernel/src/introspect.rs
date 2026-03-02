@@ -2,6 +2,7 @@ use serde::Deserialize;
 use std::path::Path;
 use crate::traits::{InferenceEngine, QueryableStore, IngestionAdapter};
 use corvia_common::errors::{CorviaError, Result};
+use corvia_common::types::{EntryMetadata, KnowledgeEntry};
 use tracing::info;
 
 /// Default batch size for embedding operations.
@@ -171,6 +172,13 @@ impl Introspect {
     }
 
     /// Phase 2: Ingest Corvia's own source code.
+    ///
+    /// Uses the D69 `ingest_sources` API: the adapter returns raw
+    /// [`SourceFile`](crate::chunking_strategy::SourceFile)s which are
+    /// converted to [`KnowledgeEntry`]s, embedded, and stored.
+    ///
+    /// NOTE: This bypasses the `ChunkingPipeline` for now (each source
+    /// file becomes one entry). Task 10 will wire full pipeline chunking.
     pub async fn ingest_self(
         &self,
         source_path: &str,
@@ -178,9 +186,29 @@ impl Introspect {
         engine: &dyn InferenceEngine,
         store: &dyn QueryableStore,
     ) -> Result<usize> {
-        let entries = adapter.ingest(source_path).await?;
-        let total = entries.len();
-        info!("{total} chunks extracted from {source_path}");
+        let source_files = adapter.ingest_sources(source_path).await?;
+        let total = source_files.len();
+        info!("{total} source files extracted from {source_path}");
+
+        // Convert SourceFiles to KnowledgeEntries (one entry per file for now).
+        let entries: Vec<KnowledgeEntry> = source_files
+            .iter()
+            .map(|sf| {
+                let mut entry = KnowledgeEntry::new(
+                    sf.content.clone(),
+                    self.config.config.scope_id.clone(),
+                    sf.metadata.source_version.clone(),
+                );
+                entry.metadata = EntryMetadata {
+                    source_file: Some(sf.metadata.file_path.clone()),
+                    language: sf.metadata.language.clone(),
+                    chunk_type: Some("file".into()),
+                    start_line: None,
+                    end_line: None,
+                };
+                entry
+            })
+            .collect();
 
         let mut stored = 0;
         for batch in entries.chunks(EMBED_BATCH_SIZE) {
@@ -189,13 +217,12 @@ impl Introspect {
 
             for (entry, embedding) in batch.iter().zip(embeddings) {
                 let mut entry = entry.clone();
-                entry.scope_id = self.config.config.scope_id.clone();
                 entry.embedding = Some(embedding);
                 store.insert(&entry).await?;
                 stored += 1;
             }
         }
-        info!("{stored}/{total} chunks embedded and stored");
+        info!("{stored}/{total} source files embedded and stored");
         Ok(stored)
     }
 
