@@ -1,5 +1,9 @@
 <p align="center">
-  <img src="docs/assets/corvia-logo.png" alt="corvia" width="280">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/corvia-logo-light.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/corvia-logo.png">
+    <img src="docs/assets/corvia-logo.png" alt="corvia" width="280">
+  </picture>
 </p>
 
 <p align="center">
