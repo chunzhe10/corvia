@@ -5,6 +5,11 @@ use corvia_proto::chat_service_client::ChatServiceClient;
 use corvia_proto::ChatRequest;
 use tonic::transport::Channel;
 
+/// Default temperature for merge/reasoning chat calls.
+const DEFAULT_TEMPERATURE: f32 = 0.7;
+/// Default max tokens for merge/reasoning chat calls.
+const DEFAULT_MAX_TOKENS: u32 = 2048;
+
 pub struct GrpcChatEngine {
     endpoint: String,
 }
@@ -22,7 +27,7 @@ impl GrpcChatEngine {
         };
         ChatServiceClient::connect(url)
             .await
-            .map_err(|e| CorviaError::Agent(format!("gRPC chat connect failed: {e}")))
+            .map_err(|e| CorviaError::Infra(format!("gRPC chat connect failed: {e}")))
     }
 }
 
@@ -40,15 +45,15 @@ impl super::traits::ChatEngine for GrpcChatEngine {
         let request = tonic::Request::new(ChatRequest {
             model: model.to_string(),
             messages: proto_messages,
-            temperature: 0.7,
-            max_tokens: 2048,
+            temperature: DEFAULT_TEMPERATURE,
+            max_tokens: DEFAULT_MAX_TOKENS,
         });
 
         let response = client.chat(request).await
-            .map_err(|e| CorviaError::Agent(format!("gRPC Chat failed: {e}")))?;
+            .map_err(|e| CorviaError::Infra(format!("gRPC Chat failed: {e}")))?;
 
         let msg = response.into_inner().message
-            .ok_or_else(|| CorviaError::Agent("gRPC Chat response missing message".into()))?;
+            .ok_or_else(|| CorviaError::Infra("gRPC Chat response missing message".into()))?;
         Ok(msg.content)
     }
 }

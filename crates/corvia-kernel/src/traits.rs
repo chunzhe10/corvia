@@ -115,7 +115,7 @@ pub trait GraphStore: Send + Sync {
     async fn remove_edges(&self, entry_id: &uuid::Uuid) -> Result<()>;
 }
 
-// Re-export ChatMessage from corvia-common for backward compatibility.
+// Re-export ChatMessage so kernel consumers don't need a direct corvia-common dependency.
 pub use corvia_common::types::ChatMessage;
 
 /// Chat/reasoning provider for LLM inference (D60).

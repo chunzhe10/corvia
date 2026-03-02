@@ -88,14 +88,8 @@ pub struct AugmentationMetrics {
     pub augmenter_name: String,
 }
 
-/// Output of the generation stage.
-#[derive(Debug, Clone)]
-pub struct GenerationResult {
-    pub text: String,
-    pub model: String,
-    pub input_tokens: usize,
-    pub output_tokens: usize,
-}
+// Re-export from traits — single definition used by both GenerationEngine and RAG pipeline.
+pub use crate::traits::GenerationResult;
 
 /// Metrics from the generation stage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,28 +121,5 @@ pub struct RagResponse {
     pub trace: PipelineTrace,
 }
 
-/// RAG pipeline configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RagConfig {
-    pub default_limit: usize,
-    pub graph_expand: bool,
-    pub graph_depth: usize,
-    pub graph_alpha: f32,
-    pub reserve_for_answer: f32,
-    pub max_context_tokens: usize,
-    pub system_prompt: Option<String>,
-}
-
-impl Default for RagConfig {
-    fn default() -> Self {
-        Self {
-            default_limit: 10,
-            graph_expand: true,
-            graph_depth: 2,
-            graph_alpha: 0.3,
-            reserve_for_answer: 0.2,
-            max_context_tokens: 0,
-            system_prompt: None,
-        }
-    }
-}
+// Re-export from config — single definition for TOML deserialization and runtime use.
+pub use corvia_common::config::RagConfig;
