@@ -1,6 +1,8 @@
+mod embedding_service;
 mod model_manager;
 
 use clap::Parser;
+use corvia_proto::embedding_service_server::EmbeddingServiceServer;
 use corvia_proto::model_manager_server::ModelManagerServer;
 use tonic::transport::Server;
 
@@ -37,11 +39,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Serve { port } => {
             let addr = format!("0.0.0.0:{port}").parse()?;
             let model_mgr = model_manager::ModelManagerService::new();
+            let embed_svc = embedding_service::EmbeddingServiceImpl::new();
 
             tracing::info!("corvia-inference listening on {addr}");
 
             Server::builder()
                 .add_service(ModelManagerServer::new(model_mgr))
+                .add_service(EmbeddingServiceServer::new(embed_svc))
                 .serve(addr)
                 .await?;
         }
