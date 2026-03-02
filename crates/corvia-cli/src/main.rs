@@ -327,11 +327,27 @@ async fn cmd_init(full: bool) -> Result<()> {
 
         println!("  LiteStore initialized in {}/", config.storage.data_dir);
 
-        // Provision Ollama (install, start, pull model) — mirrors Docker provisioning for FullStore
-        println!("  Provisioning Ollama...");
-        let provisioner = OllamaProvisioner::new(&config.embedding.url);
-        provisioner.ensure_ready(&config.embedding.model).await?;
-        println!("  Ollama ready (model: {})", config.embedding.model);
+        // Provision inference backend
+        match config.embedding.provider {
+            corvia_common::config::InferenceProvider::Corvia => {
+                println!("  Provisioning Corvia inference server...");
+                let provisioner = corvia_kernel::inference_provisioner::InferenceProvisioner::new(
+                    &config.embedding.url,
+                );
+                provisioner.ensure_ready(&config.embedding.model, &config.merge.model).await?;
+                println!("  Corvia inference ready (embed: {}, chat: {})",
+                    config.embedding.model, config.merge.model);
+            }
+            corvia_common::config::InferenceProvider::Ollama => {
+                println!("  Provisioning Ollama...");
+                let provisioner = OllamaProvisioner::new(&config.embedding.url);
+                provisioner.ensure_ready(&config.embedding.model).await?;
+                println!("  Ollama ready (model: {})", config.embedding.model);
+            }
+            corvia_common::config::InferenceProvider::Vllm => {
+                // vLLM is provisioned via Docker in full mode — nothing needed here
+            }
+        }
     }
 
     println!("\nNext: corvia ingest <path-to-repo>");
@@ -345,9 +361,18 @@ async fn cmd_serve(mcp: bool) -> Result<()> {
 
     // Construct AgentCoordinator
     let data_dir = std::path::Path::new(&config.storage.data_dir);
-    let chat_engine: std::sync::Arc<dyn corvia_kernel::traits::ChatEngine> = std::sync::Arc::new(
-        corvia_kernel::ollama_chat::OllamaChatEngine::new(&config.embedding.url)
-    );
+    let chat_engine: std::sync::Arc<dyn corvia_kernel::traits::ChatEngine> = match config.merge.provider {
+        corvia_common::config::InferenceProvider::Corvia => {
+            std::sync::Arc::new(corvia_kernel::grpc_chat::GrpcChatEngine::new(&config.embedding.url))
+        }
+        corvia_common::config::InferenceProvider::Ollama => {
+            std::sync::Arc::new(corvia_kernel::ollama_chat::OllamaChatEngine::new(&config.embedding.url))
+        }
+        corvia_common::config::InferenceProvider::Vllm => {
+            // vLLM chat not yet implemented — fall back to Ollama
+            std::sync::Arc::new(corvia_kernel::ollama_chat::OllamaChatEngine::new(&config.embedding.url))
+        }
+    };
     let coordinator = match AgentCoordinator::new(
         store.clone(),
         engine.clone(),
