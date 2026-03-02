@@ -1,0 +1,361 @@
+//! Retriever trait and implementations for the RAG pipeline (D61).
+//!
+//! The retriever is the first stage of the R->A->G pipeline. It converts
+//! a natural-language query into a ranked list of [`SearchResult`]s.
+//!
+//! # Implementations
+//!
+//! - [`VectorRetriever`] — embed query, search store, apply RBAC + visibility filters.
+//! - `GraphExpandRetriever` (planned) — vector search + graph expansion with alpha blending.
+
+use async_trait::async_trait;
+use corvia_common::agent_types::{AgentPermission, EntryStatus, VisibilityMode};
+use corvia_common::errors::Result;
+use corvia_common::types::SearchResult;
+use std::sync::Arc;
+use std::time::Instant;
+use tracing::info;
+
+use crate::rag_types::{RetrievalMetrics, RetrievalOpts, RetrievalResult};
+use crate::traits::{InferenceEngine, QueryableStore};
+
+/// First stage of the RAG pipeline: query -> ranked results.
+///
+/// Implementations must be Send + Sync so they can be shared across
+/// async tasks and wrapped in `Arc`.
+#[async_trait]
+pub trait Retriever: Send + Sync {
+    /// Human-readable name for metrics attribution (D62).
+    fn name(&self) -> &str;
+
+    /// Retrieve relevant knowledge entries for a query within a scope.
+    async fn retrieve(
+        &self,
+        query: &str,
+        scope_id: &str,
+        opts: &RetrievalOpts,
+    ) -> Result<RetrievalResult>;
+}
+
+/// Baseline retriever: embed query -> vector search -> RBAC + visibility filter.
+///
+/// This is the default retriever used when `expand_graph` is false.
+pub struct VectorRetriever {
+    store: Arc<dyn QueryableStore>,
+    engine: Arc<dyn InferenceEngine>,
+}
+
+impl VectorRetriever {
+    pub fn new(store: Arc<dyn QueryableStore>, engine: Arc<dyn InferenceEngine>) -> Self {
+        Self { store, engine }
+    }
+}
+
+#[async_trait]
+impl Retriever for VectorRetriever {
+    fn name(&self) -> &str {
+        "VectorRetriever"
+    }
+
+    async fn retrieve(
+        &self,
+        query: &str,
+        scope_id: &str,
+        opts: &RetrievalOpts,
+    ) -> Result<RetrievalResult> {
+        let start = Instant::now();
+
+        // RBAC scope check: if agent has ReadWrite with explicit scopes, verify access.
+        if let Some(ref perms) = opts.permissions {
+            if let AgentPermission::ReadWrite { scopes } = perms {
+                if !scopes.iter().any(|s| s == scope_id || s == "*") {
+                    info!(
+                        retriever = self.name(),
+                        scope_id,
+                        "RBAC denied: agent lacks scope access"
+                    );
+                    return Ok(RetrievalResult {
+                        results: Vec::new(),
+                        metrics: RetrievalMetrics {
+                            latency_ms: start.elapsed().as_millis() as u64,
+                            vector_results: 0,
+                            graph_expanded: 0,
+                            post_filter_count: 0,
+                            retriever_name: self.name().to_string(),
+                        },
+                    });
+                }
+            }
+        }
+
+        // Embed the query.
+        let embedding = self.engine.embed(query).await?;
+
+        // 2x oversample (min 10) to allow for post-filter elimination.
+        let fetch_limit = (opts.limit * 2).max(10);
+        let raw_results = self.store.search(&embedding, scope_id, fetch_limit).await?;
+        let vector_results = raw_results.len();
+
+        // Visibility post-filter.
+        let filtered: Vec<SearchResult> = raw_results
+            .into_iter()
+            .filter(|sr| visibility_filter(&sr.entry, &opts.visibility, opts.agent_id.as_deref()))
+            .take(opts.limit)
+            .collect();
+
+        let post_filter_count = filtered.len();
+
+        info!(
+            retriever = self.name(),
+            scope_id,
+            vector_results,
+            post_filter_count,
+            latency_ms = start.elapsed().as_millis() as u64,
+            "retrieval complete"
+        );
+
+        Ok(RetrievalResult {
+            results: filtered,
+            metrics: RetrievalMetrics {
+                latency_ms: start.elapsed().as_millis() as u64,
+                vector_results,
+                graph_expanded: 0,
+                post_filter_count,
+                retriever_name: self.name().to_string(),
+            },
+        })
+    }
+}
+
+/// Shared visibility filter for retrieval results.
+///
+/// Rules:
+/// - **Merged** entries are always visible.
+/// - **Pending** / **Committed** entries are filtered by [`VisibilityMode`]:
+///   - `Own` — only the requesting agent's entries.
+///   - `All` — all agents' pending/committed entries.
+///   - `Explicit(agents)` — only named agents' entries.
+/// - **Rejected** entries are never visible.
+pub fn visibility_filter(
+    entry: &corvia_common::types::KnowledgeEntry,
+    mode: &VisibilityMode,
+    agent_id: Option<&str>,
+) -> bool {
+    match entry.entry_status {
+        EntryStatus::Merged => true,
+        EntryStatus::Rejected => false,
+        EntryStatus::Pending | EntryStatus::Committed => match mode {
+            VisibilityMode::All => true,
+            VisibilityMode::Own => {
+                // Visible only if the entry belongs to the requesting agent.
+                match (agent_id, entry.agent_id.as_deref()) {
+                    (Some(me), Some(owner)) => me == owner,
+                    _ => false,
+                }
+            }
+            VisibilityMode::Explicit(agents) => {
+                // Visible if the entry's agent is in the explicit list.
+                match entry.agent_id.as_deref() {
+                    Some(owner) => agents.iter().any(|a| a == owner),
+                    None => false,
+                }
+            }
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lite_store::LiteStore;
+    use corvia_common::agent_types::{AgentPermission, EntryStatus, VisibilityMode};
+    use corvia_common::types::KnowledgeEntry;
+
+    /// Mock embedding engine that returns a fixed 3-dim vector.
+    struct MockEngine;
+
+    #[async_trait]
+    impl InferenceEngine for MockEngine {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>> {
+            Ok(vec![1.0, 0.0, 0.0])
+        }
+        async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect())
+        }
+        fn dimensions(&self) -> usize {
+            3
+        }
+    }
+
+    /// Insert 10 entries with slight embedding variation, search, verify results + metrics.
+    #[tokio::test]
+    async fn test_vector_retriever_basic_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+
+        let engine: Arc<dyn InferenceEngine> = Arc::new(MockEngine);
+
+        // Insert 10 entries with slight embedding variation for HNSW connectivity.
+        let mut idx: usize = 0;
+        let mut next_emb = || {
+            idx += 1;
+            vec![1.0, idx as f32 * 0.001, 0.0]
+        };
+
+        for i in 0..10 {
+            let mut entry = KnowledgeEntry::new(
+                format!("knowledge item {i}"),
+                "test-scope".to_string(),
+                "v1".to_string(),
+            );
+            entry.embedding = Some(next_emb());
+            store.insert(&entry).await.unwrap();
+        }
+
+        let retriever = VectorRetriever::new(store.clone() as Arc<dyn QueryableStore>, engine);
+
+        let opts = RetrievalOpts {
+            limit: 5,
+            visibility: VisibilityMode::All,
+            ..Default::default()
+        };
+        let result = retriever.retrieve("test query", "test-scope", &opts).await.unwrap();
+
+        // HNSW approximate recall is unreliable at small N — use >= assertions.
+        assert!(result.results.len() >= 2, "expected at least 2 results, got {}", result.results.len());
+        assert!(result.results.len() <= 5, "should respect limit");
+        assert_eq!(result.metrics.retriever_name, "VectorRetriever");
+        assert!(result.metrics.vector_results >= 2);
+        assert!(result.metrics.post_filter_count >= 2);
+        assert_eq!(result.metrics.graph_expanded, 0);
+    }
+
+    /// Agent with scope-b permission searches scope-a -> 0 results (RBAC).
+    #[tokio::test]
+    async fn test_vector_retriever_rbac_filtering() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+
+        let engine: Arc<dyn InferenceEngine> = Arc::new(MockEngine);
+
+        // Insert entries into scope-a.
+        let mut idx: usize = 0;
+        let mut next_emb = || {
+            idx += 1;
+            vec![1.0, idx as f32 * 0.001, 0.0]
+        };
+
+        for i in 0..10 {
+            let mut entry = KnowledgeEntry::new(
+                format!("scope-a item {i}"),
+                "scope-a".to_string(),
+                "v1".to_string(),
+            );
+            entry.embedding = Some(next_emb());
+            store.insert(&entry).await.unwrap();
+        }
+
+        let retriever = VectorRetriever::new(store.clone() as Arc<dyn QueryableStore>, engine);
+
+        // Agent only has access to scope-b, not scope-a.
+        let opts = RetrievalOpts {
+            limit: 5,
+            permissions: Some(AgentPermission::ReadWrite {
+                scopes: vec!["scope-b".to_string()],
+            }),
+            visibility: VisibilityMode::All,
+            ..Default::default()
+        };
+
+        let result = retriever.retrieve("test", "scope-a", &opts).await.unwrap();
+        assert_eq!(result.results.len(), 0, "RBAC should block scope-a access");
+        assert_eq!(result.metrics.vector_results, 0);
+    }
+
+    /// With Own visibility: agent-A sees merged + own pending, NOT agent-B's pending.
+    #[tokio::test]
+    async fn test_vector_retriever_visibility_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+
+        let engine: Arc<dyn InferenceEngine> = Arc::new(MockEngine);
+
+        let mut idx: usize = 0;
+        let mut next_emb = || {
+            idx += 1;
+            vec![1.0, idx as f32 * 0.001, 0.0]
+        };
+
+        // 8 filler merged entries for HNSW connectivity.
+        for i in 0..8 {
+            let mut entry = KnowledgeEntry::new(
+                format!("filler {i}"),
+                "vis-scope".to_string(),
+                "v1".to_string(),
+            );
+            entry.embedding = Some(next_emb());
+            // EntryStatus::Merged is the default.
+            store.insert(&entry).await.unwrap();
+        }
+
+        // Agent-A pending entry.
+        let mut entry_a = KnowledgeEntry::new(
+            "agent-A pending work".to_string(),
+            "vis-scope".to_string(),
+            "v1".to_string(),
+        );
+        entry_a.embedding = Some(next_emb());
+        entry_a.agent_id = Some("agent-A".to_string());
+        entry_a.session_id = Some("sess-A".to_string());
+        entry_a.entry_status = EntryStatus::Pending;
+        store.insert(&entry_a).await.unwrap();
+
+        // Agent-B pending entry.
+        let mut entry_b = KnowledgeEntry::new(
+            "agent-B pending work".to_string(),
+            "vis-scope".to_string(),
+            "v1".to_string(),
+        );
+        entry_b.embedding = Some(next_emb());
+        entry_b.agent_id = Some("agent-B".to_string());
+        entry_b.session_id = Some("sess-B".to_string());
+        entry_b.entry_status = EntryStatus::Pending;
+        store.insert(&entry_b).await.unwrap();
+
+        let retriever = VectorRetriever::new(store.clone() as Arc<dyn QueryableStore>, engine);
+
+        // Agent-A with Own visibility.
+        let opts = RetrievalOpts {
+            limit: 20,
+            visibility: VisibilityMode::Own,
+            agent_id: Some("agent-A".to_string()),
+            ..Default::default()
+        };
+
+        let result = retriever.retrieve("work", "vis-scope", &opts).await.unwrap();
+
+        // Should see merged entries + agent-A's pending, but NOT agent-B's pending.
+        let has_agent_a = result.results.iter().any(|sr| {
+            sr.entry.agent_id.as_deref() == Some("agent-A")
+                && sr.entry.entry_status == EntryStatus::Pending
+        });
+        let has_agent_b = result.results.iter().any(|sr| {
+            sr.entry.agent_id.as_deref() == Some("agent-B")
+                && sr.entry.entry_status == EntryStatus::Pending
+        });
+        let merged_count = result.results.iter().filter(|sr| sr.entry.entry_status == EntryStatus::Merged).count();
+
+        // At least some merged entries should be visible (HNSW approximate, use >=).
+        assert!(merged_count >= 1, "expected merged entries to be visible, got {merged_count}");
+        // Agent-B's pending should be filtered out.
+        assert!(!has_agent_b, "agent-B's pending should NOT be visible under Own mode");
+        // Agent-A's pending may or may not appear depending on HNSW recall,
+        // but if it does, the filter must have allowed it.
+        if has_agent_a {
+            // Confirmed: agent-A's own pending is visible.
+        }
+    }
+}

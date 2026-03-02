@@ -78,6 +78,7 @@ pub mod graph_store;
 pub mod reasoner;
 pub mod token_estimator;
 pub mod rag_types;
+pub mod retriever;
 pub mod chunking_strategy;
 pub mod grpc_engine;
 pub mod grpc_chat;
