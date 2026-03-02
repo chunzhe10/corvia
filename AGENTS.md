@@ -1,6 +1,6 @@
-# Corvia
+# corvia
 
-> Organizational reasoning memory for AI agents. Rust workspace, AGPL-3.0.
+> Organizational memory for AI agents. Rust workspace, AGPL-3.0.
 
 This file follows the [AGENTS.md standard](https://agents.md/) — the cross-platform
 convention for AI agent project instructions, governed by the Agentic AI Foundation

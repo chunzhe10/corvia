@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the internal architecture of Corvia — its layered design, crate
+This document describes the internal architecture of corvia — its layered design, crate
 structure, kernel subsystems, storage implementations, core traits, API surface, and key
 design decisions. It is intended for contributors and anyone who wants to understand how
 the system is built.
@@ -9,7 +9,7 @@ For a user-facing overview and quick start guide, see [README.md](README.md).
 
 ## Layered Architecture
 
-Corvia follows a strict layered dependency model. Each layer may only depend on the layer
+corvia follows a strict layered dependency model. Each layer may only depend on the layer
 directly below it. This prevents circular dependencies and ensures the kernel remains
 independent of any specific frontend, adapter, or integration surface.
 
@@ -88,7 +88,7 @@ Created ──► Active ──► Committing ──► Merging ──► Closed
 
 ## Storage Tiers
 
-Corvia has two storage backends that implement the same kernel traits. The **two-tier storage**
+corvia has two storage backends that implement the same kernel traits. The **two-tier storage**
 design exists because requiring Docker for a dev tool kills adoption — but SurrealDB's unified
 vector+graph+temporal queries are genuinely valuable at scale. Rather than choose one, both
 tiers implement the same traits: LiteStore is the full product with zero external dependencies,
@@ -268,14 +268,14 @@ Corvia implements the Model Context Protocol (version `2024-11-05`) via JSON-RPC
 
 ## Key Design Decisions
 
-Corvia's architecture is shaped by documented design decisions made during development. The
+corvia's architecture is shaped by documented design decisions made during development. The
 most architecturally significant ones are listed here with the alternative that was considered
 and the reasoning behind the choice. The full decision log with alternatives and rationale is
 available at [`docs/plans/`](docs/plans/).
 
 | Decision | Alternative rejected | Why this choice wins |
 |----------|---------------------|---------------------|
-| **AGPL-3.0-only license** | MIT/Apache-2.0 | SaaS protection — prevents cloud providers from offering Corvia-as-a-service without contributing back. Dual-license path preserves commercial option (Grafana/MinIO playbook) |
+| **AGPL-3.0-only license** | MIT/Apache-2.0 | SaaS protection — prevents cloud providers from offering corvia-as-a-service without contributing back. Dual-license path preserves commercial option (Grafana/MinIO playbook) |
 | **SurrealDB behind `QueryableStore` trait** | Hardcode SurrealDB directly | Trait boundary enabled building LiteStore (zero-Docker) without touching kernel code. Storage became a compile-time choice, not a runtime dependency |
 | **LLM-assisted merge** | Last-write-wins / manual merge | Knowledge conflicts are semantic, not textual — an LLM can reason about which version of "how auth works" is more accurate. Last-write-wins silently loses knowledge |
 | **Two-tier storage (LiteStore + FullStore)** | SurrealDB-only | Requiring Docker for a dev tool kills adoption. LiteStore is the full product at zero cost; FullStore is a power-user upgrade, not a requirement |
@@ -290,7 +290,7 @@ available at [`docs/plans/`](docs/plans/).
 
 ### KnowledgeEntry
 
-The fundamental unit of storage. Every piece of knowledge in Corvia is a `KnowledgeEntry`.
+The fundamental unit of storage. Every piece of knowledge in corvia is a `KnowledgeEntry`.
 
 ```
 KnowledgeEntry
@@ -316,7 +316,7 @@ KnowledgeEntry
 ```
 
 **Bi-temporal model:** Each entry has two time axes. `recorded_at` tracks when the entry was
-stored in Corvia (transaction time). `valid_from`/`valid_to` track when the knowledge was
+stored in corvia (transaction time). `valid_from`/`valid_to` track when the knowledge was
 true in the real world (valid time). This enables queries like "what did we know last Tuesday?"
 (transaction time) and "what was the API like before the v3 migration?" (valid time).
 
@@ -342,7 +342,7 @@ uses graph structure for its `DanglingImport` and `DependencyCycle` checks.
 
 ### Agent Identity
 
-Corvia supports three layers of agent identity:
+corvia supports three layers of agent identity:
 
 | Layer | Type | Write access | Staging |
 |-------|------|-------------|---------|
@@ -350,6 +350,6 @@ Corvia supports three layers of agent identity:
 | **MCP Client** | Client info + `_meta.agent_id` | Yes (with hint) | Lightweight |
 | **Anonymous** | No identity | Read-only | None |
 
-This multi-layer model allows Corvia to work with any agent framework — from fully registered
+This multi-layer model allows corvia to work with any agent framework — from fully registered
 long-lived agents to anonymous one-shot queries — while maintaining write safety through
 identity-based access control.
