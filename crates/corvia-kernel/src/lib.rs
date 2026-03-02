@@ -216,6 +216,34 @@ pub async fn create_full_store(
     }
 }
 
+/// Create a RAG pipeline with auto-selected retriever.
+///
+/// Uses [`GraphExpandRetriever`](retriever::GraphExpandRetriever) when a
+/// [`GraphStore`](traits::GraphStore) is available,
+/// [`VectorRetriever`](retriever::VectorRetriever) otherwise.
+///
+/// This is the main entry point for constructing a ready-to-use
+/// [`RagPipeline`](rag_pipeline::RagPipeline) from the kernel's factory layer.
+pub fn create_rag_pipeline(
+    store: Arc<dyn traits::QueryableStore>,
+    engine: Arc<dyn traits::InferenceEngine>,
+    graph: Option<Arc<dyn traits::GraphStore>>,
+    generator: Option<Arc<dyn traits::GenerationEngine>>,
+    config: &CorviaConfig,
+) -> rag_pipeline::RagPipeline {
+    let ret: Arc<dyn retriever::Retriever> = match graph {
+        Some(g) => Arc::new(retriever::GraphExpandRetriever::new(
+            store.clone(),
+            engine.clone(),
+            g,
+            config.rag.graph_alpha,
+        )),
+        None => Arc::new(retriever::VectorRetriever::new(store.clone(), engine.clone())),
+    };
+    let aug: Arc<dyn augmenter::Augmenter> = Arc::new(augmenter::StructuredAugmenter::new());
+    rag_pipeline::RagPipeline::new(ret, aug, generator, config.rag.clone())
+}
+
 /// Same as `create_store_with_graph` but with explicit data_dir (for workspace support).
 pub async fn create_store_at_with_graph(
     config: &CorviaConfig,
@@ -262,5 +290,46 @@ mod tests {
         let store = create_store(&config).await.unwrap();
         store.init_schema().await.unwrap();
         assert_eq!(store.count("test").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_create_rag_pipeline_without_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = CorviaConfig::default();
+        config.storage.data_dir = dir.path().to_string_lossy().to_string();
+
+        let store = create_store(&config).await.unwrap();
+        let store: Arc<dyn traits::QueryableStore> = Arc::from(store);
+        store.init_schema().await.unwrap();
+        let engine: Arc<dyn traits::InferenceEngine> = Arc::new(
+            ollama_engine::OllamaEngine::new(
+                &config.embedding.url,
+                &config.embedding.model,
+                config.embedding.dimensions,
+            ),
+        );
+
+        let pipeline = create_rag_pipeline(store, engine, None, None, &config);
+        assert_eq!(pipeline.retriever_name(), "VectorRetriever");
+    }
+
+    #[tokio::test]
+    async fn test_create_rag_pipeline_with_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = CorviaConfig::default();
+        config.storage.data_dir = dir.path().to_string_lossy().to_string();
+
+        let (store, graph) = create_store_with_graph(&config).await.unwrap();
+        store.init_schema().await.unwrap();
+        let engine: Arc<dyn traits::InferenceEngine> = Arc::new(
+            ollama_engine::OllamaEngine::new(
+                &config.embedding.url,
+                &config.embedding.model,
+                config.embedding.dimensions,
+            ),
+        );
+
+        let pipeline = create_rag_pipeline(store, engine, Some(graph), None, &config);
+        assert_eq!(pipeline.retriever_name(), "graph_expand");
     }
 }
