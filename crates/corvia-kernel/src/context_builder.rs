@@ -3,6 +3,7 @@ use corvia_common::errors::Result;
 use corvia_common::types::SearchResult;
 use std::sync::Arc;
 
+use crate::retriever::visibility_filter;
 use crate::traits::{InferenceEngine, QueryableStore};
 
 /// Context builder that wraps search with visibility mode filtering and RBAC scope enforcement.
@@ -61,46 +62,10 @@ impl ContextBuilder {
         let fetch_limit = std::cmp::max(limit * 2, 10);
         let results = self.store.search(&embedding, scope_id, fetch_limit).await?;
 
-        // Post-filter by visibility mode
+        // Post-filter by visibility mode (delegates to retriever::visibility_filter)
         let filtered: Vec<SearchResult> = results
             .into_iter()
-            .filter(|r| {
-                match r.entry.entry_status {
-                    EntryStatus::Merged => true, // Always visible
-                    EntryStatus::Pending => {
-                        match visibility {
-                            VisibilityMode::Own => {
-                                // Only show agent's own Pending entries
-                                match (agent_id, &r.entry.agent_id) {
-                                    (Some(aid), Some(entry_aid)) => aid == entry_aid,
-                                    _ => false,
-                                }
-                            }
-                            VisibilityMode::All => true, // Show all Pending
-                            VisibilityMode::Explicit(agents) => {
-                                // Show Pending from named agents
-                                match &r.entry.agent_id {
-                                    Some(entry_aid) => agents.iter().any(|a| a == entry_aid),
-                                    None => false,
-                                }
-                            }
-                        }
-                    }
-                    EntryStatus::Committed => {
-                        // Committed entries are in transition — treat like Pending
-                        match visibility {
-                            VisibilityMode::All => true,
-                            _ => {
-                                match (agent_id, &r.entry.agent_id) {
-                                    (Some(aid), Some(entry_aid)) => aid == entry_aid,
-                                    _ => false,
-                                }
-                            }
-                        }
-                    }
-                    EntryStatus::Rejected => false, // Never visible
-                }
-            })
+            .filter(|r| visibility_filter(&r.entry, visibility, agent_id))
             .take(limit)
             .collect();
 
