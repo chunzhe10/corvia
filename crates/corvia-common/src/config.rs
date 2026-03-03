@@ -68,6 +68,10 @@ pub struct CorviaConfig {
     pub rag: RagConfig,
     #[serde(default)]
     pub chunking: ChunkingConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapters: Option<AdaptersConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<Vec<SourceConfig>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,6 +246,23 @@ impl Default for ChunkingConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AdaptersConfig {
+    #[serde(default)]
+    pub search_dirs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceConfig {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_config: Option<toml::Value>,
+}
+
 impl Default for CorviaConfig {
     fn default() -> Self {
         Self {
@@ -275,6 +296,8 @@ impl Default for CorviaConfig {
             reasoning: None,
             rag: RagConfig::default(),
             chunking: ChunkingConfig::default(),
+            adapters: None,
+            sources: None,
         }
     }
 }
@@ -715,6 +738,75 @@ port = 8020
         assert_eq!(json, "\"corvia\"");
         let parsed: InferenceProvider = serde_json::from_str("\"corvia\"").unwrap();
         assert_eq!(parsed, InferenceProvider::Corvia);
+    }
+
+    #[test]
+    fn test_adapters_config_from_toml() {
+        let toml_str = r#"
+[project]
+name = "test"
+scope_id = "test"
+
+[storage]
+data_dir = ".corvia"
+
+[embedding]
+model = "nomic-embed-text"
+url = "http://127.0.0.1:11434"
+dimensions = 768
+
+[server]
+host = "127.0.0.1"
+port = 8020
+
+[adapters]
+search_dirs = ["~/.config/corvia/adapters", "/opt/corvia/adapters"]
+default = "git"
+
+[[sources]]
+path = "./backend"
+adapter = "git"
+
+[[sources]]
+path = "https://company.atlassian.net/wiki/spaces/ENG"
+adapter = "confluence"
+"#;
+        let config: CorviaConfig = toml::from_str(toml_str).unwrap();
+        let adapters = config.adapters.unwrap();
+        assert_eq!(adapters.search_dirs.len(), 2);
+        assert_eq!(adapters.default, Some("git".into()));
+
+        let sources = config.sources.unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].path, "./backend");
+        assert_eq!(sources[0].adapter, Some("git".into()));
+        assert_eq!(sources[1].adapter, Some("confluence".into()));
+    }
+
+    #[test]
+    fn test_adapters_config_optional() {
+        let config = CorviaConfig::default();
+        assert!(config.adapters.is_none());
+        assert!(config.sources.is_none());
+    }
+
+    #[test]
+    fn test_adapters_config_roundtrip() {
+        let mut config = CorviaConfig::default();
+        config.adapters = Some(AdaptersConfig {
+            search_dirs: vec!["~/adapters".into()],
+            default: Some("basic".into()),
+        });
+        config.sources = Some(vec![SourceConfig {
+            path: "./repo".into(),
+            adapter: Some("git".into()),
+            adapter_config: None,
+        }]);
+
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let loaded: CorviaConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(loaded.adapters.unwrap().default, Some("basic".into()));
+        assert_eq!(loaded.sources.unwrap().len(), 1);
     }
 
     #[test]
