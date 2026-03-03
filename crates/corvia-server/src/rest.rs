@@ -324,7 +324,7 @@ async fn search_memories(
     if let Some(rag) = &state.rag {
         let opts = corvia_kernel::rag_types::RetrievalOpts {
             limit,
-            expand_graph: false, // backward compat: pure vector for search endpoint
+            expand_graph: false, // search endpoint: pure vector (context/ask use graph)
             ..Default::default()
         };
         let response = rag.context(&req.query, &req.scope_id, Some(opts)).await
