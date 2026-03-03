@@ -11,6 +11,7 @@
 //! - `overlap_context` — returns `None` (opt-in per strategy)
 
 use corvia_common::errors::Result;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -18,7 +19,7 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 /// Metadata about a source file being chunked.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceMetadata {
     pub file_path: String,
     pub extension: String,
@@ -28,7 +29,7 @@ pub struct SourceMetadata {
 }
 
 /// A raw chunk produced by a [`ChunkingStrategy`] before pipeline processing.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawChunk {
     pub content: String,
     pub chunk_type: String,
@@ -38,7 +39,7 @@ pub struct RawChunk {
 }
 
 /// Per-chunk metadata carried through the pipeline.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChunkMetadata {
     pub source_file: String,
     pub language: Option<String>,
@@ -47,7 +48,7 @@ pub struct ChunkMetadata {
 }
 
 /// A fully-processed chunk ready for embedding and storage.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessedChunk {
     pub content: String,
     pub original_content: String,
@@ -60,7 +61,7 @@ pub struct ProcessedChunk {
 }
 
 /// Records what the pipeline did to a chunk.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessingInfo {
     pub strategy_name: String,
     pub was_split: bool,
@@ -72,7 +73,7 @@ pub struct ProcessingInfo {
 ///
 /// Uses `(from_source_file, from_start_line)` instead of chunk indices so that
 /// relations remain stable through the pipeline's merge/split steps.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkRelation {
     /// Source file of the chunk that has this relation.
     pub from_source_file: String,
@@ -87,14 +88,14 @@ pub struct ChunkRelation {
 }
 
 /// Result from a chunking operation: chunks + discovered relations.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChunkResult {
     pub chunks: Vec<RawChunk>,
     pub relations: Vec<ChunkRelation>,
 }
 
 /// A source file with its metadata, returned by [`IngestionAdapter::ingest_sources`] (D69).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceFile {
     pub content: String,
     pub metadata: SourceMetadata,
@@ -336,5 +337,54 @@ mod tests {
         let chunks = strategy.chunk("a\nb", &test_meta()).unwrap().chunks;
         let a = &chunks[0];
         assert!(strategy.overlap_context(a, a).is_none());
+    }
+
+    #[test]
+    fn test_source_file_serde_roundtrip() {
+        let sf = SourceFile {
+            content: "fn main() {}".into(),
+            metadata: SourceMetadata {
+                file_path: "src/main.rs".into(),
+                extension: "rs".into(),
+                language: Some("rust".into()),
+                scope_id: "test".into(),
+                source_version: "abc123".into(),
+            },
+        };
+        let json = serde_json::to_string(&sf).unwrap();
+        let parsed: SourceFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.content, sf.content);
+        assert_eq!(parsed.metadata.file_path, sf.metadata.file_path);
+        assert_eq!(parsed.metadata.language, sf.metadata.language);
+    }
+
+    #[test]
+    fn test_chunk_result_serde_roundtrip() {
+        let cr = ChunkResult {
+            chunks: vec![RawChunk {
+                content: "fn main() {}".into(),
+                chunk_type: "function".into(),
+                start_line: 1,
+                end_line: 3,
+                metadata: ChunkMetadata {
+                    source_file: "src/main.rs".into(),
+                    language: Some("rust".into()),
+                    ..Default::default()
+                },
+            }],
+            relations: vec![ChunkRelation {
+                from_source_file: "src/main.rs".into(),
+                from_start_line: 1,
+                relation: "imports".into(),
+                to_file: "src/lib.rs".into(),
+                to_name: Some("MyStruct".into()),
+            }],
+        };
+        let json = serde_json::to_string(&cr).unwrap();
+        let parsed: ChunkResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.chunks.len(), 1);
+        assert_eq!(parsed.relations.len(), 1);
+        assert_eq!(parsed.chunks[0].content, "fn main() {}");
+        assert_eq!(parsed.relations[0].to_name, Some("MyStruct".into()));
     }
 }
