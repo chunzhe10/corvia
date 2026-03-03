@@ -25,6 +25,9 @@ use crate::chunking_strategy::{
 };
 use crate::token_estimator::TokenEstimator;
 
+use crate::process_adapter::ProcessAdapter;
+use std::sync::Mutex;
+
 // ---------------------------------------------------------------------------
 // FormatRegistry
 // ---------------------------------------------------------------------------
@@ -463,6 +466,76 @@ impl ChunkingPipeline {
         }
 
         (contents, overlap_tokens_vec)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ProcessChunkingStrategy — delegates to adapter process via IPC (D77)
+// ---------------------------------------------------------------------------
+
+/// Routes chunking calls to an external adapter process via JSONL IPC.
+///
+/// Registered in the [`FormatRegistry`] override tier for extensions the
+/// adapter claims in its `chunking_extensions` metadata field.
+pub struct ProcessChunkingStrategy {
+    adapter: Arc<Mutex<ProcessAdapter>>,
+    extension_list: Vec<String>,
+}
+
+impl ProcessChunkingStrategy {
+    /// Create a new strategy backed by the given adapter process.
+    pub fn new(adapter: Arc<Mutex<ProcessAdapter>>, extensions: Vec<String>) -> Self {
+        Self {
+            adapter,
+            extension_list: extensions,
+        }
+    }
+}
+
+impl crate::chunking_strategy::ChunkingStrategy for ProcessChunkingStrategy {
+    fn name(&self) -> &str {
+        "process-adapter"
+    }
+
+    fn supported_extensions(&self) -> &[&str] {
+        &[]
+    }
+
+    fn chunk(
+        &self,
+        source: &str,
+        meta: &crate::chunking_strategy::SourceMetadata,
+    ) -> corvia_common::errors::Result<crate::chunking_strategy::ChunkResult> {
+        let mut adapter = self.adapter.lock().map_err(|e| {
+            corvia_common::errors::CorviaError::Infra(format!("Adapter lock poisoned: {e}"))
+        })?;
+
+        let (chunks, relations) = adapter.chunk(source, meta).map_err(|e| {
+            corvia_common::errors::CorviaError::Infra(format!("Adapter chunk failed: {e}"))
+        })?;
+
+        Ok(crate::chunking_strategy::ChunkResult { chunks, relations })
+    }
+}
+
+/// Register an adapter's chunking extensions in the format registry.
+///
+/// For each extension in `chunking_extensions`, registers a
+/// [`ProcessChunkingStrategy`] as an override in the registry.
+pub fn register_adapter_chunking(
+    registry: &mut FormatRegistry,
+    adapter: Arc<Mutex<ProcessAdapter>>,
+    chunking_extensions: &[String],
+) {
+    if chunking_extensions.is_empty() {
+        return;
+    }
+    let strategy = Arc::new(ProcessChunkingStrategy::new(
+        adapter,
+        chunking_extensions.to_vec(),
+    ));
+    for ext in chunking_extensions {
+        registry.register_override(ext, strategy.clone());
     }
 }
 
