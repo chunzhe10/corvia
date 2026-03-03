@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
-use corvia_adapter_git::GitAdapter;
 use corvia_common::config::{CorviaConfig, InferenceProvider, RepoConfig, WorkspaceConfig};
-use corvia_kernel::traits::IngestionAdapter;
+use corvia_kernel::adapter_discovery;
+use corvia_kernel::chunking_pipeline::register_adapter_chunking;
+use corvia_kernel::process_adapter::ProcessAdapter;
 use std::path::{Path, PathBuf};
 
 /// Validate that a name is safe to use as a directory component.
@@ -134,8 +135,14 @@ pub fn clone_repo(url: &str, target_dir: &Path) -> Result<PathBuf> {
     }
 
     tracing::info!("Cloning {} into {}", url, target_dir.display());
-    git2::Repository::clone(url, target_dir)
-        .with_context(|| format!("Failed to clone '{}' into '{}'", url, target_dir.display()))?;
+    let status = std::process::Command::new("git")
+        .args(["clone", url])
+        .arg(target_dir)
+        .status()
+        .with_context(|| format!("Failed to run 'git clone' for '{}'", url))?;
+    if !status.success() {
+        anyhow::bail!("git clone failed for '{}' into '{}'", url, target_dir.display());
+    }
 
     Ok(target_dir.to_path_buf())
 }
@@ -308,10 +315,9 @@ pub fn remove_repo_from_config(config: &mut CorviaConfig, name: &str) -> Result<
 
 /// Ingest all (or one) workspace repos with namespace isolation.
 ///
-/// For each repo in the workspace, runs tree-sitter parsing via `GitAdapter`,
-/// sets `scope_id` and `workstream` on each entry for namespace isolation,
-/// batch-embeds the content, stores the entries, and wires structural
-/// relations into the graph store.
+/// For each repo in the workspace, discovers an adapter at runtime, spawns
+/// it as a process, streams source files via JSONL, runs them through the
+/// chunking pipeline, embeds, and stores entries with namespace isolation.
 ///
 /// The `fresh` parameter is accepted but not yet used (future: delete existing
 /// entries before re-ingest).
@@ -330,6 +336,23 @@ pub async fn ingest_workspace(
     let data_dir = root.join(&config.storage.data_dir);
     let (store, graph) = corvia_kernel::create_store_at_with_graph(&config, &data_dir).await?;
     let engine = corvia_kernel::create_engine(&config);
+
+    // Discover adapters once for the whole workspace
+    let extra_dirs = config
+        .adapters
+        .as_ref()
+        .map(|a| a.search_dirs.clone())
+        .unwrap_or_default();
+    let discovered = adapter_discovery::discover_adapters(&extra_dirs);
+
+    if discovered.is_empty() {
+        anyhow::bail!(
+            "No adapters found. Install corvia-adapter-basic to PATH or \
+             ~/.config/corvia/adapters/. Adapter binaries must be named corvia-adapter-<name>."
+        );
+    }
+
+    let default_name = config.adapters.as_ref().and_then(|a| a.default.as_deref());
 
     let repos_to_ingest: Vec<&RepoConfig> = if let Some(name) = repo_filter {
         let repo = ws
@@ -352,21 +375,52 @@ pub async fn ingest_workspace(
             continue;
         }
 
-        println!(
-            "\nIngesting {} (namespace: {})...",
-            repo_config.name, repo_config.namespace
-        );
-
-        let adapter = GitAdapter::new();
         let repo_path_str = repo_path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("Invalid path for repo {}", repo_config.name))?;
 
-        // D69 pipeline flow: source files → ChunkingPipeline → embed → store
-        let source_files = adapter.ingest_sources(repo_path_str).await?;
+        // Resolve adapter for this repo
+        let explicit = config
+            .sources
+            .as_ref()
+            .and_then(|sources| {
+                sources.iter().find(|s| s.path == repo_path_str).and_then(|s| s.adapter.as_deref())
+            });
+        let adapter_info = adapter_discovery::resolve_adapter(repo_path_str, &discovered, explicit, default_name)
+            .ok_or_else(|| anyhow::anyhow!("No suitable adapter found for '{}'", repo_path_str))?;
 
+        println!(
+            "\nIngesting {} (namespace: {}, adapter: {})...",
+            repo_config.name, repo_config.namespace, adapter_info.metadata.name
+        );
+
+        // Spawn adapter process
+        let mut process = ProcessAdapter::new(
+            adapter_info.binary_path.clone(),
+            adapter_info.metadata.clone(),
+        );
+        process.spawn().map_err(|e| anyhow::anyhow!(e))?;
+
+        // Ingest source files via IPC
+        let source_files = process
+            .ingest(repo_path_str, &config.project.scope_id)
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        // Build chunking pipeline with adapter strategies
         let mut pipeline = corvia_kernel::create_chunking_pipeline(&config);
-        adapter.register_chunking(pipeline.registry_mut());
+
+        // Register adapter's chunking extensions via IPC
+        if !adapter_info.metadata.chunking_extensions.is_empty() {
+            let adapter_arc = std::sync::Arc::new(std::sync::Mutex::new(
+                ProcessAdapter::new(adapter_info.binary_path.clone(), adapter_info.metadata.clone()),
+            ));
+            adapter_arc.lock().unwrap().spawn().map_err(|e| anyhow::anyhow!(e))?;
+            register_adapter_chunking(
+                pipeline.registry_mut(),
+                adapter_arc,
+                &adapter_info.metadata.chunking_extensions,
+            );
+        }
 
         let (processed, pipeline_relations, report) = pipeline.process_batch(&source_files)?;
         println!(
@@ -413,7 +467,7 @@ pub async fn ingest_workspace(
             println!("  embedded and stored {}/{}", stored, total);
         }
 
-        // Wire relations from pipeline (now native to ChunkingStrategy)
+        // Wire relations from pipeline
         if !pipeline_relations.is_empty() {
             let relations_stored = crate::wire_pipeline_relations(
                 &pipeline_relations, &processed, &stored_ids, &*graph,
@@ -422,6 +476,9 @@ pub async fn ingest_workspace(
                 println!("  {relations_stored} graph relations stored");
             }
         }
+
+        // Shutdown adapter
+        process.shutdown().map_err(|e| anyhow::anyhow!(e))?;
 
         println!(
             "  {} chunks stored for namespace '{}'",

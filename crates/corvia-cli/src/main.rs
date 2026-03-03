@@ -35,8 +35,10 @@ use corvia_common::config::CorviaConfig;
 use corvia_kernel::docker::DockerProvisioner;
 use corvia_kernel::ollama_provisioner::OllamaProvisioner;
 use corvia_kernel::agent_coordinator::AgentCoordinator;
-use corvia_kernel::traits::{InferenceEngine, IngestionAdapter, QueryableStore, GraphStore, TemporalStore};
-use corvia_adapter_git::GitAdapter;
+use corvia_kernel::traits::{InferenceEngine, QueryableStore, GraphStore, TemporalStore};
+use corvia_kernel::adapter_discovery;
+use corvia_kernel::process_adapter::ProcessAdapter;
+use corvia_kernel::chunking_pipeline::register_adapter_chunking;
 use corvia_kernel::introspect::Introspect;
 use std::sync::Arc;
 
@@ -194,6 +196,18 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// List discovered adapters
+    Adapters {
+        #[command(subcommand)]
+        action: AdaptersAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdaptersAction {
+    /// List all discovered adapters
+    List,
 }
 
 #[derive(Subcommand)]
@@ -289,6 +303,20 @@ async fn main() -> Result<()> {
         Commands::Reason { scope, check, llm } => cmd_reason(scope.as_deref(), check.as_deref(), llm).await?,
         Commands::Migrate { to, dry_run } => upgrade::cmd_migrate(&to, dry_run).await?,
         Commands::Upgrade { dry_run } => upgrade::cmd_migrate("surrealdb", dry_run).await?,
+        Commands::Adapters { action } => {
+            match action {
+                AdaptersAction::List => {
+                    let config = load_config().unwrap_or_default();
+                    let extra_dirs = config
+                        .adapters
+                        .as_ref()
+                        .map(|a| a.search_dirs.clone())
+                        .unwrap_or_default();
+                    let adapters = adapter_discovery::discover_adapters(&extra_dirs);
+                    print!("{}", adapter_discovery::format_adapter_list(&adapters));
+                }
+            }
+        }
     }
 
     Ok(())
@@ -446,23 +474,69 @@ async fn cmd_serve(mcp: bool) -> Result<()> {
 
 async fn cmd_ingest(path: Option<&str>) -> Result<()> {
     if let Some(path) = path {
-        // D69 pipeline flow: source files → ChunkingPipeline → embed → store
         let config = load_config()?;
         let (store, graph) = connect_store_with_graph(&config).await?;
         let engine = connect_engine(&config);
 
-        let adapter = GitAdapter::new();
-        println!("Ingesting {}...", path);
+        // Step 1: Discover adapters
+        let extra_dirs = config
+            .adapters
+            .as_ref()
+            .map(|a| a.search_dirs.clone())
+            .unwrap_or_default();
+        let discovered = adapter_discovery::discover_adapters(&extra_dirs);
 
-        // Step 1: Collect source files via D69 adapter interface
-        let source_files = adapter.ingest_sources(path).await?;
+        if discovered.is_empty() {
+            anyhow::bail!(
+                "No adapters found. Install corvia-adapter-basic to PATH or \
+                 ~/.config/corvia/adapters/. Adapter binaries must be named corvia-adapter-<name>."
+            );
+        }
+
+        // Step 2: Resolve which adapter to use
+        let explicit = config
+            .sources
+            .as_ref()
+            .and_then(|sources| {
+                sources.iter().find(|s| s.path == path).and_then(|s| s.adapter.as_deref())
+            });
+        let default_name = config.adapters.as_ref().and_then(|a| a.default.as_deref());
+        let adapter_info = adapter_discovery::resolve_adapter(path, &discovered, explicit, default_name)
+            .ok_or_else(|| anyhow::anyhow!("No suitable adapter found for '{}'", path))?;
+
+        println!("Ingesting {} (adapter: {})...", path, adapter_info.metadata.name);
+
+        // Step 3: Spawn adapter process
+        let mut process = ProcessAdapter::new(
+            adapter_info.binary_path.clone(),
+            adapter_info.metadata.clone(),
+        );
+        process.spawn().map_err(|e| anyhow::anyhow!(e))?;
+
+        // Step 4: Ingest source files via IPC
+        let source_files = process
+            .ingest(path, &config.project.scope_id)
+            .map_err(|e| anyhow::anyhow!(e))?;
         let total_files = source_files.len();
 
-        // Step 2: Build chunking pipeline with adapter strategies
+        // Step 5: Build chunking pipeline with adapter strategies
         let mut pipeline = corvia_kernel::create_chunking_pipeline(&config);
-        adapter.register_chunking(pipeline.registry_mut());
 
-        // Step 3: Process through chunking pipeline (merge, split, overlap)
+        // Register adapter's chunking extensions via IPC
+        if !adapter_info.metadata.chunking_extensions.is_empty() {
+            let adapter_arc = std::sync::Arc::new(std::sync::Mutex::new(
+                ProcessAdapter::new(adapter_info.binary_path.clone(), adapter_info.metadata.clone()),
+            ));
+            // Spawn a second process for chunking (ingest process is done streaming)
+            adapter_arc.lock().unwrap().spawn().map_err(|e| anyhow::anyhow!(e))?;
+            register_adapter_chunking(
+                pipeline.registry_mut(),
+                adapter_arc,
+                &adapter_info.metadata.chunking_extensions,
+            );
+        }
+
+        // Step 6: Process through chunking pipeline
         let (processed, pipeline_relations, report) = pipeline.process_batch(&source_files)?;
         println!(
             "Chunked {} files → {} chunks ({} merged, {} split)",
@@ -470,7 +544,7 @@ async fn cmd_ingest(path: Option<&str>) -> Result<()> {
             report.chunks_merged, report.chunks_split
         );
 
-        // Step 4: Convert ProcessedChunks to KnowledgeEntries, embed, and store
+        // Step 7: Convert, embed, and store
         let entries: Vec<corvia_common::types::KnowledgeEntry> = processed
             .iter()
             .map(|pc| {
@@ -507,7 +581,7 @@ async fn cmd_ingest(path: Option<&str>) -> Result<()> {
             println!("  {stored}/{total} chunks stored");
         }
 
-        // Step 5: Wire relations from pipeline (now native to ChunkingStrategy)
+        // Step 8: Wire relations
         if !pipeline_relations.is_empty() {
             let relations_stored = wire_pipeline_relations(
                 &pipeline_relations, &processed, &stored_ids, &*graph,
@@ -517,10 +591,13 @@ async fn cmd_ingest(path: Option<&str>) -> Result<()> {
             }
         }
 
+        // Step 9: Shutdown adapter
+        process.shutdown().map_err(|e| anyhow::anyhow!(e))?;
+
         println!("Done. {stored} chunks from {total_files} files ingested from {path}.");
         println!("Next: corvia search \"your query\"");
     } else {
-        // Workspace mode: ingest all workspace repos
+        // Workspace mode
         let root = std::env::current_dir()?;
         let config = load_config()?;
         if config.is_workspace() {
@@ -746,10 +823,22 @@ async fn cmd_test(check_only: bool, keep: bool, ci: bool) -> Result<()> {
     }
 
     let engine = connect_engine(&config);
-    let adapter = GitAdapter::new();
 
     println!("\n  Introspect: ingesting own source...");
-    let chunks = introspect.ingest_self(".", &adapter, engine.as_ref(), store.as_ref()).await?;
+    let chunks = {
+        let extra_dirs: Vec<String> = Vec::new();
+        let discovered = adapter_discovery::discover_adapters(&extra_dirs);
+        if discovered.is_empty() {
+            anyhow::bail!("No adapters found. Install corvia-adapter-git or corvia-adapter-basic to PATH.");
+        }
+        let adapter_info = adapter_discovery::resolve_adapter(".", &discovered, None, None)
+            .ok_or_else(|| anyhow::anyhow!("No suitable adapter found for introspect"))?;
+        let mut process = ProcessAdapter::new(adapter_info.binary_path.clone(), adapter_info.metadata.clone());
+        process.spawn().map_err(|e| anyhow::anyhow!(e))?;
+        let source_files = process.ingest(".", introspect.scope_id()).map_err(|e| anyhow::anyhow!(e))?;
+        process.shutdown().map_err(|e| anyhow::anyhow!(e))?;
+        introspect.ingest_source_files(&source_files, engine.as_ref(), store.as_ref()).await?
+    };
     println!("    {chunks} chunks embedded and stored");
 
     // Phase 3: Self-query
@@ -856,10 +945,22 @@ async fn cmd_demo(keep: bool) -> Result<()> {
     store.init_schema().await?;
 
     let engine = connect_engine(&config);
-    let adapter = GitAdapter::new();
 
     println!("\n  Ingesting Corvia's own source code...");
-    let chunks = introspect.ingest_self(".", &adapter, engine.as_ref(), store.as_ref()).await?;
+    let chunks = {
+        let extra_dirs: Vec<String> = Vec::new();
+        let discovered = adapter_discovery::discover_adapters(&extra_dirs);
+        if discovered.is_empty() {
+            anyhow::bail!("No adapters found. Install corvia-adapter-git or corvia-adapter-basic to PATH.");
+        }
+        let adapter_info = adapter_discovery::resolve_adapter(".", &discovered, None, None)
+            .ok_or_else(|| anyhow::anyhow!("No suitable adapter found for demo"))?;
+        let mut process = ProcessAdapter::new(adapter_info.binary_path.clone(), adapter_info.metadata.clone());
+        process.spawn().map_err(|e| anyhow::anyhow!(e))?;
+        let source_files = process.ingest(".", introspect.scope_id()).map_err(|e| anyhow::anyhow!(e))?;
+        process.shutdown().map_err(|e| anyhow::anyhow!(e))?;
+        introspect.ingest_source_files(&source_files, engine.as_ref(), store.as_ref()).await?
+    };
     println!("  {chunks} chunks stored.\n");
 
     println!("  Corvia is ready. Search its own codebase.");

@@ -226,6 +226,55 @@ impl Introspect {
         Ok(stored)
     }
 
+    /// Phase 2 (alternative): Ingest pre-collected source files.
+    ///
+    /// Like `ingest_self` but takes already-collected source files instead of
+    /// requiring an `IngestionAdapter`. Used when adapters are spawned as
+    /// external processes via the adapter plugin system.
+    pub async fn ingest_source_files(
+        &self,
+        source_files: &[crate::chunking_strategy::SourceFile],
+        engine: &dyn InferenceEngine,
+        store: &dyn QueryableStore,
+    ) -> Result<usize> {
+        let total = source_files.len();
+        info!("{total} source files provided for introspect ingestion");
+
+        let entries: Vec<KnowledgeEntry> = source_files
+            .iter()
+            .map(|sf| {
+                let mut entry = KnowledgeEntry::new(
+                    sf.content.clone(),
+                    self.config.config.scope_id.clone(),
+                    sf.metadata.source_version.clone(),
+                );
+                entry.metadata = EntryMetadata {
+                    source_file: Some(sf.metadata.file_path.clone()),
+                    language: sf.metadata.language.clone(),
+                    chunk_type: Some("file".into()),
+                    start_line: None,
+                    end_line: None,
+                };
+                entry
+            })
+            .collect();
+
+        let mut stored = 0;
+        for batch in entries.chunks(EMBED_BATCH_SIZE) {
+            let texts: Vec<String> = batch.iter().map(|e| e.content.clone()).collect();
+            let embeddings = engine.embed_batch(&texts).await?;
+
+            for (entry, embedding) in batch.iter().zip(embeddings) {
+                let mut entry = entry.clone();
+                entry.embedding = Some(embedding);
+                store.insert(&entry).await?;
+                stored += 1;
+            }
+        }
+        info!("{stored}/{total} source files embedded and stored");
+        Ok(stored)
+    }
+
     /// Phase 3: Run canonical queries and score results.
     pub async fn query_self(
         &self,
