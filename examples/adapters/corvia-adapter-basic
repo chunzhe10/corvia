@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""
+corvia-adapter-basic — Minimal filesystem ingestion adapter for Corvia.
+
+Demonstrates the adapter protocol in Python. Walks a directory, reads text
+files, and streams them as JSONL to stdout. No language intelligence, no
+AST parsing — just raw file content for the kernel's default chunkers.
+
+Install:
+    chmod +x corvia-adapter-basic
+    cp corvia-adapter-basic ~/.config/corvia/adapters/
+
+Protocol (D75):
+    corvia-adapter-basic --corvia-metadata   → JSON metadata
+    corvia-adapter-basic ingest <path>       → JSONL stream of source files
+    echo '{"method":"chunk",...}' | corvia-adapter-basic chunk  → not supported (kernel defaults)
+"""
+
+import json
+import os
+import sys
+
+VERSION = "0.1.0"
+PROTOCOL_VERSION = 1
+
+SKIP_DIRS = {
+    ".git", "target", "node_modules", "__pycache__", ".venv",
+    "dist", "build", "vendor", ".corvia", ".tox", ".mypy_cache",
+    ".pytest_cache", "venv", "env", ".env", ".idea", ".vscode",
+}
+
+TEXT_EXTENSIONS = {
+    "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "rb", "php",
+    "c", "cpp", "h", "hpp", "cs", "swift", "kt", "scala", "ex", "exs",
+    "sh", "bash", "zsh", "fish",
+    "md", "txt", "rst", "adoc",
+    "toml", "yaml", "yml", "json", "xml", "csv",
+    "html", "css", "scss", "less", "sql",
+    "dockerfile", "makefile", "justfile",
+}
+
+MAX_FILE_SIZE = 100 * 1024  # 100KB
+
+
+def metadata():
+    return {
+        "name": "basic",
+        "version": VERSION,
+        "domain": "filesystem",
+        "protocol_version": PROTOCOL_VERSION,
+        "description": "Basic filesystem adapter — walks directories, reads text files",
+        "supported_extensions": sorted(TEXT_EXTENSIONS),
+        "chunking_extensions": [],  # no custom chunking, kernel defaults handle it
+    }
+
+
+def ingest(source_path):
+    total = 0
+    for root, dirs, files in os.walk(source_path):
+        # Skip ignored directories (in-place mutation filters os.walk)
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+
+        for filename in sorted(files):
+            filepath = os.path.join(root, filename)
+            ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+            # Also handle extensionless files by name
+            if ext not in TEXT_EXTENSIONS and filename.lower() not in TEXT_EXTENSIONS:
+                continue
+
+            try:
+                size = os.path.getsize(filepath)
+                if size > MAX_FILE_SIZE or size == 0:
+                    continue
+
+                with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except (OSError, UnicodeDecodeError):
+                continue
+
+            rel_path = os.path.relpath(filepath, source_path)
+
+            msg = {
+                "source_file": {
+                    "content": content,
+                    "metadata": {
+                        "file_path": rel_path,
+                        "extension": ext,
+                        "language": None,
+                        "scope_id": os.path.basename(os.path.abspath(source_path)),
+                        "source_version": "unknown",
+                    },
+                },
+            }
+            print(json.dumps(msg, ensure_ascii=False), flush=True)
+            total += 1
+
+    print(json.dumps({"done": True, "total_files": total}), flush=True)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} --corvia-metadata | ingest <path>", file=sys.stderr)
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+
+    if cmd == "--corvia-metadata":
+        print(json.dumps(metadata(), ensure_ascii=False))
+
+    elif cmd == "ingest":
+        if len(sys.argv) < 3:
+            print("Error: ingest requires a path argument", file=sys.stderr)
+            sys.exit(1)
+        source_path = sys.argv[2]
+        if not os.path.isdir(source_path):
+            print(
+                json.dumps({"error": {"code": "NOT_A_DIRECTORY", "message": f"'{source_path}' is not a directory"}}),
+                flush=True,
+            )
+            sys.exit(1)
+        ingest(source_path)
+
+    elif cmd == "chunk":
+        # Basic adapter doesn't provide custom chunking.
+        # Kernel will use its default strategies (MarkdownChunker, ConfigChunker, FallbackChunker).
+        print(
+            json.dumps({"error": {"code": "NOT_SUPPORTED", "message": "basic adapter does not provide chunking"}}),
+            flush=True,
+        )
+
+    else:
+        print(f"Unknown command: {cmd}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
