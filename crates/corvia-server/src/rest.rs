@@ -17,7 +17,7 @@ use tracing::info;
 pub struct AppState {
     pub store: Arc<dyn QueryableStore>,
     pub engine: Arc<dyn InferenceEngine>,
-    pub coordinator: Option<Arc<AgentCoordinator>>,
+    pub coordinator: Arc<AgentCoordinator>,
     pub graph: Arc<dyn GraphStore>,
     pub temporal: Arc<dyn TemporalStore>,
     pub data_dir: std::path::PathBuf,
@@ -275,10 +275,8 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 // --- Helper ---
 
-fn require_coordinator(state: &AppState) -> std::result::Result<&AgentCoordinator, (StatusCode, String)> {
-    state.coordinator.as_ref()
-        .map(|c| c.as_ref())
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "Agent coordination not enabled".into()))
+fn coordinator(state: &AppState) -> &AgentCoordinator {
+    &state.coordinator
 }
 
 // --- Existing handlers ---
@@ -402,7 +400,7 @@ async fn register_agent(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RegisterAgentRequest>,
 ) -> std::result::Result<(StatusCode, Json<AgentResponse>), (StatusCode, String)> {
-    let coord = require_coordinator(&state)?;
+    let coord = coordinator(&state);
 
     let identity = AgentIdentity::Registered {
         agent_id: format!("{}::{}", req.scope, req.name),
@@ -427,7 +425,7 @@ async fn create_session(
     State(state): State<Arc<AppState>>,
     Path(agent_id): Path<String>,
 ) -> std::result::Result<(StatusCode, Json<ConnectResponseDto>), (StatusCode, String)> {
-    let coord = require_coordinator(&state)?;
+    let coord = coordinator(&state);
 
     // Create session (with staging for registered agents)
     let _session = coord.create_session(&agent_id, true)
@@ -448,7 +446,7 @@ async fn heartbeat(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> std::result::Result<StatusCode, (StatusCode, String)> {
-    let coord = require_coordinator(&state)?;
+    let coord = coordinator(&state);
     coord.heartbeat(&session_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Heartbeat failed: {e}")))?;
     Ok(StatusCode::OK)
@@ -459,7 +457,7 @@ async fn session_write(
     Path(session_id): Path<String>,
     Json(req): Json<SessionWriteRequest>,
 ) -> std::result::Result<(StatusCode, Json<SessionWriteResponse>), (StatusCode, String)> {
-    let coord = require_coordinator(&state)?;
+    let coord = coordinator(&state);
 
     let entry = coord.write_entry(
         &session_id,
@@ -479,7 +477,7 @@ async fn commit_session(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> std::result::Result<StatusCode, (StatusCode, String)> {
-    let coord = require_coordinator(&state)?;
+    let coord = coordinator(&state);
     coord.commit_session(&session_id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Commit failed: {e}")))?;
     Ok(StatusCode::OK)
@@ -489,7 +487,7 @@ async fn rollback_session(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> std::result::Result<StatusCode, (StatusCode, String)> {
-    let coord = require_coordinator(&state)?;
+    let coord = coordinator(&state);
     coord.rollback_session(&session_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Rollback failed: {e}")))?;
     Ok(StatusCode::OK)
@@ -500,7 +498,7 @@ async fn recover_session(
     Path(session_id): Path<String>,
     Json(req): Json<RecoverRequest>,
 ) -> std::result::Result<StatusCode, (StatusCode, String)> {
-    let coord = require_coordinator(&state)?;
+    let coord = coordinator(&state);
     let action = match req.action.as_str() {
         "resume" => RecoveryAction::Resume,
         "commit" => RecoveryAction::Commit,
@@ -516,7 +514,7 @@ async fn session_state(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> std::result::Result<Json<SessionStateResponse>, (StatusCode, String)> {
-    let coord = require_coordinator(&state)?;
+    let coord = coordinator(&state);
     let session = coord.sessions.get(&session_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get session: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, format!("Session {session_id} not found")))?;

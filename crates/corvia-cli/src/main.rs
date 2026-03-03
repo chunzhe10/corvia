@@ -373,23 +373,15 @@ async fn cmd_serve(mcp: bool) -> Result<()> {
             std::sync::Arc::new(corvia_kernel::ollama_chat::OllamaChatEngine::new(&config.embedding.url, &config.merge.model))
         }
     };
-    let coordinator = match AgentCoordinator::new(
+    let coordinator = Arc::new(AgentCoordinator::new(
         store.clone(),
         engine.clone(),
         data_dir,
         config.agent_lifecycle.clone(),
         config.merge.clone(),
         gen_engine,
-    ) {
-        Ok(c) => {
-            println!("Agent coordination: enabled");
-            Some(Arc::new(c))
-        }
-        Err(e) => {
-            println!("Agent coordination: disabled ({e})");
-            None
-        }
-    };
+    )?);
+    println!("Agent coordination: enabled");
 
     // Construct RAG pipeline — auto-selects retriever based on graph availability.
     // generator: None until a GenerationEngine adapter is wired (ask mode unavailable).

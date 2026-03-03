@@ -334,62 +334,47 @@ async fn tool_corvia_write(
         .ok_or((INVALID_PARAMS, "Missing 'scope_id' parameter".into()))?;
     let source_version = args.get("source_version").and_then(|v| v.as_str()).unwrap_or("mcp");
 
-    // If coordinator is available, use agent write path
-    if let Some(coord) = &state.coordinator {
-        // Ensure agent has a session (create one if needed)
-        let connect = coord.connect(agent_id)
-            .or_else(|_| {
-                // Auto-register MCP agent
-                let identity = AgentIdentity::McpClient {
-                    client_name: agent_id.to_string(),
-                    client_version: "unknown".into(),
-                    agent_hint: None,
-                };
-                coord.register_agent(
-                    &identity,
-                    agent_id,
-                    AgentPermission::ReadWrite { scopes: vec![scope_id.to_string()] },
-                )?;
-                coord.create_session(agent_id, false)?;
-                coord.connect(agent_id)
-            })
+    let coord = &state.coordinator;
+
+    // Ensure agent has a session (create one if needed)
+    let mut connect = coord.connect(agent_id)
+        .unwrap_or_else(|_| corvia_kernel::agent_coordinator::ConnectResponse {
+            agent_id: agent_id.into(),
+            active_sessions: vec![],
+            recoverable_sessions: vec![],
+        });
+
+    if connect.active_sessions.is_empty() {
+        // Auto-register MCP agent and create session
+        let identity = AgentIdentity::McpClient {
+            client_name: agent_id.to_string(),
+            client_version: "unknown".into(),
+            agent_hint: None,
+        };
+        let _ = coord.register_agent(
+            &identity,
+            agent_id,
+            AgentPermission::ReadWrite { scopes: vec![scope_id.to_string()] },
+        );
+        coord.create_session(agent_id, false)
+            .map_err(|e| (INTERNAL_ERROR, format!("Session creation failed: {e}")))?;
+        connect = coord.connect(agent_id)
             .map_err(|e| (INTERNAL_ERROR, format!("Agent setup failed: {e}")))?;
-
-        let session_id = connect.active_sessions.first()
-            .map(|s| s.session_id.as_str())
-            .ok_or((INTERNAL_ERROR, "No active session".into()))?;
-
-        let entry = coord.write_entry(session_id, content, scope_id, source_version).await
-            .map_err(|e| (INTERNAL_ERROR, format!("Write failed: {e}")))?;
-
-        Ok(json!({
-            "content": [{
-                "type": "text",
-                "text": format!("Entry {} written (status: {:?})", entry.id, entry.entry_status)
-            }]
-        }))
-    } else {
-        // No coordinator — direct write (backward compatibility)
-        let embedding = state.engine.embed(content).await
-            .map_err(|e| (INTERNAL_ERROR, format!("Embedding failed: {e}")))?;
-
-        let entry = corvia_common::types::KnowledgeEntry::new(
-            content.to_string(),
-            scope_id.to_string(),
-            source_version.to_string(),
-        ).with_embedding(embedding);
-
-        let id = entry.id.to_string();
-        state.store.insert(&entry).await
-            .map_err(|e| (INTERNAL_ERROR, format!("Storage failed: {e}")))?;
-
-        Ok(json!({
-            "content": [{
-                "type": "text",
-                "text": format!("Entry {id} written (direct mode)")
-            }]
-        }))
     }
+
+    let session_id = connect.active_sessions.first()
+        .map(|s| s.session_id.as_str())
+        .ok_or((INTERNAL_ERROR, "No active session".into()))?;
+
+    let entry = coord.write_entry(session_id, content, scope_id, source_version).await
+        .map_err(|e| (INTERNAL_ERROR, format!("Write failed: {e}")))?;
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": format!("Entry {} written (status: {:?})", entry.id, entry.entry_status)
+        }]
+    }))
 }
 
 async fn tool_corvia_history(
@@ -546,39 +531,31 @@ fn tool_corvia_agent_status(
     let agent_id = agent_id
         .ok_or((INVALID_PARAMS, "agent_status requires _meta.agent_id".into()))?;
 
-    if let Some(coord) = &state.coordinator {
-        let connect = coord.connect(agent_id)
-            .map_err(|e| (INTERNAL_ERROR, format!("Connect failed: {e}")))?;
+    let coord = &state.coordinator;
+    let connect = coord.connect(agent_id)
+        .map_err(|e| (INTERNAL_ERROR, format!("Connect failed: {e}")))?;
 
-        let total_written: u64 = connect.active_sessions.iter()
-            .chain(connect.recoverable_sessions.iter())
-            .map(|s| s.entries_written)
-            .sum();
-        let total_merged: u64 = connect.active_sessions.iter()
-            .chain(connect.recoverable_sessions.iter())
-            .map(|s| s.entries_merged)
-            .sum();
+    let total_written: u64 = connect.active_sessions.iter()
+        .chain(connect.recoverable_sessions.iter())
+        .map(|s| s.entries_written)
+        .sum();
+    let total_merged: u64 = connect.active_sessions.iter()
+        .chain(connect.recoverable_sessions.iter())
+        .map(|s| s.entries_merged)
+        .sum();
 
-        Ok(json!({
-            "content": [{
-                "type": "text",
-                "text": serde_json::to_string_pretty(&json!({
-                    "agent_id": agent_id,
-                    "active_sessions": connect.active_sessions.len(),
-                    "recoverable_sessions": connect.recoverable_sessions.len(),
-                    "total_entries_written": total_written,
-                    "total_entries_merged": total_merged,
-                })).unwrap()
-            }]
-        }))
-    } else {
-        Ok(json!({
-            "content": [{
-                "type": "text",
-                "text": format!("Agent coordination not enabled — no status for {agent_id}")
-            }]
-        }))
-    }
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(&json!({
+                "agent_id": agent_id,
+                "active_sessions": connect.active_sessions.len(),
+                "recoverable_sessions": connect.recoverable_sessions.len(),
+                "total_entries_written": total_written,
+                "total_entries_merged": total_merged,
+            })).unwrap()
+        }]
+    }))
 }
 
 async fn tool_corvia_context(
@@ -671,8 +648,9 @@ async fn tool_corvia_ask(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use corvia_kernel::agent_coordinator::AgentCoordinator;
     use corvia_kernel::lite_store::LiteStore;
-    use corvia_kernel::traits::{GraphStore, InferenceEngine, QueryableStore, TemporalStore};
+    use corvia_kernel::traits::{GenerationEngine, GenerationResult, GraphStore, InferenceEngine, QueryableStore, TemporalStore};
 
     struct MockEngine;
     #[async_trait::async_trait]
@@ -686,14 +664,38 @@ mod tests {
         fn dimensions(&self) -> usize { 3 }
     }
 
+    struct MockGenerationEngine;
+    #[async_trait::async_trait]
+    impl GenerationEngine for MockGenerationEngine {
+        fn name(&self) -> &str { "mock" }
+        async fn generate(&self, _system_prompt: &str, user_message: &str) -> corvia_common::errors::Result<GenerationResult> {
+            Ok(GenerationResult {
+                text: format!("merged: {user_message}"),
+                model: "mock".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+            })
+        }
+        fn context_window(&self) -> usize { 4096 }
+    }
+
     async fn test_state(dir: &std::path::Path) -> Arc<AppState> {
         let store = Arc::new(LiteStore::open(dir, 3).unwrap());
         store.init_schema().await.unwrap();
         let engine = Arc::new(MockEngine) as Arc<dyn InferenceEngine>;
+        let gen_engine = Arc::new(MockGenerationEngine) as Arc<dyn GenerationEngine>;
+        let coordinator = Arc::new(AgentCoordinator::new(
+            store.clone() as Arc<dyn QueryableStore>,
+            engine.clone(),
+            dir,
+            corvia_common::config::AgentLifecycleConfig::default(),
+            corvia_common::config::MergeConfig { similarity_threshold: 2.0, ..Default::default() },
+            gen_engine,
+        ).unwrap());
         Arc::new(AppState {
             store: store.clone() as Arc<dyn QueryableStore>,
             engine,
-            coordinator: None,
+            coordinator,
             graph: store.clone() as Arc<dyn GraphStore>,
             temporal: store as Arc<dyn TemporalStore>,
             data_dir: dir.to_path_buf(),
@@ -768,7 +770,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(dir.path()).await;
 
-        // Without coordinator, falls back to direct write
+        // Write through coordinator path (auto-registers MCP agent)
         let args = json!({ "content": "agent knowledge", "scope_id": "test-scope" });
         let result = tool_corvia_write(&state, &args, Some("mcp::test-agent")).await.unwrap();
 
@@ -916,16 +918,6 @@ mod tests {
         assert_eq!(code, INVALID_PARAMS);
     }
 
-    #[tokio::test]
-    async fn test_corvia_agent_status_no_coordinator() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = test_state(dir.path()).await;
-
-        let result = tool_corvia_agent_status(&state, Some("test-agent")).unwrap();
-        let text = result["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("not enabled"));
-    }
-
     /// When AppState has rag: Some(...), corvia_search should route through RAG.
     #[tokio::test]
     async fn test_corvia_search_routes_through_rag() {
@@ -957,10 +949,20 @@ mod tests {
             &config,
         ));
 
+        let gen_engine = Arc::new(MockGenerationEngine) as Arc<dyn GenerationEngine>;
+        let coordinator = Arc::new(AgentCoordinator::new(
+            store.clone() as Arc<dyn QueryableStore>,
+            engine.clone(),
+            dir.path(),
+            corvia_common::config::AgentLifecycleConfig::default(),
+            corvia_common::config::MergeConfig::default(),
+            gen_engine,
+        ).unwrap());
+
         let state = Arc::new(AppState {
             store: store.clone() as Arc<dyn QueryableStore>,
             engine,
-            coordinator: None,
+            coordinator,
             graph: store.clone() as Arc<dyn GraphStore>,
             temporal: store as Arc<dyn TemporalStore>,
             data_dir: dir.path().to_path_buf(),
