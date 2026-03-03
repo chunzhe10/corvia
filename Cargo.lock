@@ -1001,6 +1001,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "corvia-adapter-basic"
+version = "0.3.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "corvia-adapter-git"
 version = "0.1.0"
 source = "git+https://github.com/chunzhe10/corvia-adapter-git?tag=v0.3.2#a6898c2b7a40397a4a644ed0814be7a41854a96a"

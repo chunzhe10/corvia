@@ -1,0 +1,22 @@
+[package]
+name = "corvia-adapter-basic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Basic filesystem ingestion adapter for Corvia"
+keywords = ["ai-agents", "ingestion", "adapter", "filesystem"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "corvia-adapter-basic"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
