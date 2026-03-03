@@ -15,7 +15,7 @@
 
 use corvia_common::errors::Result;
 
-use crate::chunking_strategy::{ChunkMetadata, ChunkingStrategy, RawChunk, SourceMetadata};
+use crate::chunking_strategy::{ChunkMetadata, ChunkResult, ChunkingStrategy, RawChunk, SourceMetadata};
 
 /// Heading-based Markdown section chunker.
 pub struct MarkdownChunker;
@@ -55,9 +55,9 @@ impl ChunkingStrategy for MarkdownChunker {
         &["md"]
     }
 
-    fn chunk(&self, source: &str, meta: &SourceMetadata) -> Result<Vec<RawChunk>> {
+    fn chunk(&self, source: &str, meta: &SourceMetadata) -> Result<ChunkResult> {
         if source.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ChunkResult::default());
         }
 
         let lines: Vec<&str> = source.lines().collect();
@@ -132,7 +132,7 @@ impl ChunkingStrategy for MarkdownChunker {
             });
         }
 
-        Ok(chunks)
+        Ok(ChunkResult { chunks, relations: vec![] })
     }
 
     fn overlap_context(&self, prev: &RawChunk, _next: &RawChunk) -> Option<String> {
@@ -230,7 +230,7 @@ mod tests {
     fn test_splits_on_h1_headings() {
         let chunker = MarkdownChunker::new();
         let source = "# A\n\ntext under A\n\n# B\n\ntext under B";
-        let chunks = chunker.chunk(source, &test_meta()).unwrap();
+        let chunks = chunker.chunk(source, &test_meta()).unwrap().chunks;
 
         assert_eq!(chunks.len(), 2, "expected 2 chunks, got {}", chunks.len());
         assert!(chunks[0].content.contains("# A"));
@@ -243,7 +243,7 @@ mod tests {
     fn test_splits_on_mixed_heading_levels() {
         let chunker = MarkdownChunker::new();
         let source = "# Top\n\nIntro.\n\n## A\n\nSection A body.\n\n## B\n\nSection B body.";
-        let chunks = chunker.chunk(source, &test_meta()).unwrap();
+        let chunks = chunker.chunk(source, &test_meta()).unwrap().chunks;
 
         assert!(
             chunks.len() >= 2,
@@ -261,7 +261,7 @@ mod tests {
     fn test_no_headings_returns_single_chunk() {
         let chunker = MarkdownChunker::new();
         let source = "Just plain text.\nNo headings here.";
-        let chunks = chunker.chunk(source, &test_meta()).unwrap();
+        let chunks = chunker.chunk(source, &test_meta()).unwrap().chunks;
 
         assert_eq!(chunks.len(), 1, "expected 1 chunk, got {}", chunks.len());
         assert_eq!(chunks[0].chunk_type, "text");
@@ -272,7 +272,7 @@ mod tests {
     fn test_chunk_type_is_heading_section() {
         let chunker = MarkdownChunker::new();
         let source = "## Auth\n\nAuth details here.";
-        let chunks = chunker.chunk(source, &test_meta()).unwrap();
+        let chunks = chunker.chunk(source, &test_meta()).unwrap().chunks;
 
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].chunk_type, "heading_section");
@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn test_empty_source() {
         let chunker = MarkdownChunker::new();
-        let chunks = chunker.chunk("", &test_meta()).unwrap();
+        let chunks = chunker.chunk("", &test_meta()).unwrap().chunks;
         assert!(chunks.is_empty(), "expected empty vec for empty source");
     }
 
@@ -339,7 +339,7 @@ mod tests {
     fn test_content_before_first_heading_gets_own_chunk() {
         let chunker = MarkdownChunker::new();
         let source = "Preamble text.\n\n# First Heading\n\nBody.";
-        let chunks = chunker.chunk(source, &test_meta()).unwrap();
+        let chunks = chunker.chunk(source, &test_meta()).unwrap().chunks;
 
         assert_eq!(chunks.len(), 2, "expected 2 chunks, got {}", chunks.len());
         assert_eq!(chunks[0].chunk_type, "text");
@@ -352,7 +352,7 @@ mod tests {
     fn test_line_numbers_are_accurate() {
         let chunker = MarkdownChunker::new();
         let source = "Preamble.\n\n# Heading\n\nBody line 1.\nBody line 2.";
-        let chunks = chunker.chunk(source, &test_meta()).unwrap();
+        let chunks = chunker.chunk(source, &test_meta()).unwrap().chunks;
 
         assert_eq!(chunks.len(), 2);
         // Preamble: lines 1..2 (line 1 = "Preamble.", line 2 = "")
@@ -368,7 +368,7 @@ mod tests {
         let chunker = MarkdownChunker::new();
         let source = "# Title\n\nContent.";
         let meta = test_meta();
-        let chunks = chunker.chunk(source, &meta).unwrap();
+        let chunks = chunker.chunk(source, &meta).unwrap().chunks;
 
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].metadata.source_file, "docs/guide.md");

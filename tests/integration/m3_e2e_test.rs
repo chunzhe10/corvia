@@ -323,6 +323,7 @@ async fn test_reasoner_finds_issues() {
 #[tokio::test]
 async fn test_ingest_and_reason() {
     use corvia_adapter_git::git::GitAdapter;
+    use corvia_kernel::traits::IngestionAdapter;
 
     // 1. Create a small temp "repo" with 2 Rust files
     let repo_dir = tempdir().unwrap();
@@ -364,16 +365,22 @@ fn main() {
     )
     .unwrap();
 
-    // 2. Use GitAdapter to ingest with relations
+    // 2. Use GitAdapter + ChunkingPipeline to ingest with relations
     let adapter = GitAdapter::new();
-    let result = adapter
-        .ingest_with_relations(repo_dir.path().to_str().unwrap())
+    let source_files = adapter
+        .ingest_sources(repo_dir.path().to_str().unwrap())
         .await
         .unwrap();
 
+    let config = corvia_common::config::CorviaConfig::default();
+    let mut pipeline = corvia_kernel::create_chunking_pipeline(&config);
+    adapter.register_chunking(pipeline.registry_mut());
+
+    let (processed, relations, _report) = pipeline.process_batch(&source_files).unwrap();
+
     assert!(
-        !result.entries.is_empty(),
-        "Ingestion should produce entries from the Rust files"
+        !processed.is_empty(),
+        "Ingestion should produce chunks from the Rust files"
     );
 
     // 3. Set up LiteStore and insert entries with embeddings
@@ -382,7 +389,19 @@ fn main() {
     store.init_schema().await.unwrap();
 
     let mut stored_entries = Vec::new();
-    for (i, mut e) in result.entries.into_iter().enumerate() {
+    for (i, pc) in processed.iter().enumerate() {
+        let mut e = KnowledgeEntry::new(
+            pc.content.clone(),
+            "test:scope".into(),
+            pc.metadata.source_file.clone(),
+        );
+        e.metadata = corvia_common::types::EntryMetadata {
+            source_file: Some(pc.metadata.source_file.clone()),
+            language: pc.metadata.language.clone(),
+            chunk_type: Some(pc.chunk_type.clone()),
+            start_line: Some(pc.start_line),
+            end_line: Some(pc.end_line),
+        };
         // Assign deterministic embeddings (vary by index for diversity)
         let x = if i % 3 == 0 { 1.0 } else { 0.0 };
         let y = if i % 3 == 1 { 1.0 } else { 0.0 };
@@ -406,22 +425,26 @@ fn main() {
         );
     }
 
-    // 5. Wire relations into graph
+    // 5. Wire relations into graph using pipeline ChunkRelations
     let mut edge_count = 0;
-    for rel in &result.relations {
-        if rel.from_chunk_index < stored_entries.len() {
-            let from_id = stored_entries[rel.from_chunk_index].id;
-            // For "imports" relations, create edges to a deterministic target.
-            // In a real pipeline, the target would be resolved by file name.
-            // For this test, just create a graph edge to the first entry
-            // to exercise the graph pipeline.
-            let to_id = stored_entries[0].id;
-            if from_id != to_id {
-                store
-                    .relate(&from_id, &rel.relation, &to_id, None)
-                    .await
-                    .unwrap();
-                edge_count += 1;
+    for rel in &relations {
+        // Find source chunk by (source_file, start_line)
+        let from_idx = processed.iter().position(|pc| {
+            pc.metadata.source_file == rel.from_source_file && pc.start_line == rel.from_start_line
+        });
+        if let Some(idx) = from_idx {
+            if idx < stored_entries.len() {
+                let from_id = stored_entries[idx].id;
+                // For this test, create a graph edge to the first entry
+                // to exercise the graph pipeline.
+                let to_id = stored_entries[0].id;
+                if from_id != to_id {
+                    store
+                        .relate(&from_id, &rel.relation, &to_id, None)
+                        .await
+                        .unwrap();
+                    edge_count += 1;
+                }
             }
         }
     }

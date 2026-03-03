@@ -13,7 +13,7 @@
 
 use corvia_common::errors::Result;
 
-use crate::chunking_strategy::{ChunkMetadata, ChunkingStrategy, RawChunk, SourceMetadata};
+use crate::chunking_strategy::{ChunkMetadata, ChunkResult, ChunkingStrategy, RawChunk, SourceMetadata};
 
 /// The separator cascade, tried in order from coarsest to finest.
 const SEPARATORS: &[&str] = &["\n\n", "\n", " "];
@@ -126,9 +126,9 @@ impl ChunkingStrategy for FallbackChunker {
         &[]
     }
 
-    fn chunk(&self, source: &str, meta: &SourceMetadata) -> Result<Vec<RawChunk>> {
+    fn chunk(&self, source: &str, meta: &SourceMetadata) -> Result<ChunkResult> {
         if source.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ChunkResult::default());
         }
 
         let text_chunks = Self::recursive_split(source, self.max_tokens, 0);
@@ -153,33 +153,16 @@ impl ChunkingStrategy for FallbackChunker {
                 },
             });
 
-            // Advance past this chunk's lines. The separator between chunks
-            // (which was consumed by split) also contributes newlines. We track
-            // the worst case: the coarsest separator that could have been between
-            // chunks is \n\n (2 newlines). But since we don't know which separator
-            // was used, we compute line advancement from the original source.
-            //
-            // Actually, the simplest correct approach: we track how many lines
-            // we've consumed. The next chunk starts on end_line + 1 if the
-            // separator contained a newline, or end_line if it didn't. Since
-            // we're splitting on separators that contain newlines (except space),
-            // and we're reassembling, the line count is implicit.
-            //
-            // We use a simpler approach: track via the original source.
             current_line = end_line + 1;
         }
 
         // Fix line tracking: recompute from the original source for accuracy.
-        // Walk through original source and match each chunk's content to find
-        // its actual position.
         let mut search_offset: usize = 0;
         let mut line_at_offset: u32 = 1;
 
         for chunk in &mut chunks {
-            // Find this chunk's content in the source starting from search_offset.
             if let Some(pos) = source[search_offset..].find(&chunk.content) {
                 let abs_pos = search_offset + pos;
-                // Count newlines in the skipped separator region.
                 let skipped = &source[search_offset..abs_pos];
                 line_at_offset += Self::newline_count(skipped);
 
@@ -191,7 +174,7 @@ impl ChunkingStrategy for FallbackChunker {
             }
         }
 
-        Ok(chunks)
+        Ok(ChunkResult { chunks, relations: vec![] })
     }
 }
 
@@ -217,7 +200,7 @@ mod tests {
     fn test_small_file_single_chunk() {
         let chunker = FallbackChunker::new(1000);
         let source = "Hello, world! This is a small file.";
-        let chunks = chunker.chunk(source, &test_meta()).unwrap();
+        let chunks = chunker.chunk(source, &test_meta()).unwrap().chunks;
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].content, source);
         assert_eq!(chunks[0].chunk_type, "text");
@@ -231,7 +214,7 @@ mod tests {
         // the chunker to split at paragraph boundaries.
         let source = "First paragraph here.\n\nSecond paragraph here.\n\nThird paragraph here.";
         let chunker = FallbackChunker::new(10);
-        let chunks = chunker.chunk(source, &test_meta()).unwrap();
+        let chunks = chunker.chunk(source, &test_meta()).unwrap().chunks;
 
         assert!(
             chunks.len() >= 2,
@@ -260,7 +243,7 @@ mod tests {
         let source =
             "Line one content.\nLine two content.\nLine three content.\nLine four content.";
         let chunker = FallbackChunker::new(10);
-        let chunks = chunker.chunk(source, &test_meta()).unwrap();
+        let chunks = chunker.chunk(source, &test_meta()).unwrap().chunks;
 
         assert!(
             chunks.len() >= 2,
@@ -276,7 +259,7 @@ mod tests {
     #[test]
     fn test_empty_source() {
         let chunker = FallbackChunker::new(100);
-        let chunks = chunker.chunk("", &test_meta()).unwrap();
+        let chunks = chunker.chunk("", &test_meta()).unwrap().chunks;
         assert!(chunks.is_empty(), "expected empty vec for empty source");
     }
 
@@ -285,7 +268,7 @@ mod tests {
         let chunker = FallbackChunker::new(1000);
         let source = "Some content here.";
         let meta = test_meta();
-        let chunks = chunker.chunk(source, &meta).unwrap();
+        let chunks = chunker.chunk(source, &meta).unwrap().chunks;
 
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].metadata.source_file, "docs/notes.txt");

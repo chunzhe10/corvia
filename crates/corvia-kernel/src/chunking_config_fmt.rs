@@ -11,7 +11,7 @@
 
 use corvia_common::errors::Result;
 
-use crate::chunking_strategy::{ChunkMetadata, ChunkingStrategy, RawChunk, SourceMetadata};
+use crate::chunking_strategy::{ChunkMetadata, ChunkResult, ChunkingStrategy, RawChunk, SourceMetadata};
 
 /// Configuration file chunker for TOML, YAML, and JSON.
 pub struct ConfigChunker;
@@ -242,9 +242,9 @@ impl ChunkingStrategy for ConfigChunker {
         &["toml", "yaml", "yml", "json"]
     }
 
-    fn chunk(&self, source: &str, meta: &SourceMetadata) -> Result<Vec<RawChunk>> {
+    fn chunk(&self, source: &str, meta: &SourceMetadata) -> Result<ChunkResult> {
         if source.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ChunkResult::default());
         }
 
         let chunks = match meta.extension.as_str() {
@@ -263,7 +263,7 @@ impl ChunkingStrategy for ConfigChunker {
             }
         };
 
-        Ok(chunks)
+        Ok(ChunkResult { chunks, relations: vec![] })
     }
 }
 
@@ -309,7 +309,7 @@ mod tests {
     fn test_toml_section_splitting() {
         let chunker = ConfigChunker::new();
         let source = "[package]\nname=\"test\"\n\n[deps]\nserde=\"1\"";
-        let chunks = chunker.chunk(source, &toml_meta()).unwrap();
+        let chunks = chunker.chunk(source, &toml_meta()).unwrap().chunks;
 
         assert!(
             chunks.len() >= 2,
@@ -327,7 +327,7 @@ mod tests {
     fn test_json_top_level_keys() {
         let chunker = ConfigChunker::new();
         let source = r#"{"name": "test", "version": "1.0", "deps": {"serde": "1"}}"#;
-        let chunks = chunker.chunk(source, &json_meta()).unwrap();
+        let chunks = chunker.chunk(source, &json_meta()).unwrap().chunks;
 
         assert!(
             chunks.len() >= 3,
@@ -346,7 +346,7 @@ mod tests {
     fn test_yaml_top_level_keys() {
         let chunker = ConfigChunker::new();
         let source = "name: test\nversion: \"1.0\"\ndeps:\n  serde: \"1\"\n  toml: \"0.8\"";
-        let chunks = chunker.chunk(source, &yaml_meta()).unwrap();
+        let chunks = chunker.chunk(source, &yaml_meta()).unwrap().chunks;
 
         assert!(
             chunks.len() >= 3,
@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn test_empty_config() {
         let chunker = ConfigChunker::new();
-        let chunks = chunker.chunk("", &toml_meta()).unwrap();
+        let chunks = chunker.chunk("", &toml_meta()).unwrap().chunks;
         assert!(chunks.is_empty(), "expected empty vec for empty source");
     }
 
@@ -371,7 +371,7 @@ mod tests {
     fn test_chunk_type_is_section() {
         let chunker = ConfigChunker::new();
         let source = "[package]\nname=\"test\"";
-        let chunks = chunker.chunk(source, &toml_meta()).unwrap();
+        let chunks = chunker.chunk(source, &toml_meta()).unwrap().chunks;
 
         for chunk in &chunks {
             assert_eq!(chunk.chunk_type, "section", "all chunks should be type 'section'");

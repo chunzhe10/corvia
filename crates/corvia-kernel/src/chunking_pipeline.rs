@@ -20,7 +20,8 @@ use corvia_common::errors::Result;
 use tracing::info;
 
 use crate::chunking_strategy::{
-    ChunkingStrategy, ProcessedChunk, ProcessingInfo, RawChunk, SourceFile, SourceMetadata,
+    ChunkRelation, ChunkingStrategy, ProcessedChunk, ProcessingInfo, RawChunk, SourceFile,
+    SourceMetadata,
 };
 use crate::token_estimator::TokenEstimator;
 
@@ -166,7 +167,13 @@ impl ChunkingPipeline {
     ///
     /// Steps: resolve strategy, domain chunk, merge small, split oversized,
     /// add overlap context, build `ProcessedChunk`s.
-    pub fn process(&self, source: &str, meta: &SourceMetadata) -> Result<Vec<ProcessedChunk>> {
+    ///
+    /// Returns processed chunks and any relations discovered by the strategy.
+    pub fn process(
+        &self,
+        source: &str,
+        meta: &SourceMetadata,
+    ) -> Result<(Vec<ProcessedChunk>, Vec<ChunkRelation>)> {
         // Step 1: Resolve strategy via FormatRegistry.
         let strategy = self.registry.resolve(&meta.extension);
         let strategy_name = strategy.name().to_string();
@@ -178,7 +185,9 @@ impl ChunkingPipeline {
         );
 
         // Step 2: Domain chunking.
-        let mut chunks = strategy.chunk(source, meta)?;
+        let chunk_result = strategy.chunk(source, meta)?;
+        let mut chunks = chunk_result.chunks;
+        let relations = chunk_result.relations;
 
         // Step 3: Merge small chunks.
         let (chunks_after_merge, merge_count) =
@@ -227,19 +236,20 @@ impl ChunkingPipeline {
             "chunking_completed"
         );
 
-        Ok(processed)
+        Ok((processed, relations))
     }
 
-    /// Process a batch of source files, returning all chunks and a report.
+    /// Process a batch of source files, returning all chunks, relations, and a report.
     pub fn process_batch(
         &self,
         files: &[SourceFile],
-    ) -> Result<(Vec<ProcessedChunk>, ProcessingReport)> {
+    ) -> Result<(Vec<ProcessedChunk>, Vec<ChunkRelation>, ProcessingReport)> {
         let mut all_chunks = Vec::new();
+        let mut all_relations = Vec::new();
         let mut report = ProcessingReport::default();
 
         for file in files {
-            let chunks = self.process(&file.content, &file.metadata)?;
+            let (chunks, relations) = self.process(&file.content, &file.metadata)?;
 
             let strategy_name = if let Some(first) = chunks.first() {
                 first.processing.strategy_name.clone()
@@ -269,9 +279,10 @@ impl ChunkingPipeline {
             report.files_processed += 1;
             report.total_chunks += chunks.len();
             all_chunks.extend(chunks);
+            all_relations.extend(relations);
         }
 
-        Ok((all_chunks, report))
+        Ok((all_chunks, all_relations, report))
     }
 
     // -- Internal pipeline steps -------------------------------------------
@@ -480,8 +491,8 @@ mod tests {
             &["txt", "log"]
         }
 
-        fn chunk(&self, source: &str, meta: &SourceMetadata) -> Result<Vec<RawChunk>> {
-            Ok(source
+        fn chunk(&self, source: &str, meta: &SourceMetadata) -> Result<crate::chunking_strategy::ChunkResult> {
+            let chunks = source
                 .lines()
                 .enumerate()
                 .map(|(i, line)| RawChunk {
@@ -495,7 +506,8 @@ mod tests {
                         ..Default::default()
                     },
                 })
-                .collect())
+                .collect();
+            Ok(crate::chunking_strategy::ChunkResult { chunks, relations: vec![] })
         }
     }
 
@@ -583,7 +595,7 @@ mod tests {
         let source = "Hello, world! This is a small test file.";
         let meta = test_meta("txt");
 
-        let chunks = pipeline.process(source, &meta).unwrap();
+        let (chunks, _relations) = pipeline.process(source, &meta).unwrap();
         assert_eq!(chunks.len(), 1, "small single-line file should produce 1 chunk");
         assert_eq!(chunks[0].processing.strategy_name, "line_chunker");
         assert!(
@@ -610,7 +622,7 @@ mod tests {
                        Another line to push the total higher still.";
         let meta = test_meta("xyz"); // unknown ext -> fallback
 
-        let chunks = pipeline.process(source, &meta).unwrap();
+        let (chunks, _relations) = pipeline.process(source, &meta).unwrap();
         assert!(
             chunks.len() > 1,
             "expected multiple chunks after budget enforcement, got {}",
@@ -646,7 +658,7 @@ mod tests {
         let source = "one\ntwo\nthree\nfour\nfive\nsix";
         let meta = test_meta("txt");
 
-        let chunks = pipeline.process(source, &meta).unwrap();
+        let (chunks, _relations) = pipeline.process(source, &meta).unwrap();
         // 6 tiny lines should be merged into fewer chunks.
         assert!(
             chunks.len() < 6,
@@ -683,7 +695,7 @@ mod tests {
             },
         ];
 
-        let (chunks, report) = pipeline.process_batch(&files).unwrap();
+        let (chunks, _relations, report) = pipeline.process_batch(&files).unwrap();
         assert!(
             !chunks.is_empty(),
             "expected chunks from batch processing"
@@ -704,7 +716,7 @@ mod tests {
         let source = "First line here with content.\nSecond line here with content.";
         let meta = test_meta("txt");
 
-        let chunks = pipeline.process(source, &meta).unwrap();
+        let (chunks, _relations) = pipeline.process(source, &meta).unwrap();
         assert!(
             chunks.len() >= 2,
             "expected at least 2 chunks, got {}",
@@ -736,7 +748,7 @@ mod tests {
         let source = "Simple content.";
         let meta = test_meta("txt");
 
-        let chunks = pipeline.process(source, &meta).unwrap();
+        let (chunks, _relations) = pipeline.process(source, &meta).unwrap();
         assert_eq!(chunks.len(), 1);
 
         let info = &chunks[0].processing;
@@ -765,7 +777,7 @@ mod tests {
         // (they have different merge groups: h1 vs h2).
         let source = "# Hello\n\nWorld.\n\n## Goodbye\n\nSee you.";
         let meta = test_meta("md");
-        let chunks = pipeline.process(source, &meta).unwrap();
+        let (chunks, _relations) = pipeline.process(source, &meta).unwrap();
         assert!(
             chunks.len() >= 2,
             "expected >= 2 chunks, got {} (different heading depths should prevent merging)",
@@ -780,7 +792,7 @@ mod tests {
         let pipeline = ChunkingPipeline::with_kernel_defaults(config);
         let source = "[package]\nname = \"test\"\n\n[deps]\nserde = \"1\"\n";
         let meta = test_meta("toml");
-        let chunks = pipeline.process(source, &meta).unwrap();
+        let (chunks, _relations) = pipeline.process(source, &meta).unwrap();
         assert_eq!(chunks[0].processing.strategy_name, "config");
     }
 
@@ -790,7 +802,7 @@ mod tests {
         let pipeline = ChunkingPipeline::with_kernel_defaults(config);
         let source = "some random content";
         let meta = test_meta("xyz");
-        let chunks = pipeline.process(source, &meta).unwrap();
+        let (chunks, _relations) = pipeline.process(source, &meta).unwrap();
         assert_eq!(chunks[0].processing.strategy_name, "fallback");
     }
 
@@ -841,7 +853,7 @@ mod tests {
             },
         ];
 
-        let (chunks, report) = pipeline.process_batch(&files).unwrap();
+        let (chunks, _relations, report) = pipeline.process_batch(&files).unwrap();
 
         // Verify strategy routing
         let strategies: Vec<&str> = chunks

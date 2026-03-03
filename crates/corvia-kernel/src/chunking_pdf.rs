@@ -10,7 +10,7 @@
 
 use corvia_common::errors::{CorviaError, Result};
 
-use crate::chunking_strategy::{ChunkMetadata, ChunkingStrategy, RawChunk, SourceMetadata};
+use crate::chunking_strategy::{ChunkMetadata, ChunkResult, ChunkingStrategy, RawChunk, SourceMetadata};
 
 /// Paragraph-level PDF text chunker.
 ///
@@ -34,9 +34,9 @@ impl ChunkingStrategy for PdfChunker {
         &["pdf"]
     }
 
-    fn chunk(&self, source: &str, meta: &SourceMetadata) -> Result<Vec<RawChunk>> {
+    fn chunk(&self, source: &str, meta: &SourceMetadata) -> Result<ChunkResult> {
         if source.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ChunkResult::default());
         }
 
         // Split on double-newline paragraph boundaries.
@@ -75,7 +75,7 @@ impl ChunkingStrategy for PdfChunker {
             current_line = end_line + 2;
         }
 
-        Ok(chunks)
+        Ok(ChunkResult { chunks, relations: vec![] })
     }
 }
 
@@ -111,7 +111,7 @@ mod tests {
     fn test_paragraph_splitting() {
         let chunker = PdfChunker::new();
         let source = "First paragraph of the PDF.\n\nSecond paragraph with more detail.\n\nThird and final paragraph.";
-        let chunks = chunker.chunk(source, &test_meta()).unwrap();
+        let chunks = chunker.chunk(source, &test_meta()).unwrap().chunks;
 
         assert_eq!(chunks.len(), 3, "expected 3 chunks, got {}", chunks.len());
         assert_eq!(chunks[0].content, "First paragraph of the PDF.");
@@ -123,7 +123,7 @@ mod tests {
     fn test_single_paragraph() {
         let chunker = PdfChunker::new();
         let source = "This is a single paragraph with no double-newline separators.";
-        let chunks = chunker.chunk(source, &test_meta()).unwrap();
+        let chunks = chunker.chunk(source, &test_meta()).unwrap().chunks;
 
         assert_eq!(chunks.len(), 1, "expected 1 chunk, got {}", chunks.len());
         assert_eq!(chunks[0].content, source);
@@ -132,7 +132,7 @@ mod tests {
     #[test]
     fn test_empty_text() {
         let chunker = PdfChunker::new();
-        let chunks = chunker.chunk("", &test_meta()).unwrap();
+        let chunks = chunker.chunk("", &test_meta()).unwrap().chunks;
         assert!(chunks.is_empty(), "expected empty vec for empty source");
     }
 
@@ -140,7 +140,7 @@ mod tests {
     fn test_chunk_type() {
         let chunker = PdfChunker::new();
         let source = "Para one.\n\nPara two.";
-        let chunks = chunker.chunk(source, &test_meta()).unwrap();
+        let chunks = chunker.chunk(source, &test_meta()).unwrap().chunks;
 
         assert_eq!(chunks.len(), 2);
         for c in &chunks {

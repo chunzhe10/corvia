@@ -368,7 +368,7 @@ pub async fn ingest_workspace(
         let mut pipeline = corvia_kernel::create_chunking_pipeline(&config);
         adapter.register_chunking(pipeline.registry_mut());
 
-        let (processed, report) = pipeline.process_batch(&source_files)?;
+        let (processed, pipeline_relations, report) = pipeline.process_batch(&source_files)?;
         println!(
             "  {} files → {} chunks ({} merged, {} split)",
             report.files_processed, report.total_chunks,
@@ -413,12 +413,10 @@ pub async fn ingest_workspace(
             println!("  embedded and stored {}/{}", stored, total);
         }
 
-        // Wire relations via old path (temporary — relation extraction will be
-        // integrated into ChunkingStrategy in a future milestone)
-        let relation_result = adapter.ingest_with_relations(repo_path_str).await?;
-        if !relation_result.relations.is_empty() {
-            let relations_stored = crate::wire_relations(
-                &relation_result, &stored_ids, &*graph,
+        // Wire relations from pipeline (now native to ChunkingStrategy)
+        if !pipeline_relations.is_empty() {
+            let relations_stored = crate::wire_pipeline_relations(
+                &pipeline_relations, &processed, &stored_ids, &*graph,
             ).await;
             if relations_stored > 0 {
                 println!("  {relations_stored} graph relations stored");

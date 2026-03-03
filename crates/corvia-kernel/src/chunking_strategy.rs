@@ -68,6 +68,31 @@ pub struct ProcessingInfo {
     pub overlap_tokens: usize,
 }
 
+/// A cross-chunk or cross-file relation discovered during chunking.
+///
+/// Uses `(from_source_file, from_start_line)` instead of chunk indices so that
+/// relations remain stable through the pipeline's merge/split steps.
+#[derive(Debug, Clone)]
+pub struct ChunkRelation {
+    /// Source file of the chunk that has this relation.
+    pub from_source_file: String,
+    /// Start line of the source chunk (stable through merge/split).
+    pub from_start_line: u32,
+    /// Relation type (e.g., "imports", "implements", "contains").
+    pub relation: String,
+    /// Target file path (for cross-file relations).
+    pub to_file: String,
+    /// Target symbol name within the target file (optional).
+    pub to_name: Option<String>,
+}
+
+/// Result from a chunking operation: chunks + discovered relations.
+#[derive(Debug, Clone, Default)]
+pub struct ChunkResult {
+    pub chunks: Vec<RawChunk>,
+    pub relations: Vec<ChunkRelation>,
+}
+
 /// A source file with its metadata, returned by [`IngestionAdapter::ingest_sources`] (D69).
 #[derive(Debug, Clone)]
 pub struct SourceFile {
@@ -91,8 +116,8 @@ pub trait ChunkingStrategy: Send + Sync {
     /// File extensions this strategy handles (e.g. `["rs", "go", "py"]`).
     fn supported_extensions(&self) -> &[&str];
 
-    /// Split source text into [`RawChunk`]s.
-    fn chunk(&self, source: &str, meta: &SourceMetadata) -> Result<Vec<RawChunk>>;
+    /// Split source text into [`RawChunk`]s, optionally with discovered relations.
+    fn chunk(&self, source: &str, meta: &SourceMetadata) -> Result<ChunkResult>;
 
     /// Split a chunk that exceeds `max_tokens` into smaller pieces.
     ///
@@ -249,19 +274,22 @@ mod tests {
             &["txt"]
         }
 
-        fn chunk(&self, source: &str, meta: &SourceMetadata) -> Result<Vec<RawChunk>> {
+        fn chunk(&self, source: &str, meta: &SourceMetadata) -> Result<ChunkResult> {
             // Trivial: one chunk = entire source
-            Ok(vec![RawChunk {
-                content: source.to_string(),
-                chunk_type: "file".into(),
-                start_line: 1,
-                end_line: source.lines().count() as u32,
-                metadata: ChunkMetadata {
-                    source_file: meta.file_path.clone(),
-                    language: meta.language.clone(),
-                    ..Default::default()
-                },
-            }])
+            Ok(ChunkResult {
+                chunks: vec![RawChunk {
+                    content: source.to_string(),
+                    chunk_type: "file".into(),
+                    start_line: 1,
+                    end_line: source.lines().count() as u32,
+                    metadata: ChunkMetadata {
+                        source_file: meta.file_path.clone(),
+                        language: meta.language.clone(),
+                        ..Default::default()
+                    },
+                }],
+                relations: vec![],
+            })
         }
     }
 
@@ -279,7 +307,7 @@ mod tests {
     fn test_default_split_oversized() {
         let strategy = TestStrategy;
         let source = "line one\nline two\nline three\nline four";
-        let chunks = strategy.chunk(source, &test_meta()).unwrap();
+        let chunks = strategy.chunk(source, &test_meta()).unwrap().chunks;
         assert_eq!(chunks.len(), 1);
 
         let split = strategy.split_oversized(&chunks[0], 10).unwrap();
@@ -298,14 +326,14 @@ mod tests {
     #[test]
     fn test_default_merge_returns_none() {
         let strategy = TestStrategy;
-        let chunks = strategy.chunk("hello", &test_meta()).unwrap();
+        let chunks = strategy.chunk("hello", &test_meta()).unwrap().chunks;
         assert!(strategy.merge_small(&chunks, 100).is_none());
     }
 
     #[test]
     fn test_default_overlap_returns_none() {
         let strategy = TestStrategy;
-        let chunks = strategy.chunk("a\nb", &test_meta()).unwrap();
+        let chunks = strategy.chunk("a\nb", &test_meta()).unwrap().chunks;
         let a = &chunks[0];
         assert!(strategy.overlap_context(a, a).is_none());
     }

@@ -35,7 +35,7 @@ use corvia_kernel::docker::DockerProvisioner;
 use corvia_kernel::ollama_provisioner::OllamaProvisioner;
 use corvia_kernel::agent_coordinator::AgentCoordinator;
 use corvia_kernel::traits::{InferenceEngine, IngestionAdapter, QueryableStore, GraphStore, TemporalStore};
-use corvia_adapter_git::{GitAdapter, IngestionResult};
+use corvia_adapter_git::GitAdapter;
 use corvia_kernel::introspect::Introspect;
 use std::sync::Arc;
 
@@ -429,7 +429,7 @@ async fn cmd_ingest(path: Option<&str>) -> Result<()> {
         adapter.register_chunking(pipeline.registry_mut());
 
         // Step 3: Process through chunking pipeline (merge, split, overlap)
-        let (processed, report) = pipeline.process_batch(&source_files)?;
+        let (processed, pipeline_relations, report) = pipeline.process_batch(&source_files)?;
         println!(
             "Chunked {} files → {} chunks ({} merged, {} split)",
             report.files_processed, report.total_chunks,
@@ -473,14 +473,10 @@ async fn cmd_ingest(path: Option<&str>) -> Result<()> {
             println!("  {stored}/{total} chunks stored");
         }
 
-        // Step 5: Wire relations via the old path (temporary — relation extraction
-        // will be integrated into ChunkingStrategy in a future milestone)
-        let relation_result = adapter.ingest_with_relations(path).await?;
-        if !relation_result.relations.is_empty() {
-            // Best-effort: relation indices align with the old chunking path.
-            // This works because wire_relations gracefully handles index mismatches.
-            let relations_stored = wire_relations(
-                &relation_result, &stored_ids, &*graph,
+        // Step 5: Wire relations from pipeline (now native to ChunkingStrategy)
+        if !pipeline_relations.is_empty() {
+            let relations_stored = wire_pipeline_relations(
+                &pipeline_relations, &processed, &stored_ids, &*graph,
             ).await;
             if relations_stored > 0 {
                 println!("  {relations_stored} graph relations stored");
@@ -1273,33 +1269,32 @@ async fn connect_full_store(
     Ok(corvia_kernel::create_full_store(config).await?)
 }
 
-/// Resolve relations from an IngestionResult and store them as graph edges.
+/// Resolve pipeline relations and store them as graph edges.
 ///
+/// Uses `(source_file, start_line)` to match relations to stored chunks.
 /// Best-effort: unresolvable cross-file references are silently skipped.
-/// Handles both aligned (old path) and misaligned (D69 pipeline) stored_ids
-/// gracefully — out-of-range indices are skipped, and `zip` stops at the
-/// shorter of entries/stored_ids.
-///
-/// This is transitional — relation extraction will be integrated into
-/// `ChunkingStrategy` in a future milestone.
-pub(crate) async fn wire_relations(
-    result: &IngestionResult,
+pub(crate) async fn wire_pipeline_relations(
+    relations: &[corvia_kernel::chunking_strategy::ChunkRelation],
+    processed: &[corvia_kernel::chunking_strategy::ProcessedChunk],
     stored_ids: &[uuid::Uuid],
     graph: &dyn GraphStore,
 ) -> usize {
     let mut relations_stored = 0;
-    for rel in &result.relations {
-        if rel.from_chunk_index >= stored_ids.len() {
-            continue;
-        }
-        let from_uuid = stored_ids[rel.from_chunk_index];
+    for rel in relations {
+        // Find the source chunk by (source_file, start_line) match
+        let from_idx = processed.iter().position(|pc| {
+            pc.metadata.source_file == rel.from_source_file && pc.start_line == rel.from_start_line
+        });
+        let from_uuid = match from_idx {
+            Some(idx) if idx < stored_ids.len() => stored_ids[idx],
+            _ => continue,
+        };
 
-        // Try to resolve target: find an entry whose source_file matches to_file
-        let to_uuid = result.entries.iter().zip(stored_ids.iter()).find_map(|(entry, id)| {
-            let source_file = entry.metadata.source_file.as_deref().unwrap_or("");
-            if source_file == rel.to_file {
+        // Find the target chunk by file name (and optionally symbol name)
+        let to_uuid = processed.iter().zip(stored_ids.iter()).find_map(|(pc, id)| {
+            if pc.metadata.source_file == rel.to_file {
                 if let Some(ref name) = rel.to_name {
-                    if entry.content.contains(name) {
+                    if pc.content.contains(name) {
                         return Some(*id);
                     }
                 } else {
