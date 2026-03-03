@@ -255,6 +255,15 @@ pub fn create_rag_pipeline(
     rag_pipeline::RagPipeline::new(ret, aug, generator, config.rag.clone())
 }
 
+/// Create a [`ChunkingPipeline`] pre-loaded with kernel default strategies.
+///
+/// The returned pipeline has [`FallbackChunker`], [`MarkdownChunker`],
+/// [`ConfigChunker`], and [`PdfChunker`] registered. Adapters can register
+/// additional strategies (e.g., [`AstChunker`]) via [`ChunkingPipeline::registry_mut()`].
+pub fn create_chunking_pipeline(config: &CorviaConfig) -> chunking_pipeline::ChunkingPipeline {
+    chunking_pipeline::ChunkingPipeline::with_kernel_defaults(config.chunking.clone())
+}
+
 /// Same as `create_store_with_graph` but with explicit data_dir (for workspace support).
 pub async fn create_store_at_with_graph(
     config: &CorviaConfig,

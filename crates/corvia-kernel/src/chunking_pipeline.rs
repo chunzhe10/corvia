@@ -20,8 +20,7 @@ use corvia_common::errors::Result;
 use tracing::info;
 
 use crate::chunking_strategy::{
-    ChunkMetadata, ChunkingStrategy, ProcessedChunk, ProcessingInfo, RawChunk, SourceFile,
-    SourceMetadata,
+    ChunkingStrategy, ProcessedChunk, ProcessingInfo, RawChunk, SourceFile, SourceMetadata,
 };
 use crate::token_estimator::TokenEstimator;
 
@@ -464,6 +463,7 @@ impl ChunkingPipeline {
 mod tests {
     use super::*;
     use crate::chunking_fallback::FallbackChunker;
+    use crate::chunking_strategy::ChunkMetadata;
     use crate::token_estimator::CharDivFourEstimator;
 
     // -- Helpers -----------------------------------------------------------
@@ -792,5 +792,97 @@ mod tests {
         let meta = test_meta("xyz");
         let chunks = pipeline.process(source, &meta).unwrap();
         assert_eq!(chunks[0].processing.strategy_name, "fallback");
+    }
+
+    // -- E2E integration test ------------------------------------------------
+
+    #[test]
+    fn test_e2e_mixed_format_batch() {
+        use crate::chunking_strategy::SourceFile;
+
+        let config = ChunkingConfig {
+            max_tokens: 100,
+            min_tokens: 5,
+            overlap_tokens: 4,
+            strategy: "auto".into(),
+        };
+        let pipeline = ChunkingPipeline::with_kernel_defaults(config);
+
+        let files = vec![
+            SourceFile {
+                content: "# Title\n\nIntro paragraph.\n\n## Section\n\nContent here.".into(),
+                metadata: SourceMetadata {
+                    file_path: "README.md".into(),
+                    extension: "md".into(),
+                    language: Some("markdown".into()),
+                    scope_id: "test".into(),
+                    source_version: "v1".into(),
+                },
+            },
+            SourceFile {
+                content: "[package]\nname = \"test\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n".into(),
+                metadata: SourceMetadata {
+                    file_path: "Cargo.toml".into(),
+                    extension: "toml".into(),
+                    language: Some("toml".into()),
+                    scope_id: "test".into(),
+                    source_version: "v1".into(),
+                },
+            },
+            SourceFile {
+                content: "Just a plain text file with some content.".into(),
+                metadata: SourceMetadata {
+                    file_path: "notes.txt".into(),
+                    extension: "txt".into(),
+                    language: None,
+                    scope_id: "test".into(),
+                    source_version: "v1".into(),
+                },
+            },
+        ];
+
+        let (chunks, report) = pipeline.process_batch(&files).unwrap();
+
+        // Verify strategy routing
+        let strategies: Vec<&str> = chunks
+            .iter()
+            .map(|c| c.processing.strategy_name.as_str())
+            .collect();
+        assert!(
+            strategies.contains(&"markdown"),
+            "should route .md to MarkdownChunker, got: {:?}",
+            strategies
+        );
+        assert!(
+            strategies.contains(&"config"),
+            "should route .toml to ConfigChunker, got: {:?}",
+            strategies
+        );
+        assert!(
+            strategies.contains(&"fallback"),
+            "should route .txt to FallbackChunker, got: {:?}",
+            strategies
+        );
+
+        // Verify token budget enforcement
+        for chunk in &chunks {
+            assert!(
+                chunk.token_estimate <= 120,
+                "chunk from {} has {} tokens, exceeds budget",
+                chunk.metadata.source_file,
+                chunk.token_estimate
+            );
+        }
+
+        // Verify report
+        assert_eq!(report.files_processed, 3);
+        assert!(
+            report.total_chunks >= 3,
+            "expected at least 3 chunks, got {}",
+            report.total_chunks
+        );
+        assert!(report.per_strategy.contains_key("markdown"));
+        assert!(report.per_strategy.contains_key("config"));
+        assert!(report.per_strategy.contains_key("fallback"));
     }
 }

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use corvia_adapter_git::GitAdapter;
 use corvia_common::config::{CorviaConfig, InferenceProvider, RepoConfig, WorkspaceConfig};
+use corvia_kernel::traits::IngestionAdapter;
 use std::path::{Path, PathBuf};
 
 /// Validate that a name is safe to use as a directory component.
@@ -360,22 +361,50 @@ pub async fn ingest_workspace(
         let repo_path_str = repo_path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("Invalid path for repo {}", repo_config.name))?;
-        let result = adapter.ingest_with_relations(repo_path_str).await?;
-        let total = result.entries.len();
 
-        println!("  {} entries from tree-sitter ({} relations detected)", total, result.relations.len());
+        // D69 pipeline flow: source files → ChunkingPipeline → embed → store
+        let source_files = adapter.ingest_sources(repo_path_str).await?;
 
-        // Batch embed and store — follows same pattern as cmd_ingest in main.rs
+        let mut pipeline = corvia_kernel::create_chunking_pipeline(&config);
+        adapter.register_chunking(pipeline.registry_mut());
+
+        let (processed, report) = pipeline.process_batch(&source_files)?;
+        println!(
+            "  {} files → {} chunks ({} merged, {} split)",
+            report.files_processed, report.total_chunks,
+            report.chunks_merged, report.chunks_split
+        );
+
+        // Convert ProcessedChunks to KnowledgeEntries, embed, and store
+        let entries: Vec<corvia_common::types::KnowledgeEntry> = processed
+            .iter()
+            .map(|pc| {
+                let mut entry = corvia_common::types::KnowledgeEntry::new(
+                    pc.content.clone(),
+                    config.project.scope_id.clone(),
+                    pc.metadata.source_file.clone(),
+                );
+                entry.workstream = repo_config.namespace.clone();
+                entry.metadata = corvia_common::types::EntryMetadata {
+                    source_file: Some(pc.metadata.source_file.clone()),
+                    language: pc.metadata.language.clone(),
+                    chunk_type: Some(pc.chunk_type.clone()),
+                    start_line: Some(pc.start_line),
+                    end_line: Some(pc.end_line),
+                };
+                entry
+            })
+            .collect();
+
+        let total = entries.len();
         let mut stored_ids: Vec<uuid::Uuid> = Vec::with_capacity(total);
         let mut stored = 0;
-        for batch in result.entries.chunks(corvia_kernel::introspect::EMBED_BATCH_SIZE) {
+        for batch in entries.chunks(corvia_kernel::introspect::EMBED_BATCH_SIZE) {
             let texts: Vec<String> = batch.iter().map(|e| e.content.clone()).collect();
             let embeddings = engine.embed_batch(&texts).await?;
 
             for (entry, embedding) in batch.iter().zip(embeddings) {
                 let mut entry = entry.clone();
-                entry.scope_id = config.project.scope_id.clone();
-                entry.workstream = repo_config.namespace.clone();
                 entry.embedding = Some(embedding);
                 store.insert(&entry).await?;
                 stored_ids.push(entry.id);
@@ -384,14 +413,20 @@ pub async fn ingest_workspace(
             println!("  embedded and stored {}/{}", stored, total);
         }
 
-        // Wire relations into the graph store (best-effort resolution)
-        let relations_stored = crate::wire_relations(&result, &stored_ids, &*graph).await;
-        if relations_stored > 0 {
-            println!("  {relations_stored} graph relations stored");
+        // Wire relations via old path (temporary — relation extraction will be
+        // integrated into ChunkingStrategy in a future milestone)
+        let relation_result = adapter.ingest_with_relations(repo_path_str).await?;
+        if !relation_result.relations.is_empty() {
+            let relations_stored = crate::wire_relations(
+                &relation_result, &stored_ids, &*graph,
+            ).await;
+            if relations_stored > 0 {
+                println!("  {relations_stored} graph relations stored");
+            }
         }
 
         println!(
-            "  {} entries stored for namespace '{}'",
+            "  {} chunks stored for namespace '{}'",
             stored, repo_config.namespace
         );
     }
