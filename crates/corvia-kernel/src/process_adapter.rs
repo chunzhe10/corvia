@@ -315,4 +315,30 @@ for line in sys.stdin:
         // Drop without explicit shutdown — should not panic
         drop(adapter);
     }
+
+    #[test]
+    fn test_python_adapter_protocol_conformance() {
+        // Use the Python reference adapter from examples/
+        let adapter_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("examples/adapters/corvia-adapter-basic");
+
+        if !adapter_path.exists() {
+            eprintln!("Skipping: Python adapter not found at {}", adapter_path.display());
+            return;
+        }
+
+        // Probe metadata via --corvia-metadata
+        let output = std::process::Command::new(&adapter_path)
+            .arg("--corvia-metadata")
+            .output()
+            .expect("Failed to run Python adapter");
+
+        assert!(output.status.success(), "Python adapter should exit 0 for --corvia-metadata");
+        let parsed: AdapterMetadata = serde_json::from_slice(&output.stdout)
+            .expect("Failed to parse Python adapter metadata");
+        assert_eq!(parsed.name, "basic");
+        assert_eq!(parsed.protocol_version, 1);
+        assert!(parsed.chunking_extensions.is_empty());
+    }
 }
