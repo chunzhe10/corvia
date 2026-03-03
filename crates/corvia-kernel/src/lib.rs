@@ -115,6 +115,18 @@ pub fn create_engine(config: &CorviaConfig) -> Arc<dyn traits::InferenceEngine> 
     }
 }
 
+/// Internal: connect to SurrealDB with config defaults.
+async fn connect_surrealdb(config: &CorviaConfig) -> Result<knowledge_store::SurrealStore> {
+    knowledge_store::SurrealStore::connect(
+        config.storage.surrealdb_url.as_deref().unwrap_or("127.0.0.1:8000"),
+        config.storage.surrealdb_ns.as_deref().unwrap_or("corvia"),
+        config.storage.surrealdb_db.as_deref().unwrap_or("main"),
+        config.storage.surrealdb_user.as_deref().unwrap_or("root"),
+        config.storage.surrealdb_pass.as_deref().unwrap_or("root"),
+        config.embedding.dimensions,
+    ).await
+}
+
 /// Create a store at a specific directory path (for workspace support).
 ///
 /// For LiteStore, opens the store at the given `data_dir` path instead of
@@ -145,14 +157,7 @@ pub async fn create_store(config: &CorviaConfig) -> Result<Box<dyn traits::Query
             Ok(Box::new(store))
         }
         StoreType::Surrealdb => {
-            let store = knowledge_store::SurrealStore::connect(
-                config.storage.surrealdb_url.as_deref().unwrap_or("127.0.0.1:8000"),
-                config.storage.surrealdb_ns.as_deref().unwrap_or("corvia"),
-                config.storage.surrealdb_db.as_deref().unwrap_or("main"),
-                config.storage.surrealdb_user.as_deref().unwrap_or("root"),
-                config.storage.surrealdb_pass.as_deref().unwrap_or("root"),
-                config.embedding.dimensions,
-            ).await?;
+            let store = connect_surrealdb(config).await?;
             Ok(Box::new(store))
         }
     }
@@ -172,14 +177,7 @@ pub async fn create_store_with_graph(
             Ok((store.clone() as Arc<dyn traits::QueryableStore>, store as Arc<dyn traits::GraphStore>))
         }
         StoreType::Surrealdb => {
-            let store = Arc::new(knowledge_store::SurrealStore::connect(
-                config.storage.surrealdb_url.as_deref().unwrap_or("127.0.0.1:8000"),
-                config.storage.surrealdb_ns.as_deref().unwrap_or("corvia"),
-                config.storage.surrealdb_db.as_deref().unwrap_or("main"),
-                config.storage.surrealdb_user.as_deref().unwrap_or("root"),
-                config.storage.surrealdb_pass.as_deref().unwrap_or("root"),
-                config.embedding.dimensions,
-            ).await?);
+            let store = Arc::new(connect_surrealdb(config).await?);
             Ok((store.clone() as Arc<dyn traits::QueryableStore>, store as Arc<dyn traits::GraphStore>))
         }
     }
@@ -203,14 +201,7 @@ pub async fn create_full_store(
             ))
         }
         StoreType::Surrealdb => {
-            let store = Arc::new(knowledge_store::SurrealStore::connect(
-                config.storage.surrealdb_url.as_deref().unwrap_or("127.0.0.1:8000"),
-                config.storage.surrealdb_ns.as_deref().unwrap_or("corvia"),
-                config.storage.surrealdb_db.as_deref().unwrap_or("main"),
-                config.storage.surrealdb_user.as_deref().unwrap_or("root"),
-                config.storage.surrealdb_pass.as_deref().unwrap_or("root"),
-                config.embedding.dimensions,
-            ).await?);
+            let store = Arc::new(connect_surrealdb(config).await?);
             Ok((
                 store.clone() as Arc<dyn traits::QueryableStore>,
                 store.clone() as Arc<dyn traits::GraphStore>,
