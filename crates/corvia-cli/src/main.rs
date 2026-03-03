@@ -357,7 +357,7 @@ async fn cmd_init(full: bool) -> Result<()> {
 async fn cmd_serve(mcp: bool) -> Result<()> {
     let config = load_config()?;
     let (store, graph, temporal) = connect_full_store(&config).await?;
-    let engine: Arc<dyn InferenceEngine> = Arc::from(connect_engine(&config));
+    let engine: Arc<dyn InferenceEngine> = connect_engine(&config);
 
     // Construct AgentCoordinator
     let data_dir = std::path::Path::new(&config.storage.data_dir);
@@ -1261,7 +1261,7 @@ fn load_config() -> Result<CorviaConfig> {
     Ok(CorviaConfig::load(&path)?)
 }
 
-fn connect_engine(config: &CorviaConfig) -> Box<dyn InferenceEngine> {
+fn connect_engine(config: &CorviaConfig) -> Arc<dyn InferenceEngine> {
     corvia_kernel::create_engine(config)
 }
 

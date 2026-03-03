@@ -95,19 +95,19 @@ use corvia_common::errors::Result;
 use std::sync::Arc;
 
 /// Create the appropriate InferenceEngine based on config.
-pub fn create_engine(config: &CorviaConfig) -> Box<dyn traits::InferenceEngine> {
+pub fn create_engine(config: &CorviaConfig) -> Arc<dyn traits::InferenceEngine> {
     match config.embedding.provider {
-        InferenceProvider::Ollama => Box::new(ollama_engine::OllamaEngine::new(
+        InferenceProvider::Ollama => Arc::new(ollama_engine::OllamaEngine::new(
             &config.embedding.url,
             &config.embedding.model,
             config.embedding.dimensions,
         )),
-        InferenceProvider::Vllm => Box::new(embedding_pipeline::VllmEngine::new(
+        InferenceProvider::Vllm => Arc::new(embedding_pipeline::VllmEngine::new(
             &config.embedding.url,
             &config.embedding.model,
             config.embedding.dimensions,
         )),
-        InferenceProvider::Corvia => Box::new(grpc_engine::GrpcInferenceEngine::new(
+        InferenceProvider::Corvia => Arc::new(grpc_engine::GrpcInferenceEngine::new(
             &config.embedding.url,
             &config.embedding.model,
             config.embedding.dimensions,
