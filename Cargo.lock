@@ -1011,26 +1011,6 @@ dependencies = [
 
 [[package]]
 name = "corvia-adapter-git"
-version = "0.1.0"
-source = "git+https://github.com/chunzhe10/corvia-adapter-git?tag=v0.3.2#a6898c2b7a40397a4a644ed0814be7a41854a96a"
-dependencies = [
- "async-trait",
- "corvia-common",
- "corvia-kernel",
- "git2",
- "tokio",
- "tracing",
- "tree-sitter",
- "tree-sitter-javascript",
- "tree-sitter-language",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-typescript",
- "walkdir",
-]
-
-[[package]]
-name = "corvia-adapter-git"
 version = "0.3.1"
 dependencies = [
  "async-trait",
@@ -1060,12 +1040,11 @@ dependencies = [
  "axum 0.8.8",
  "chrono",
  "clap",
- "corvia-adapter-git 0.1.0",
+ "corvia-adapter-git",
  "corvia-common",
  "corvia-kernel",
  "corvia-proto",
  "corvia-server",
- "git2",
  "serde",
  "serde_json",
  "tempfile",

@@ -33,10 +33,3 @@ anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Override adapter-git's transitive git deps so they resolve to local workspace crates.
-# Without this, Cargo would pull corvia-common/kernel from the git tag AND use the
-# local workspace versions, causing duplicate types and compilation errors.
-[patch."https://github.com/chunzhe10/corvia"]
-corvia-common = { path = "crates/corvia-common" }
-corvia-kernel = { path = "crates/corvia-kernel" }
