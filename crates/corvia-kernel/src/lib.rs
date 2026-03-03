@@ -88,6 +88,7 @@ pub mod chunking_pipeline;
 pub mod chunking_markdown;
 pub mod chunking_config_fmt;
 pub mod chunking_pdf;
+pub mod adapter_protocol;
 pub mod grpc_engine;
 pub mod grpc_chat;
 pub mod inference_provisioner;
