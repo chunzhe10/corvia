@@ -1,7 +1,8 @@
 //! Integration tests for the corvia-inference gRPC server.
 //!
-//! These tests auto-start the server and gracefully skip if the binary
-//! isn't available — following the same pattern as the Ollama e2e tests.
+//! These tests auto-build and auto-start the server. If any setup step
+//! fails (build, spawn, health check), the test panics with a clear
+//! diagnostic rather than silently skipping.
 //!
 //! Run with: cargo test --test grpc_inference_test -- --nocapture
 
@@ -18,7 +19,7 @@ const TEST_PORT: u16 = 18030;
 
 /// Shared server process — started once, reused by all tests.
 /// We use OnceCell so only the first test to run actually starts the server.
-static SERVER: LazyLock<OnceCell<Option<ServerGuard>>> = LazyLock::new(OnceCell::new);
+static SERVER: LazyLock<OnceCell<ServerGuard>> = LazyLock::new(OnceCell::new);
 
 /// RAII guard that kills the server process on drop.
 struct ServerGuard {
@@ -34,39 +35,52 @@ impl Drop for ServerGuard {
     }
 }
 
-/// Try to find the corvia-inference binary. Prefer the pre-built binary in
-/// target/debug, fall back to PATH.
-fn find_binary() -> Option<String> {
-    // CARGO_MANIFEST_DIR points to the crate that owns this test (corvia-cli).
-    // Walk up to the workspace root to find the target/ directory.
+/// Find the corvia-inference binary, building it if necessary.
+///
+/// Resolution order:
+/// 1. target/debug/corvia-inference (already built)
+/// 2. target/release/corvia-inference
+/// 3. Build via `cargo build -p corvia-inference`, then return debug path
+///
+/// Panics if the binary cannot be found or built.
+fn find_or_build_binary() -> String {
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .find(|p| p.join("Cargo.lock").exists())
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-    // Check target/debug first (built by `cargo build --workspace`)
     let debug_path = workspace_root.join("target/debug/corvia-inference");
     if debug_path.exists() {
-        return Some(debug_path.to_string_lossy().to_string());
+        return debug_path.to_string_lossy().to_string();
     }
-    // Check target/release
+
     let release_path = workspace_root.join("target/release/corvia-inference");
     if release_path.exists() {
-        return Some(release_path.to_string_lossy().to_string());
+        return release_path.to_string_lossy().to_string();
     }
-    // Check PATH
-    if Command::new("corvia-inference")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+
+    // Binary not found — build it
+    eprintln!("corvia-inference binary not found, building...");
+    let status = Command::new("cargo")
+        .args(["build", "-p", "corvia-inference"])
+        .current_dir(&workspace_root)
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-    {
-        return Some("corvia-inference".to_string());
-    }
-    None
+        .expect("failed to run `cargo build -p corvia-inference`");
+
+    assert!(
+        status.success(),
+        "cargo build -p corvia-inference failed with exit code: {:?}",
+        status.code()
+    );
+
+    assert!(
+        debug_path.exists(),
+        "cargo build succeeded but binary not found at {}",
+        debug_path.display()
+    );
+
+    debug_path.to_string_lossy().to_string()
 }
 
 async fn wait_for_server(addr: &str, timeout: Duration) -> bool {
@@ -85,63 +99,48 @@ async fn wait_for_server(addr: &str, timeout: Duration) -> bool {
     false
 }
 
-/// Ensure the shared test server is running. Returns the gRPC URL, or None
-/// if the binary isn't available (test should skip).
-async fn ensure_server() -> Option<String> {
+/// Ensure the shared test server is running. Builds the binary if needed,
+/// starts the server, and waits for it to become healthy.
+///
+/// Panics if any setup step fails.
+async fn ensure_server() -> String {
     let addr = format!("127.0.0.1:{TEST_PORT}");
     let url = format!("http://{addr}");
 
     // Check if something is already listening (e.g. previous test run, dev server)
     if wait_for_server(&addr, Duration::from_millis(500)).await {
-        return Some(url);
+        return url;
     }
 
-    let guard = SERVER
+    SERVER
         .get_or_init(|| async {
-            let Some(binary) = find_binary() else {
-                eprintln!(
-                    "SKIPPING gRPC tests: corvia-inference binary not found. \
-                     Run `cargo build -p corvia-inference` first."
-                );
-                return None;
-            };
+            let binary = find_or_build_binary();
 
             let child = Command::new(&binary)
                 .args(["serve", "--port", &TEST_PORT.to_string()])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .spawn();
+                .spawn()
+                .unwrap_or_else(|e| panic!("failed to start {binary}: {e}"));
 
-            match child {
-                Ok(child) => Some(ServerGuard {
-                    child: std::sync::Mutex::new(child),
-                }),
-                Err(e) => {
-                    eprintln!("SKIPPING gRPC tests: failed to start {binary}: {e}");
-                    None
-                }
+            ServerGuard {
+                child: std::sync::Mutex::new(child),
             }
         })
         .await;
 
-    if guard.is_none() {
-        return None;
-    }
-
     // Wait for it to be healthy
-    if !wait_for_server(&addr, Duration::from_secs(30)).await {
-        eprintln!("SKIPPING gRPC tests: server did not become healthy within 30s");
-        return None;
-    }
+    assert!(
+        wait_for_server(&addr, Duration::from_secs(30)).await,
+        "corvia-inference server did not become healthy within 30s on port {TEST_PORT}"
+    );
 
-    Some(url)
+    url
 }
 
 #[tokio::test]
 async fn test_grpc_health_check() {
-    let Some(url) = ensure_server().await else {
-        return;
-    };
+    let url = ensure_server().await;
 
     let mut mgr = ModelManagerClient::connect(url).await.unwrap();
     let resp = mgr
@@ -154,9 +153,7 @@ async fn test_grpc_health_check() {
 
 #[tokio::test]
 async fn test_grpc_model_lifecycle() {
-    let Some(url) = ensure_server().await else {
-        return;
-    };
+    let url = ensure_server().await;
 
     // Use a real fastembed model name (smallest available).
     // Loading downloads from HuggingFace on first run (~33 MB).
@@ -173,14 +170,11 @@ async fn test_grpc_model_lifecycle() {
         .await
         .unwrap();
     let load_resp = resp.into_inner();
-    if !load_resp.success {
-        eprintln!(
-            "SKIPPING test_grpc_model_lifecycle: model load failed \
-             (likely no network for HuggingFace download): {}",
-            load_resp.error
-        );
-        return;
-    }
+    assert!(
+        load_resp.success,
+        "load_model failed: {}",
+        load_resp.error
+    );
 
     // Verify model is listed
     let resp = mgr
@@ -210,12 +204,9 @@ async fn test_grpc_model_lifecycle() {
 
 #[tokio::test]
 async fn test_grpc_chat_stub() {
-    let Some(url) = ensure_server().await else {
-        return;
-    };
+    let url = ensure_server().await;
 
     // Register a chat model via ModelManager (the ChatService checks its own registry)
-    // First register in the chat service's model map by calling the stub load
     let mut mgr = ModelManagerClient::connect(url.clone()).await.unwrap();
     mgr.load_model(tonic::Request::new(LoadModelRequest {
         name: "test-chat".into(),
@@ -224,9 +215,7 @@ async fn test_grpc_chat_stub() {
     .await
     .unwrap();
 
-    // Call chat — the stub currently checks its own internal model map,
-    // not the ModelManager's. The chat stub should accept any model or
-    // return not_found. Let's test the not_found path first.
+    // Call chat with a nonexistent model — should return NOT_FOUND
     let mut chat = ChatServiceClient::connect(url.clone()).await.unwrap();
     let result = chat
         .chat(tonic::Request::new(ChatRequest {
@@ -240,7 +229,6 @@ async fn test_grpc_chat_stub() {
         }))
         .await;
 
-    // Should fail with NOT_FOUND for unknown model
     assert!(
         result.is_err(),
         "Expected NOT_FOUND error for unregistered chat model"
@@ -251,9 +239,7 @@ async fn test_grpc_chat_stub() {
 
 #[tokio::test]
 async fn test_grpc_embedding_model_info() {
-    let Some(url) = ensure_server().await else {
-        return;
-    };
+    let url = ensure_server().await;
 
     let mut embed =
         corvia_proto::embedding_service_client::EmbeddingServiceClient::connect(url)
