@@ -61,7 +61,6 @@ pub mod ollama_engine;
 pub mod ollama_provisioner;
 pub mod knowledge_files;
 pub mod lite_store;
-#[allow(deprecated)]
 pub mod docker;
 pub mod introspect;
 pub mod agent_registry;
