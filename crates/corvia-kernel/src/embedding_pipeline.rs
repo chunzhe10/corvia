@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use corvia_common::errors::{CorviaError, Result};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use tracing::warn;
 
 /// Maximum character length for embedding input. nomic-embed-text has a 2048-token
@@ -15,9 +16,9 @@ pub struct VllmEngine {
 }
 
 #[derive(Serialize)]
-struct EmbedRequest {
-    model: String,
-    input: Vec<String>,
+struct EmbedRequest<'a> {
+    model: &'a str,
+    input: Vec<Cow<'a, str>>,
 }
 
 #[derive(Deserialize)]
@@ -52,16 +53,16 @@ impl super::traits::InferenceEngine for VllmEngine {
 
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let url = format!("{}/v1/embeddings", self.url);
-        let input: Vec<String> = texts.iter().map(|t| {
+        let input: Vec<Cow<'_, str>> = texts.iter().map(|t| {
             if t.len() > MAX_EMBED_CHARS {
                 warn!("Truncating input from {} to {} chars for embedding", t.len(), MAX_EMBED_CHARS);
-                t[..MAX_EMBED_CHARS].to_string()
+                Cow::Owned(t[..MAX_EMBED_CHARS].to_string())
             } else {
-                t.clone()
+                Cow::Borrowed(t.as_str())
             }
         }).collect();
         let request = EmbedRequest {
-            model: self.model.clone(),
+            model: &self.model,
             input,
         };
 
