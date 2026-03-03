@@ -20,7 +20,7 @@ corvia-common.workspace = true
 corvia-kernel.workspace = true
 uuid.workspace = true
 corvia-server.workspace = true
-corvia-adapter-git = { path = "../../../corvia-adapter-git" }
+corvia-adapter-git = { git = "https://github.com/chunzhe10/corvia-adapter-git", tag = "v0.3.2" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
