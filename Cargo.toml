@@ -15,7 +15,7 @@ edition = "2024"
 license = "AGPL-3.0-only"
 repository = "https://github.com/corvia/corvia"
 homepage = "https://github.com/corvia/corvia"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 corvia-common = { path = "crates/corvia-common" }
