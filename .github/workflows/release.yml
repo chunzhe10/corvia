@@ -32,13 +32,15 @@ jobs:
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build release binaries
-        run: cargo build --release -p corvia-cli -p corvia-inference
+        run: cargo build --release -p corvia-cli -p corvia-inference -p corvia-adapter-basic -p corvia-adapter-git
 
       - name: Prepare release assets
         run: |
           cp target/release/corvia corvia-cli-linux-amd64
           cp target/release/corvia-inference corvia-inference-linux-amd64
-          chmod +x corvia-cli-linux-amd64 corvia-inference-linux-amd64
+          cp target/release/corvia-adapter-basic corvia-adapter-basic-linux-amd64
+          cp target/release/corvia-adapter-git corvia-adapter-git-linux-amd64
+          chmod +x corvia-cli-linux-amd64 corvia-inference-linux-amd64 corvia-adapter-basic-linux-amd64 corvia-adapter-git-linux-amd64
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
@@ -46,4 +48,6 @@ jobs:
           files: |
             corvia-cli-linux-amd64
             corvia-inference-linux-amd64
+            corvia-adapter-basic-linux-amd64
+            corvia-adapter-git-linux-amd64
           generate_release_notes: true
