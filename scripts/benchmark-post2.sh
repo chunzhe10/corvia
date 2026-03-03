@@ -7,7 +7,7 @@ CORVIA="$REPO_ROOT/target/release/corvia"
 CORVIA_INFERENCE="$REPO_ROOT/target/release/corvia-inference"
 INFERENCE_PORT=8030
 SERVER_PORT=8020
-SCOPE_ID="corvia-introspect"
+SCOPE_ID="corvia-benchmark"
 RESULTS_DIR=""
 SKIP_SETUP=false
 INFERENCE_PID=""
@@ -50,13 +50,13 @@ wait_for_http() {
   done
 }
 
-wait_for_grpc() {
+wait_for_port() {
   local port="$1" timeout="$2" elapsed=0
-  while ! curl -sf "http://127.0.0.1:$port" > /dev/null 2>&1; do
+  while ! (echo > /dev/tcp/127.0.0.1/$port) 2>/dev/null; do
     sleep 1
     elapsed=$((elapsed + 1))
     if [[ $elapsed -ge $timeout ]]; then
-      echo "FAIL: gRPC on port $port not ready after ${timeout}s"
+      echo "FAIL: port $port not ready after ${timeout}s"
       exit 1
     fi
   done
@@ -83,7 +83,7 @@ if [[ "$SKIP_SETUP" == false ]]; then
   "$CORVIA_INFERENCE" serve --port "$INFERENCE_PORT" &
   INFERENCE_PID=$!
   echo "corvia-inference starting (pid $INFERENCE_PID)..."
-  sleep 3
+  wait_for_port "$INFERENCE_PORT" 30
   echo "corvia-inference ready on :$INFERENCE_PORT"
 
   # Phase 3: Init
@@ -98,13 +98,14 @@ if [[ "$SKIP_SETUP" == false ]]; then
     sed -i 's/provider = "ollama"/provider = "corvia"/' corvia.toml
     sed -i 's|url = "http://127.0.0.1:11434"|url = "http://127.0.0.1:'"$INFERENCE_PORT"'"|' corvia.toml
     sed -i 's/model = "nomic-embed-text"/model = "nomic-embed-text-v1.5"/' corvia.toml
+    sed -i 's/scope_id = ".*"/scope_id = "corvia-benchmark"/' corvia.toml
   fi
   echo "Config patched: provider=corvia, port=$INFERENCE_PORT"
   cat corvia.toml
 
   # Phase 4: Ingest
   phase "Phase 4: Self-ingest Corvia codebase"
-  "$CORVIA" demo --keep
+  "$CORVIA" ingest "$REPO_ROOT"
   echo "Ingest complete"
 
   # Phase 5: Serve
@@ -117,10 +118,16 @@ if [[ "$SKIP_SETUP" == false ]]; then
 
 else
   phase "Skipping setup (--skip-setup)"
+  [[ -d "$WORK_DIR" ]] || { echo "FAIL: $WORK_DIR does not exist. Run without --skip-setup first."; exit 1; }
   cd "$WORK_DIR"
 fi
 
 # ── Phase 6: Benchmark ─────────────────────────────────────────────────
+if [[ "$SKIP_SETUP" == false ]]; then
+  kill -0 "$INFERENCE_PID" 2>/dev/null || { echo "FAIL: corvia-inference died"; exit 1; }
+  kill -0 "$SERVER_PID" 2>/dev/null   || { echo "FAIL: corvia serve died"; exit 1; }
+fi
+
 phase "Phase 6: Running benchmark queries"
 
 BASE_URL="http://127.0.0.1:$SERVER_PORT"
@@ -165,6 +172,7 @@ done
 phase "Phase 7: Building summary"
 
 GIT_SHA="$(cd "$REPO_ROOT" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")"
+VERSION="$("$CORVIA" --version 2>/dev/null | awk '{print $2}' || echo "unknown")"
 
 # Extract per-query metrics and build summary
 SUMMARY_QUERIES="[]"
@@ -189,8 +197,8 @@ for i in "${!QUERIES[@]}"; do
       vector: {
         sources_count:  ($vf.sources | length),
         top_score:      ($vf.sources[0].score // 0),
-        top_source_file:($vf.sources[0].entry.metadata.source_file // "none"),
-        source_files:   [($vf.sources[].entry.metadata.source_file // "none")],
+        top_source_file:($vf.sources[0].source_file // "none"),
+        source_files:   [($vf.sources[].source_file // "none")],
         latency_ms:     ($vf.trace.retrieval.latency_ms // 0),
         vector_results: ($vf.trace.retrieval.vector_results // 0),
         graph_expanded: ($vf.trace.retrieval.graph_expanded // 0)
@@ -198,8 +206,8 @@ for i in "${!QUERIES[@]}"; do
       graph: {
         sources_count:  ($gf.sources | length),
         top_score:      ($gf.sources[0].score // 0),
-        top_source_file:($gf.sources[0].entry.metadata.source_file // "none"),
-        source_files:   [($gf.sources[].entry.metadata.source_file // "none")],
+        top_source_file:($gf.sources[0].source_file // "none"),
+        source_files:   [($gf.sources[].source_file // "none")],
         latency_ms:     ($gf.trace.retrieval.latency_ms // 0),
         vector_results: ($gf.trace.retrieval.vector_results // 0),
         graph_expanded: ($gf.trace.retrieval.graph_expanded // 0)
@@ -212,7 +220,7 @@ done
 # Write metadata.json
 jq -n \
   --arg run_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  --arg version "0.3.0" \
+  --arg version "$VERSION" \
   --arg git_sha "$GIT_SHA" \
   '{
     run_at: $run_at,
@@ -223,7 +231,7 @@ jq -n \
     inference_model: "nomic-embed-text-v1.5",
     graph_alpha: 0.3,
     graph_depth: 2,
-    scope_id: "corvia-introspect"
+    scope_id: "corvia-benchmark"
   }' > "$RESULTS_DIR/metadata.json"
 
 # Write summary.json
