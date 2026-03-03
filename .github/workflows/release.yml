@@ -32,7 +32,7 @@ jobs:
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build release binaries
-        run: cargo build --release -p corvia -p corvia-inference
+        run: cargo build --release -p corvia-cli -p corvia-inference
 
       - name: Prepare release assets
         run: |
