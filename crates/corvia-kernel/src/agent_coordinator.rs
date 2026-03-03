@@ -14,7 +14,7 @@ use crate::merge_queue::MergeQueue;
 use crate::merge_worker::MergeWorker;
 use crate::session_manager::SessionManager;
 use crate::staging::StagingManager;
-use crate::traits::{ChatEngine, InferenceEngine, QueryableStore};
+use crate::traits::{GenerationEngine, InferenceEngine, QueryableStore};
 
 /// Response from `connect()` — shows the agent's active and recoverable sessions.
 #[derive(Debug, Clone)]
@@ -56,7 +56,7 @@ impl AgentCoordinator {
         data_dir: &Path,
         lifecycle_config: AgentLifecycleConfig,
         merge_config: MergeConfig,
-        chat_engine: Arc<dyn ChatEngine>,
+        gen_engine: Arc<dyn GenerationEngine>,
     ) -> Result<Self> {
         // Open or create the shared coordination database
         let registry = AgentRegistry::open(data_dir)?;
@@ -86,7 +86,7 @@ impl AgentCoordinator {
             staging.clone(),
             sessions.clone(),
             merge_config,
-            chat_engine,
+            gen_engine,
         ));
 
         let context = Arc::new(ContextBuilder::new(store, engine));
@@ -365,19 +365,26 @@ mod tests {
         fn dimensions(&self) -> usize { 3 }
     }
 
-    struct MockChatEngine;
+    struct MockGenerationEngine;
     #[async_trait::async_trait]
-    impl crate::traits::ChatEngine for MockChatEngine {
-        async fn chat(&self, messages: &[corvia_common::types::ChatMessage], _model: &str) -> corvia_common::errors::Result<String> {
-            Ok(format!("merged: {}", messages.last().map(|m| m.content.as_str()).unwrap_or("")))
+    impl crate::traits::GenerationEngine for MockGenerationEngine {
+        fn name(&self) -> &str { "mock" }
+        async fn generate(&self, _system_prompt: &str, user_message: &str) -> corvia_common::errors::Result<crate::traits::GenerationResult> {
+            Ok(crate::traits::GenerationResult {
+                text: format!("merged: {user_message}"),
+                model: "mock".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+            })
         }
+        fn context_window(&self) -> usize { 4096 }
     }
 
     async fn setup_coordinator(dir: &Path) -> AgentCoordinator {
         let store = Arc::new(LiteStore::open(dir, 3).unwrap()) as Arc<dyn QueryableStore>;
         let engine = Arc::new(MockEngine) as Arc<dyn InferenceEngine>;
         store.init_schema().await.unwrap();
-        let chat_engine = Arc::new(MockChatEngine) as Arc<dyn ChatEngine>;
+        let gen_engine = Arc::new(MockGenerationEngine) as Arc<dyn GenerationEngine>;
 
         AgentCoordinator::new(
             store,
@@ -385,7 +392,7 @@ mod tests {
             dir,
             AgentLifecycleConfig::default(),
             MergeConfig::default(),
-            chat_engine,
+            gen_engine,
         ).unwrap()
     }
 
@@ -509,12 +516,12 @@ mod tests {
         let mut lifecycle_config = AgentLifecycleConfig::default();
         lifecycle_config.gc_orphan_after_secs = 0; // Instant orphan cleanup
 
-        let chat_engine = Arc::new(MockChatEngine) as Arc<dyn ChatEngine>;
+        let gen_engine = Arc::new(MockGenerationEngine) as Arc<dyn GenerationEngine>;
         let coord = AgentCoordinator::new(
             store, engine, dir.path(),
             lifecycle_config,
             MergeConfig::default(),
-            chat_engine,
+            gen_engine,
         ).unwrap();
 
         let identity = AgentIdentity::Registered {

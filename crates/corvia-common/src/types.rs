@@ -103,7 +103,7 @@ pub enum EdgeDirection {
     Both,
 }
 
-/// A chat message for LLM inference (used by ChatEngine trait).
+/// A chat message for LLM inference (used by GenerationEngine implementations).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,

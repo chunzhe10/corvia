@@ -1,37 +1,43 @@
-//! OllamaChatEngine — ChatEngine implementation that calls Ollama's `/api/chat` endpoint.
+//! OllamaChatEngine — GenerationEngine implementation that calls Ollama's `/api/chat` endpoint.
 //!
 //! Extracted from the inline HTTP logic in `merge_worker.rs` to support trait-based
-//! chat providers (D60). This is the default ChatEngine for LiteStore deployments.
+//! generation providers (D63). This is the default GenerationEngine for LiteStore deployments.
 
 use async_trait::async_trait;
 use corvia_common::errors::{CorviaError, Result};
-use corvia_common::types::ChatMessage;
 
-/// ChatEngine backed by Ollama's HTTP `/api/chat` endpoint.
+use crate::traits::{GenerationEngine, GenerationResult};
+
+/// GenerationEngine backed by Ollama's HTTP `/api/chat` endpoint.
 pub struct OllamaChatEngine {
     url: String,
+    model: String,
     client: reqwest::Client,
 }
 
 impl OllamaChatEngine {
-    pub fn new(url: &str) -> Self {
+    pub fn new(url: &str, model: &str) -> Self {
         Self {
             url: url.to_string(),
+            model: model.to_string(),
             client: reqwest::Client::new(),
         }
     }
 }
 
 #[async_trait]
-impl super::traits::ChatEngine for OllamaChatEngine {
-    async fn chat(&self, messages: &[ChatMessage], model: &str) -> Result<String> {
-        let api_messages: Vec<serde_json::Value> = messages.iter().map(|m| {
-            serde_json::json!({ "role": m.role, "content": m.content })
-        }).collect();
+impl GenerationEngine for OllamaChatEngine {
+    fn name(&self) -> &str { "ollama_chat" }
+
+    async fn generate(&self, system_prompt: &str, user_message: &str) -> Result<GenerationResult> {
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": system_prompt}),
+            serde_json::json!({"role": "user", "content": user_message}),
+        ];
 
         let request_body = serde_json::json!({
-            "model": model,
-            "messages": api_messages,
+            "model": self.model,
+            "messages": messages,
             "stream": false
         });
 
@@ -52,9 +58,18 @@ impl super::traits::ChatEngine for OllamaChatEngine {
         let body: serde_json::Value = response.json().await
             .map_err(|e| CorviaError::Agent(format!("Failed to parse LLM response: {e}")))?;
 
-        body["message"]["content"]
+        let text = body["message"]["content"]
             .as_str()
-            .ok_or_else(|| CorviaError::Agent("LLM response missing message.content".into()))
-            .map(|s| s.to_string())
+            .ok_or_else(|| CorviaError::Agent("LLM response missing message.content".into()))?
+            .to_string();
+
+        Ok(GenerationResult {
+            text,
+            model: self.model.clone(),
+            input_tokens: 0,  // Ollama doesn't always report token counts
+            output_tokens: 0,
+        })
     }
+
+    fn context_window(&self) -> usize { 4096 }
 }

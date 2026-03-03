@@ -1,21 +1,21 @@
 use corvia_common::agent_types::{EntryStatus, MergeQueueEntry};
 use corvia_common::config::MergeConfig;
 use corvia_common::errors::{CorviaError, Result};
-use corvia_common::types::{ChatMessage, KnowledgeEntry};
+use corvia_common::types::KnowledgeEntry;
 use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::merge_queue::MergeQueue;
 use crate::session_manager::SessionManager;
 use crate::staging::StagingManager;
-use crate::traits::{ChatEngine, InferenceEngine, QueryableStore};
+use crate::traits::{GenerationEngine, InferenceEngine, QueryableStore};
 
 /// Merge worker that processes the merge queue.
 ///
 /// For each queued entry:
 /// 1. Detect conflict: search for similar Merged entries in the same scope
 /// 2. No conflict → auto-merge (move staging file to knowledge/, update status)
-/// 3. Conflict → LLM merge via ChatEngine trait, re-embed, replace both entries
+/// 3. Conflict → LLM merge via GenerationEngine trait, re-embed, replace both entries
 /// 4. On failure → retry with exponential backoff, mark Rejected after max retries
 pub struct MergeWorker {
     store: Arc<dyn QueryableStore>,
@@ -24,7 +24,7 @@ pub struct MergeWorker {
     staging: Arc<StagingManager>,
     session_mgr: Arc<SessionManager>,
     merge_config: MergeConfig,
-    chat_engine: Arc<dyn ChatEngine>,
+    gen_engine: Arc<dyn GenerationEngine>,
 }
 
 impl MergeWorker {
@@ -35,7 +35,7 @@ impl MergeWorker {
         staging: Arc<StagingManager>,
         session_mgr: Arc<SessionManager>,
         merge_config: MergeConfig,
-        chat_engine: Arc<dyn ChatEngine>,
+        gen_engine: Arc<dyn GenerationEngine>,
     ) -> Self {
         Self {
             store,
@@ -44,7 +44,7 @@ impl MergeWorker {
             staging,
             session_mgr,
             merge_config,
-            chat_engine,
+            gen_engine,
         }
     }
 
@@ -168,23 +168,22 @@ impl MergeWorker {
         Ok(())
     }
 
-    /// LLM merge: use ChatEngine to merge two conflicting entries.
+    /// LLM merge: use GenerationEngine to merge two conflicting entries.
     async fn llm_merge(
         &self,
         new_entry: &KnowledgeEntry,
         existing: &KnowledgeEntry,
     ) -> Result<KnowledgeEntry> {
-        let prompt = format!(
-            "You are merging two knowledge entries that conflict. \
-             Produce a single merged entry that preserves all important information from both.\n\n\
-             Entry A (existing):\n{}\n\n\
-             Entry B (new):\n{}\n\n\
-             Merged entry:",
+        let system_prompt = "You are merging two knowledge entries that conflict. \
+             Produce a single merged entry that preserves all important information from both.";
+
+        let user_message = format!(
+            "Entry A (existing):\n{}\n\nEntry B (new):\n{}\n\nMerged entry:",
             existing.content, new_entry.content
         );
 
-        let messages = vec![ChatMessage::user(prompt)];
-        let merged_content = self.chat_engine.chat(&messages, &self.merge_config.model).await?;
+        let result = self.gen_engine.generate(system_prompt, &user_message).await?;
+        let merged_content = result.text;
 
         // Re-embed the merged content
         let embedding = self.engine.embed(&merged_content).await?;
@@ -251,20 +250,29 @@ mod tests {
         fn dimensions(&self) -> usize { 3 }
     }
 
-    struct MockChatEngine;
+    struct MockGenerationEngine;
     #[async_trait::async_trait]
-    impl crate::traits::ChatEngine for MockChatEngine {
-        async fn chat(&self, messages: &[corvia_common::types::ChatMessage], _model: &str) -> corvia_common::errors::Result<String> {
-            Ok(format!("merged: {}", messages.last().map(|m| m.content.as_str()).unwrap_or("")))
+    impl crate::traits::GenerationEngine for MockGenerationEngine {
+        fn name(&self) -> &str { "mock" }
+        async fn generate(&self, _system_prompt: &str, user_message: &str) -> corvia_common::errors::Result<crate::traits::GenerationResult> {
+            Ok(crate::traits::GenerationResult {
+                text: format!("merged: {user_message}"),
+                model: "mock".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+            })
         }
+        fn context_window(&self) -> usize { 4096 }
     }
 
-    struct FailingChatEngine;
+    struct FailingGenerationEngine;
     #[async_trait::async_trait]
-    impl crate::traits::ChatEngine for FailingChatEngine {
-        async fn chat(&self, _messages: &[corvia_common::types::ChatMessage], _model: &str) -> corvia_common::errors::Result<String> {
+    impl crate::traits::GenerationEngine for FailingGenerationEngine {
+        fn name(&self) -> &str { "failing" }
+        async fn generate(&self, _system_prompt: &str, _user_message: &str) -> corvia_common::errors::Result<crate::traits::GenerationResult> {
             Err(corvia_common::errors::CorviaError::Agent("Mock failure".into()))
         }
+        fn context_window(&self) -> usize { 4096 }
     }
 
     fn setup(dir: &std::path::Path) -> (MergeWorker, Arc<dyn QueryableStore>, Arc<MergeQueue>, Arc<SessionManager>) {
@@ -277,7 +285,7 @@ mod tests {
         let staging = Arc::new(StagingManager::new(dir));
         let session_mgr = Arc::new(SessionManager::from_db(db).unwrap());
         let config = MergeConfig::default();
-        let chat_engine = Arc::new(MockChatEngine) as Arc<dyn ChatEngine>;
+        let gen_engine = Arc::new(MockGenerationEngine) as Arc<dyn GenerationEngine>;
 
         let worker = MergeWorker::new(
             store.clone(),
@@ -286,7 +294,7 @@ mod tests {
             staging,
             session_mgr.clone(),
             config,
-            chat_engine,
+            gen_engine,
         );
 
         (worker, store, queue, session_mgr)
@@ -354,7 +362,7 @@ mod tests {
     #[tokio::test]
     async fn test_failed_merge_retries() {
         let dir = tempfile::tempdir().unwrap();
-        // Use a FailingChatEngine to simulate LLM failures
+        // Use a FailingGenerationEngine to simulate LLM failures
         let db = std::sync::Arc::new(
             redb::Database::create(dir.path().join("coordination.redb")).unwrap()
         );
@@ -364,12 +372,12 @@ mod tests {
         let staging = Arc::new(StagingManager::new(dir.path()));
         let session_mgr = Arc::new(SessionManager::from_db(db).unwrap());
         let config = MergeConfig::default();
-        let chat_engine = Arc::new(FailingChatEngine) as Arc<dyn ChatEngine>;
+        let gen_engine = Arc::new(FailingGenerationEngine) as Arc<dyn GenerationEngine>;
 
         let worker = MergeWorker::new(
             store.clone(), engine, queue.clone(), staging, session_mgr.clone(),
             config,
-            chat_engine,
+            gen_engine,
         );
         store.init_schema().await.unwrap();
 

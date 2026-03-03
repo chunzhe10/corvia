@@ -9,7 +9,7 @@ use corvia_common::agent_types::*;
 use corvia_common::config::{AgentLifecycleConfig, MergeConfig};
 use corvia_kernel::agent_coordinator::AgentCoordinator;
 use corvia_kernel::lite_store::LiteStore;
-use corvia_kernel::traits::{ChatEngine, InferenceEngine, QueryableStore};
+use corvia_kernel::traits::{GenerationEngine, GenerationResult, InferenceEngine, QueryableStore};
 use std::sync::Arc;
 
 struct MockEngine;
@@ -24,19 +24,26 @@ impl InferenceEngine for MockEngine {
     fn dimensions(&self) -> usize { 3 }
 }
 
-struct MockChatEngine;
+struct MockGenerationEngine;
 #[async_trait]
-impl ChatEngine for MockChatEngine {
-    async fn chat(&self, messages: &[corvia_common::types::ChatMessage], _model: &str) -> corvia_common::errors::Result<String> {
-        Ok(format!("merged: {}", messages.last().map(|m| m.content.as_str()).unwrap_or("")))
+impl GenerationEngine for MockGenerationEngine {
+    fn name(&self) -> &str { "mock" }
+    async fn generate(&self, _system_prompt: &str, user_message: &str) -> corvia_common::errors::Result<GenerationResult> {
+        Ok(GenerationResult {
+            text: format!("merged: {user_message}"),
+            model: "mock".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+        })
     }
+    fn context_window(&self) -> usize { 4096 }
 }
 
 async fn setup_coordinator(dir: &std::path::Path) -> (AgentCoordinator, Arc<dyn QueryableStore>) {
     let store = Arc::new(LiteStore::open(dir, 3).unwrap()) as Arc<dyn QueryableStore>;
     store.init_schema().await.unwrap();
     let engine = Arc::new(MockEngine) as Arc<dyn InferenceEngine>;
-    let chat_engine = Arc::new(MockChatEngine) as Arc<dyn ChatEngine>;
+    let gen_engine = Arc::new(MockGenerationEngine) as Arc<dyn GenerationEngine>;
 
     let coord = AgentCoordinator::new(
         store.clone(),
@@ -50,7 +57,7 @@ async fn setup_coordinator(dir: &std::path::Path) -> (AgentCoordinator, Arc<dyn 
             max_retries: 3,
             ..Default::default()
         },
-        chat_engine,
+        gen_engine,
     ).unwrap();
 
     (coord, store)

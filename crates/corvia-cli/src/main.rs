@@ -361,16 +361,16 @@ async fn cmd_serve(mcp: bool) -> Result<()> {
 
     // Construct AgentCoordinator
     let data_dir = std::path::Path::new(&config.storage.data_dir);
-    let chat_engine: std::sync::Arc<dyn corvia_kernel::traits::ChatEngine> = match config.merge.provider {
+    let gen_engine: std::sync::Arc<dyn corvia_kernel::traits::GenerationEngine> = match config.merge.provider {
         corvia_common::config::InferenceProvider::Corvia => {
-            std::sync::Arc::new(corvia_kernel::grpc_chat::GrpcChatEngine::new(&config.embedding.url))
+            std::sync::Arc::new(corvia_kernel::grpc_chat::GrpcChatEngine::new(&config.embedding.url, &config.merge.model))
         }
         corvia_common::config::InferenceProvider::Ollama => {
-            std::sync::Arc::new(corvia_kernel::ollama_chat::OllamaChatEngine::new(&config.embedding.url))
+            std::sync::Arc::new(corvia_kernel::ollama_chat::OllamaChatEngine::new(&config.embedding.url, &config.merge.model))
         }
         corvia_common::config::InferenceProvider::Vllm => {
             // vLLM chat not yet implemented — fall back to Ollama
-            std::sync::Arc::new(corvia_kernel::ollama_chat::OllamaChatEngine::new(&config.embedding.url))
+            std::sync::Arc::new(corvia_kernel::ollama_chat::OllamaChatEngine::new(&config.embedding.url, &config.merge.model))
         }
     };
     let coordinator = match AgentCoordinator::new(
@@ -379,7 +379,7 @@ async fn cmd_serve(mcp: bool) -> Result<()> {
         data_dir,
         config.agent_lifecycle.clone(),
         config.merge.clone(),
-        chat_engine,
+        gen_engine,
     ) {
         Ok(c) => {
             println!("Agent coordination: enabled");
