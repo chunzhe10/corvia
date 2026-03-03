@@ -93,7 +93,6 @@ impl AgentPermission {
 pub enum AgentStatus {
     Active,
     Suspended,
-    Deregistered,
 }
 
 /// Persistent agent record stored in Redb.
