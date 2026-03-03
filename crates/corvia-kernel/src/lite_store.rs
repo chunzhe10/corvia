@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use corvia_common::errors::{CorviaError, Result};
 use corvia_common::types::{KnowledgeEntry, SearchResult};
 use hnsw_rs::prelude::*;
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -103,6 +103,41 @@ impl LiteStore {
         }
 
         Ok(store)
+    }
+
+    /// Fetch all knowledge entries from the Redb ENTRIES table in a single pass.
+    /// Used for migration export — avoids re-reading JSON files from disk.
+    pub fn fetch_all_entries(&self) -> Result<Vec<KnowledgeEntry>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| CorviaError::Storage(format!("Failed to begin read txn: {e}")))?;
+        let entries_table = match read_txn.open_table(ENTRIES) {
+            Ok(t) => t,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let mut entries = Vec::new();
+        for item in entries_table
+            .iter()
+            .map_err(|e| CorviaError::Storage(format!("Failed to iterate ENTRIES: {e}")))?
+        {
+            let (_key, value) = item
+                .map_err(|e| CorviaError::Storage(format!("Failed to read entry: {e}")))?;
+            match serde_json::from_slice::<KnowledgeEntry>(value.value()) {
+                Ok(entry) => entries.push(entry),
+                Err(e) => {
+                    tracing::warn!("Skipping malformed entry in Redb: {e}");
+                }
+            }
+        }
+
+        Ok(entries)
+    }
+
+    /// Access the underlying graph store (for migration export).
+    pub fn graph(&self) -> &crate::graph_store::LiteGraphStore {
+        &self.graph
     }
 
     /// Allocate the next HNSW data ID (atomic counter).

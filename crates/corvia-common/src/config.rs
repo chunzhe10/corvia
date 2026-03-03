@@ -8,6 +8,7 @@ pub enum StoreType {
     #[default]
     Lite,
     Surrealdb,
+    Postgres,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -86,6 +87,7 @@ pub struct StorageConfig {
     pub surrealdb_db: Option<String>,
     pub surrealdb_user: Option<String>,
     pub surrealdb_pass: Option<String>,
+    pub postgres_url: Option<String>,
 }
 
 fn default_data_dir() -> String {
@@ -255,6 +257,7 @@ impl Default for CorviaConfig {
                 surrealdb_db: None,
                 surrealdb_user: None,
                 surrealdb_pass: None,
+                postgres_url: None,
             },
             embedding: EmbeddingConfig {
                 provider: InferenceProvider::Ollama,
@@ -293,6 +296,30 @@ impl CorviaConfig {
                 surrealdb_db: Some("main".into()),
                 surrealdb_user: Some("root".into()),
                 surrealdb_pass: Some("root".into()),
+                postgres_url: None,
+            },
+            embedding: EmbeddingConfig {
+                provider: InferenceProvider::Vllm,
+                model: "nomic-ai/nomic-embed-text-v1.5".into(),
+                url: "http://127.0.0.1:8001".into(),
+                dimensions: 768,
+            },
+            ..Self::default()
+        }
+    }
+
+    /// Return a config preset for PostgreSQL + vLLM.
+    pub fn postgres_default() -> Self {
+        Self {
+            storage: StorageConfig {
+                store_type: StoreType::Postgres,
+                data_dir: ".corvia".into(),
+                surrealdb_url: None,
+                surrealdb_ns: None,
+                surrealdb_db: None,
+                surrealdb_user: None,
+                surrealdb_pass: None,
+                postgres_url: Some("postgres://corvia:corvia@127.0.0.1:5432/corvia".into()),
             },
             embedding: EmbeddingConfig {
                 provider: InferenceProvider::Vllm,
@@ -338,10 +365,14 @@ impl CorviaConfig {
         if let Ok(val) = std::env::var("CORVIA_TEST_NAMESPACE") {
             self.storage.surrealdb_ns = Some(val);
         }
+        if let Ok(val) = std::env::var("CORVIA_POSTGRES_URL") {
+            self.storage.postgres_url = Some(val);
+        }
         if let Ok(val) = std::env::var("CORVIA_STORE_TYPE") {
             match val.as_str() {
                 "lite" => self.storage.store_type = StoreType::Lite,
                 "surrealdb" => self.storage.store_type = StoreType::Surrealdb,
+                "postgres" => self.storage.store_type = StoreType::Postgres,
                 _ => {}
             }
         }

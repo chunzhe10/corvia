@@ -176,6 +176,51 @@ impl LiteGraphStore {
             None => Ok(None),
         }
     }
+
+    /// Fetch all graph edges from the Redb GRAPH_EDGES table in a single pass.
+    /// Used for migration export — avoids N per-entry `edges()` calls.
+    pub fn fetch_all_edges(&self) -> Result<Vec<GraphEdge>> {
+        let read_txn = self.db.begin_read()
+            .map_err(|e| CorviaError::Storage(format!("Failed to begin read: {e}")))?;
+        let table = match read_txn.open_table(GRAPH_EDGES) {
+            Ok(t) => t,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let mut edges = Vec::new();
+        for item in table.iter().map_err(|e| CorviaError::Storage(format!("Failed to iterate: {e}")))? {
+            let (key, value) = item.map_err(|e| CorviaError::Storage(format!("Failed to read: {e}")))?;
+            let key_str = key.value();
+            let parts: Vec<&str> = key_str.splitn(3, ':').collect();
+            if parts.len() != 3 {
+                tracing::warn!("Malformed GRAPH_EDGES key: {}", key_str);
+                continue;
+            }
+
+            let from = match Uuid::parse_str(parts[0]) {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::warn!("Skipping edge with invalid from_id '{}': {e}", parts[0]);
+                    continue;
+                }
+            };
+            let to = match Uuid::parse_str(parts[2]) {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::warn!("Skipping edge with invalid to_id '{}': {e}", parts[2]);
+                    continue;
+                }
+            };
+            let relation = parts[1].to_string();
+            let metadata: Option<serde_json::Value> = serde_json::from_slice(value.value())
+                .ok()
+                .and_then(|v: serde_json::Value| if v.is_null() { None } else { Some(v) });
+
+            edges.push(GraphEdge { from, to, relation, metadata });
+        }
+
+        Ok(edges)
+    }
 }
 
 #[async_trait]

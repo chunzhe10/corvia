@@ -9,5 +9,19 @@ services:
       - corvia-surreal-data:/data
     restart: unless-stopped
 
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: corvia-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: corvia
+      POSTGRES_PASSWORD: corvia
+      POSTGRES_DB: corvia
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
 volumes:
   corvia-surreal-data:
+  pgdata:

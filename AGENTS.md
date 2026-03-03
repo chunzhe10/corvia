@@ -12,8 +12,10 @@ in CLAUDE.md), Gemini CLI (settings.json), and Aider (`--read AGENTS.md`).
 
 ```bash
 cargo build --workspace          # Build everything
-cargo test --workspace           # Run all tests (SurrealDB tests auto-skip)
+cargo test --workspace           # Run all tests (SurrealDB/PG tests auto-skip)
 make test-full                   # Start SurrealDB + run ALL tests fully
+make test-postgres               # Start PostgreSQL + run tests with --features postgres
+make test-all                    # Start both DBs + run all tests
 ```
 
 ## Test Tiers
@@ -22,8 +24,8 @@ make test-full                   # Start SurrealDB + run ALL tests fully
 ```bash
 cargo test --workspace
 ```
-Runs 203 tests. LiteStore tests exercise full functionality. SurrealDB-dependent tests (10)
-auto-skip gracefully when the server is unreachable. No Docker, no Ollama required.
+Runs 203+ tests. LiteStore tests exercise full functionality. SurrealDB and PostgreSQL
+tests auto-skip gracefully when the server is unreachable. No Docker, no Ollama required.
 This is the primary test suite and must always pass.
 
 **Tier 2 — With SurrealDB (FullStore tests fully exercised):**
@@ -32,11 +34,24 @@ make test-full                   # Start SurrealDB, run tests, stop SurrealDB
 ```
 Or manually: `make surrealdb-up && cargo test --workspace && make surrealdb-down`
 
-All 203 tests run with SurrealDB tests fully exercised instead of skipping.
+All tests run with SurrealDB tests fully exercised instead of skipping.
+
+**Tier 2.5 — With PostgreSQL (PostgresStore tests fully exercised):**
+```bash
+make test-postgres               # Start PostgreSQL, run tests, stop PostgreSQL
+```
+Or manually: `make postgres-up && cargo test --workspace --features postgres && make postgres-down`
+
+Requires the `postgres` feature flag. PostgresStore tests use pgvector/pgvector:pg17.
 
 **Tier 3 — With Ollama (real embeddings):**
 Requires Ollama running on port 11434 with `nomic-embed-text` model.
 The e2e integration tests (`test_ollama_*`) auto-skip when Ollama is unreachable.
+
+**All tiers combined:**
+```bash
+make test-all                    # Start SurrealDB + PostgreSQL, run all tests
+```
 
 ## Workspace Crates
 
@@ -58,7 +73,8 @@ The e2e integration tests (`test_ollama_*`) auto-skip when Ollama is unreachable
 
 ## Architecture Decisions to Respect
 
-- **Two-tier storage**: LiteStore is the full product (zero Docker). SurrealStore is opt-in.
+- **Three-tier storage**: LiteStore is the full product (zero Docker). SurrealStore and PostgresStore are opt-in.
+  PostgresStore requires `--features postgres` at compile time.
 - **Git as truth**: All knowledge stored as JSON in `.corvia/knowledge/`, tracked by Git.
 - **Local-first**: No API keys required. Ollama provides embeddings.
 - **Trait-bounded**: All storage/inference/ingestion is behind traits. Don't add concrete dependencies.
@@ -87,6 +103,19 @@ When writing SurrealDB queries or tests, be aware of these SDK issues:
 6. **Namespace/database creation**: Must `DEFINE NAMESPACE IF NOT EXISTS` and
    `DEFINE DATABASE IF NOT EXISTS` before `use_ns()`/`use_db()`.
 
+## PostgreSQL (pgvector) Notes
+
+PostgresStore (`crates/corvia-kernel/src/postgres_store.rs`) is behind the `postgres` feature flag.
+
+- **Dependencies**: `sqlx` (async PostgreSQL driver) + `pgvector` (vector type support)
+- **Docker image**: `pgvector/pgvector:pg17` — PostgreSQL 17 with pgvector pre-installed
+- **Default URL**: `postgres://corvia:corvia@127.0.0.1:5432/corvia`
+- **Env override**: `CORVIA_POSTGRES_URL`
+- **Schema**: Uses `vector(768)` column type, HNSW index with cosine ops, JSONB for metadata
+- **Graph**: Relational `edges` table with composite primary key `(from_id, relation, to_id)`
+- **Temporal**: `valid_from`/`valid_to` TIMESTAMPTZ columns, `superseded_by` UUID chain
+- **Tests**: Each test gets its own database (`corvia_test_{PID}_{suffix}`), dropped on teardown
+
 ## Testing Conventions
 
 - Unit tests live in `#[cfg(test)] mod tests` inside each module
@@ -104,6 +133,7 @@ When writing SurrealDB queries or tests, be aware of these SDK issues:
 
 - `knowledge_store.rs` — SurrealStore implementation (FullStore)
 - `lite_store.rs` — LiteStore implementation (default)
+- `postgres_store.rs` — PostgresStore implementation (feature-gated)
 - `traits.rs` — All kernel trait definitions
 - `reasoner.rs` — 5 deterministic health checks + 2 LLM-assisted checks
 - `graph_store.rs` — petgraph-based graph for LiteStore

@@ -8,7 +8,7 @@
 //!
 //! | Command | Purpose |
 //! |---------|---------|
-//! | `init` | Initialize a new Corvia store (LiteStore or `--full` SurrealDB) |
+//! | `init` | Initialize a new Corvia store (`--store lite\|surrealdb\|postgres`) |
 //! | `ingest` | Ingest a Git repository (or all workspace repos) |
 //! | `search` | Semantic search across ingested knowledge |
 //! | `serve` | Start the REST API and optional MCP server |
@@ -19,6 +19,7 @@
 //! | `relate` | Create a directed edge between two entries |
 //! | `agent` | Multi-agent session management (start, list, commit, merge) |
 //! | `workspace` | Workspace lifecycle (init, add, list, status, ingest) |
+//! | `migrate` | Migrate data between storage backends (`--to lite\|surrealdb\|postgres`) |
 //! | `demo` | Run the built-in demo workspace |
 //!
 //! See the [README](https://github.com/corvia/corvia) and
@@ -50,11 +51,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize Corvia (LiteStore by default, --full for SurrealDB+vLLM)
+    /// Initialize Corvia (LiteStore by default, --store to select backend)
     Init {
-        /// Use FullStore: SurrealDB + vLLM (requires Docker)
-        #[arg(long)]
-        full: bool,
+        /// Storage backend: lite (default), surrealdb, postgres
+        #[arg(long, default_value = "lite")]
+        store: String,
     },
 
     /// Start the REST API server
@@ -176,7 +177,18 @@ enum Commands {
         llm: bool,
     },
 
-    /// Upgrade from LiteStore to SurrealDB (one-way migration)
+    /// Migrate data between storage backends
+    Migrate {
+        /// Target storage backend: lite, surrealdb, postgres
+        #[arg(long)]
+        to: String,
+        /// Show what would be migrated without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Alias for 'migrate --to surrealdb' (deprecated, use migrate instead)
+    #[command(hide = true)]
     Upgrade {
         /// Dry run: show what would be migrated without making changes
         #[arg(long)]
@@ -260,7 +272,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init { full } => cmd_init(full).await?,
+        Commands::Init { store } => cmd_init(&store).await?,
         Commands::Serve { mcp } => cmd_serve(mcp).await?,
         Commands::Ingest { path } => cmd_ingest(path.as_deref()).await?,
         Commands::Search { query, limit } => cmd_search(&query, limit).await?,
@@ -275,19 +287,30 @@ async fn main() -> Result<()> {
         Commands::Graph { entry_id, scope, relation } => cmd_graph(entry_id.as_deref(), scope.as_deref(), relation.as_deref()).await?,
         Commands::Relate { from, relation, to } => cmd_relate(&from, &relation, &to).await?,
         Commands::Reason { scope, check, llm } => cmd_reason(scope.as_deref(), check.as_deref(), llm).await?,
-        Commands::Upgrade { dry_run } => upgrade::cmd_upgrade(dry_run).await?,
+        Commands::Migrate { to, dry_run } => upgrade::cmd_migrate(&to, dry_run).await?,
+        Commands::Upgrade { dry_run } => upgrade::cmd_migrate("surrealdb", dry_run).await?,
     }
 
     Ok(())
 }
 
-async fn cmd_init(full: bool) -> Result<()> {
-    let config = if full {
-        println!("Initializing Corvia (FullStore: SurrealDB + vLLM)...");
-        CorviaConfig::full_default()
-    } else {
-        println!("Initializing Corvia (LiteStore: zero Docker)...");
-        CorviaConfig::default()
+async fn cmd_init(store: &str) -> Result<()> {
+    let config = match store {
+        "surrealdb" => {
+            println!("Initializing Corvia (SurrealDB + vLLM)...");
+            CorviaConfig::full_default()
+        }
+        "postgres" => {
+            println!("Initializing Corvia (PostgreSQL + pgvector + vLLM)...");
+            CorviaConfig::postgres_default()
+        }
+        "lite" => {
+            println!("Initializing Corvia (LiteStore: zero Docker)...");
+            CorviaConfig::default()
+        }
+        other => {
+            anyhow::bail!("Unknown store type '{other}'. Valid options: lite, surrealdb, postgres");
+        }
     };
 
     let config_path = CorviaConfig::config_path();
@@ -298,54 +321,65 @@ async fn cmd_init(full: bool) -> Result<()> {
         println!("  Config already exists: {}", config_path.display());
     }
 
-    if full {
-        // Provision Docker containers for FullStore
-        let docker = DockerProvisioner::new()?;
-        docker.start(
-            config.storage.surrealdb_user.as_deref().unwrap_or("root"),
-            config.storage.surrealdb_pass.as_deref().unwrap_or("root"),
-        ).await?;
+    match store {
+        "surrealdb" => {
+            // Provision Docker containers for SurrealDB
+            let docker = DockerProvisioner::new()?;
+            docker.start(
+                config.storage.surrealdb_user.as_deref().unwrap_or("root"),
+                config.storage.surrealdb_pass.as_deref().unwrap_or("root"),
+            ).await?;
 
-        let store = connect_store(&config).await?;
-        store.init_schema().await?;
-        println!("  SurrealDB running on port 8000.");
-    } else {
-        // Initialize LiteStore directory
-        let store = connect_store(&config).await?;
-        store.init_schema().await?;
-
-        // Create .gitignore for ephemeral files
-        let data_dir = std::path::Path::new(&config.storage.data_dir);
-        let gitignore_path = data_dir.join(".gitignore");
-        if !gitignore_path.exists() {
-            std::fs::create_dir_all(data_dir)?;
-            std::fs::write(&gitignore_path,
-                "# Ephemeral indexes (rebuilt from knowledge files)\nhnsw/\nlite_store.redb\nlite_store.redb.tmp\n"
-            )?;
-            println!("  Created {}", gitignore_path.display());
+            let s = connect_store(&config).await?;
+            s.init_schema().await?;
+            println!("  SurrealDB running on port 8000.");
         }
+        "postgres" => {
+            // PostgreSQL must be running (user manages via docker-compose or make postgres-up)
+            println!("  Connecting to PostgreSQL...");
+            let s = connect_store(&config).await?;
+            s.init_schema().await?;
+            println!("  PostgreSQL schema initialized at {}",
+                config.storage.postgres_url.as_deref().unwrap_or("postgres://127.0.0.1:5432/corvia"));
+        }
+        _ => {
+            // LiteStore initialization
+            let s = connect_store(&config).await?;
+            s.init_schema().await?;
 
-        println!("  LiteStore initialized in {}/", config.storage.data_dir);
+            // Create .gitignore for ephemeral files
+            let data_dir = std::path::Path::new(&config.storage.data_dir);
+            let gitignore_path = data_dir.join(".gitignore");
+            if !gitignore_path.exists() {
+                std::fs::create_dir_all(data_dir)?;
+                std::fs::write(&gitignore_path,
+                    "# Ephemeral indexes (rebuilt from knowledge files)\nhnsw/\nlite_store.redb\nlite_store.redb.tmp\n"
+                )?;
+                println!("  Created {}", gitignore_path.display());
+            }
 
-        // Provision inference backend
-        match config.embedding.provider {
-            corvia_common::config::InferenceProvider::Corvia => {
-                println!("  Provisioning Corvia inference server...");
-                let provisioner = corvia_kernel::inference_provisioner::InferenceProvisioner::new(
-                    &config.embedding.url,
-                );
-                provisioner.ensure_ready(&config.embedding.model, &config.merge.model).await?;
-                println!("  Corvia inference ready (embed: {}, chat: {})",
-                    config.embedding.model, config.merge.model);
-            }
-            corvia_common::config::InferenceProvider::Ollama => {
-                println!("  Provisioning Ollama...");
-                let provisioner = OllamaProvisioner::new(&config.embedding.url);
-                provisioner.ensure_ready(&config.embedding.model).await?;
-                println!("  Ollama ready (model: {})", config.embedding.model);
-            }
-            corvia_common::config::InferenceProvider::Vllm => {
-                // vLLM is provisioned via Docker in full mode — nothing needed here
+            println!("  LiteStore initialized in {}/", config.storage.data_dir);
+
+            // Provision inference backend
+            match config.embedding.provider {
+                corvia_common::config::InferenceProvider::Corvia => {
+                    println!("  Provisioning Corvia inference server...");
+                    let provisioner = corvia_kernel::inference_provisioner::InferenceProvisioner::new(
+                        &config.embedding.url,
+                    );
+                    provisioner.ensure_ready(&config.embedding.model, &config.merge.model).await?;
+                    println!("  Corvia inference ready (embed: {}, chat: {})",
+                        config.embedding.model, config.merge.model);
+                }
+                corvia_common::config::InferenceProvider::Ollama => {
+                    println!("  Provisioning Ollama...");
+                    let provisioner = OllamaProvisioner::new(&config.embedding.url);
+                    provisioner.ensure_ready(&config.embedding.model).await?;
+                    println!("  Ollama ready (model: {})", config.embedding.model);
+                }
+                corvia_common::config::InferenceProvider::Vllm => {
+                    // vLLM is provisioned via Docker — nothing needed here
+                }
             }
         }
     }
@@ -554,6 +588,17 @@ async fn cmd_status() -> Result<()> {
                 println!("Entries in scope '{}': {count}", config.project.scope_id);
             }
         }
+        corvia_common::config::StoreType::Postgres => {
+            println!("Store: PostgresStore ({})",
+                config.storage.postgres_url.as_deref().unwrap_or("postgres://127.0.0.1:5432/corvia"));
+            match connect_store(&config).await {
+                Ok(store) => {
+                    let count = store.count(&config.project.scope_id).await?;
+                    println!("Entries in scope '{}': {count}", config.project.scope_id);
+                }
+                Err(e) => println!("  PostgreSQL not reachable: {e}"),
+            }
+        }
     }
 
     // Show agent coordination status if available
@@ -597,6 +642,9 @@ async fn cmd_rebuild() -> Result<()> {
         }
         corvia_common::config::StoreType::Surrealdb => {
             println!("Rebuild is only needed for LiteStore. SurrealDB manages its own indexes.");
+        }
+        corvia_common::config::StoreType::Postgres => {
+            println!("Rebuild is only needed for LiteStore. PostgreSQL manages its own indexes.");
         }
     }
 

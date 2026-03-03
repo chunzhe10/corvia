@@ -85,6 +85,68 @@ impl SurrealStore {
 
         Ok(Self { db, dimensions })
     }
+
+    /// Fetch all knowledge entries (used for migration export).
+    pub async fn fetch_all_entries(&self) -> Result<Vec<KnowledgeEntry>> {
+        let query = format!("SELECT {KNOWLEDGE_FIELDS} FROM knowledge");
+        let mut response = self
+            .db
+            .query(query)
+            .await
+            .map_err(|e| CorviaError::Storage(format!("Failed to fetch all entries: {e}")))?;
+
+        let results: Vec<serde_json::Value> = response
+            .take(0)
+            .map_err(|e| CorviaError::Storage(format!("Failed to parse entries: {e}")))?;
+
+        Ok(results.into_iter().filter_map(json_to_entry).collect())
+    }
+
+    /// Fetch all graph edges (used for migration export).
+    pub async fn fetch_all_edges(&self) -> Result<Vec<GraphEdge>> {
+        let mut response = self
+            .db
+            .query("SELECT from_id, to_id, relation, metadata FROM edges")
+            .await
+            .map_err(|e| CorviaError::Storage(format!("Failed to fetch all edges: {e}")))?;
+
+        let results: Vec<serde_json::Value> = response
+            .take(0)
+            .map_err(|e| CorviaError::Storage(format!("Failed to parse edges: {e}")))?;
+
+        let mut edges = Vec::new();
+        for row in results {
+            let from_str = row.get("from_id").and_then(|v| v.as_str()).unwrap_or_default();
+            let to_str = row.get("to_id").and_then(|v| v.as_str()).unwrap_or_default();
+            let relation = row
+                .get("relation")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let metadata = row.get("metadata").cloned().and_then(|v| {
+                if v.is_null() { None } else { Some(v) }
+            });
+
+            let from = match uuid::Uuid::parse_str(from_str) {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::warn!("Skipping edge with invalid from_id '{}': {e}", from_str);
+                    continue;
+                }
+            };
+            let to = match uuid::Uuid::parse_str(to_str) {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::warn!("Skipping edge with invalid to_id '{}': {e}", to_str);
+                    continue;
+                }
+            };
+
+            edges.push(GraphEdge { from, to, relation, metadata });
+        }
+
+        Ok(edges)
+    }
 }
 
 /// Convert a KnowledgeEntry to a serde_json::Value for SurrealDB storage.

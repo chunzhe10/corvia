@@ -32,6 +32,9 @@ axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 git2 = "0.20"
 
+[features]
+postgres = ["corvia-kernel/postgres"]
+
 [dev-dependencies]
 tempfile = "3"
 async-trait = "0.1"

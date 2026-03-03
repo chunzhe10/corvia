@@ -116,7 +116,7 @@ capabilities or vLLM's GPU-accelerated inference.
 
 **Both tiers share:** Git-trackable JSON knowledge files as the rebuildable source of truth, Redb for coordination, and the same kernel traits
 (`QueryableStore`, `TemporalStore`, `GraphStore`). Switching tiers is a configuration change
-(`corvia init` vs `corvia init --full`), not a code change.
+(`corvia init --store lite|surrealdb|postgres`), not a code change.
 
 ## Core Traits
 

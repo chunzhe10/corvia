@@ -6,13 +6,15 @@
 //!
 //! # Storage Tiers
 //!
-//! Corvia offers two storage tiers behind the same [`QueryableStore`](traits::QueryableStore) trait:
+//! Corvia offers three storage tiers behind the same [`QueryableStore`](traits::QueryableStore) trait:
 //!
 //! - **[`LiteStore`](lite_store::LiteStore)** (default) — zero-Docker, uses hnsw_rs for
 //!   vector search, petgraph for graph traversal, and Redb for metadata. Knowledge is
 //!   persisted as Git-tracked JSON files in `.corvia/knowledge/`.
 //! - **[`SurrealStore`](knowledge_store::SurrealStore)** (opt-in) — SurrealDB-backed store
 //!   with native vector indexes, graph `RELATE`, and bi-temporal queries.
+//! - **`PostgresStore`** (opt-in, `--features postgres`) — PostgreSQL + pgvector store
+//!   with HNSW vector indexes, recursive CTE temporal queries, and relational graph edges.
 //!
 //! # Core Traits
 //!
@@ -89,6 +91,8 @@ pub mod chunking_pdf;
 pub mod grpc_engine;
 pub mod grpc_chat;
 pub mod inference_provisioner;
+#[cfg(feature = "postgres")]
+pub mod postgres_store;
 
 use corvia_common::config::{CorviaConfig, InferenceProvider, StoreType};
 use corvia_common::errors::Result;
@@ -127,6 +131,17 @@ async fn connect_surrealdb(config: &CorviaConfig) -> Result<knowledge_store::Sur
     ).await
 }
 
+/// Internal: connect to PostgreSQL with config defaults.
+#[cfg(feature = "postgres")]
+async fn connect_postgres(config: &CorviaConfig) -> Result<postgres_store::PostgresStore> {
+    let url = config
+        .storage
+        .postgres_url
+        .as_deref()
+        .unwrap_or("postgres://corvia:corvia@127.0.0.1:5432/corvia");
+    postgres_store::PostgresStore::connect(url, config.embedding.dimensions).await
+}
+
 /// Create a store at a specific directory path (for workspace support).
 ///
 /// For LiteStore, opens the store at the given `data_dir` path instead of
@@ -142,6 +157,17 @@ pub async fn create_store_at(
         }
         StoreType::Surrealdb => {
             create_store(config).await
+        }
+        #[cfg(feature = "postgres")]
+        StoreType::Postgres => {
+            let store = connect_postgres(config).await?;
+            Ok(Box::new(store))
+        }
+        #[cfg(not(feature = "postgres"))]
+        StoreType::Postgres => {
+            Err(corvia_common::errors::CorviaError::Config(
+                "PostgresStore requires --features postgres".into(),
+            ))
         }
     }
 }
@@ -159,6 +185,17 @@ pub async fn create_store(config: &CorviaConfig) -> Result<Box<dyn traits::Query
         StoreType::Surrealdb => {
             let store = connect_surrealdb(config).await?;
             Ok(Box::new(store))
+        }
+        #[cfg(feature = "postgres")]
+        StoreType::Postgres => {
+            let store = connect_postgres(config).await?;
+            Ok(Box::new(store))
+        }
+        #[cfg(not(feature = "postgres"))]
+        StoreType::Postgres => {
+            Err(corvia_common::errors::CorviaError::Config(
+                "PostgresStore requires --features postgres".into(),
+            ))
         }
     }
 }
@@ -179,6 +216,17 @@ pub async fn create_store_with_graph(
         StoreType::Surrealdb => {
             let store = Arc::new(connect_surrealdb(config).await?);
             Ok((store.clone() as Arc<dyn traits::QueryableStore>, store as Arc<dyn traits::GraphStore>))
+        }
+        #[cfg(feature = "postgres")]
+        StoreType::Postgres => {
+            let store = Arc::new(connect_postgres(config).await?);
+            Ok((store.clone() as Arc<dyn traits::QueryableStore>, store as Arc<dyn traits::GraphStore>))
+        }
+        #[cfg(not(feature = "postgres"))]
+        StoreType::Postgres => {
+            Err(corvia_common::errors::CorviaError::Config(
+                "PostgresStore requires --features postgres".into(),
+            ))
         }
     }
 }
@@ -206,6 +254,21 @@ pub async fn create_full_store(
                 store.clone() as Arc<dyn traits::QueryableStore>,
                 store.clone() as Arc<dyn traits::GraphStore>,
                 store as Arc<dyn traits::TemporalStore>,
+            ))
+        }
+        #[cfg(feature = "postgres")]
+        StoreType::Postgres => {
+            let store = Arc::new(connect_postgres(config).await?);
+            Ok((
+                store.clone() as Arc<dyn traits::QueryableStore>,
+                store.clone() as Arc<dyn traits::GraphStore>,
+                store as Arc<dyn traits::TemporalStore>,
+            ))
+        }
+        #[cfg(not(feature = "postgres"))]
+        StoreType::Postgres => {
+            Err(corvia_common::errors::CorviaError::Config(
+                "PostgresStore requires --features postgres".into(),
             ))
         }
     }
@@ -265,6 +328,9 @@ pub async fn create_store_at_with_graph(
             Ok((store.clone() as Arc<dyn traits::QueryableStore>, store as Arc<dyn traits::GraphStore>))
         }
         StoreType::Surrealdb => {
+            create_store_with_graph(config).await
+        }
+        StoreType::Postgres => {
             create_store_with_graph(config).await
         }
     }
