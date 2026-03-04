@@ -12,7 +12,7 @@
 //! The [`FormatRegistry`] routes file extensions to strategies with a three-level
 //! priority: adapter overrides > kernel defaults > fallback (D66).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use corvia_common::config::ChunkingConfig;
@@ -282,6 +282,16 @@ impl ChunkingPipeline {
             all_relations.extend(relations);
         }
 
+        // After all files are processed, discover cross-file relations
+        let cross_file_relations = Self::discover_cross_file_relations(&all_chunks);
+        if !cross_file_relations.is_empty() {
+            tracing::info!(
+                count = cross_file_relations.len(),
+                "discovered cross-file declaration→usage relations"
+            );
+            all_relations.extend(cross_file_relations);
+        }
+
         Ok((all_chunks, all_relations, report))
     }
 
@@ -473,6 +483,160 @@ impl ChunkingPipeline {
 
         (contents, overlap_tokens_vec)
     }
+
+    /// Discover cross-file relations by tracking type/trait definitions and usages.
+    ///
+    /// Pass 1: Collect definitions (structs, traits, enums) from chunk metadata.
+    /// Pass 2: Find cross-file usages of those definitions in chunk content.
+    /// Returns additional `ChunkRelation` entries with relation type `"uses"`.
+    pub fn discover_cross_file_relations(
+        chunks: &[ProcessedChunk],
+    ) -> Vec<ChunkRelation> {
+        // Types to skip — common standard library / serde / language primitives.
+        let skip_types: HashSet<&str> = [
+            "String", "Vec", "HashMap", "HashSet", "BTreeMap", "BTreeSet",
+            "Option", "Result", "Box", "Arc", "Mutex", "RwLock", "Rc", "Cell",
+            "RefCell", "Pin", "Future", "Stream", "Iterator", "Display", "Debug",
+            "Clone", "Copy", "Send", "Sync", "Default", "From", "Into",
+            "TryFrom", "TryInto", "AsRef", "AsMut", "Deref", "DerefMut", "Drop",
+            "Fn", "FnMut", "FnOnce", "Error", "Ord", "PartialOrd", "Eq",
+            "PartialEq", "Hash", "Sized", "Unpin", "Serialize", "Deserialize",
+            "None", "Some", "Ok", "Err", "Self", "TRUE", "FALSE", "Path",
+            "PathBuf", "File", "Read", "Write", "Seek", "Command", "Output",
+            "ExitStatus",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        // Pass 1: Collect definitions.
+        // symbol_name → Vec<(source_file, start_line)>
+        let definition_types: HashSet<&str> = [
+            "struct_item", "trait_item", "enum_item", "impl_item", "mod_item",
+            "struct", "trait", "enum", "impl", "mod",
+        ]
+        .iter()
+        .copied()
+        .collect();
+
+        let mut definitions: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+
+        for chunk in chunks {
+            if !definition_types.contains(chunk.chunk_type.as_str()) {
+                continue;
+            }
+            if let Some(name) = extract_definition_name(&chunk.content) {
+                // Only keep CamelCase names >= 3 chars, not in skip set.
+                if name.len() >= 3
+                    && name.starts_with(|c: char| c.is_uppercase())
+                    && !skip_types.contains(name.as_str())
+                {
+                    definitions
+                        .entry(name)
+                        .or_default()
+                        .push((
+                            chunk.metadata.source_file.clone(),
+                            chunk.start_line,
+                        ));
+                }
+            }
+        }
+
+        // Filter out symbols defined in 10+ unique files (too generic).
+        definitions.retain(|_name, locs| {
+            let unique_files: HashSet<&str> =
+                locs.iter().map(|(f, _)| f.as_str()).collect();
+            unique_files.len() < 10
+        });
+
+        // Pass 2: Find cross-file usages.
+        let mut seen: HashSet<(String, u32, String, String)> = HashSet::new();
+        let mut relations: Vec<ChunkRelation> = Vec::new();
+
+        for chunk in chunks {
+            let from_file = &chunk.metadata.source_file;
+            let from_line = chunk.start_line;
+
+            for (symbol, def_locs) in &definitions {
+                if !content_references_symbol(&chunk.content, symbol) {
+                    continue;
+                }
+
+                for (def_file, def_line) in def_locs {
+                    // Skip self-references (same file + same start_line).
+                    if from_file == def_file && from_line == *def_line {
+                        continue;
+                    }
+                    // Skip same-file references.
+                    if from_file == def_file {
+                        continue;
+                    }
+
+                    let key = (
+                        from_file.clone(),
+                        from_line,
+                        def_file.clone(),
+                        symbol.clone(),
+                    );
+                    if seen.contains(&key) {
+                        continue;
+                    }
+                    seen.insert(key);
+
+                    relations.push(ChunkRelation {
+                        from_source_file: from_file.clone(),
+                        from_start_line: from_line,
+                        relation: "uses".to_string(),
+                        to_file: def_file.clone(),
+                        to_name: Some(symbol.clone()),
+                    });
+                }
+            }
+        }
+
+        relations
+    }
+}
+
+/// Extract a definition name (struct/trait/enum) from the first line of chunk content.
+fn extract_definition_name(content: &str) -> Option<String> {
+    let first_line = content.lines().next()?;
+    let trimmed = first_line.trim();
+    let keywords = ["struct ", "trait ", "enum "];
+    for keyword in &keywords {
+        if let Some(pos) = trimmed.find(keyword) {
+            let after = &trimmed[pos + keyword.len()..];
+            let name: String = after
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+/// Word-boundary-aware substring search: returns true if `symbol` appears
+/// in `content` as a whole word (not part of a longer identifier).
+fn content_references_symbol(content: &str, symbol: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = content[start..].find(symbol) {
+        let abs_pos = start + pos;
+        let before_ok = abs_pos == 0
+            || !content.as_bytes()[abs_pos - 1].is_ascii_alphanumeric()
+                && content.as_bytes()[abs_pos - 1] != b'_';
+        let after_pos = abs_pos + symbol.len();
+        let after_ok = after_pos >= content.len()
+            || !content.as_bytes()[after_pos].is_ascii_alphanumeric()
+                && content.as_bytes()[after_pos] != b'_';
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs_pos + 1;
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -905,5 +1069,145 @@ mod tests {
         assert!(report.per_strategy.contains_key("markdown"));
         assert!(report.per_strategy.contains_key("config"));
         assert!(report.per_strategy.contains_key("fallback"));
+    }
+
+    // -- Cross-file relation discovery tests --------------------------------
+
+    /// Helper to build a `ProcessedChunk` for cross-file relation tests.
+    fn make_chunk(
+        source_file: &str,
+        chunk_type: &str,
+        start_line: u32,
+        content: &str,
+    ) -> ProcessedChunk {
+        ProcessedChunk {
+            content: content.to_string(),
+            original_content: content.to_string(),
+            chunk_type: chunk_type.to_string(),
+            start_line,
+            end_line: start_line + 10,
+            metadata: ChunkMetadata {
+                source_file: source_file.to_string(),
+                language: Some("rust".to_string()),
+                ..Default::default()
+            },
+            token_estimate: 100,
+            processing: ProcessingInfo {
+                strategy_name: "test".to_string(),
+                was_split: false,
+                was_merged: false,
+                overlap_tokens: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn test_discover_cross_file_uses() {
+        // traits.rs defines QueryableStore, lite_store.rs implements it.
+        let chunks = vec![
+            make_chunk(
+                "src/traits.rs",
+                "trait_item",
+                1,
+                "pub trait QueryableStore {\n    fn query(&self);\n}",
+            ),
+            make_chunk(
+                "src/lite_store.rs",
+                "impl_item",
+                10,
+                "impl QueryableStore for LiteStore {\n    fn query(&self) {}\n}",
+            ),
+        ];
+
+        let relations = ChunkingPipeline::discover_cross_file_relations(&chunks);
+
+        // Should produce a "uses" relation from lite_store.rs to traits.rs
+        assert!(
+            !relations.is_empty(),
+            "expected at least one cross-file relation"
+        );
+        let uses = relations
+            .iter()
+            .find(|r| r.relation == "uses" && r.to_name == Some("QueryableStore".to_string()));
+        assert!(uses.is_some(), "expected a 'uses' relation for QueryableStore");
+        let r = uses.unwrap();
+        assert_eq!(r.from_source_file, "src/lite_store.rs");
+        assert_eq!(r.to_file, "src/traits.rs");
+    }
+
+    #[test]
+    fn test_skip_same_file_references() {
+        // Both chunks in the same file — should produce NO relations.
+        let chunks = vec![
+            make_chunk(
+                "src/traits.rs",
+                "trait_item",
+                1,
+                "pub trait QueryableStore {\n    fn query(&self);\n}",
+            ),
+            make_chunk(
+                "src/traits.rs",
+                "impl_item",
+                20,
+                "impl QueryableStore for DefaultStore {}",
+            ),
+        ];
+
+        let relations = ChunkingPipeline::discover_cross_file_relations(&chunks);
+        assert!(
+            relations.is_empty(),
+            "expected no cross-file relations for same-file references, got {:?}",
+            relations
+        );
+    }
+
+    #[test]
+    fn test_skip_std_types() {
+        // Chunk defines "String" — should not produce edges even if other files use String.
+        let chunks = vec![
+            make_chunk(
+                "src/string_wrapper.rs",
+                "struct_item",
+                1,
+                "pub struct String {\n    inner: Vec<u8>,\n}",
+            ),
+            make_chunk(
+                "src/main.rs",
+                "function_item",
+                1,
+                "fn main() {\n    let s: String = String::new();\n}",
+            ),
+        ];
+
+        let relations = ChunkingPipeline::discover_cross_file_relations(&chunks);
+        assert!(
+            relations.is_empty(),
+            "expected no relations for std type 'String', got {:?}",
+            relations
+        );
+    }
+
+    #[test]
+    fn test_word_boundary_matching() {
+        // "QueryableStore" should match in "impl QueryableStore for Foo"
+        assert!(content_references_symbol(
+            "impl QueryableStore for Foo",
+            "QueryableStore"
+        ));
+
+        // "QueryableStore" should NOT match in "NotQueryableStoreButSimilar"
+        assert!(!content_references_symbol(
+            "NotQueryableStoreButSimilar",
+            "QueryableStore"
+        ));
+
+        // "LiteStore" should match in "use LiteStore;"
+        assert!(content_references_symbol("use LiteStore;", "LiteStore"));
+
+        // "LiteStore" should NOT match in "use LiteStoreExtra;"
+        assert!(!content_references_symbol(
+            "use LiteStoreExtra;",
+            "LiteStore"
+        ));
     }
 }
