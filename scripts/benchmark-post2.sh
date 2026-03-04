@@ -91,7 +91,7 @@ if [[ "$SKIP_SETUP" == false ]]; then
   rm -rf "$WORK_DIR"
   mkdir -p "$WORK_DIR"
   cd "$WORK_DIR"
-  "$CORVIA" init --store lite
+  "$CORVIA" init
 
   # Patch corvia.toml: switch from ollama to corvia-inference
   if command -v sed >/dev/null; then

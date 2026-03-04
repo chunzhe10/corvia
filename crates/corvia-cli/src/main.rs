@@ -35,10 +35,8 @@ use corvia_common::config::CorviaConfig;
 use corvia_kernel::docker::DockerProvisioner;
 use corvia_kernel::ollama_provisioner::OllamaProvisioner;
 use corvia_kernel::agent_coordinator::AgentCoordinator;
-use corvia_kernel::traits::{InferenceEngine, QueryableStore, GraphStore, TemporalStore};
-use corvia_kernel::adapter_discovery;
-use corvia_kernel::process_adapter::ProcessAdapter;
-use corvia_kernel::chunking_pipeline::register_adapter_chunking;
+use corvia_kernel::traits::{InferenceEngine, IngestionAdapter, QueryableStore, GraphStore, TemporalStore};
+use corvia_adapter_git::GitAdapter;
 use corvia_kernel::introspect::Introspect;
 use std::sync::Arc;
 
@@ -196,18 +194,6 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-
-    /// List discovered adapters
-    Adapters {
-        #[command(subcommand)]
-        action: AdaptersAction,
-    },
-}
-
-#[derive(Subcommand)]
-enum AdaptersAction {
-    /// List all discovered adapters
-    List,
 }
 
 #[derive(Subcommand)]
@@ -303,20 +289,6 @@ async fn main() -> Result<()> {
         Commands::Reason { scope, check, llm } => cmd_reason(scope.as_deref(), check.as_deref(), llm).await?,
         Commands::Migrate { to, dry_run } => upgrade::cmd_migrate(&to, dry_run).await?,
         Commands::Upgrade { dry_run } => upgrade::cmd_migrate("surrealdb", dry_run).await?,
-        Commands::Adapters { action } => {
-            match action {
-                AdaptersAction::List => {
-                    let config = load_config().unwrap_or_default();
-                    let extra_dirs = config
-                        .adapters
-                        .as_ref()
-                        .map(|a| a.search_dirs.clone())
-                        .unwrap_or_default();
-                    let adapters = adapter_discovery::discover_adapters(&extra_dirs);
-                    print!("{}", adapter_discovery::format_adapter_list(&adapters));
-                }
-            }
-        }
     }
 
     Ok(())
@@ -474,78 +446,24 @@ async fn cmd_serve(mcp: bool) -> Result<()> {
 
 async fn cmd_ingest(path: Option<&str>) -> Result<()> {
     if let Some(path) = path {
+        // D69 pipeline flow: source files → ChunkingPipeline → embed → store
         let config = load_config()?;
         let (store, graph) = connect_store_with_graph(&config).await?;
-
-        // Provision inference backend (ensures models are loaded before embedding).
-        if config.embedding.provider == corvia_common::config::InferenceProvider::Corvia {
-            let provisioner = corvia_kernel::inference_provisioner::InferenceProvisioner::new(
-                &config.embedding.url,
-            );
-            provisioner.ensure_ready(&config.embedding.model, &config.merge.model).await?;
-        }
-
+        ensure_inference_ready(&config).await?;
         let engine = connect_engine(&config);
 
-        // Step 1: Discover adapters
-        let extra_dirs = config
-            .adapters
-            .as_ref()
-            .map(|a| a.search_dirs.clone())
-            .unwrap_or_default();
-        let discovered = adapter_discovery::discover_adapters(&extra_dirs);
+        let adapter = GitAdapter::new();
+        println!("Ingesting {}...", path);
 
-        if discovered.is_empty() {
-            anyhow::bail!(
-                "No adapters found. Install corvia-adapter-basic to PATH or \
-                 ~/.config/corvia/adapters/. Adapter binaries must be named corvia-adapter-<name>."
-            );
-        }
-
-        // Step 2: Resolve which adapter to use
-        let explicit = config
-            .sources
-            .as_ref()
-            .and_then(|sources| {
-                sources.iter().find(|s| s.path == path).and_then(|s| s.adapter.as_deref())
-            });
-        let default_name = config.adapters.as_ref().and_then(|a| a.default.as_deref());
-        let adapter_info = adapter_discovery::resolve_adapter(path, &discovered, explicit, default_name)
-            .ok_or_else(|| anyhow::anyhow!("No suitable adapter found for '{}'", path))?;
-
-        println!("Ingesting {} (adapter: {})...", path, adapter_info.metadata.name);
-
-        // Step 3: Spawn adapter process
-        let mut process = ProcessAdapter::new(
-            adapter_info.binary_path.clone(),
-            adapter_info.metadata.clone(),
-        );
-        process.spawn().map_err(|e| anyhow::anyhow!(e))?;
-
-        // Step 4: Ingest source files via IPC
-        let source_files = process
-            .ingest(path, &config.project.scope_id)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        // Step 1: Collect source files via D69 adapter interface
+        let source_files = adapter.ingest_sources(path).await?;
         let total_files = source_files.len();
 
-        // Step 5: Build chunking pipeline with adapter strategies
+        // Step 2: Build chunking pipeline with adapter strategies
         let mut pipeline = corvia_kernel::create_chunking_pipeline(&config);
+        adapter.register_chunking(pipeline.registry_mut());
 
-        // Register adapter's chunking extensions via IPC
-        if !adapter_info.metadata.chunking_extensions.is_empty() {
-            let adapter_arc = std::sync::Arc::new(std::sync::Mutex::new(
-                ProcessAdapter::new(adapter_info.binary_path.clone(), adapter_info.metadata.clone()),
-            ));
-            // Spawn a second process for chunking (ingest process is done streaming)
-            adapter_arc.lock().unwrap().spawn().map_err(|e| anyhow::anyhow!(e))?;
-            register_adapter_chunking(
-                pipeline.registry_mut(),
-                adapter_arc,
-                &adapter_info.metadata.chunking_extensions,
-            );
-        }
-
-        // Step 6: Process through chunking pipeline
+        // Step 3: Process through chunking pipeline (merge, split, overlap)
         let (processed, pipeline_relations, report) = pipeline.process_batch(&source_files)?;
         println!(
             "Chunked {} files → {} chunks ({} merged, {} split)",
@@ -553,7 +471,7 @@ async fn cmd_ingest(path: Option<&str>) -> Result<()> {
             report.chunks_merged, report.chunks_split
         );
 
-        // Step 7: Convert, embed, and store
+        // Step 4: Convert ProcessedChunks to KnowledgeEntries, embed, and store
         let entries: Vec<corvia_common::types::KnowledgeEntry> = processed
             .iter()
             .map(|pc| {
@@ -590,7 +508,7 @@ async fn cmd_ingest(path: Option<&str>) -> Result<()> {
             println!("  {stored}/{total} chunks stored");
         }
 
-        // Step 8: Wire relations
+        // Step 5: Wire relations from pipeline (now native to ChunkingStrategy)
         if !pipeline_relations.is_empty() {
             let relations_stored = wire_pipeline_relations(
                 &pipeline_relations, &processed, &stored_ids, &*graph,
@@ -600,13 +518,10 @@ async fn cmd_ingest(path: Option<&str>) -> Result<()> {
             }
         }
 
-        // Step 9: Shutdown adapter
-        process.shutdown().map_err(|e| anyhow::anyhow!(e))?;
-
         println!("Done. {stored} chunks from {total_files} files ingested from {path}.");
         println!("Next: corvia search \"your query\"");
     } else {
-        // Workspace mode
+        // Workspace mode: ingest all workspace repos
         let root = std::env::current_dir()?;
         let config = load_config()?;
         if config.is_workspace() {
@@ -832,22 +747,10 @@ async fn cmd_test(check_only: bool, keep: bool, ci: bool) -> Result<()> {
     }
 
     let engine = connect_engine(&config);
+    let adapter = GitAdapter::new();
 
     println!("\n  Introspect: ingesting own source...");
-    let chunks = {
-        let extra_dirs: Vec<String> = Vec::new();
-        let discovered = adapter_discovery::discover_adapters(&extra_dirs);
-        if discovered.is_empty() {
-            anyhow::bail!("No adapters found. Install corvia-adapter-git or corvia-adapter-basic to PATH.");
-        }
-        let adapter_info = adapter_discovery::resolve_adapter(".", &discovered, None, None)
-            .ok_or_else(|| anyhow::anyhow!("No suitable adapter found for introspect"))?;
-        let mut process = ProcessAdapter::new(adapter_info.binary_path.clone(), adapter_info.metadata.clone());
-        process.spawn().map_err(|e| anyhow::anyhow!(e))?;
-        let source_files = process.ingest(".", introspect.scope_id()).map_err(|e| anyhow::anyhow!(e))?;
-        process.shutdown().map_err(|e| anyhow::anyhow!(e))?;
-        introspect.ingest_source_files(&source_files, engine.as_ref(), store.as_ref()).await?
-    };
+    let chunks = introspect.ingest_self(".", &adapter, engine.as_ref(), store.as_ref()).await?;
     println!("    {chunks} chunks embedded and stored");
 
     // Phase 3: Self-query
@@ -954,22 +857,10 @@ async fn cmd_demo(keep: bool) -> Result<()> {
     store.init_schema().await?;
 
     let engine = connect_engine(&config);
+    let adapter = GitAdapter::new();
 
     println!("\n  Ingesting Corvia's own source code...");
-    let chunks = {
-        let extra_dirs: Vec<String> = Vec::new();
-        let discovered = adapter_discovery::discover_adapters(&extra_dirs);
-        if discovered.is_empty() {
-            anyhow::bail!("No adapters found. Install corvia-adapter-git or corvia-adapter-basic to PATH.");
-        }
-        let adapter_info = adapter_discovery::resolve_adapter(".", &discovered, None, None)
-            .ok_or_else(|| anyhow::anyhow!("No suitable adapter found for demo"))?;
-        let mut process = ProcessAdapter::new(adapter_info.binary_path.clone(), adapter_info.metadata.clone());
-        process.spawn().map_err(|e| anyhow::anyhow!(e))?;
-        let source_files = process.ingest(".", introspect.scope_id()).map_err(|e| anyhow::anyhow!(e))?;
-        process.shutdown().map_err(|e| anyhow::anyhow!(e))?;
-        introspect.ingest_source_files(&source_files, engine.as_ref(), store.as_ref()).await?
-    };
+    let chunks = introspect.ingest_self(".", &adapter, engine.as_ref(), store.as_ref()).await?;
     println!("  {chunks} chunks stored.\n");
 
     println!("  Corvia is ready. Search its own codebase.");
@@ -1411,6 +1302,27 @@ fn connect_engine(config: &CorviaConfig) -> Arc<dyn InferenceEngine> {
     corvia_kernel::create_engine(config)
 }
 
+/// Ensure the inference backend is ready (model loaded).
+/// For Ollama: checks server + model availability.
+/// For Corvia: ensures gRPC server is running + model loaded.
+/// For vLLM: no-op (Docker-managed).
+async fn ensure_inference_ready(config: &CorviaConfig) -> Result<()> {
+    match config.embedding.provider {
+        corvia_common::config::InferenceProvider::Corvia => {
+            let provisioner = corvia_kernel::inference_provisioner::InferenceProvisioner::new(
+                &config.embedding.url,
+            );
+            provisioner.ensure_ready(&config.embedding.model, &config.merge.model).await?;
+        }
+        corvia_common::config::InferenceProvider::Ollama => {
+            let provisioner = OllamaProvisioner::new(&config.embedding.url);
+            provisioner.ensure_ready(&config.embedding.model).await?;
+        }
+        corvia_common::config::InferenceProvider::Vllm => {}
+    }
+    Ok(())
+}
+
 async fn connect_store(config: &CorviaConfig) -> Result<Box<dyn QueryableStore>> {
     Ok(corvia_kernel::create_store(config).await?)
 }
@@ -1429,31 +1341,14 @@ async fn connect_full_store(
 
 /// Resolve pipeline relations and store them as graph edges.
 ///
-/// Uses multi-strategy target resolution:
-/// 1. Direct match: `source_file == to_file` (handles "implements"/"contains")
-/// 2. CRATE_REF resolution: `crate::foo` → `<root>/foo.rs` or `<root>/foo/mod.rs`
-/// 3. JS/TS relative imports: `./utils` → resolve relative to source file
-/// 4. Suffix fallback: match `to_file` as a suffix of known `source_file` paths
+/// Uses `(source_file, start_line)` to match relations to stored chunks.
+/// Best-effort: unresolvable cross-file references are silently skipped.
 pub(crate) async fn wire_pipeline_relations(
     relations: &[corvia_kernel::chunking_strategy::ChunkRelation],
     processed: &[corvia_kernel::chunking_strategy::ProcessedChunk],
     stored_ids: &[uuid::Uuid],
     graph: &dyn GraphStore,
 ) -> usize {
-    use std::collections::HashMap;
-
-    // Build file index: source_file → Vec<(idx, &chunk)>
-    let mut file_index: HashMap<&str, Vec<(usize, &corvia_kernel::chunking_strategy::ProcessedChunk)>> =
-        HashMap::new();
-    for (idx, pc) in processed.iter().enumerate() {
-        file_index
-            .entry(pc.metadata.source_file.as_str())
-            .or_default()
-            .push((idx, pc));
-    }
-
-    let all_files: Vec<&str> = file_index.keys().copied().collect();
-
     let mut relations_stored = 0;
     for rel in relations {
         // Find the source chunk by (source_file, start_line) match
@@ -1465,17 +1360,21 @@ pub(crate) async fn wire_pipeline_relations(
             _ => continue,
         };
 
-        // Resolve target files using multi-strategy approach
-        let target_files = resolve_target_files(&rel.to_file, &rel.from_source_file, &all_files);
-
-        // Find the best target chunk across all candidate files
-        let to_uuid = find_target_chunk(&target_files, &rel.to_name, &file_index, stored_ids);
+        // Find the target chunk by file name (and optionally symbol name)
+        let to_uuid = processed.iter().zip(stored_ids.iter()).find_map(|(pc, id)| {
+            if pc.metadata.source_file == rel.to_file {
+                if let Some(ref name) = rel.to_name {
+                    if pc.content.contains(name) {
+                        return Some(*id);
+                    }
+                } else {
+                    return Some(*id);
+                }
+            }
+            None
+        });
 
         if let Some(to_uuid) = to_uuid {
-            // Filter self-edges for "imports" relations
-            if rel.relation == "imports" && to_uuid == from_uuid {
-                continue;
-            }
             if let Err(e) = graph.relate(&from_uuid, &rel.relation, &to_uuid, None).await {
                 tracing::warn!("Failed to store relation: {e}");
             } else {
@@ -1484,202 +1383,6 @@ pub(crate) async fn wire_pipeline_relations(
         }
     }
     relations_stored
-}
-
-/// Resolve a `to_file` reference to candidate file paths using multiple strategies.
-fn resolve_target_files<'a>(
-    to_file: &str,
-    from_source_file: &str,
-    all_files: &[&'a str],
-) -> Vec<String> {
-    let mut candidates = Vec::new();
-
-    // Strategy 1: Direct match
-    if all_files.iter().any(|f| *f == to_file) {
-        candidates.push(to_file.to_string());
-        return candidates;
-    }
-
-    // Strategy 2: CRATE_REF resolution (Rust crate:: and super:: imports)
-    if let Some(rest) = to_file.strip_prefix("CRATE_REF:") {
-        let resolved = resolve_rust_crate_ref(rest, all_files);
-        if !resolved.is_empty() {
-            return resolved;
-        }
-    }
-
-    // Strategy 3: JS/TS relative imports (./utils, ../types, etc.)
-    if to_file.starts_with("./") || to_file.starts_with("../") {
-        let resolved = resolve_js_relative_import(to_file, from_source_file, all_files);
-        if !resolved.is_empty() {
-            return resolved;
-        }
-    }
-
-    // Strategy 4: Suffix fallback — match to_file as a suffix of known paths
-    let to_file_normalized = to_file.replace("::", "/");
-    for file in all_files {
-        if file.ends_with(&to_file_normalized)
-            || file.ends_with(&format!("/{to_file_normalized}"))
-        {
-            candidates.push(file.to_string());
-        }
-    }
-
-    candidates
-}
-
-/// Resolve `CRATE_REF:<src_root>:<module_path>` to candidate file paths.
-///
-/// For `CRATE_REF:crates/corvia-kernel/src:foo::bar`, tries:
-/// - `crates/corvia-kernel/src/foo/bar.rs`
-/// - `crates/corvia-kernel/src/foo/bar/mod.rs`
-/// - `crates/corvia-kernel/src/foo.rs` (partial match for deeper modules)
-fn resolve_rust_crate_ref(rest: &str, all_files: &[&str]) -> Vec<String> {
-    let (root, module_path) = match rest.split_once(':') {
-        Some((r, m)) => (r, m),
-        None => return vec![],
-    };
-
-    if module_path.is_empty() {
-        // Bare CRATE_REF (e.g., from `super::*`) — match any file under root
-        return all_files
-            .iter()
-            .filter(|f| f.starts_with(root))
-            .map(|f| f.to_string())
-            .collect();
-    }
-
-    let module_as_path = module_path.replace("::", "/");
-    let mut candidates = Vec::new();
-
-    // Try exact: <root>/<module_as_path>.rs
-    let exact = if root.is_empty() {
-        format!("{module_as_path}.rs")
-    } else {
-        format!("{root}/{module_as_path}.rs")
-    };
-    if all_files.iter().any(|f| *f == exact) {
-        candidates.push(exact.clone());
-    }
-
-    // Try mod.rs: <root>/<module_as_path>/mod.rs
-    let mod_rs = if root.is_empty() {
-        format!("{module_as_path}/mod.rs")
-    } else {
-        format!("{root}/{module_as_path}/mod.rs")
-    };
-    if all_files.iter().any(|f| *f == mod_rs) {
-        candidates.push(mod_rs);
-    }
-
-    // If module_path has multiple segments, try partial (first segment only)
-    if candidates.is_empty() {
-        if let Some(first_segment) = module_path.split("::").next() {
-            let partial = if root.is_empty() {
-                format!("{first_segment}.rs")
-            } else {
-                format!("{root}/{first_segment}.rs")
-            };
-            if all_files.iter().any(|f| *f == partial) {
-                candidates.push(partial);
-            }
-            let partial_mod = if root.is_empty() {
-                format!("{first_segment}/mod.rs")
-            } else {
-                format!("{root}/{first_segment}/mod.rs")
-            };
-            if all_files.iter().any(|f| *f == partial_mod) {
-                candidates.push(partial_mod);
-            }
-        }
-    }
-
-    candidates
-}
-
-/// Resolve a JS/TS relative import (e.g., `./utils`) relative to the source file.
-///
-/// Tries extensions: `.ts`, `.js`, `.tsx`, `.jsx`, and `/index.{ts,js}`.
-fn resolve_js_relative_import(import_path: &str, from_source_file: &str, all_files: &[&str]) -> Vec<String> {
-    let parent = from_source_file
-        .rsplit_once('/')
-        .map(|(dir, _)| dir)
-        .unwrap_or("");
-
-    // Resolve the relative path
-    let resolved_base = if let Some(rel) = import_path.strip_prefix("./") {
-        if parent.is_empty() {
-            rel.to_string()
-        } else {
-            format!("{parent}/{rel}")
-        }
-    } else if let Some(rel) = import_path.strip_prefix("../") {
-        let grandparent = parent.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-        if grandparent.is_empty() {
-            rel.to_string()
-        } else {
-            format!("{grandparent}/{rel}")
-        }
-    } else {
-        return vec![];
-    };
-
-    let mut candidates = Vec::new();
-    let extensions = [".ts", ".js", ".tsx", ".jsx"];
-    let index_variants = ["/index.ts", "/index.js"];
-
-    // Try with each extension
-    for ext in &extensions {
-        let candidate = format!("{resolved_base}{ext}");
-        if all_files.iter().any(|f| *f == candidate) {
-            candidates.push(candidate);
-        }
-    }
-
-    // Try index files
-    for idx in &index_variants {
-        let candidate = format!("{resolved_base}{idx}");
-        if all_files.iter().any(|f| *f == candidate) {
-            candidates.push(candidate);
-        }
-    }
-
-    // Also try exact match (already has extension)
-    if all_files.iter().any(|f| *f == resolved_base) {
-        candidates.push(resolved_base);
-    }
-
-    candidates
-}
-
-/// Find the best target chunk across candidate files, optionally matching by symbol name.
-fn find_target_chunk(
-    target_files: &[String],
-    to_name: &Option<String>,
-    file_index: &std::collections::HashMap<&str, Vec<(usize, &corvia_kernel::chunking_strategy::ProcessedChunk)>>,
-    stored_ids: &[uuid::Uuid],
-) -> Option<uuid::Uuid> {
-    for target_file in target_files {
-        if let Some(chunks) = file_index.get(target_file.as_str()) {
-            if let Some(name) = to_name {
-                // Find a chunk that contains the symbol name
-                for (idx, pc) in chunks {
-                    if *idx < stored_ids.len() && pc.content.contains(name.as_str()) {
-                        return Some(stored_ids[*idx]);
-                    }
-                }
-            } else {
-                // No symbol name filter — return first chunk in the target file
-                if let Some((idx, _)) = chunks.first() {
-                    if *idx < stored_ids.len() {
-                        return Some(stored_ids[*idx]);
-                    }
-                }
-            }
-        }
-    }
-    None
 }
 
 fn print_search_results(results: &[corvia_common::types::SearchResult], show_namespace: bool) {

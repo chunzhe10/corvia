@@ -25,9 +25,6 @@ use crate::chunking_strategy::{
 };
 use crate::token_estimator::TokenEstimator;
 
-use crate::process_adapter::ProcessAdapter;
-use std::sync::Mutex;
-
 // ---------------------------------------------------------------------------
 // FormatRegistry
 // ---------------------------------------------------------------------------
@@ -193,36 +190,12 @@ impl ChunkingPipeline {
         let relations = chunk_result.relations;
 
         // Step 3: Merge small chunks.
-        let (chunks_after_merge, merge_flags) =
+        let (chunks_after_merge, merge_flags_pre_split) =
             self.merge_step(&strategy, &mut chunks);
 
         // Step 4: Enforce token budget — split oversized chunks.
-        let (chunks_after_split, split_flags) =
-            self.split_step(&strategy, chunks_after_merge)?;
-
-        // Expand merge_flags to match post-split length: when a chunk is split
-        // into N pieces, replicate its merge flag N times.
-        let merge_count = {
-            let mut expanded = Vec::with_capacity(chunks_after_split.len());
-            let mut src = 0;
-            let mut dst = 0;
-            while dst < split_flags.len() {
-                let flag = merge_flags.get(src).copied().unwrap_or(false);
-                if split_flags[dst] {
-                    // This chunk was split — count consecutive split=true entries
-                    // that came from the same source chunk.
-                    while dst < split_flags.len() && split_flags[dst] {
-                        expanded.push(flag);
-                        dst += 1;
-                    }
-                } else {
-                    expanded.push(flag);
-                    dst += 1;
-                }
-                src += 1;
-            }
-            expanded
-        };
+        let (chunks_after_split, split_flags, merge_count) =
+            self.split_step(&strategy, chunks_after_merge, merge_flags_pre_split)?;
 
         // Step 5: Add overlap context.
         let (final_contents, overlap_tokens_vec) =
@@ -392,11 +365,14 @@ impl ChunkingPipeline {
         &self,
         strategy: &Arc<dyn ChunkingStrategy>,
         chunks: Vec<RawChunk>,
-    ) -> Result<(Vec<RawChunk>, Vec<bool>)> {
+        merge_flags: Vec<bool>,
+    ) -> Result<(Vec<RawChunk>, Vec<bool>, Vec<bool>)> {
         let mut result = Vec::new();
         let mut split_flags = Vec::new();
+        let mut expanded_merge_flags = Vec::new();
 
-        for chunk in chunks {
+        for (idx, chunk) in chunks.into_iter().enumerate() {
+            let was_merged = merge_flags[idx];
             let tokens = self.estimator.estimate(&chunk.content);
             if tokens > self.config.max_tokens {
                 let split_chunks =
@@ -405,13 +381,16 @@ impl ChunkingPipeline {
                 result.extend(split_chunks);
                 // All chunks produced from a split are marked as split.
                 split_flags.extend(std::iter::repeat(count > 1).take(count));
+                // Propagate the merge flag to all split pieces.
+                expanded_merge_flags.extend(std::iter::repeat(was_merged).take(count));
             } else {
                 result.push(chunk);
                 split_flags.push(false);
+                expanded_merge_flags.push(was_merged);
             }
         }
 
-        Ok((result, split_flags))
+        Ok((result, split_flags, expanded_merge_flags))
     }
 
     /// Recursively split a chunk until all pieces fit within the budget
@@ -479,10 +458,8 @@ impl ChunkingPipeline {
                 let prev_content = &prev.content;
                 let overlap_text = if prev_content.len() > char_budget {
                     let start = prev_content.len() - char_budget;
-                    // Find the nearest char boundary at or after `start`.
-                    let start = (start..prev_content.len())
-                        .find(|&i| prev_content.is_char_boundary(i))
-                        .unwrap_or(prev_content.len());
+                    // Find the nearest char boundary at or after the byte offset.
+                    let start = prev_content.ceil_char_boundary(start);
                     &prev_content[start..]
                 } else {
                     prev_content.as_str()
@@ -495,76 +472,6 @@ impl ChunkingPipeline {
         }
 
         (contents, overlap_tokens_vec)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ProcessChunkingStrategy — delegates to adapter process via IPC (D77)
-// ---------------------------------------------------------------------------
-
-/// Routes chunking calls to an external adapter process via JSONL IPC.
-///
-/// Registered in the [`FormatRegistry`] override tier for extensions the
-/// adapter claims in its `chunking_extensions` metadata field.
-pub struct ProcessChunkingStrategy {
-    adapter: Arc<Mutex<ProcessAdapter>>,
-    extension_list: Vec<String>,
-}
-
-impl ProcessChunkingStrategy {
-    /// Create a new strategy backed by the given adapter process.
-    pub fn new(adapter: Arc<Mutex<ProcessAdapter>>, extensions: Vec<String>) -> Self {
-        Self {
-            adapter,
-            extension_list: extensions,
-        }
-    }
-}
-
-impl crate::chunking_strategy::ChunkingStrategy for ProcessChunkingStrategy {
-    fn name(&self) -> &str {
-        "process-adapter"
-    }
-
-    fn supported_extensions(&self) -> &[&str] {
-        &[]
-    }
-
-    fn chunk(
-        &self,
-        source: &str,
-        meta: &crate::chunking_strategy::SourceMetadata,
-    ) -> corvia_common::errors::Result<crate::chunking_strategy::ChunkResult> {
-        let mut adapter = self.adapter.lock().map_err(|e| {
-            corvia_common::errors::CorviaError::Infra(format!("Adapter lock poisoned: {e}"))
-        })?;
-
-        let (chunks, relations) = adapter.chunk(source, meta).map_err(|e| {
-            corvia_common::errors::CorviaError::Infra(format!("Adapter chunk failed: {e}"))
-        })?;
-
-        Ok(crate::chunking_strategy::ChunkResult { chunks, relations })
-    }
-}
-
-/// Register an adapter's chunking extensions in the format registry.
-///
-/// For each extension in `chunking_extensions`, registers a
-/// [`ProcessChunkingStrategy`] as an override in the registry.
-pub fn register_adapter_chunking(
-    registry: &mut FormatRegistry,
-    adapter: Arc<Mutex<ProcessAdapter>>,
-    chunking_extensions: &[String],
-) {
-    if chunking_extensions.is_empty() {
-        return;
-    }
-    let strategy = Arc::new(ProcessChunkingStrategy::new(
-        adapter,
-        chunking_extensions.to_vec(),
-    ));
-    for ext in chunking_extensions {
-        registry.register_override(ext, strategy.clone());
     }
 }
 
