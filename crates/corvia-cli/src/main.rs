@@ -452,7 +452,8 @@ async fn cmd_ingest(path: Option<&str>) -> Result<()> {
         ensure_inference_ready(&config).await?;
         let engine = connect_engine(&config);
 
-        let adapter = GitAdapter::new();
+        let mut adapter = GitAdapter::new();
+        adapter.prepare(path);
         println!("Ingesting {}...", path);
 
         // Step 1: Collect source files via D69 adapter interface
@@ -747,7 +748,8 @@ async fn cmd_test(check_only: bool, keep: bool, ci: bool) -> Result<()> {
     }
 
     let engine = connect_engine(&config);
-    let adapter = GitAdapter::new();
+    let mut adapter = GitAdapter::new();
+    adapter.prepare(".");
 
     println!("\n  Introspect: ingesting own source...");
     let chunks = introspect.ingest_self(".", &adapter, engine.as_ref(), store.as_ref()).await?;
@@ -857,7 +859,8 @@ async fn cmd_demo(keep: bool) -> Result<()> {
     store.init_schema().await?;
 
     let engine = connect_engine(&config);
-    let adapter = GitAdapter::new();
+    let mut adapter = GitAdapter::new();
+    adapter.prepare(".");
 
     println!("\n  Ingesting Corvia's own source code...");
     let chunks = introspect.ingest_self(".", &adapter, engine.as_ref(), store.as_ref()).await?;
