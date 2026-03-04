@@ -13,9 +13,12 @@
 //! - [`merge_small`](ChunkingStrategy::merge_small) — merges adjacent heading
 //!   sections at the same heading depth when both are small.
 
-use corvia_common::errors::Result;
+use std::collections::HashSet;
 
-use crate::chunking_strategy::{ChunkMetadata, ChunkResult, ChunkingStrategy, RawChunk, SourceMetadata};
+use corvia_common::errors::Result;
+use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+
+use crate::chunking_strategy::{ChunkMetadata, ChunkRelation, ChunkResult, ChunkingStrategy, RawChunk, SourceMetadata};
 
 /// Heading-based Markdown section chunker.
 pub struct MarkdownChunker;
@@ -43,6 +46,173 @@ impl MarkdownChunker {
         } else {
             None
         }
+    }
+
+    /// Check whether a code-span symbol is a meaningful CamelCase identifier
+    /// worth creating a cross-reference relation for.
+    fn is_meaningful_symbol(text: &str) -> bool {
+        if text.len() < 3 {
+            return false;
+        }
+        // Must start with an uppercase letter.
+        let first = text.chars().next().unwrap();
+        if !first.is_ascii_uppercase() {
+            return false;
+        }
+        // Must consist only of valid identifier chars (alphanumeric + underscore).
+        if !text.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return false;
+        }
+        // Skip common / standard-library types and traits.
+        const SKIP: &[&str] = &[
+            "String", "Vec", "HashMap", "HashSet", "BTreeMap", "BTreeSet",
+            "Option", "Result", "Box", "Arc", "Mutex", "RwLock", "Rc", "Cell",
+            "RefCell", "Pin", "Future", "Stream", "Iterator", "Display", "Debug",
+            "Clone", "Copy", "Send", "Sync", "Default", "From", "Into",
+            "TryFrom", "TryInto", "AsRef", "AsMut", "Deref", "DerefMut", "Drop",
+            "Fn", "FnMut", "FnOnce", "Error", "Ord", "PartialOrd", "Eq",
+            "PartialEq", "Hash", "Sized", "Unpin", "Serialize", "Deserialize",
+            "None", "Some", "Ok", "Err", "Self", "TRUE", "FALSE",
+        ];
+        !SKIP.contains(&text)
+    }
+
+    /// Return `true` if the string looks like a relative file-path reference
+    /// (not an HTTP URL) with a recognised source-code extension.
+    fn is_file_path_reference(s: &str) -> bool {
+        if s.starts_with("http://") || s.starts_with("https://") {
+            return false;
+        }
+        const EXTENSIONS: &[&str] = &[
+            ".rs", ".ts", ".tsx", ".js", ".jsx", ".py",
+            ".toml", ".yaml", ".yml", ".json", ".md",
+        ];
+        EXTENSIONS.iter().any(|ext| s.ends_with(ext))
+    }
+
+    /// Find the chunk whose line range contains the given 1-indexed line number.
+    fn find_chunk_for_line<'a>(chunks: &'a [RawChunk], line: u32) -> Option<&'a RawChunk> {
+        chunks
+            .iter()
+            .find(|c| line >= c.start_line && line <= c.end_line)
+            .or_else(|| chunks.last())
+    }
+
+    /// Parse `source` with pulldown-cmark and extract cross-reference relations
+    /// (code-span symbols and file-path links) mapped back to their owning chunks.
+    fn extract_references(
+        source: &str,
+        chunks: &[RawChunk],
+        meta: &SourceMetadata,
+    ) -> Vec<ChunkRelation> {
+        if chunks.is_empty() {
+            return vec![];
+        }
+
+        // Pre-compute a line-start byte-offset table so we can convert byte
+        // offsets from pulldown-cmark into 1-indexed line numbers.
+        let line_starts: Vec<usize> = std::iter::once(0)
+            .chain(source.match_indices('\n').map(|(i, _)| i + 1))
+            .collect();
+
+        let byte_offset_to_line = |offset: usize| -> u32 {
+            match line_starts.binary_search(&offset) {
+                Ok(idx) => (idx + 1) as u32,
+                Err(idx) => idx as u32,  // idx is insertion point; line = idx (1-indexed)
+            }
+        };
+
+        let mut relations: Vec<ChunkRelation> = Vec::new();
+        let mut seen: HashSet<(u32, String, String)> = HashSet::new();
+        let mut in_code_block = false;
+
+        let parser = Parser::new(source);
+        for (event, range) in parser.into_offset_iter() {
+            match event {
+                Event::Start(Tag::CodeBlock(_)) => {
+                    in_code_block = true;
+                }
+                Event::End(TagEnd::CodeBlock) => {
+                    in_code_block = false;
+                }
+                Event::Code(code) => {
+                    let symbol = code.as_ref();
+                    if Self::is_meaningful_symbol(symbol) {
+                        let line = byte_offset_to_line(range.start);
+                        if let Some(chunk) = Self::find_chunk_for_line(chunks, line) {
+                            let key = (
+                                chunk.start_line,
+                                String::new(),
+                                symbol.to_string(),
+                            );
+                            if seen.insert(key) {
+                                relations.push(ChunkRelation {
+                                    from_source_file: meta.file_path.clone(),
+                                    from_start_line: chunk.start_line,
+                                    relation: "references".into(),
+                                    to_file: String::new(),
+                                    to_name: Some(symbol.to_string()),
+                                });
+                            }
+                        }
+                    }
+                }
+                Event::Start(Tag::Link { dest_url, .. }) => {
+                    let url = dest_url.as_ref();
+                    if Self::is_file_path_reference(url) {
+                        let clean_path = url.split('#').next().unwrap_or(url).to_string();
+                        let line = byte_offset_to_line(range.start);
+                        if let Some(chunk) = Self::find_chunk_for_line(chunks, line) {
+                            let key = (
+                                chunk.start_line,
+                                clean_path.clone(),
+                                String::new(),
+                            );
+                            if seen.insert(key) {
+                                relations.push(ChunkRelation {
+                                    from_source_file: meta.file_path.clone(),
+                                    from_start_line: chunk.start_line,
+                                    relation: "references".into(),
+                                    to_file: clean_path,
+                                    to_name: None,
+                                });
+                            }
+                        }
+                    }
+                }
+                Event::Text(text) if in_code_block => {
+                    // Scan code block text for file-path patterns.
+                    let line = byte_offset_to_line(range.start);
+                    for word in text.split_whitespace() {
+                        // Strip surrounding quotes/punctuation.
+                        let cleaned = word.trim_matches(|c: char| {
+                            c == '"' || c == '\'' || c == ',' || c == ';' || c == '('  || c == ')'
+                        });
+                        if Self::is_file_path_reference(cleaned) {
+                            if let Some(chunk) = Self::find_chunk_for_line(chunks, line) {
+                                let key = (
+                                    chunk.start_line,
+                                    cleaned.to_string(),
+                                    String::new(),
+                                );
+                                if seen.insert(key) {
+                                    relations.push(ChunkRelation {
+                                        from_source_file: meta.file_path.clone(),
+                                        from_start_line: chunk.start_line,
+                                        relation: "references".into(),
+                                        to_file: cleaned.to_string(),
+                                        to_name: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        relations
     }
 }
 
@@ -132,7 +302,8 @@ impl ChunkingStrategy for MarkdownChunker {
             });
         }
 
-        Ok(ChunkResult { chunks, relations: vec![] })
+        let relations = Self::extract_references(source, &chunks, meta);
+        Ok(ChunkResult { chunks, relations })
     }
 
     fn overlap_context(&self, prev: &RawChunk, _next: &RawChunk) -> Option<String> {
@@ -446,5 +617,105 @@ mod tests {
             None => {} // fine
             Some(ref v) => assert_eq!(v.len(), 2, "should not merge across heading depths"),
         }
+    }
+
+    // -- Cross-reference extraction tests -----------------------------------
+
+    #[test]
+    fn test_extract_code_span_references() {
+        let chunker = MarkdownChunker::new();
+        let source = "# Architecture\n\nThe `QueryableStore` trait provides search.";
+        let meta = test_meta();
+        let result = chunker.chunk(source, &meta).unwrap();
+
+        let refs: Vec<_> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "references" && r.to_name.is_some())
+            .collect();
+
+        assert!(
+            !refs.is_empty(),
+            "expected at least one code-span reference, got none"
+        );
+        assert_eq!(refs[0].to_name.as_deref(), Some("QueryableStore"));
+        assert_eq!(refs[0].to_file, "");
+        assert_eq!(refs[0].from_source_file, "docs/guide.md");
+    }
+
+    #[test]
+    fn test_extract_link_references() {
+        let chunker = MarkdownChunker::new();
+        let source = "# Traits\n\nSee [trait file](src/traits.rs) for details.";
+        let meta = test_meta();
+        let result = chunker.chunk(source, &meta).unwrap();
+
+        let refs: Vec<_> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "references" && !r.to_file.is_empty())
+            .collect();
+
+        assert!(
+            !refs.is_empty(),
+            "expected at least one file-path reference, got none"
+        );
+        assert_eq!(refs[0].to_file, "src/traits.rs");
+        assert!(refs[0].to_name.is_none());
+    }
+
+    #[test]
+    fn test_skip_common_types() {
+        let chunker = MarkdownChunker::new();
+        let source =
+            "# Types\n\nUses `String` and `Vec` internally, wraps `QueryableStore`.";
+        let meta = test_meta();
+        let result = chunker.chunk(source, &meta).unwrap();
+
+        let names: Vec<_> = result
+            .relations
+            .iter()
+            .filter_map(|r| r.to_name.as_deref())
+            .collect();
+
+        assert!(
+            !names.contains(&"String"),
+            "String should be skipped, but was found in relations"
+        );
+        assert!(
+            !names.contains(&"Vec"),
+            "Vec should be skipped, but was found in relations"
+        );
+        assert!(
+            names.contains(&"QueryableStore"),
+            "QueryableStore should be kept, but was not found in relations"
+        );
+    }
+
+    #[test]
+    fn test_skip_http_urls() {
+        let chunker = MarkdownChunker::new();
+        let source =
+            "# Links\n\nSee [docs](https://example.com/foo.rs) and [local](src/main.rs).";
+        let meta = test_meta();
+        let result = chunker.chunk(source, &meta).unwrap();
+
+        let files: Vec<_> = result
+            .relations
+            .iter()
+            .filter(|r| !r.to_file.is_empty())
+            .map(|r| r.to_file.as_str())
+            .collect();
+
+        assert!(
+            !files.contains(&"https://example.com/foo.rs"),
+            "HTTP URL should be skipped, but was found: {:?}",
+            files
+        );
+        assert!(
+            files.contains(&"src/main.rs"),
+            "local file reference should be kept: {:?}",
+            files
+        );
     }
 }
