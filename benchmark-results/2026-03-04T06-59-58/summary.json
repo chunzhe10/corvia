@@ -1,0 +1,183 @@
+{
+  "run_at": "2026-03-04T07:14:33Z",
+  "queries": [
+    {
+      "id": 1,
+      "query": "How do I configure the embedding model and what dimensions does it use?",
+      "expected_winner": "vector",
+      "vector": {
+        "sources_count": 10,
+        "top_score": 0.708252,
+        "top_source_file": "crates/corvia-kernel/src/grpc_engine.rs",
+        "source_files": [
+          "crates/corvia-kernel/src/grpc_engine.rs",
+          "crates/corvia-kernel/src/lib.rs",
+          "crates/corvia-kernel/src/grpc_engine.rs",
+          "crates/corvia-kernel/src/embedding_pipeline.rs",
+          "crates/corvia-kernel/src/ollama_engine.rs",
+          "crates/corvia-kernel/src/ollama_engine.rs",
+          "crates/corvia-inference/src/embedding_service.rs",
+          "docs/plans/2026-03-02-grpc-inference-server-impl.md",
+          "crates/corvia-kernel/src/embedding_pipeline.rs",
+          "crates/corvia-common/src/config.rs"
+        ],
+        "latency_ms": 41,
+        "vector_results": 20,
+        "graph_expanded": 0
+      },
+      "graph": {
+        "sources_count": 10,
+        "top_score": 0.708252,
+        "top_source_file": "crates/corvia-kernel/src/grpc_engine.rs",
+        "source_files": [
+          "crates/corvia-kernel/src/grpc_engine.rs",
+          "crates/corvia-kernel/src/lib.rs",
+          "crates/corvia-kernel/src/grpc_engine.rs",
+          "crates/corvia-kernel/src/embedding_pipeline.rs",
+          "crates/corvia-kernel/src/ollama_engine.rs",
+          "crates/corvia-kernel/src/ollama_engine.rs",
+          "crates/corvia-inference/src/embedding_service.rs",
+          "docs/plans/2026-03-02-grpc-inference-server-impl.md",
+          "crates/corvia-kernel/src/embedding_pipeline.rs",
+          "crates/corvia-common/src/config.rs"
+        ],
+        "latency_ms": 38,
+        "vector_results": 20,
+        "graph_expanded": 0
+      }
+    },
+    {
+      "id": 2,
+      "query": "I'm adding a new storage backend. Walk me through what traits I need to implement and how the existing backends do it.",
+      "expected_winner": "graph",
+      "vector": {
+        "sources_count": 10,
+        "top_score": 0.70311284,
+        "top_source_file": "docs/plans/2026-03-02-m3.2-rag-pipeline-design.md",
+        "source_files": [
+          "docs/plans/2026-03-02-m3.2-rag-pipeline-design.md",
+          "docs/plans/2026-03-02-m3.3-embedding-chunking-design.md",
+          "AGENTS.md",
+          "ARCHITECTURE.md",
+          "docs/plans/2026-02-28-m1-implementation.md",
+          "ARCHITECTURE.md",
+          "docs/plans/2026-02-28-m1-implementation.md",
+          "docs/plans/2026-03-02-m3-implementation.md",
+          "ARCHITECTURE.md",
+          "crates/corvia-kernel/README.md"
+        ],
+        "latency_ms": 42,
+        "vector_results": 20,
+        "graph_expanded": 0
+      },
+      "graph": {
+        "sources_count": 10,
+        "top_score": 0.70311284,
+        "top_source_file": "docs/plans/2026-03-02-m3.2-rag-pipeline-design.md",
+        "source_files": [
+          "docs/plans/2026-03-02-m3.2-rag-pipeline-design.md",
+          "docs/plans/2026-03-02-m3.3-embedding-chunking-design.md",
+          "AGENTS.md",
+          "ARCHITECTURE.md",
+          "docs/plans/2026-02-28-m1-implementation.md",
+          "ARCHITECTURE.md",
+          "docs/plans/2026-02-28-m1-implementation.md",
+          "docs/plans/2026-03-02-m3-implementation.md",
+          "ARCHITECTURE.md",
+          "crates/corvia-kernel/README.md"
+        ],
+        "latency_ms": 40,
+        "vector_results": 20,
+        "graph_expanded": 0
+      }
+    },
+    {
+      "id": 3,
+      "query": "A search request is returning unexpected results. Trace the full path from the REST API endpoint through the RAG pipeline to the storage layer.",
+      "expected_winner": "graph",
+      "vector": {
+        "sources_count": 10,
+        "top_score": 0.7799272,
+        "top_source_file": "docs/plans/2026-03-02-m3.2-rag-pipeline-impl.md",
+        "source_files": [
+          "docs/plans/2026-03-02-m3.2-rag-pipeline-impl.md",
+          "crates/corvia-server/src/rest.rs",
+          "crates/corvia-server/src/rest.rs",
+          "crates/corvia-server/src/rest.rs",
+          "docs/plans/2026-03-02-m3.2-rag-pipeline-design.md",
+          "docs/plans/2026-03-02-m3.2-rag-pipeline-design.md",
+          "docs/plans/2026-03-02-m3.2-rag-pipeline-design.md",
+          "docs/plans/2026-03-02-m3.2-rag-pipeline-impl.md",
+          "crates/corvia-server/src/rest.rs",
+          "README.md"
+        ],
+        "latency_ms": 41,
+        "vector_results": 20,
+        "graph_expanded": 0
+      },
+      "graph": {
+        "sources_count": 10,
+        "top_score": 0.7799272,
+        "top_source_file": "docs/plans/2026-03-02-m3.2-rag-pipeline-impl.md",
+        "source_files": [
+          "docs/plans/2026-03-02-m3.2-rag-pipeline-impl.md",
+          "crates/corvia-server/src/rest.rs",
+          "crates/corvia-server/src/rest.rs",
+          "crates/corvia-server/src/rest.rs",
+          "docs/plans/2026-03-02-m3.2-rag-pipeline-design.md",
+          "docs/plans/2026-03-02-m3.2-rag-pipeline-design.md",
+          "docs/plans/2026-03-02-m3.2-rag-pipeline-design.md",
+          "docs/plans/2026-03-02-m3.2-rag-pipeline-impl.md",
+          "crates/corvia-server/src/rest.rs",
+          "README.md"
+        ],
+        "latency_ms": 42,
+        "vector_results": 20,
+        "graph_expanded": 6
+      }
+    },
+    {
+      "id": 4,
+      "query": "How does the agent session lifecycle interact with the staging system and conflict resolution during merge?",
+      "expected_winner": "graph",
+      "vector": {
+        "sources_count": 9,
+        "top_score": 0.709764,
+        "top_source_file": "docs/plans/scratch/milestone-revision-notes.md",
+        "source_files": [
+          "docs/plans/scratch/milestone-revision-notes.md",
+          "docs/local/plans/scratch/2026-03-02-competitive-deep-dive.md",
+          "crates/corvia-kernel/src/merge_worker.rs",
+          "crates/corvia-kernel/src/commit_pipeline.rs",
+          "crates/corvia-kernel/src/commit_pipeline.rs",
+          "crates/corvia-kernel/src/commit_pipeline.rs",
+          "crates/corvia-kernel/src/commit_pipeline.rs",
+          "docs/plans/scratch/milestone-revision-notes.md",
+          "crates/corvia-kernel/src/commit_pipeline.rs"
+        ],
+        "latency_ms": 35,
+        "vector_results": 20,
+        "graph_expanded": 0
+      },
+      "graph": {
+        "sources_count": 9,
+        "top_score": 0.709764,
+        "top_source_file": "docs/plans/scratch/milestone-revision-notes.md",
+        "source_files": [
+          "docs/plans/scratch/milestone-revision-notes.md",
+          "docs/local/plans/scratch/2026-03-02-competitive-deep-dive.md",
+          "crates/corvia-kernel/src/merge_worker.rs",
+          "crates/corvia-kernel/src/commit_pipeline.rs",
+          "crates/corvia-kernel/src/commit_pipeline.rs",
+          "crates/corvia-kernel/src/commit_pipeline.rs",
+          "crates/corvia-kernel/src/commit_pipeline.rs",
+          "docs/plans/scratch/milestone-revision-notes.md",
+          "crates/corvia-kernel/src/commit_pipeline.rs"
+        ],
+        "latency_ms": 37,
+        "vector_results": 20,
+        "graph_expanded": 1
+      }
+    }
+  ]
+}

@@ -1,0 +1,115 @@
+{
+  "answer": null,
+  "sources": [
+    {
+      "content": "### Crate placement\n### New files\n\n## Trait Definitions\n",
+      "score": 0.70311284,
+      "source_file": "docs/plans/2026-03-02-m3.2-rag-pipeline-design.md",
+      "language": "markdown",
+      "chunk_type": "heading_section",
+      "start_line": 59,
+      "end_line": 60
+    },
+    {
+      "content": "### Crate Placement\n### New Files\n\n## Trait Definitions\n",
+      "score": 0.70311284,
+      "source_file": "docs/plans/2026-03-02-m3.3-embedding-chunking-design.md",
+      "language": "markdown",
+      "chunk_type": "heading_section",
+      "start_line": 84,
+      "end_line": 85
+    },
+    {
+      "content": "## Workspace Crates\n## Key Traits (extend these, don't modify)\n\n## Architecture Decisions to Respect\n\n- **Three-tier storage**: LiteStore is the full product (zero Docker). SurrealStore and PostgresStore are opt-in.\n  PostgresStore requires `--features postgres` at compile time.\n- **Git as truth**: All knowledge stored as JSON in `.corvia/knowledge/`, tracked by Git.\n- **Local-first**: No API keys required. Ollama provides embeddings.\n- **Trait-bounded**: All storage/inference/ingestion is behind traits. Don't add concrete dependencies.\n\n\n## Known SurrealDB v3 Quirks\n\nWhen writing SurrealDB queries or tests, be aware of these SDK issues:\n\n1. **Record type deserialization**: `SELECT *` fails — use explicit field lists with\n   `record::id(id) AS id` to convert Record types to strings.\n\n2. **NONE vs NULL**: Rust `Option::None` → JSON `null` → SurrealDB `NULL` (not `NONE`).\n   Use `IS NULL` in queries, not `IS NONE`.\n\n3. **Native datetimes**: `time::now()` creates native datetimes that can't deserialize as strings.\n   Use: `IF type::is_datetime(f) THEN type::string(f) ELSE f END`\n\n4. **HNSW dimension caching (server-level bug)**: Once an HNSW index is created with dimension N\n   on a SurrealDB server, ALL subsequent indexes with the same name enforce dimension N — even\n   in different namespaces/databases, even after `REMOVE TABLE`. Workaround: all test suites\n   sharing a SurrealDB instance MUST use the same embedding dimension (768).\n\n5. **`DEFINE INDEX IF NOT EXISTS`** won't update an existing index. To change dimensions,\n   you must `REMOVE INDEX` first.\n\n6. **Namespace/database creation**: Must `DEFINE NAMESPACE IF NOT EXISTS` and\n   `DEFINE DATABASE IF NOT EXISTS` before `use_ns()`/`use_db()`.\n",
+      "score": 0.6864126,
+      "source_file": "AGENTS.md",
+      "language": "markdown",
+      "chunk_type": "heading_section",
+      "start_line": 74,
+      "end_line": 105
+    },
+    {
+      "content": "## Core Traits\n\n### `QueryableStore`\n\nThe primary storage interface. Handles entry insertion (with embeddings), semantic search,\nretrieval by ID, scope counting, schema initialization, and scope deletion.\n\n```rust\npub trait QueryableStore: Send + Sync {\n    async fn insert(&self, entry: &KnowledgeEntry) -> Result<()>;\n    async fn search(&self, embedding: &[f32], scope_id: &str, limit: usize) -> Result<Vec<SearchResult>>;\n    async fn get(&self, id: &uuid::Uuid) -> Result<Option<KnowledgeEntry>>;\n    async fn count(&self, scope_id: &str) -> Result<u64>;\n    async fn init_schema(&self) -> Result<()>;\n    async fn delete_scope(&self, scope_id: &str) -> Result<()>;\n}\n```\n\n**Implementations:** `LiteStore` (hnsw_rs + Redb), `SurrealStore` (SurrealDB HTTP client).\n\n\n### `InferenceEngine`\n\nProvider-agnostic embedding generation. Supports single and batch embedding, and reports\nthe model's output dimensionality.\n\n```rust\npub trait InferenceEngine: Send + Sync {\n    async fn embed(&self, text: &str) -> Result<Vec<f32>>;\n    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;\n    fn dimensions(&self) -> usize;\n}\n```\n\n**Implementations:** `OllamaEngine` (Ollama HTTP API), `VllmEngine` (vLLM HTTP API).\n",
+      "score": 0.6754155,
+      "source_file": "ARCHITECTURE.md",
+      "language": "markdown",
+      "chunk_type": "heading_section",
+      "start_line": 126,
+      "end_line": 158
+    },
+    {
+      "content": "-common/\ngit commit -m \"feat(common): add namespace (D17), config, and event log\n\nFive-segment namespace with parse/display roundtrip.\nTOML config with defaults for SurrealDB, Ollama, and REST server.\nAppend-only event log for audit trail (D14).\"\n```\n\n---\n\n## Task 4: corvia-kernel — Trait Definitions\n\n**Files:**\n- Create: `crates/corvia-kernel/src/traits.rs`\n- Modify: `crates/corvia-kernel/src/lib.rs`\n\n**Step 1: Define QueryableStore and InferenceEngine traits**\n\n`crates/corvia-kernel/src/traits.rs`:\n```rust\nuse async_trait::async_trait;\nuse corvia_common::errors::Result;\nuse corvia_common::types::{KnowledgeEntry, SearchResult};\n\n/// Queryable store for knowledge entries (D15).\n/// SurrealDB is the first implementation. Trait-bounded for future swap.\n#[async_trait]\npub trait QueryableStore: Send + Sync {\n    /// Insert a knowledge entry (must have embedding set).\n    async fn insert(&self, entry: &KnowledgeEntry) -> Result<()>;\n\n    /// Semantic search by embedding vector.\n    async fn search(&self, embedding: &[f32], scope_id: &str, limit: usize) -> Result<Vec<SearchResult>>;\n\n    /// Get a single entry by ID.\n    async fn get(&self, id: &uuid::Uuid) -> Result<Option<KnowledgeEntry>>;\n\n    /// Count entries in a scope.\n    async fn count(&self, scope_id: &str) -> Result<u64>;\n\n    /// Initialize the store schema (create tables, indexes).\n    async fn init_schema(&self) -> Result<()>;\n}\n\n/// Embedding and inference provider (D5).\n/// Ollama is the first implementation. Provider-agnostic via trait.\n#[async_trait]\npub trait InferenceEngine: Send + Sync {\n    /// Generate an embedding vector for the given text.\n    async fn embed(&self, text: &str) -> Result<Vec<f32>>;\n\n    /// Generate embeddings for a batch of texts.\n    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;\n\n    /// Return the embedding dimension for this model.\n    fn dimensions(&self) -> usize;\n}",
+      "score": 0.64807695,
+      "source_file": "docs/plans/2026-02-28-m1-implementation.md",
+      "language": "markdown",
+      "chunk_type": "heading_section",
+      "start_line": 760,
+      "end_line": 806
+    },
+    {
+      "content": "el` for the `IngestionAdapter` trait and `corvia-common` for shared types.\n- Storage implementations live inside the kernel crate and implement kernel traits.\n- `corvia-common` is the shared foundation — types, config, errors — imported by all layers.\n\n## Crate Map\n\n| Crate | Path | Role |\n|-------|------|------|\n| `corvia-common` | `crates/corvia-common` | Shared types (`KnowledgeEntry`, `GraphEdge`, `EntryMetadata`), configuration (`CorviaConfig`), error types, namespace parsing, event types, agent identity types |\n| `corvia-kernel` | `crates/corvia-kernel` | All kernel subsystems: both storage implementations (LiteStore, SurrealStore), embedding engines, agent coordination, graph store, temporal queries, reasoning, merge worker, context builder |\n| `corvia-server` | `crates/corvia-server` | Axum-based HTTP server exposing REST endpoints under `/v1/` and the MCP JSON-RPC 2.0 endpoint at `/mcp`. Thin orchestration layer that wires kernel types together and handles request/response translation |\n| `corvia` (CLI) | `crates/corvia-cli` | Binary crate. CLI commands (`init`, `ingest`, `search`, `serve`, `reason`, etc.) and workspace management. Orchestrates kernel + server |\n| `corvia-adapter-git` | External (sibling repo) | Git repository ingestion using tree-sitter for code-aware chunking. Supports Rust, JavaScript, TypeScript, and Python. Implements the `IngestionAdapter` trait |\n\nAll workspace crates share `version.workspace = true` from the root `Cargo.toml`. The adapter\nis a separate repository to demonstrate that adapters are independently publishable.\n",
+      "score": 0.64484745,
+      "source_file": "ARCHITECTURE.md",
+      "language": "markdown",
+      "chunk_type": "heading_section",
+      "start_line": 44,
+      "end_line": 56
+    },
+    {
+      "content": "## Task 4: corvia-kernel — Trait Definitions\n\n\n/// Ingestion adapter for domain-specific sources (D11, Section 4).\n/// Git/code adapter is the first implementation.\n#[async_trait]\npub trait IngestionAdapter: Send + Sync {\n    /// Domain name (e.g., \"git\", \"general\").\n    fn domain(&self) -> &str;\n\n    /// Ingest a source and return knowledge entries (without embeddings).\n    /// Embeddings are added by the kernel after ingestion.\n    async fn ingest(&self, source_path: &str) -> Result<Vec<KnowledgeEntry>>;\n}\n```\n\n**Step 2: Update lib.rs**\n\n`crates/corvia-kernel/src/lib.rs`:\n```rust\npub mod traits;\npub mod knowledge_store;\npub mod embedding_pipeline;\npub mod docker;\n```\n\n**Step 3: Create placeholder modules**\n\nCreate empty files so the crate compiles:\n- `crates/corvia-kernel/src/knowledge_store.rs`: `// SurrealDB implementation — Task 6`\n- `crates/corvia-kernel/src/embedding_pipeline.rs`: `// Ollama implementation — Task 7`\n- `crates/corvia-kernel/src/docker.rs`: `// Docker provisioning — Task 5`\n\n**Step 4: Verify it compiles**\n\nRun: `cargo check -p corvia-kernel`\nExpected: Compiles (warnings about unused modules are fine)\n\n**Step 5: Commit**\n\n```bash\ngit add crates/corvia-kernel/\ngit commit -m \"feat(kernel): define QueryableStore, InferenceEngine, and IngestionAdapter traits\n\nCore trait boundaries per D15, D5, D11. No implementations yet.\"\n```\n\n---\n",
+      "score": 0.6378253,
+      "source_file": "docs/plans/2026-02-28-m1-implementation.md",
+      "language": "markdown",
+      "chunk_type": "heading_section",
+      "start_line": 807,
+      "end_line": 853
+    },
+    {
+      "content": "\nExpected: Compiles (traits defined but not yet implemented).\n\n**Step 5: Commit**\n\n```\ngit add crates/corvia-kernel/src/traits.rs crates/corvia-common/src/types.rs\ngit commit -m \"feat(m3): define TemporalStore and GraphStore traits + graph types\"\n```\n\n---\n\n### Task 2: LiteStore temporal index — Redb table + insert integration\n\nAdd the `TEMPORAL_INDEX` Redb table and populate it during `insert()`.\n\n**Files:**\n- Modify: `crates/corvia-kernel/src/lite_store.rs`\n\n**Step 1: Write failing test**\n\nAdd to `mod tests` in `lite_store.rs`:\n\n```rust\n#[tokio::test]\nasync fn test_temporal_index_populated_on_insert() {\n    let dir = tempfile::tempdir().unwrap();\n    let store = LiteStore::open(dir.path(), 3).unwrap();\n    store.init_schema().await.unwrap();\n\n    let entry = KnowledgeEntry::new(\"temporal test\".into(), \"scope\".into(), \"v1\".into())\n        .with_embedding(vec![1.0, 0.0, 0.0]);\n    let id = entry.id;\n    let valid_from = entry.valid_from;\n    store.insert(&entry).await.unwrap();\n\n    // Verify temporal index was written\n    let results = store.as_of(\"scope\", valid_from + chrono::Duration::seconds(1), 10).await.unwrap();\n    assert_eq!(results.len(), 1);\n    assert_eq!(results[0].id, id);\n}\n```\n\n**Step 2: Run test to verify it fails**\n\nRun: `cargo test -p corvia-kernel -- test_temporal_index_populated_on_insert`\nExpected: FAIL — `as_of` method doesn't exist yet.\n\n**Step 3: Add TEMPORAL_INDEX table definition**\n\nAdd after the existing table definitions (line 18 of `lite_store.rs`):\n\n```rust\n/// Temporal index: compound key (scope_id, valid_from_millis, entry_id) → (valid_to_millis, recorded_at_millis)\n/// Enables O(log n) range scans for bi-temporal queries via Redb B-tree.\nconst TEMPORAL_INDEX: TableDefinition<&str, &[u8]> = TableDefinition::new(\"temporal_index\");\n```\n",
+      "score": 0.6368276,
+      "source_file": "docs/plans/2026-03-02-m3-implementation.md",
+      "language": "markdown",
+      "chunk_type": "heading_section",
+      "start_line": 136,
+      "end_line": 181
+    },
+    {
+      "content": "### LiteStore (default, zero Docker)\n### FullStore (SurrealDB + vLLM)\n\n## Core Traits\n\nAll kernel subsystems are built around five async traits defined in\n`crates/corvia-kernel/src/traits.rs`. Each trait uses `async_trait` and requires `Send + Sync`.\n",
+      "score": 0.6361828,
+      "source_file": "ARCHITECTURE.md",
+      "language": "markdown",
+      "chunk_type": "heading_section",
+      "start_line": 121,
+      "end_line": 125
+    },
+    {
+      "content": "## Overview\n## Core Traits\n\n## Subsystems\n\n- **Storage** — `lite_store`, `knowledge_store` (SurrealDB), `knowledge_files` (Git JSON)\n- **Embeddings** — `ollama_engine`, `embedding_pipeline` (vLLM)\n- **Agent Coordination** — `agent_coordinator`, `session_manager`, `staging`, `merge_worker`\n- **Reasoning** — `reasoner` (5 deterministic + 2 LLM-powered health checks)\n- **Graph** — `graph_store` (petgraph-based overlay for LiteStore)\n- **Introspection** — `introspect` (self-validation pipeline)\n\n\n## Usage\n\n```rust,no_run\nuse corvia_common::config::CorviaConfig;\nuse corvia_kernel::{create_engine, create_store};\n\nasync fn example() -> corvia_common::errors::Result<()> {\n    let config = CorviaConfig::default(); // LiteStore + Ollama\n    let engine = create_engine(&config);\n    let store = create_store(&config).await?;\n    store.init_schema().await?;\n    Ok(())\n}\n```\n",
+      "score": 0.63201755,
+      "source_file": "crates/corvia-kernel/README.md",
+      "language": "markdown",
+      "chunk_type": "heading_section",
+      "start_line": 25,
+      "end_line": 48
+    }
+  ],
+  "trace": {
+    "trace_id": "019cb7b2-c864-7fa3-8875-9009809313d4",
+    "retrieval": {
+      "latency_ms": 40,
+      "vector_results": 20,
+      "graph_expanded": 0,
+      "post_filter_count": 10,
+      "retriever_name": "graph_expand"
+    },
+    "augmentation": {
+      "latency_ms": 0,
+      "token_estimate": 2985,
+      "token_budget": 3276,
+      "sources_included": 10,
+      "sources_truncated": 0,
+      "augmenter_name": "structured"
+    },
+    "generation": null,
+    "total_latency_ms": 41
+  }
+}
