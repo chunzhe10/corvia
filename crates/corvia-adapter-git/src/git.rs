@@ -27,7 +27,7 @@ impl GitAdapter {
 const SUPPORTED_EXTENSIONS: &[&str] = &["rs", "js", "jsx", "ts", "tsx", "py", "md", "toml", "yaml", "yml", "json"];
 
 /// Directories to skip during ingestion.
-const SKIP_DIRS: &[&str] = &["target", "node_modules", ".git", ".corvia", "dist", "build", "__pycache__", ".venv", "vendor"];
+const SKIP_DIRS: &[&str] = &["target", "node_modules", ".git", ".corvia", ".claude", "dist", "build", "__pycache__", ".venv", "vendor", "benchmark-results"];
 
 #[async_trait]
 impl IngestionAdapter for GitAdapter {

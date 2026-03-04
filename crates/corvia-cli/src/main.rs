@@ -476,6 +476,15 @@ async fn cmd_ingest(path: Option<&str>) -> Result<()> {
     if let Some(path) = path {
         let config = load_config()?;
         let (store, graph) = connect_store_with_graph(&config).await?;
+
+        // Provision inference backend (ensures models are loaded before embedding).
+        if config.embedding.provider == corvia_common::config::InferenceProvider::Corvia {
+            let provisioner = corvia_kernel::inference_provisioner::InferenceProvisioner::new(
+                &config.embedding.url,
+            );
+            provisioner.ensure_ready(&config.embedding.model, &config.merge.model).await?;
+        }
+
         let engine = connect_engine(&config);
 
         // Step 1: Discover adapters

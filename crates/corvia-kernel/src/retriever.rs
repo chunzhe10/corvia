@@ -18,6 +18,7 @@ use std::time::Instant;
 use tracing::info;
 
 use crate::rag_types::{RetrievalMetrics, RetrievalOpts, RetrievalResult};
+use crate::reasoner::cosine_similarity;
 use crate::traits::{GraphStore, InferenceEngine, QueryableStore};
 
 /// Check RBAC scope access. Returns `Some(empty result)` if denied, `None` if allowed.
@@ -279,13 +280,19 @@ impl Retriever for GraphExpandRetriever {
                             continue;
                         }
                         seen.insert(neighbor_id);
-                        // hop distance = 1 => hop_score = α * (1/(1+1)) = α * 0.5
-                        let hop_score = self.alpha * 0.5;
+                        // Blend cosine similarity with graph proximity:
+                        // final = (1-α)*cosine + α*0.5
+                        let cosine = neighbor_entry
+                            .embedding
+                            .as_ref()
+                            .map(|emb| cosine_similarity(&embedding, emb))
+                            .unwrap_or(0.0);
+                        let blended = (1.0 - self.alpha) * cosine + self.alpha * 0.5;
                         scored.push((
-                            hop_score,
+                            blended,
                             SearchResult {
                                 entry: neighbor_entry,
-                                score: hop_score,
+                                score: blended,
                             },
                         ));
                         graph_expanded += 1;
@@ -313,15 +320,19 @@ impl Retriever for GraphExpandRetriever {
                             continue;
                         }
                         seen.insert(entry.id);
-                        // Deeper hops get progressively lower scores.
-                        // Use hop distance = 2 as a conservative estimate for
-                        // traverse results beyond the first hop.
-                        let hop_score = self.alpha * (1.0 / 3.0);
+                        // Blend cosine similarity with graph proximity (hop 2+):
+                        // final = (1-α)*cosine + α*(1/3)
+                        let cosine = entry
+                            .embedding
+                            .as_ref()
+                            .map(|emb| cosine_similarity(&embedding, emb))
+                            .unwrap_or(0.0);
+                        let blended = (1.0 - self.alpha) * cosine + self.alpha * (1.0 / 3.0);
                         scored.push((
-                            hop_score,
+                            blended,
                             SearchResult {
                                 entry,
-                                score: hop_score,
+                                score: blended,
                             },
                         ));
                         graph_expanded += 1;

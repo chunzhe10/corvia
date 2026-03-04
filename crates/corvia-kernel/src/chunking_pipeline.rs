@@ -193,12 +193,36 @@ impl ChunkingPipeline {
         let relations = chunk_result.relations;
 
         // Step 3: Merge small chunks.
-        let (chunks_after_merge, merge_count) =
+        let (chunks_after_merge, merge_flags) =
             self.merge_step(&strategy, &mut chunks);
 
         // Step 4: Enforce token budget — split oversized chunks.
         let (chunks_after_split, split_flags) =
             self.split_step(&strategy, chunks_after_merge)?;
+
+        // Expand merge_flags to match post-split length: when a chunk is split
+        // into N pieces, replicate its merge flag N times.
+        let merge_count = {
+            let mut expanded = Vec::with_capacity(chunks_after_split.len());
+            let mut src = 0;
+            let mut dst = 0;
+            while dst < split_flags.len() {
+                let flag = merge_flags.get(src).copied().unwrap_or(false);
+                if split_flags[dst] {
+                    // This chunk was split — count consecutive split=true entries
+                    // that came from the same source chunk.
+                    while dst < split_flags.len() && split_flags[dst] {
+                        expanded.push(flag);
+                        dst += 1;
+                    }
+                } else {
+                    expanded.push(flag);
+                    dst += 1;
+                }
+                src += 1;
+            }
+            expanded
+        };
 
         // Step 5: Add overlap context.
         let (final_contents, overlap_tokens_vec) =
@@ -454,7 +478,12 @@ impl ChunkingPipeline {
                 let char_budget = self.config.overlap_tokens * 4;
                 let prev_content = &prev.content;
                 let overlap_text = if prev_content.len() > char_budget {
-                    &prev_content[prev_content.len() - char_budget..]
+                    let start = prev_content.len() - char_budget;
+                    // Find the nearest char boundary at or after `start`.
+                    let start = (start..prev_content.len())
+                        .find(|&i| prev_content.is_char_boundary(i))
+                        .unwrap_or(prev_content.len());
+                    &prev_content[start..]
                 } else {
                     prev_content.as_str()
                 };
