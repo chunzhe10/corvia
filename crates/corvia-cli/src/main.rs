@@ -1429,14 +1429,31 @@ async fn connect_full_store(
 
 /// Resolve pipeline relations and store them as graph edges.
 ///
-/// Uses `(source_file, start_line)` to match relations to stored chunks.
-/// Best-effort: unresolvable cross-file references are silently skipped.
+/// Uses multi-strategy target resolution:
+/// 1. Direct match: `source_file == to_file` (handles "implements"/"contains")
+/// 2. CRATE_REF resolution: `crate::foo` → `<root>/foo.rs` or `<root>/foo/mod.rs`
+/// 3. JS/TS relative imports: `./utils` → resolve relative to source file
+/// 4. Suffix fallback: match `to_file` as a suffix of known `source_file` paths
 pub(crate) async fn wire_pipeline_relations(
     relations: &[corvia_kernel::chunking_strategy::ChunkRelation],
     processed: &[corvia_kernel::chunking_strategy::ProcessedChunk],
     stored_ids: &[uuid::Uuid],
     graph: &dyn GraphStore,
 ) -> usize {
+    use std::collections::HashMap;
+
+    // Build file index: source_file → Vec<(idx, &chunk)>
+    let mut file_index: HashMap<&str, Vec<(usize, &corvia_kernel::chunking_strategy::ProcessedChunk)>> =
+        HashMap::new();
+    for (idx, pc) in processed.iter().enumerate() {
+        file_index
+            .entry(pc.metadata.source_file.as_str())
+            .or_default()
+            .push((idx, pc));
+    }
+
+    let all_files: Vec<&str> = file_index.keys().copied().collect();
+
     let mut relations_stored = 0;
     for rel in relations {
         // Find the source chunk by (source_file, start_line) match
@@ -1448,21 +1465,17 @@ pub(crate) async fn wire_pipeline_relations(
             _ => continue,
         };
 
-        // Find the target chunk by file name (and optionally symbol name)
-        let to_uuid = processed.iter().zip(stored_ids.iter()).find_map(|(pc, id)| {
-            if pc.metadata.source_file == rel.to_file {
-                if let Some(ref name) = rel.to_name {
-                    if pc.content.contains(name) {
-                        return Some(*id);
-                    }
-                } else {
-                    return Some(*id);
-                }
-            }
-            None
-        });
+        // Resolve target files using multi-strategy approach
+        let target_files = resolve_target_files(&rel.to_file, &rel.from_source_file, &all_files);
+
+        // Find the best target chunk across all candidate files
+        let to_uuid = find_target_chunk(&target_files, &rel.to_name, &file_index, stored_ids);
 
         if let Some(to_uuid) = to_uuid {
+            // Filter self-edges for "imports" relations
+            if rel.relation == "imports" && to_uuid == from_uuid {
+                continue;
+            }
             if let Err(e) = graph.relate(&from_uuid, &rel.relation, &to_uuid, None).await {
                 tracing::warn!("Failed to store relation: {e}");
             } else {
@@ -1471,6 +1484,202 @@ pub(crate) async fn wire_pipeline_relations(
         }
     }
     relations_stored
+}
+
+/// Resolve a `to_file` reference to candidate file paths using multiple strategies.
+fn resolve_target_files<'a>(
+    to_file: &str,
+    from_source_file: &str,
+    all_files: &[&'a str],
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+
+    // Strategy 1: Direct match
+    if all_files.iter().any(|f| *f == to_file) {
+        candidates.push(to_file.to_string());
+        return candidates;
+    }
+
+    // Strategy 2: CRATE_REF resolution (Rust crate:: and super:: imports)
+    if let Some(rest) = to_file.strip_prefix("CRATE_REF:") {
+        let resolved = resolve_rust_crate_ref(rest, all_files);
+        if !resolved.is_empty() {
+            return resolved;
+        }
+    }
+
+    // Strategy 3: JS/TS relative imports (./utils, ../types, etc.)
+    if to_file.starts_with("./") || to_file.starts_with("../") {
+        let resolved = resolve_js_relative_import(to_file, from_source_file, all_files);
+        if !resolved.is_empty() {
+            return resolved;
+        }
+    }
+
+    // Strategy 4: Suffix fallback — match to_file as a suffix of known paths
+    let to_file_normalized = to_file.replace("::", "/");
+    for file in all_files {
+        if file.ends_with(&to_file_normalized)
+            || file.ends_with(&format!("/{to_file_normalized}"))
+        {
+            candidates.push(file.to_string());
+        }
+    }
+
+    candidates
+}
+
+/// Resolve `CRATE_REF:<src_root>:<module_path>` to candidate file paths.
+///
+/// For `CRATE_REF:crates/corvia-kernel/src:foo::bar`, tries:
+/// - `crates/corvia-kernel/src/foo/bar.rs`
+/// - `crates/corvia-kernel/src/foo/bar/mod.rs`
+/// - `crates/corvia-kernel/src/foo.rs` (partial match for deeper modules)
+fn resolve_rust_crate_ref(rest: &str, all_files: &[&str]) -> Vec<String> {
+    let (root, module_path) = match rest.split_once(':') {
+        Some((r, m)) => (r, m),
+        None => return vec![],
+    };
+
+    if module_path.is_empty() {
+        // Bare CRATE_REF (e.g., from `super::*`) — match any file under root
+        return all_files
+            .iter()
+            .filter(|f| f.starts_with(root))
+            .map(|f| f.to_string())
+            .collect();
+    }
+
+    let module_as_path = module_path.replace("::", "/");
+    let mut candidates = Vec::new();
+
+    // Try exact: <root>/<module_as_path>.rs
+    let exact = if root.is_empty() {
+        format!("{module_as_path}.rs")
+    } else {
+        format!("{root}/{module_as_path}.rs")
+    };
+    if all_files.iter().any(|f| *f == exact) {
+        candidates.push(exact.clone());
+    }
+
+    // Try mod.rs: <root>/<module_as_path>/mod.rs
+    let mod_rs = if root.is_empty() {
+        format!("{module_as_path}/mod.rs")
+    } else {
+        format!("{root}/{module_as_path}/mod.rs")
+    };
+    if all_files.iter().any(|f| *f == mod_rs) {
+        candidates.push(mod_rs);
+    }
+
+    // If module_path has multiple segments, try partial (first segment only)
+    if candidates.is_empty() {
+        if let Some(first_segment) = module_path.split("::").next() {
+            let partial = if root.is_empty() {
+                format!("{first_segment}.rs")
+            } else {
+                format!("{root}/{first_segment}.rs")
+            };
+            if all_files.iter().any(|f| *f == partial) {
+                candidates.push(partial);
+            }
+            let partial_mod = if root.is_empty() {
+                format!("{first_segment}/mod.rs")
+            } else {
+                format!("{root}/{first_segment}/mod.rs")
+            };
+            if all_files.iter().any(|f| *f == partial_mod) {
+                candidates.push(partial_mod);
+            }
+        }
+    }
+
+    candidates
+}
+
+/// Resolve a JS/TS relative import (e.g., `./utils`) relative to the source file.
+///
+/// Tries extensions: `.ts`, `.js`, `.tsx`, `.jsx`, and `/index.{ts,js}`.
+fn resolve_js_relative_import(import_path: &str, from_source_file: &str, all_files: &[&str]) -> Vec<String> {
+    let parent = from_source_file
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .unwrap_or("");
+
+    // Resolve the relative path
+    let resolved_base = if let Some(rel) = import_path.strip_prefix("./") {
+        if parent.is_empty() {
+            rel.to_string()
+        } else {
+            format!("{parent}/{rel}")
+        }
+    } else if let Some(rel) = import_path.strip_prefix("../") {
+        let grandparent = parent.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        if grandparent.is_empty() {
+            rel.to_string()
+        } else {
+            format!("{grandparent}/{rel}")
+        }
+    } else {
+        return vec![];
+    };
+
+    let mut candidates = Vec::new();
+    let extensions = [".ts", ".js", ".tsx", ".jsx"];
+    let index_variants = ["/index.ts", "/index.js"];
+
+    // Try with each extension
+    for ext in &extensions {
+        let candidate = format!("{resolved_base}{ext}");
+        if all_files.iter().any(|f| *f == candidate) {
+            candidates.push(candidate);
+        }
+    }
+
+    // Try index files
+    for idx in &index_variants {
+        let candidate = format!("{resolved_base}{idx}");
+        if all_files.iter().any(|f| *f == candidate) {
+            candidates.push(candidate);
+        }
+    }
+
+    // Also try exact match (already has extension)
+    if all_files.iter().any(|f| *f == resolved_base) {
+        candidates.push(resolved_base);
+    }
+
+    candidates
+}
+
+/// Find the best target chunk across candidate files, optionally matching by symbol name.
+fn find_target_chunk(
+    target_files: &[String],
+    to_name: &Option<String>,
+    file_index: &std::collections::HashMap<&str, Vec<(usize, &corvia_kernel::chunking_strategy::ProcessedChunk)>>,
+    stored_ids: &[uuid::Uuid],
+) -> Option<uuid::Uuid> {
+    for target_file in target_files {
+        if let Some(chunks) = file_index.get(target_file.as_str()) {
+            if let Some(name) = to_name {
+                // Find a chunk that contains the symbol name
+                for (idx, pc) in chunks {
+                    if *idx < stored_ids.len() && pc.content.contains(name.as_str()) {
+                        return Some(stored_ids[*idx]);
+                    }
+                }
+            } else {
+                // No symbol name filter — return first chunk in the target file
+                if let Some((idx, _)) = chunks.first() {
+                    if *idx < stored_ids.len() {
+                        return Some(stored_ids[*idx]);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn print_search_results(results: &[corvia_common::types::SearchResult], show_namespace: bool) {

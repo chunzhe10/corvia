@@ -1,0 +1,115 @@
+{
+  "answer": null,
+  "sources": [
+    {
+      "content": "StatusCode::SERVICE_UNAVAILABLE, \"RAG pipeline not configured\".into()))?;\n\n    let opts = corvia_kernel::rag_types::RetrievalOpts {\n        limit: req.limit.unwrap_or(10),\n        expand_graph: req.expand_graph.unwrap_or(true),\n        ..Default::default()\n    };\n\n    let response = rag.ask(&req.query, &req.scope_id, Some(opts)).await\n        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!(\"RAG failed: {e}\")))?;\n\n    Ok(Json(RagResponseDto {\n        answer: response.answer,\n        sources: response.context.sources.into_iter().map(Into::into).collect(),\n        trace: response.trace,\n    }))\n}\n```\n\n**Step 4: Add routes to router**\n\nAdd to the `router()` function:\n\n```rust\n        .route(\"/v1/context\", post(rag_context))\n        .route(\"/v1/ask\", post(rag_ask))\n```\n\n**Step 5: Fix existing search_memories to use RAG pipeline**\n\nUpdate `search_memories` to route through `rag.context()` when available, falling back to raw store search for backward compatibility:\n\n```rust\nasync fn search_memories(\n    State(state): State<Arc<AppState>>,\n    Json(req): Json<SearchRequest>,\n) -> std::result::Result<Json<SearchResponse>, (StatusCode, String)> {\n    let limit = req.limit.unwrap_or(10);\n\n    // Route through RAG pipeline if available (fixes ContextBuilder bypass bug)\n    if let Some(rag) = &state.rag {\n        let opts = corvia_kernel::rag_types::RetrievalOpts {\n            limit,\n            expand_graph: false, // backward compat: pure vector for search endpoint\n            ..Default::default()\n        };",
+      "score": 0.7799272,
+      "source_file": "docs/plans/2026-03-02-m3.2-rag-pipeline-impl.md",
+      "language": "markdown",
+      "chunk_type": "heading_section",
+      "start_line": 1818,
+      "end_line": 1857
+    },
+    {
+      "content": "    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!(\"Search failed: {e}\")))?;\n\n    let count = results.len();\n    let results: Vec<SearchResultDto> = results.into_iter().map(Into::into).collect();\n\n    Ok(Json(SearchResponse { results, count }))\n}\nasync fn rag_context(\n    State(state): State<Arc<AppState>>,\n    Json(req): Json<RagRequest>,\n) -> std::result::Result<Json<RagResponseDto>, (StatusCode, String)> {\n    let rag = state.rag.as_ref()\n        .ok_or((StatusCode::SERVICE_UNAVAILABLE, \"RAG pipeline not configured\".into()))?;\n\n    let opts = corvia_kernel::rag_types::RetrievalOpts {\n        limit: req.limit.unwrap_or(10),\n        expand_graph: req.expand_graph.unwrap_or(true),\n        ..Default::default()\n    };\n\n    let response = rag.context(&req.query, &req.scope_id, Some(opts)).await\n        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!(\"RAG failed: {e}\")))?;\n\n    Ok(Json(RagResponseDto {\n        answer: response.answer,\n        sources: response.context.sources.into_iter().map(Into::into).collect(),\n        trace: response.trace,\n    }))\n}",
+      "score": 0.7622392,
+      "source_file": "crates/corvia-server/src/rest.rs",
+      "language": "rs",
+      "chunk_type": "function_item",
+      "start_line": 351,
+      "end_line": 372
+    },
+    {
+      "content": " }\n\n    let id = entry.id.to_string();\n\n    state.store.insert(&entry).await\n        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!(\"Storage failed: {e}\")))?;\n\n    info!(\"Stored memory {id}\");\n\n    Ok(Json(WriteResponse { id, embedded: true }))\n}\nasync fn search_memories(\n    State(state): State<Arc<AppState>>,\n    Json(req): Json<SearchRequest>,\n) -> std::result::Result<Json<SearchResponse>, (StatusCode, String)> {\n    let limit = req.limit.unwrap_or(10);\n\n    // Route through RAG pipeline if available (fixes ContextBuilder bypass bug)\n    if let Some(rag) = &state.rag {\n        let opts = corvia_kernel::rag_types::RetrievalOpts {\n            limit,\n            expand_graph: false, // search endpoint: pure vector (context/ask use graph)\n            ..Default::default()\n        };\n        let response = rag.context(&req.query, &req.scope_id, Some(opts)).await\n            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!(\"Search failed: {e}\")))?;\n\n        let results: Vec<SearchResultDto> = response.context.sources.into_iter().map(Into::into).collect();\n        let count = results.len();\n        return Ok(Json(SearchResponse { results, count }));\n    }\n\n    // Fallback: raw store search (no RAG pipeline configured)\n    let query_embedding = state.engine.embed(&req.query).await\n        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!(\"Embedding failed: {e}\")))?;\n\n    let results = state.store.search(&query_embedding, &req.scope_id, limit).await\n        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!(\"Search failed: {e}\")))?;\n\n    let count = results.len();\n    let results: Vec<SearchResultDto> = results.into_iter().map(Into::into).collect();\n\n    Ok(Json(SearchResponse { results, count }))\n}",
+      "score": 0.7456404,
+      "source_file": "crates/corvia-server/src/rest.rs",
+      "language": "rs",
+      "chunk_type": "function_item",
+      "start_line": 315,
+      "end_line": 347
+    },
+    {
+      "content": "pub struct RagRequest {\n    pub query: String,\n    pub scope_id: String,\n    pub limit: Option<usize>,\n    pub expand_graph: Option<bool>,\n}\npub struct RagResponseDto {\n    pub answer: Option<String>,\n    pub sources: Vec<SearchResultDto>,\n    pub trace: corvia_kernel::rag_types::PipelineTrace,\n}",
+      "score": 0.74390996,
+      "source_file": "crates/corvia-server/src/rest.rs",
+      "language": "rs",
+      "chunk_type": "struct_item",
+      "start_line": 92,
+      "end_line": 96
+    },
+    {
+      "content": "# M3.2: RAG Pipeline Design\n\n## Summary\n\nAdd a trait-based RAG pipeline to `corvia-kernel` that standardizes all retrieval, context assembly, and generation through a single orchestrated path. Three pluggable stages — `Retriever`, `Augmenter`, `GenerationEngine` — enable strategy benchmarking and future adaptation. Two modes: `context()` (retrieve + augment) and `ask()` (retrieve + augment + generate).\n\n\n## Motivation\n\n1. **No RAG today.** Corvia has strong vector retrieval but no context assembly or answer generation. MCP `corvia_search` returns raw results — agents must interpret them alone.\n\n2. **REST/MCP bypass ContextBuilder.** Both `rest.rs:search_memories` and `mcp.rs:corvia_search` call `store.search()` directly, skipping RBAC and visibility filtering. This is a correctness bug.\n\n3. **Graph+vector is the differentiator.** Commodity vector search is everywhere (Pinecone, pgvector, built-in IDE memory). Corvia's moat is organizational graph relationships + git-truth + temporal awareness. The RAG pipeline must combine vector similarity with graph traversal.\n\n4. **Benchmarking readiness.** The industry moves fast. Trait-based stages let M6 eval swap in different retrieval/augmentation strategies and measure precision@k, MRR, NDCG without code changes.\n",
+      "score": 0.7398045,
+      "source_file": "docs/plans/2026-03-02-m3.2-rag-pipeline-design.md",
+      "language": "markdown",
+      "chunk_type": "heading_section",
+      "start_line": 8,
+      "end_line": 21
+    },
+    {
+      "content": "### New REST endpoints\n### New MCP tools\n\n### Bug fix: Route existing search through pipeline\n\n`POST /v1/memories/search` and `corvia_search` MCP tool are updated to route through `VectorRetriever` instead of raw `store.search()`. Same API contract, now with proper RBAC and visibility filtering.\n\n\n### AppState update\n\n```rust\npub struct AppState {\n    pub store: Arc<dyn QueryableStore>,\n    pub engine: Arc<dyn InferenceEngine>,\n    pub coordinator: Option<Arc<AgentCoordinator>>,\n    pub rag: Arc<RagPipeline>,\n}\n```\n",
+      "score": 0.7354661,
+      "source_file": "docs/plans/2026-03-02-m3.2-rag-pipeline-design.md",
+      "language": "markdown",
+      "chunk_type": "heading_section",
+      "start_line": 391,
+      "end_line": 405
+    },
+    {
+      "content": "## Architecture\n\n### Crate placement\n\nAll RAG logic lives in `corvia-kernel`. Server layer (`corvia-server`) adds thin REST/MCP endpoints. Python SDK (M5) gets RAG for free via PyO3.\n\n\n### New files\n\n```\ncrates/corvia-kernel/src/\n  rag_pipeline.rs       — RagPipeline struct, context()/ask() orchestration\n  retriever.rs          — Retriever trait + VectorRetriever + GraphExpandRetriever\n  augmenter.rs          — Augmenter trait + StructuredAugmenter + TokenEstimator\n  rag_types.rs          — RetrievalOpts, TokenBudget, PipelineTrace, RagResponse, etc.\n\ncrates/corvia-common/src/\n  config.rs             — add RagConfig section\n\ncrates/corvia-server/src/\n  rest.rs               — add POST /v1/context, POST /v1/ask; fix search routing\n  mcp.rs                — add corvia_context, corvia_ask tools; fix search routing\n```\n",
+      "score": 0.73192376,
+      "source_file": "docs/plans/2026-03-02-m3.2-rag-pipeline-design.md",
+      "language": "markdown",
+      "chunk_type": "heading_section",
+      "start_line": 38,
+      "end_line": 58
+    },
+    {
+      "content": "bypass bug)\n    if let Some(rag) = &state.rag {\n        let opts = corvia_kernel::rag_types::RetrievalOpts {\n            limit,\n            expand_graph: false, // backward compat: pure vector for search endpoint\n            ..Default::default()\n        };\n        let response = rag.context(&req.query, &req.scope_id, Some(opts)).await\n            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!(\"Search failed: {e}\")))?;\n\n        let results: Vec<SearchResultDto> = response.context.sources.into_iter().map(Into::into).collect();\n        let count = results.len();\n        return Ok(Json(SearchResponse { results, count }));\n    }\n\n    // Fallback: raw store search (no RAG pipeline configured)\n    let query_embedding = state.engine.embed(&req.query).await\n        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!(\"Embedding failed: {e}\")))?;\n\n    let results = state.store.search(&query_embedding, &req.scope_id, limit).await\n        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!(\"Search failed: {e}\")))?;\n\n    let count = results.len();\n    let results: Vec<SearchResultDto> = results.into_iter().map(Into::into).collect();\n\n    Ok(Json(SearchResponse { results, count }))\n}\n```\n\n**Step 6: Update existing tests to include rag: None in AppState**\n\nFind all test `AppState` constructions and add `rag: None`.\n\n**Step 7: Verify compilation and existing tests pass**\n\nRun: `cargo test -p corvia-server -- --nocapture`\nExpected: all existing tests PASS\n\n**Step 8: Commit**\n\n```bash\ngit add crates/corvia-server/src/rest.rs\ngit commit -m \"feat(m3.2): REST /v1/context + /v1/ask endpoints; fix search routing through RAG\"\n```\n\n---\n",
+      "score": 0.72995746,
+      "source_file": "docs/plans/2026-03-02-m3.2-rag-pipeline-impl.md",
+      "language": "markdown",
+      "chunk_type": "heading_section",
+      "start_line": 1858,
+      "end_line": 1897
+    },
+    {
+      "content": "(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!(\"RAG failed: {e}\")))?;\n\n    Ok(Json(RagResponseDto {\n        answer: response.answer,\n        sources: response.context.sources.into_iter().map(Into::into).collect(),\n        trace: response.trace,\n    }))\n}\nasync fn rag_ask(\n    State(state): State<Arc<AppState>>,\n    Json(req): Json<RagRequest>,\n) -> std::result::Result<Json<RagResponseDto>, (StatusCode, String)> {\n    let rag = state.rag.as_ref()\n        .ok_or((StatusCode::SERVICE_UNAVAILABLE, \"RAG pipeline not configured\".into()))?;\n\n    let opts = corvia_kernel::rag_types::RetrievalOpts {\n        limit: req.limit.unwrap_or(10),\n        expand_graph: req.expand_graph.unwrap_or(true),\n        ..Default::default()\n    };\n\n    let response = rag.ask(&req.query, &req.scope_id, Some(opts)).await\n        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!(\"RAG failed: {e}\")))?;\n\n    Ok(Json(RagResponseDto {\n        answer: response.answer,\n        sources: response.context.sources.into_iter().map(Into::into).collect(),\n        trace: response.trace,\n    }))\n}",
+      "score": 0.7237941,
+      "source_file": "crates/corvia-server/src/rest.rs",
+      "language": "rs",
+      "chunk_type": "function_item",
+      "start_line": 374,
+      "end_line": 395
+    },
+    {
+      "content": "### REST API\n\n# search\ncurl -X POST http://localhost:8020/v1/memories/search \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"query\": \"error handling\", \"scope_id\": \"default\", \"limit\": 5}'\n\n\n# write\ncurl -X POST http://localhost:8020/v1/memories/write \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"content\": \"Auth uses JWT tokens with 24h expiry\", \"scope_id\": \"default\"}'\n",
+      "score": 0.7216176,
+      "source_file": "README.md",
+      "language": "markdown",
+      "chunk_type": "heading_section",
+      "start_line": 104,
+      "end_line": 113
+    }
+  ],
+  "trace": {
+    "trace_id": "019cb798-1c0b-78d3-8af5-d80c48956491",
+    "retrieval": {
+      "latency_ms": 44,
+      "vector_results": 20,
+      "graph_expanded": 6,
+      "post_filter_count": 10,
+      "retriever_name": "graph_expand"
+    },
+    "augmentation": {
+      "latency_ms": 0,
+      "token_estimate": 2884,
+      "token_budget": 3276,
+      "sources_included": 10,
+      "sources_truncated": 0,
+      "augmenter_name": "structured"
+    },
+    "generation": null,
+    "total_latency_ms": 44
+  }
+}

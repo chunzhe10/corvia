@@ -407,14 +407,64 @@ fn extract_rust_mod_contains(
     }
 }
 
+/// Infer the crate `src/` root from a file path.
+///
+/// Given `crates/corvia-kernel/src/chunking_strategy.rs`, returns
+/// `Some("crates/corvia-kernel/src")`.
+/// Given `src/main.rs`, returns `Some("src")`.
+fn infer_crate_src_root(file_path: &str) -> Option<&str> {
+    // Find the last `/src/` segment — everything up to and including `src`
+    if let Some(idx) = file_path.rfind("/src/") {
+        Some(&file_path[..idx + 4]) // include "/src"
+    } else if file_path.starts_with("src/") {
+        Some("src")
+    } else {
+        None
+    }
+}
+
 /// Best-effort resolution for Rust module paths.
-/// `crate::foo::bar` → record as-is (file_path for crate-internal).
-/// `super::foo` → record as-is.
-/// `std::*` / external → record as-is.
+///
+/// - `crate::foo::bar` → `CRATE_REF:<src_root>:foo::bar` so the wiring step
+///   can resolve `foo::bar` to `<src_root>/foo/bar.rs` or `<src_root>/foo.rs`.
+/// - `super::foo` → resolve relative to the source file's parent directory.
+/// - `std::*` / external → record as-is (no match expected).
 fn resolve_rust_module_path(file_path: &str, module_path: &str) -> String {
-    if module_path.starts_with("crate::") || module_path.starts_with("super::") || module_path == "crate" || module_path == "super" {
-        // Crate-internal: record the file_path as the reference file
-        file_path.to_string()
+    if module_path.starts_with("crate::") || module_path == "crate" {
+        let mod_suffix = module_path.strip_prefix("crate::").unwrap_or("");
+        if let Some(root) = infer_crate_src_root(file_path) {
+            format!("CRATE_REF:{root}:{mod_suffix}")
+        } else {
+            // Can't infer root — fall back to source file
+            file_path.to_string()
+        }
+    } else if module_path.starts_with("super::") || module_path == "super" {
+        let mod_suffix = module_path.strip_prefix("super::").unwrap_or("");
+        // Resolve relative to parent directory of the source file
+        let parent = file_path
+            .rsplit_once('/')
+            .map(|(dir, _)| dir)
+            .unwrap_or("");
+        // Go up one more directory for `super`
+        let grandparent = parent
+            .rsplit_once('/')
+            .map(|(dir, _)| dir)
+            .unwrap_or("");
+        if mod_suffix.is_empty() {
+            // `use super::*` — point at parent module
+            if grandparent.is_empty() {
+                file_path.to_string()
+            } else {
+                format!("CRATE_REF:{grandparent}:")
+            }
+        } else {
+            // `use super::foo` → try `<grandparent>/foo.rs`
+            if grandparent.is_empty() {
+                format!("CRATE_REF::{mod_suffix}")
+            } else {
+                format!("CRATE_REF:{grandparent}:{mod_suffix}")
+            }
+        }
     } else {
         // External crate or std — record the module path itself
         module_path.to_string()
@@ -795,10 +845,10 @@ fn do_stuff() {
             imports.len()
         );
 
-        // crate::foo::Bar → to_file should be the file itself (crate-internal), to_name = "Bar"
+        // crate::foo::Bar → to_file should be CRATE_REF with module path
         let bar_import = imports.iter().find(|r| r.to_name.as_deref() == Some("Bar"));
         assert!(bar_import.is_some(), "Expected import of Bar");
-        assert_eq!(bar_import.unwrap().to_file, "src/main.rs");
+        assert_eq!(bar_import.unwrap().to_file, "CRATE_REF:src:foo");
 
         // std::collections::HashMap → to_file = "std::collections", to_name = "HashMap"
         let hashmap_import = imports
@@ -807,9 +857,10 @@ fn do_stuff() {
         assert!(hashmap_import.is_some(), "Expected import of HashMap");
         assert_eq!(hashmap_import.unwrap().to_file, "std::collections");
 
-        // super::baz → to_file = file itself, to_name = "baz"
+        // super::baz from src/main.rs — super can't resolve above crate root, fallback
         let baz_import = imports.iter().find(|r| r.to_name.as_deref() == Some("baz"));
         assert!(baz_import.is_some(), "Expected import of baz");
+        // Falls back to file_path since there's no grandparent above src/
         assert_eq!(baz_import.unwrap().to_file, "src/main.rs");
     }
 
@@ -853,7 +904,7 @@ fn do_stuff() {
             .collect();
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].to_name.as_deref(), Some("*"));
-        // super is crate-internal
+        // super from src/lib.rs can't resolve above crate root, fallback
         assert_eq!(imports[0].to_file, "src/lib.rs");
     }
 
@@ -1039,6 +1090,59 @@ class MyClass:
         );
         assert!(imports.iter().any(|r| r.to_name.as_deref() == Some("utils")));
         assert!(imports.iter().any(|r| r.to_name.as_deref() == Some("engine")));
+    }
+
+    #[test]
+    fn test_rust_crate_ref_deep_path() {
+        let source = r#"
+use crate::kernel::graph::GraphStore;
+use super::utils::Helper;
+
+fn handler() {
+    println!("hi");
+}
+"#;
+        let result = chunk_file_with_relations(
+            "crates/corvia-server/src/routes/api.rs",
+            source,
+            "rs",
+        );
+        let imports: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "imports")
+            .collect();
+        assert!(imports.len() >= 2, "Expected at least 2 import relations");
+
+        // crate::kernel::graph → CRATE_REF with inferred src root
+        let graph_import = imports
+            .iter()
+            .find(|r| r.to_name.as_deref() == Some("GraphStore"));
+        assert!(graph_import.is_some());
+        assert_eq!(
+            graph_import.unwrap().to_file,
+            "CRATE_REF:crates/corvia-server/src:kernel::graph"
+        );
+
+        // super::utils from routes/api.rs → CRATE_REF with grandparent
+        let helper_import = imports
+            .iter()
+            .find(|r| r.to_name.as_deref() == Some("Helper"));
+        assert!(helper_import.is_some());
+        assert_eq!(
+            helper_import.unwrap().to_file,
+            "CRATE_REF:crates/corvia-server/src:utils"
+        );
+    }
+
+    #[test]
+    fn test_infer_crate_src_root() {
+        assert_eq!(
+            infer_crate_src_root("crates/corvia-kernel/src/chunking_strategy.rs"),
+            Some("crates/corvia-kernel/src")
+        );
+        assert_eq!(infer_crate_src_root("src/main.rs"), Some("src"));
+        assert_eq!(infer_crate_src_root("lib.rs"), None);
     }
 
     #[test]
