@@ -10,3 +10,6 @@ docs/local/
 # Benchmark output (raw JSON, generated per-run)
 benchmark-results/
 .benchmark-workspace/
+
+# Model cache (corvia-inference downloads)
+.fastembed_cache/
