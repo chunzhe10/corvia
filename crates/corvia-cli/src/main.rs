@@ -538,6 +538,7 @@ async fn cmd_ingest(path: Option<&str>) -> Result<()> {
         let root = std::env::current_dir()?;
         let config = load_config()?;
         if config.is_workspace() {
+            ensure_inference_ready(&config).await?;
             workspace::ingest_workspace(&root, None, false).await?;
         } else {
             anyhow::bail!("No path provided and not in a workspace. Usage: corvia ingest <path>");
@@ -1056,6 +1057,8 @@ async fn cmd_workspace(command: WorkspaceCommands) -> Result<()> {
         }
         WorkspaceCommands::Ingest { repo, fresh } => {
             let root = std::env::current_dir()?;
+            let config = load_config()?;
+            ensure_inference_ready(&config).await?;
             workspace::ingest_workspace(&root, repo.as_deref(), fresh).await?;
             Ok(())
         }
