@@ -1,17 +1,58 @@
 use axum::{
-    extract::{Json, State},
-    response::IntoResponse,
-    routing::post,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
+    routing::{delete, get, post},
     Router,
 };
 use corvia_common::agent_types::*;
 use corvia_common::types::EdgeDirection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::info;
+use uuid::Uuid;
 
 use crate::rest::AppState;
+
+// --- Session store ---
+
+/// Tracks active MCP sessions (Streamable HTTP transport).
+#[derive(Default)]
+pub struct McpSessions {
+    sessions: RwLock<HashSet<String>>,
+}
+
+impl McpSessions {
+    pub fn new() -> Self {
+        Self { sessions: RwLock::new(HashSet::new()) }
+    }
+
+    async fn create(&self) -> String {
+        let id = Uuid::now_v7().to_string();
+        self.sessions.write().await.insert(id.clone());
+        id
+    }
+
+    async fn is_valid(&self, id: &str) -> bool {
+        self.sessions.read().await.contains(id)
+    }
+
+    async fn remove(&self, id: &str) -> bool {
+        self.sessions.write().await.remove(id)
+    }
+}
+
+/// Shared state for MCP endpoints: app state + session tracker.
+pub struct McpState {
+    pub app: Arc<AppState>,
+    pub sessions: Arc<McpSessions>,
+}
 
 // --- JSON-RPC 2.0 types ---
 
@@ -24,7 +65,7 @@ pub struct JsonRpcRequest {
     pub params: Value,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct JsonRpcResponse {
     pub jsonrpc: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -35,7 +76,7 @@ pub struct JsonRpcResponse {
     pub error: Option<JsonRpcError>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct JsonRpcError {
     pub code: i32,
     pub message: String,
@@ -60,6 +101,10 @@ const INTERNAL_ERROR: i32 = -32603;
 /// Service unavailable (optional component not configured).
 /// Uses -32000 from the JSON-RPC implementation-defined server error range (-32000..-32099).
 const SERVICE_UNAVAILABLE: i32 = -32000;
+
+// --- MCP Streamable HTTP headers ---
+
+const MCP_SESSION_ID: &str = "mcp-session-id";
 
 // --- MCP tool definitions ---
 
@@ -164,25 +209,129 @@ fn tool_definitions() -> Vec<Value> {
     ]
 }
 
-// --- MCP handler ---
+// --- MCP Streamable HTTP router ---
 
 pub fn mcp_router(state: Arc<AppState>) -> Router {
+    let mcp_state = Arc::new(McpState {
+        app: state,
+        sessions: Arc::new(McpSessions::new()),
+    });
     Router::new()
-        .route("/mcp", post(handle_mcp))
-        .with_state(state)
+        .route("/mcp", post(handle_mcp_post))
+        .route("/mcp", get(handle_mcp_get))
+        .route("/mcp", delete(handle_mcp_delete))
+        .with_state(mcp_state)
 }
 
-async fn handle_mcp(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<JsonRpcRequest>,
-) -> impl IntoResponse {
+// --- POST /mcp — main request handler ---
+
+async fn handle_mcp_post(
+    State(state): State<Arc<McpState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    // Parse the request body as JSON-RPC
+    let req: JsonRpcRequest = match serde_json::from_str(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {e}")).into_response();
+        }
+    };
+
+    let is_initialize = req.method == "initialize";
+    let is_notification = req.id.is_none() || req.method == "notifications/initialized";
+
+    // Session validation: all requests after initialize must include a valid session ID
+    if !is_initialize {
+        match headers.get(MCP_SESSION_ID).and_then(|v| v.to_str().ok()) {
+            Some(session_id) if state.sessions.is_valid(session_id).await => {}
+            Some(_) => {
+                // Invalid session ID
+                return (StatusCode::NOT_FOUND, "Invalid or expired session").into_response();
+            }
+            None => {
+                // Missing session ID (and not initialize) — bad request
+                return (StatusCode::BAD_REQUEST, "Missing Mcp-Session-Id header").into_response();
+            }
+        }
+    }
+
+    // Notifications don't get a response body
+    if is_notification && !is_initialize {
+        return StatusCode::ACCEPTED.into_response();
+    }
+
     let id = req.id.clone();
-    let response = dispatch(&state, req).await;
-    Json(match response {
+    let response = dispatch(&state.app, req).await;
+    let rpc_response = match response {
         Ok(result) => JsonRpcResponse::success(id, result),
         Err((code, msg)) => JsonRpcResponse::error(id, code, msg),
-    })
+    };
+
+    let json_body = serde_json::to_string(&rpc_response).unwrap();
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json");
+
+    // On initialize, create a new session and return the session ID
+    if is_initialize && rpc_response.error.is_none() {
+        let session_id = state.sessions.create().await;
+        info!(session_id = %session_id, "MCP session created");
+        builder = builder.header(MCP_SESSION_ID, &session_id);
+    } else if let Some(session_id) = headers.get(MCP_SESSION_ID) {
+        // Echo back the session ID on all responses
+        builder = builder.header(MCP_SESSION_ID, session_id);
+    }
+
+    builder.body(json_body.into()).unwrap()
 }
+
+// --- GET /mcp — SSE stream for server-to-client notifications ---
+
+async fn handle_mcp_get(
+    State(state): State<Arc<McpState>>,
+    headers: HeaderMap,
+) -> Response {
+    // Require valid session
+    match headers.get(MCP_SESSION_ID).and_then(|v| v.to_str().ok()) {
+        Some(session_id) if state.sessions.is_valid(session_id).await => {
+            // Return an SSE stream. We don't currently send server-initiated messages,
+            // so this just keeps the connection alive until the client disconnects.
+            let stream = tokio_stream::wrappers::ReceiverStream::new(
+                tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(1).1,
+            );
+            Sse::new(stream)
+                .keep_alive(KeepAlive::default())
+                .into_response()
+        }
+        _ => {
+            (StatusCode::NOT_FOUND, "Invalid or missing session").into_response()
+        }
+    }
+}
+
+// --- DELETE /mcp — terminate session ---
+
+async fn handle_mcp_delete(
+    State(state): State<Arc<McpState>>,
+    headers: HeaderMap,
+) -> Response {
+    match headers.get(MCP_SESSION_ID).and_then(|v| v.to_str().ok()) {
+        Some(session_id) => {
+            if state.sessions.remove(session_id).await {
+                info!(session_id = %session_id, "MCP session terminated");
+                StatusCode::OK.into_response()
+            } else {
+                (StatusCode::NOT_FOUND, "Session not found").into_response()
+            }
+        }
+        None => {
+            (StatusCode::BAD_REQUEST, "Missing Mcp-Session-Id header").into_response()
+        }
+    }
+}
+
+// --- JSON-RPC dispatch ---
 
 async fn dispatch(
     state: &AppState,
@@ -190,6 +339,7 @@ async fn dispatch(
 ) -> Result<Value, (i32, String)> {
     match req.method.as_str() {
         "initialize" => handle_initialize(&req.params),
+        "notifications/initialized" => Ok(json!({})),
         "tools/list" => Ok(handle_tools_list()),
         "tools/call" => handle_tools_call(state, &req.params).await,
         other => Err((METHOD_NOT_FOUND, format!("Method not found: {other}"))),
@@ -205,7 +355,7 @@ fn handle_initialize(params: &Value) -> Result<Value, (i32, String)> {
     }
 
     Ok(json!({
-        "protocolVersion": "2024-11-05",
+        "protocolVersion": "2025-03-26",
         "capabilities": {
             "tools": {}
         },
@@ -709,7 +859,7 @@ mod tests {
             "clientInfo": { "name": "test-client", "version": "1.0" }
         });
         let result = handle_initialize(&params).unwrap();
-        assert_eq!(result["protocolVersion"], "2024-11-05");
+        assert_eq!(result["protocolVersion"], "2025-03-26");
         assert!(result["serverInfo"]["name"].as_str().unwrap() == "corvia");
     }
 
@@ -996,5 +1146,24 @@ mod tests {
         assert!(result.is_err());
         let (code, _) = result.unwrap_err();
         assert_eq!(code, METHOD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_session_lifecycle() {
+        let sessions = McpSessions::new();
+
+        // Create session
+        let id = sessions.create().await;
+        assert!(sessions.is_valid(&id).await);
+
+        // Invalid session
+        assert!(!sessions.is_valid("bogus").await);
+
+        // Remove session
+        assert!(sessions.remove(&id).await);
+        assert!(!sessions.is_valid(&id).await);
+
+        // Double remove returns false
+        assert!(!sessions.remove(&id).await);
     }
 }

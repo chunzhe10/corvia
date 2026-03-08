@@ -5,8 +5,8 @@
 //! - **REST** ([`rest`]) — Axum-based HTTP API on port `8020` with endpoints for
 //!   knowledge ingestion, semantic search, graph queries, temporal history,
 //!   reasoning, and agent coordination.
-//! - **MCP** ([`mcp`]) — JSON-RPC 2.0 Model Context Protocol at `POST /mcp`,
-//!   providing tool-use access for AI agents (search, ingest, reason, graph).
+//! - **MCP** ([`mcp`]) — JSON-RPC 2.0 Model Context Protocol via Streamable HTTP
+//!   transport (POST/GET/DELETE `/mcp`), providing tool-use access for AI agents.
 //!
 //! Both protocol handlers share a common `AppState` that holds trait objects
 //! ([`QueryableStore`](corvia_kernel::traits::QueryableStore),

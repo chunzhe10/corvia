@@ -436,7 +436,7 @@ async fn cmd_serve(mcp: bool) -> Result<()> {
 
     if mcp {
         app = app.merge(corvia_server::mcp::mcp_router(state));
-        println!("MCP endpoint: POST /mcp");
+        println!("MCP endpoint: POST/GET/DELETE /mcp (Streamable HTTP)");
     }
 
     let addr = format!("{}:{}", config.server.host, config.server.port);

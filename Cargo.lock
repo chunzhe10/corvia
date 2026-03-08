@@ -1002,7 +1002,7 @@ dependencies = [
 
 [[package]]
 name = "corvia-adapter-basic"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -1011,7 +1011,7 @@ dependencies = [
 
 [[package]]
 name = "corvia-adapter-git"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "async-trait",
  "corvia-common",
@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "corvia-cli"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1060,7 +1060,7 @@ dependencies = [
 
 [[package]]
 name = "corvia-common"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1073,7 +1073,7 @@ dependencies = [
 
 [[package]]
 name = "corvia-inference"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "clap",
  "corvia-proto",
@@ -1090,7 +1090,7 @@ dependencies = [
 
 [[package]]
 name = "corvia-kernel"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1121,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "corvia-proto"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "prost 0.13.5",
  "tonic 0.12.3",
@@ -1130,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "corvia-server"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1142,6 +1142,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tower-http",
  "tracing",
  "uuid",
