@@ -390,6 +390,7 @@ async fn cmd_init(store: &str) -> Result<()> {
 
 async fn cmd_serve(mcp: bool) -> Result<()> {
     let config = load_config()?;
+    ensure_inference_ready(&config).await?;
     let (store, graph, temporal) = connect_full_store(&config).await?;
     let engine: Arc<dyn InferenceEngine> = connect_engine(&config);
 
