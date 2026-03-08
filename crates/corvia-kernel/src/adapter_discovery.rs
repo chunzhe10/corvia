@@ -24,6 +24,12 @@ pub struct DiscoveredAdapter {
 /// Discovery order (D74): config dir first, then PATH. First match per
 /// adapter name wins (config dir takes priority over PATH).
 pub fn discover_adapters(extra_dirs: &[String]) -> Vec<DiscoveredAdapter> {
+    discover_adapters_inner(extra_dirs, true)
+}
+
+/// Internal discovery with option to skip PATH and config dir scanning.
+/// Used by tests to avoid picking up real adapter binaries from the host.
+fn discover_adapters_inner(extra_dirs: &[String], scan_system: bool) -> Vec<DiscoveredAdapter> {
     let mut seen_names: HashSet<String> = HashSet::new();
     let mut adapters = Vec::new();
 
@@ -33,16 +39,18 @@ pub fn discover_adapters(extra_dirs: &[String]) -> Vec<DiscoveredAdapter> {
         scan_dir(&expanded, &mut seen_names, &mut adapters);
     }
 
-    // 2. Default config dir: ~/.config/corvia/adapters/
-    if let Some(home) = home_dir() {
-        let config_dir = home.join(".config").join("corvia").join("adapters");
-        scan_dir(&config_dir, &mut seen_names, &mut adapters);
-    }
+    if scan_system {
+        // 2. Default config dir: ~/.config/corvia/adapters/
+        if let Some(home) = home_dir() {
+            let config_dir = home.join(".config").join("corvia").join("adapters");
+            scan_dir(&config_dir, &mut seen_names, &mut adapters);
+        }
 
-    // 3. $PATH
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            scan_dir(&dir, &mut seen_names, &mut adapters);
+        // 3. $PATH
+        if let Ok(path_var) = std::env::var("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                scan_dir(&dir, &mut seen_names, &mut adapters);
+            }
         }
     }
 
@@ -229,7 +237,7 @@ mod tests {
             r#"{"name":"test","version":"0.1.0","domain":"test","protocol_version":1,"description":"Test adapter","supported_extensions":["txt"],"chunking_extensions":[]}"#,
         );
 
-        let adapters = discover_adapters(&[dir.path().to_string_lossy().to_string()]);
+        let adapters = discover_adapters_inner(&[dir.path().to_string_lossy().to_string()], false);
         assert_eq!(adapters.len(), 1);
         assert_eq!(adapters[0].metadata.name, "test");
         assert_eq!(adapters[0].metadata.version, "0.1.0");
@@ -243,10 +251,10 @@ mod tests {
         create_mock_adapter(dir1.path(), "corvia-adapter-test", meta);
         create_mock_adapter(dir2.path(), "corvia-adapter-test", meta);
 
-        let adapters = discover_adapters(&[
+        let adapters = discover_adapters_inner(&[
             dir1.path().to_string_lossy().to_string(),
             dir2.path().to_string_lossy().to_string(),
-        ]);
+        ], false);
         assert_eq!(adapters.len(), 1, "should deduplicate by name");
     }
 
@@ -257,7 +265,7 @@ mod tests {
         fs::write(&path, "not executable").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
 
-        let adapters = discover_adapters(&[dir.path().to_string_lossy().to_string()]);
+        let adapters = discover_adapters_inner(&[dir.path().to_string_lossy().to_string()], false);
         assert!(adapters.is_empty());
     }
 
