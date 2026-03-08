@@ -45,6 +45,7 @@ fn check_rbac_scope(
                         latency_ms: start.elapsed().as_millis() as u64,
                         vector_results: 0,
                         graph_expanded: 0,
+                        graph_reinforced: 0,
                         post_filter_count: 0,
                         retriever_name: retriever_name.to_string(),
                     },
@@ -108,8 +109,8 @@ impl Retriever for VectorRetriever {
         // Embed the query.
         let embedding = self.engine.embed(query).await?;
 
-        // 2x oversample (min 10) to allow for post-filter elimination.
-        let fetch_limit = (opts.limit * 2).max(10);
+        // Oversample (min 10) to allow for post-filter elimination.
+        let fetch_limit = (opts.limit * opts.oversample_factor).max(10);
         let raw_results = self.store.search(&embedding, scope_id, fetch_limit).await?;
         let vector_results = raw_results.len();
 
@@ -137,6 +138,7 @@ impl Retriever for VectorRetriever {
                 latency_ms: start.elapsed().as_millis() as u64,
                 vector_results,
                 graph_expanded: 0,
+                graph_reinforced: 0,
                 post_filter_count,
                 retriever_name: self.name().to_string(),
             },
@@ -233,8 +235,8 @@ impl Retriever for GraphExpandRetriever {
         // Embed the query.
         let embedding = self.engine.embed(query).await?;
 
-        // 2x oversample (min 10) to allow for post-filter elimination.
-        let fetch_limit = (opts.limit * 2).max(10);
+        // Oversample (min 10) to allow for post-filter elimination.
+        let fetch_limit = (opts.limit * opts.oversample_factor).max(10);
         let raw_results = self
             .store
             .search(&embedding, scope_id, fetch_limit)
@@ -254,6 +256,9 @@ impl Retriever for GraphExpandRetriever {
 
         // Graph expansion.
         let mut graph_expanded: usize = 0;
+        let mut graph_reinforced: usize = 0;
+        // Track reinforcement count per result for diminishing returns.
+        let mut reinforcement_counts: std::collections::HashMap<uuid::Uuid, u32> = std::collections::HashMap::new();
 
         if opts.expand_graph {
             // Hop 1: follow edges from each vector result.
@@ -271,6 +276,20 @@ impl Retriever for GraphExpandRetriever {
                     };
 
                     if seen.contains(&neighbor_id) {
+                        // Reinforce with diminishing returns: each hit gives 50% less than previous.
+                        // Hit 1: alpha*0.25, Hit 2: alpha*0.125, Hit 3: alpha*0.0625, ...
+                        // Converges to alpha*0.5 total, preventing runaway but rewarding connectivity.
+                        let count = reinforcement_counts.entry(neighbor_id).or_insert(0);
+                        let decay = 0.5_f32.powi(*count as i32);
+                        let bonus = self.alpha * 0.25 * decay;
+                        if bonus > 0.001 {
+                            if let Some(existing) = scored.iter_mut().find(|(_, sr)| sr.entry.id == neighbor_id) {
+                                existing.0 += bonus;
+                                existing.1.score = existing.0;
+                                graph_reinforced += 1;
+                            }
+                            *count += 1;
+                        }
                         continue;
                     }
 
@@ -314,6 +333,18 @@ impl Retriever for GraphExpandRetriever {
                         .await?;
                     for entry in deep_entries {
                         if seen.contains(&entry.id) {
+                            // Reinforce with diminishing returns for deeper hops.
+                            let count = reinforcement_counts.entry(entry.id).or_insert(0);
+                            let decay = 0.5_f32.powi(*count as i32);
+                            let bonus = self.alpha * 0.15 * decay;
+                            if bonus > 0.001 {
+                                if let Some(existing) = scored.iter_mut().find(|(_, sr)| sr.entry.id == entry.id) {
+                                    existing.0 += bonus;
+                                    existing.1.score = existing.0;
+                                    graph_reinforced += 1;
+                                }
+                                *count += 1;
+                            }
                             continue;
                         }
                         if entry.scope_id != scope_id {
@@ -359,6 +390,7 @@ impl Retriever for GraphExpandRetriever {
             scope_id,
             vector_results,
             graph_expanded,
+            graph_reinforced,
             post_filter_count,
             latency_ms = start.elapsed().as_millis() as u64,
             "retrieval complete"
@@ -370,6 +402,7 @@ impl Retriever for GraphExpandRetriever {
                 latency_ms: start.elapsed().as_millis() as u64,
                 vector_results,
                 graph_expanded,
+                graph_reinforced,
                 post_filter_count,
                 retriever_name: self.name().to_string(),
             },
@@ -724,5 +757,87 @@ mod tests {
             "graph_expanded should be 0 when expand_graph is false"
         );
         assert_eq!(result.metrics.retriever_name, "graph_expand");
+    }
+
+    /// When a graph neighbor is already in vector results, its score should
+    /// be boosted (reinforced) rather than silently skipped.
+    #[tokio::test]
+    async fn test_graph_reinforcement_boosts_overlapping_results() {
+        use crate::traits::GraphStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+
+        let queryable = store.clone() as Arc<dyn QueryableStore>;
+        let graph = store.clone() as Arc<dyn GraphStore>;
+        let engine: Arc<dyn InferenceEngine> = Arc::new(MockEngine);
+
+        let mut idx: usize = 0;
+        let mut next_emb = || {
+            idx += 1;
+            vec![1.0, idx as f32 * 0.001, 0.0]
+        };
+
+        // Entry A — close to query vector [1,0,0]
+        let mut ea = KnowledgeEntry::new(
+            "auth module".to_string(),
+            "reinforce-scope".to_string(),
+            "v1".to_string(),
+        );
+        ea.embedding = Some(next_emb());
+        queryable.insert(&ea).await.unwrap();
+
+        // Entry B — also close (both in top-N vector results)
+        let mut eb = KnowledgeEntry::new(
+            "auth middleware".to_string(),
+            "reinforce-scope".to_string(),
+            "v1".to_string(),
+        );
+        eb.embedding = Some(next_emb());
+        queryable.insert(&eb).await.unwrap();
+
+        // 8 filler entries for HNSW connectivity
+        for i in 0..8 {
+            let mut filler = KnowledgeEntry::new(
+                format!("filler {i}"),
+                "reinforce-scope".to_string(),
+                "v1".to_string(),
+            );
+            filler.embedding = Some(next_emb());
+            queryable.insert(&filler).await.unwrap();
+        }
+
+        // Create edge A→B. Both A and B should be in vector results,
+        // so B should get reinforced when we follow A's edges.
+        graph.relate(&ea.id, "imports", &eb.id, None).await.unwrap();
+
+        let retriever = GraphExpandRetriever::new(
+            queryable,
+            engine,
+            graph,
+            0.3, // alpha
+        );
+
+        let opts_graph = RetrievalOpts {
+            limit: 10,
+            expand_graph: true,
+            graph_depth: 1,
+            visibility: VisibilityMode::All,
+            ..Default::default()
+        };
+
+        let result = retriever
+            .retrieve("auth", "reinforce-scope", &opts_graph)
+            .await
+            .unwrap();
+
+        // Both A and B are in vector results, and A→B edge exists,
+        // so graph reinforcement should have boosted B's score.
+        assert!(
+            result.metrics.graph_reinforced >= 1,
+            "expected graph_reinforced >= 1, got {}",
+            result.metrics.graph_reinforced
+        );
     }
 }

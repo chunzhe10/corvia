@@ -96,12 +96,19 @@ impl RagPipeline {
 
         // --- Stage 1: Retrieval ---
 
-        let retrieval_opts = opts.unwrap_or_else(|| RetrievalOpts {
-            limit: self.config.default_limit,
-            expand_graph: self.config.graph_expand,
-            graph_depth: self.config.graph_depth,
-            ..Default::default()
+        let mut retrieval_opts = opts.unwrap_or_else(|| {
+            RetrievalOpts {
+                limit: self.config.default_limit,
+                expand_graph: self.config.graph_expand,
+                graph_depth: self.config.graph_depth,
+                ..Default::default()
+            }
         });
+
+        // Always apply config-level oversample when graph expansion is active.
+        if retrieval_opts.expand_graph {
+            retrieval_opts.oversample_factor = self.config.graph_oversample_factor;
+        }
 
         let retrieval = self
             .retriever

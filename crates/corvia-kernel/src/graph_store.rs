@@ -323,7 +323,7 @@ impl crate::traits::GraphStore for LiteGraphStore {
         direction: EdgeDirection,
         max_depth: usize,
     ) -> Result<Vec<KnowledgeEntry>> {
-        // Returns empty for now — entry lookup requires QueryableStore (wired in Task 7)
+        // Stub: LiteStore overrides with entry-aware traversal via traverse_ids() + get()
         // traverse_ids is the real implementation
         let _ids = self.traverse_ids(start, relation, direction, max_depth)?;
         Ok(Vec::new())
@@ -334,7 +334,7 @@ impl crate::traits::GraphStore for LiteGraphStore {
         from: &Uuid,
         to: &Uuid,
     ) -> Result<Option<Vec<KnowledgeEntry>>> {
-        // Returns None for now — entry lookup requires QueryableStore (wired in Task 7)
+        // Stub: LiteStore overrides with entry-aware traversal via shortest_path_ids() + get()
         // shortest_path_ids is the real implementation
         let _ids = self.shortest_path_ids(from, to)?;
         Ok(None)
@@ -480,6 +480,50 @@ mod tests {
         // No path in reverse (directed graph)
         let reverse = store.shortest_path_ids(&c, &a).unwrap();
         assert!(reverse.is_none());
+    }
+
+    /// Verifies that the LiteGraphStore::traverse() stub returns empty
+    /// but traverse_ids() returns correct IDs for the same graph.
+    #[tokio::test]
+    async fn test_graph_store_traverse_stub_documents_behavior() {
+        let db = test_db();
+        let store = LiteGraphStore::new(db).unwrap();
+
+        let a = Uuid::now_v7();
+        let b = Uuid::now_v7();
+        let c = Uuid::now_v7();
+        store.relate(&a, "imports", &b, None).await.unwrap();
+        store.relate(&b, "imports", &c, None).await.unwrap();
+
+        // The trait method traverse() returns empty (stub without entry lookup)
+        let entries = store
+            .traverse(&a, None, EdgeDirection::Outgoing, 2)
+            .await
+            .unwrap();
+        assert!(
+            entries.is_empty(),
+            "LiteGraphStore::traverse() stub should return empty (no entry store)"
+        );
+
+        // But traverse_ids() returns the correct neighbor IDs
+        let ids = store
+            .traverse_ids(&a, None, EdgeDirection::Outgoing, 2)
+            .unwrap();
+        assert_eq!(ids.len(), 2, "traverse_ids should find b and c");
+        assert!(ids.contains(&b));
+        assert!(ids.contains(&c));
+
+        // shortest_path() stub returns None
+        let path_entries = store.shortest_path(&a, &c).await.unwrap();
+        assert!(
+            path_entries.is_none(),
+            "LiteGraphStore::shortest_path() stub should return None"
+        );
+
+        // But shortest_path_ids() returns the correct path
+        let path_ids = store.shortest_path_ids(&a, &c).unwrap();
+        assert!(path_ids.is_some());
+        assert_eq!(path_ids.unwrap().len(), 3);
     }
 
     #[tokio::test]

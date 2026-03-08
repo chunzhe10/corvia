@@ -1252,4 +1252,90 @@ mod tests {
         assert_eq!(path[1].content, "graph node B");
         assert_eq!(path[2].content, "graph node C");
     }
+
+    /// Traverse depth-2 with LiteStore (entry-aware): verifies depth limits,
+    /// direction filtering, and relation-type filtering.
+    #[tokio::test]
+    async fn test_lite_store_traverse_depth_2() {
+        use crate::traits::GraphStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = LiteStore::open(dir.path(), 3).unwrap();
+        store.init_schema().await.unwrap();
+
+        // Insert A, B, C with embeddings
+        let ea = KnowledgeEntry::new("node A".into(), "scope".into(), "v1".into())
+            .with_embedding(vec![1.0, 0.0, 0.0]);
+        let eb = KnowledgeEntry::new("node B".into(), "scope".into(), "v1".into())
+            .with_embedding(vec![0.0, 1.0, 0.0]);
+        let ec = KnowledgeEntry::new("node C".into(), "scope".into(), "v1".into())
+            .with_embedding(vec![0.0, 0.0, 1.0]);
+
+        let id_a = ea.id;
+        let id_b = eb.id;
+        let id_c = ec.id;
+
+        store.insert(&ea).await.unwrap();
+        store.insert(&eb).await.unwrap();
+        store.insert(&ec).await.unwrap();
+
+        // Edges: A→B (imports), B→C (imports)
+        store.relate(&id_a, "imports", &id_b, None).await.unwrap();
+        store.relate(&id_b, "imports", &id_c, None).await.unwrap();
+
+        // Depth 2, Both direction: should find B and C
+        let result = store
+            .traverse(&id_a, None, corvia_common::types::EdgeDirection::Both, 2)
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 2, "depth 2 Both should find B and C");
+        let contents: Vec<&str> = result.iter().map(|e| e.content.as_str()).collect();
+        assert!(contents.contains(&"node B"));
+        assert!(contents.contains(&"node C"));
+
+        // Depth 1: should find only B
+        let result_d1 = store
+            .traverse(&id_a, None, corvia_common::types::EdgeDirection::Both, 1)
+            .await
+            .unwrap();
+        assert_eq!(result_d1.len(), 1, "depth 1 should find only B");
+        assert_eq!(result_d1[0].content, "node B");
+
+        // Relation filter: only "imports" Outgoing depth 2
+        let result_filtered = store
+            .traverse(
+                &id_a,
+                Some("imports"),
+                corvia_common::types::EdgeDirection::Outgoing,
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result_filtered.len(),
+            2,
+            "filtered 'imports' Outgoing depth 2 should find B and C"
+        );
+
+        // Relation filter: "calls" should find nothing (no calls edges)
+        let result_no_match = store
+            .traverse(
+                &id_a,
+                Some("calls"),
+                corvia_common::types::EdgeDirection::Outgoing,
+                2,
+            )
+            .await
+            .unwrap();
+        assert!(
+            result_no_match.is_empty(),
+            "filtering by non-existent relation should return empty"
+        );
+
+        // Returned entries have correct content
+        for entry in &result {
+            assert!(!entry.content.is_empty());
+            assert_eq!(entry.scope_id, "scope");
+        }
+    }
 }

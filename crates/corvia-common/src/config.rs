@@ -196,6 +196,8 @@ pub struct RagConfig {
     pub max_context_tokens: usize,
     #[serde(default)]
     pub system_prompt: String,
+    #[serde(default = "default_graph_oversample")]
+    pub graph_oversample_factor: usize,
 }
 
 fn default_rag_limit() -> usize { 10 }
@@ -203,6 +205,7 @@ fn default_graph_expand() -> bool { true }
 fn default_graph_depth() -> usize { 2 }
 fn default_graph_alpha() -> f32 { 0.3 }
 fn default_reserve_for_answer() -> f32 { 0.2 }
+fn default_graph_oversample() -> usize { 3 }
 
 impl Default for RagConfig {
     fn default() -> Self {
@@ -214,6 +217,7 @@ impl Default for RagConfig {
             reserve_for_answer: default_reserve_for_answer(),
             max_context_tokens: 0,
             system_prompt: String::new(),
+            graph_oversample_factor: default_graph_oversample(),
         }
     }
 }
@@ -807,6 +811,42 @@ adapter = "confluence"
         let loaded: CorviaConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(loaded.adapters.unwrap().default, Some("basic".into()));
         assert_eq!(loaded.sources.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_oversample_config_default() {
+        let config = RagConfig::default();
+        assert_eq!(config.graph_oversample_factor, 3);
+    }
+
+    #[test]
+    fn test_oversample_config_serde() {
+        // Deserialize TOML without graph_oversample_factor → should get default 3
+        let toml_str = r#"
+default_limit = 10
+graph_expand = true
+graph_depth = 2
+graph_alpha = 0.3
+reserve_for_answer = 0.2
+max_context_tokens = 0
+system_prompt = ""
+"#;
+        let config: RagConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.graph_oversample_factor, 3);
+
+        // With explicit value
+        let toml_str2 = r#"
+default_limit = 10
+graph_expand = true
+graph_depth = 2
+graph_alpha = 0.3
+reserve_for_answer = 0.2
+max_context_tokens = 0
+system_prompt = ""
+graph_oversample_factor = 5
+"#;
+        let config2: RagConfig = toml::from_str(toml_str2).unwrap();
+        assert_eq!(config2.graph_oversample_factor, 5);
     }
 
     #[test]

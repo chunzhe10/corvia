@@ -18,6 +18,8 @@ pub struct RetrievalOpts {
     pub agent_id: Option<String>,
     /// Agent permissions for RBAC scope filtering.
     pub permissions: Option<AgentPermission>,
+    /// Oversample factor for vector search (more seeds = more graph expansion).
+    pub oversample_factor: usize,
 }
 
 impl Default for RetrievalOpts {
@@ -29,6 +31,7 @@ impl Default for RetrievalOpts {
             visibility: VisibilityMode::All,
             agent_id: None,
             permissions: None,
+            oversample_factor: 2,
         }
     }
 }
@@ -64,6 +67,8 @@ pub struct RetrievalMetrics {
     pub latency_ms: u64,
     pub vector_results: usize,
     pub graph_expanded: usize,
+    #[serde(default)]
+    pub graph_reinforced: usize,
     pub post_filter_count: usize,
     pub retriever_name: String,
 }
