@@ -224,8 +224,12 @@ fn extract_rust_relations(
                         let owner_idx = find_owning_chunk(chunks, node.start_position().row as u32 + 1);
                         extract_rust_use(&mut relations, source, &node, file_path, owner_idx);
                     }
+                    "function_item" => {
+                        extract_rust_calls(&mut relations, source, &node, file_path, chunks);
+                    }
                     "impl_item" => {
                         extract_rust_impl(&mut relations, source, &node, file_path, chunks);
+                        extract_rust_calls(&mut relations, source, &node, file_path, chunks);
                     }
                     "mod_item" => {
                         extract_rust_mod_contains(&mut relations, source, &node, file_path, chunks);
@@ -403,6 +407,103 @@ fn extract_rust_mod_contains(
                 to_file: file_path.to_string(),
                 to_name: child_name,
             });
+        }
+    }
+}
+
+/// Extract "calls" relations from function/method call sites in Rust code.
+///
+/// Walks AST nodes inside function/impl bodies looking for `call_expression` nodes.
+/// Emits "calls" relations for non-trivial function calls (skips std/common trait methods).
+fn extract_rust_calls(
+    relations: &mut Vec<CodeRelation>,
+    source: &str,
+    node: &Node,
+    file_path: &str,
+    chunks: &[CodeChunk],
+) {
+    // Deny list: common trait methods that would create edge explosion
+    const DENY_LIST: &[&str] = &[
+        "new", "default", "from", "into", "clone", "fmt", "drop",
+        "to_string", "to_owned", "as_ref", "as_mut", "deref", "borrow",
+        "unwrap", "expect", "ok", "err", "map", "and_then", "or_else",
+        "iter", "collect", "push", "len", "is_empty",
+    ];
+
+    let owner_line = node.start_position().row as u32 + 1;
+    let owner_idx = find_chunk_by_line(chunks, owner_line);
+
+    // Recursively collect call expressions
+    let mut call_nodes = Vec::new();
+    collect_call_expressions(node, &mut call_nodes, 0);
+
+    for call_node in &call_nodes {
+        // Extract the function part of the call expression
+        let Some(func_node) = call_node.child_by_field_name("function") else {
+            continue;
+        };
+
+        let func_text = source[func_node.byte_range()].to_string();
+
+        // Skip standard library calls
+        if func_text.starts_with("std::") || func_text.starts_with("core::") || func_text.starts_with("alloc::") {
+            continue;
+        }
+
+        // Extract the final function/method name
+        let fn_name = func_text.rsplit("::").next().unwrap_or(&func_text);
+        // For method calls like `self.foo()`, the function node is a field_expression
+        let fn_name = fn_name.rsplit('.').next().unwrap_or(fn_name);
+
+        // Skip deny-listed common methods
+        if DENY_LIST.contains(&fn_name) {
+            continue;
+        }
+        // Skip single-char or empty names (noise)
+        if fn_name.len() <= 1 {
+            continue;
+        }
+
+        // Determine target file
+        let to_file = if func_text.contains("crate::") || func_text.contains("super::") {
+            resolve_rust_module_path(file_path, &func_text.rsplit("::").skip(1).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("::"))
+        } else if func_text.contains("::") {
+            // Qualified path — use the module part
+            let parts: Vec<&str> = func_text.rsplitn(2, "::").collect();
+            if parts.len() == 2 {
+                resolve_rust_module_path(file_path, parts[1])
+            } else {
+                file_path.to_string()
+            }
+        } else {
+            // Unqualified call — likely in the same file or imported
+            file_path.to_string()
+        };
+
+        relations.push(CodeRelation {
+            from_chunk_index: owner_idx,
+            relation: "calls".to_string(),
+            to_file,
+            to_name: Some(fn_name.to_string()),
+        });
+    }
+}
+
+/// Recursively collect `call_expression` nodes from the AST, with depth limit.
+fn collect_call_expressions<'a>(node: &Node<'a>, results: &mut Vec<Node<'a>>, depth: usize) {
+    if depth > 20 {
+        return;
+    }
+    if node.kind() == "call_expression" {
+        results.push(*node);
+    }
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            collect_call_expressions(&cursor.node(), results, depth + 1);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
         }
     }
 }
@@ -1181,5 +1282,88 @@ fn world() {
             assert_eq!(a.start_line, b.start_line);
             assert_eq!(a.end_line, b.end_line);
         }
+    }
+
+    #[test]
+    fn test_rust_call_extraction() {
+        let source = r#"
+fn main() {
+    helper();
+    module::other(42);
+    let x = compute(1, 2);
+}
+"#;
+        let result = chunk_file_with_relations("src/main.rs", source, "rs");
+        let calls: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "calls")
+            .collect();
+        assert!(
+            calls.len() >= 2,
+            "Expected at least 2 'calls' relations (helper, other, compute), got {}",
+            calls.len()
+        );
+        let names: Vec<Option<&str>> = calls.iter().map(|r| r.to_name.as_deref()).collect();
+        assert!(names.contains(&Some("helper")));
+        assert!(names.contains(&Some("other")));
+    }
+
+    #[test]
+    fn test_rust_call_skips_std_and_common() {
+        let source = r#"
+fn process() {
+    let v = Vec::new();
+    let s = String::from("hello");
+    let c = s.clone();
+    let d = Default::default();
+    std::io::stdout();
+    core::mem::drop(c);
+}
+"#;
+        let result = chunk_file_with_relations("src/lib.rs", source, "rs");
+        let calls: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "calls")
+            .collect();
+        // All of these should be filtered: new, from, clone, default, std::*, core::*
+        for call in &calls {
+            let name = call.to_name.as_deref().unwrap_or("");
+            assert!(
+                !["new", "from", "clone", "default", "drop"].contains(&name),
+                "should have filtered common method '{name}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rust_call_resolves_crate_path() {
+        let source = r#"
+fn handler() {
+    crate::foo::process();
+}
+"#;
+        let result = chunk_file_with_relations(
+            "crates/corvia-server/src/routes/api.rs",
+            source,
+            "rs",
+        );
+        let calls: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "calls")
+            .collect();
+        assert!(
+            !calls.is_empty(),
+            "Expected at least 1 'calls' relation for crate::foo::process()"
+        );
+        let process_call = calls.iter().find(|r| r.to_name.as_deref() == Some("process"));
+        assert!(process_call.is_some(), "Expected call to 'process'");
+        assert!(
+            process_call.unwrap().to_file.starts_with("CRATE_REF:"),
+            "crate:: call should resolve to CRATE_REF, got: {}",
+            process_call.unwrap().to_file
+        );
     }
 }

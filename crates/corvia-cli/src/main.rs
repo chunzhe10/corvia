@@ -1379,6 +1379,10 @@ pub(crate) async fn wire_pipeline_relations(
         });
 
         if let Some(to_uuid) = to_uuid {
+            // Filter self-edges for "imports" and "calls" relations
+            if (rel.relation == "imports" || rel.relation == "calls") && to_uuid == from_uuid {
+                continue;
+            }
             if let Err(e) = graph.relate(&from_uuid, &rel.relation, &to_uuid, None).await {
                 tracing::warn!("Failed to store relation: {e}");
             } else {
