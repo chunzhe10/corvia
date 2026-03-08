@@ -520,6 +520,18 @@ async fn cmd_ingest(path: Option<&str>) -> Result<()> {
             }
         }
 
+        // Step 5b: Wire doc-to-code relations
+        let doc_edges = wire_doc_to_code_relations(&processed, &stored_ids);
+        let mut doc_edges_stored = 0;
+        for (from, rel, to) in &doc_edges {
+            if graph.relate(from, rel, to, None).await.is_ok() {
+                doc_edges_stored += 1;
+            }
+        }
+        if doc_edges_stored > 0 {
+            println!("  {doc_edges_stored} doc-to-code graph edges stored");
+        }
+
         println!("Done. {stored} chunks from {total_files} files ingested from {path}.");
         println!("Next: corvia search \"your query\"");
     } else {
@@ -1343,6 +1355,96 @@ async fn connect_full_store(
     Ok(corvia_kernel::create_full_store(config).await?)
 }
 
+/// Scan markdown chunks for references to known code files and symbols,
+/// creating "references" edges to connect documentation to the code it describes.
+fn wire_doc_to_code_relations(
+    processed: &[corvia_kernel::chunking_strategy::ProcessedChunk],
+    stored_ids: &[uuid::Uuid],
+) -> Vec<(uuid::Uuid, String, uuid::Uuid)> {
+    use std::collections::{HashMap, HashSet};
+
+    // Build code file index: basename (without extension) → Vec<(idx, &chunk)>
+    let mut code_index: HashMap<&str, Vec<(usize, &corvia_kernel::chunking_strategy::ProcessedChunk)>> =
+        HashMap::new();
+    // Also build a full-name index for exact file references
+    let mut file_index: HashMap<&str, Vec<(usize, &corvia_kernel::chunking_strategy::ProcessedChunk)>> =
+        HashMap::new();
+
+    for (idx, pc) in processed.iter().enumerate() {
+        let src = pc.metadata.source_file.as_str();
+        file_index.entry(src).or_default().push((idx, pc));
+
+        // Only index code files (not markdown) for basename matching
+        if !src.ends_with(".md") {
+            // Extract basename without extension: "crates/.../rest.rs" → "rest"
+            if let Some(filename) = src.rsplit('/').next() {
+                if let Some(stem) = filename.rsplit_once('.').map(|(s, _)| s) {
+                    code_index.entry(stem).or_default().push((idx, pc));
+                }
+            }
+        }
+    }
+
+    // Regex patterns for file references and symbol references
+    let file_re = regex::Regex::new(r"\b(\w[\w.-]*)\.(rs|py|ts|js|tsx|jsx)\b").unwrap();
+    let symbol_re = regex::Regex::new(r"`([A-Z]\w+)`").unwrap();
+
+    let mut edges: Vec<(uuid::Uuid, String, uuid::Uuid)> = Vec::new();
+
+    for (idx, pc) in processed.iter().enumerate() {
+        if idx >= stored_ids.len() {
+            continue;
+        }
+        // Only process markdown chunks
+        if !pc.metadata.source_file.ends_with(".md") {
+            continue;
+        }
+        let from_id = stored_ids[idx];
+        let mut seen_targets: HashSet<uuid::Uuid> = HashSet::new();
+
+        // Scan for file references: `traits.rs`, `config.py`, etc.
+        for cap in file_re.captures_iter(&pc.content) {
+            let stem = cap.get(1).unwrap().as_str();
+            // Look up code chunks by basename
+            if let Some(code_chunks) = code_index.get(stem) {
+                // Use the first code chunk from the matched file
+                if let Some((target_idx, _)) = code_chunks.first() {
+                    if *target_idx < stored_ids.len() {
+                        let to_id = stored_ids[*target_idx];
+                        if to_id != from_id && seen_targets.insert(to_id) {
+                            edges.push((from_id, "references".to_string(), to_id));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Scan for PascalCase symbol references in backticks: `GraphStore`, `Config`, etc.
+        for cap in symbol_re.captures_iter(&pc.content) {
+            let symbol = cap.get(1).unwrap().as_str();
+            // Find a code chunk that contains this symbol
+            let mut found = false;
+            for chunks in code_index.values() {
+                for (target_idx, target_pc) in chunks {
+                    if *target_idx < stored_ids.len() && target_pc.content.contains(symbol) {
+                        let to_id = stored_ids[*target_idx];
+                        if to_id != from_id && seen_targets.insert(to_id) {
+                            edges.push((from_id, "references".to_string(), to_id));
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if found {
+                    break;
+                }
+            }
+        }
+    }
+
+    edges
+}
+
 /// Resolve pipeline relations and store them as graph edges.
 ///
 /// Uses `(source_file, start_line)` to match relations to stored chunks.
@@ -1431,5 +1533,108 @@ fn print_search_results(results: &[corvia_common::types::SearchResult], show_nam
             println!("  ...");
         }
         println!();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use corvia_kernel::chunking_strategy::{ChunkMetadata, ProcessedChunk, ProcessingInfo};
+
+    fn make_chunk(content: &str, source_file: &str, start_line: u32) -> ProcessedChunk {
+        ProcessedChunk {
+            content: content.to_string(),
+            original_content: content.to_string(),
+            chunk_type: "file".to_string(),
+            start_line,
+            end_line: start_line + 10,
+            metadata: ChunkMetadata {
+                source_file: source_file.to_string(),
+                language: None,
+                parent_chunk_id: None,
+                merge_group: None,
+            },
+            token_estimate: content.len() / 4,
+            processing: ProcessingInfo {
+                strategy_name: "test".to_string(),
+                was_split: false,
+                was_merged: false,
+                overlap_tokens: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn test_wire_doc_to_code_relations() {
+        let md_chunk = make_chunk(
+            "See `traits.rs` for the `GraphStore` trait.",
+            "docs/architecture.md",
+            1,
+        );
+        let code_chunk = make_chunk(
+            "pub trait GraphStore {\n    fn relate(&self);\n}",
+            "crates/corvia-kernel/src/traits.rs",
+            1,
+        );
+        let other_code = make_chunk(
+            "pub fn main() {\n    println!(\"hello\");\n}",
+            "crates/corvia-cli/src/main.rs",
+            1,
+        );
+
+        let processed = vec![md_chunk, code_chunk, other_code];
+        let stored_ids: Vec<uuid::Uuid> = (0..3).map(|_| uuid::Uuid::now_v7()).collect();
+
+        let edges = wire_doc_to_code_relations(&processed, &stored_ids);
+
+        // Should have an edge from markdown chunk to traits.rs (file ref)
+        // and potentially to traits.rs again (symbol match for GraphStore)
+        assert!(
+            !edges.is_empty(),
+            "should find at least one doc-to-code edge"
+        );
+
+        // All edges should start from the markdown chunk
+        for (from, rel, to) in &edges {
+            assert_eq!(*from, stored_ids[0], "edges should start from markdown chunk");
+            assert_eq!(rel, "references");
+            assert_ne!(*to, stored_ids[0], "no self-edges");
+        }
+
+        // Should have an edge to traits.rs chunk
+        assert!(
+            edges.iter().any(|(_, _, to)| *to == stored_ids[1]),
+            "should have edge to traits.rs chunk"
+        );
+    }
+
+    #[test]
+    fn test_wire_doc_to_code_no_self_edges() {
+        // A markdown file shouldn't create edges to itself
+        let md_chunk = make_chunk(
+            "This is README.md file",
+            "README.md",
+            1,
+        );
+        let processed = vec![md_chunk];
+        let stored_ids = vec![uuid::Uuid::now_v7()];
+
+        let edges = wire_doc_to_code_relations(&processed, &stored_ids);
+        assert!(edges.is_empty(), "should not create self-edges");
+    }
+
+    #[test]
+    fn test_wire_doc_to_code_no_edges_for_code_only() {
+        // No markdown chunks → no edges
+        let code_chunk = make_chunk(
+            "pub fn hello() {}",
+            "src/lib.rs",
+            1,
+        );
+        let processed = vec![code_chunk];
+        let stored_ids = vec![uuid::Uuid::now_v7()];
+
+        let edges = wire_doc_to_code_relations(&processed, &stored_ids);
+        assert!(edges.is_empty(), "code-only should produce no doc-to-code edges");
     }
 }

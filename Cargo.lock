@@ -1045,6 +1045,7 @@ dependencies = [
  "corvia-kernel",
  "corvia-proto",
  "corvia-server",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",
