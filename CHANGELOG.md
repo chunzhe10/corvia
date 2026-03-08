@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-03-08
+
+### Added
+
+- **CLI server-aware routing**: CLI commands (`search`, `reason`, `history`, `graph`,
+  `evolution`) detect a running corvia-server and route through REST API instead of
+  opening Redb directly. Falls back to direct access when no server is running.
+  Eliminates the Redb lock conflict during development/dogfooding.
+- New `server_client` module in corvia-cli with HTTP client for all read-only operations
+
+### Fixed
+
+- Workspace ingest now auto-provisions inference model via `ensure_inference_ready()`
+  (both `corvia ingest` workspace mode and `corvia workspace ingest`)
+
 ## [0.3.3] - 2026-03-08
 
 ### Added
@@ -80,6 +95,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **M1 Core kernel**: LiteStore + SurrealStore, Ollama embedding pipeline,
   REST API, MCP server, CLI
 
+[0.3.4]: https://github.com/corvia/corvia/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/corvia/corvia/compare/v0.3.1...v0.3.3
 [0.3.1]: https://github.com/corvia/corvia/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/corvia/corvia/releases/tag/v0.3.0

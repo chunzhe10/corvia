@@ -26,6 +26,7 @@
 //! [ARCHITECTURE.md](https://github.com/corvia/corvia/blob/master/ARCHITECTURE.md)
 //! for the full project overview.
 
+mod server_client;
 mod upgrade;
 mod workspace;
 
@@ -550,6 +551,23 @@ async fn cmd_ingest(path: Option<&str>) -> Result<()> {
 async fn cmd_search(query: &str, limit: usize) -> Result<()> {
     let config = load_config()?;
     let is_ws = config.is_workspace();
+
+    // Try routing through running server
+    if let Some(client) = server_client::ServerClient::detect(&config).await {
+        println!("(via server at {})\n", client.url());
+        let response = client.search(query, &config.project.scope_id, limit).await?;
+
+        if response.results.is_empty() {
+            println!("No results found for: {query}");
+            return Ok(());
+        }
+
+        println!("Found {} results for: {query}\n", response.count);
+        print_server_search_results(&response.results, is_ws);
+        return Ok(());
+    }
+
+    // Fallback: direct store access
     let store = connect_store(&config).await?;
     let engine = connect_engine(&config);
 
@@ -1069,6 +1087,39 @@ async fn cmd_workspace(command: WorkspaceCommands) -> Result<()> {
 
 async fn cmd_history(entry_id: &str) -> Result<()> {
     let config = load_config()?;
+
+    // Try routing through running server
+    if let Some(client) = server_client::ServerClient::detect(&config).await {
+        println!("(via server at {})\n", client.url());
+        let chain = client.history(entry_id).await?;
+
+        if chain.is_empty() {
+            println!("No history found for entry {entry_id}");
+            return Ok(());
+        }
+
+        println!("History for entry {} ({} entries):", entry_id, chain.len());
+        for (i, entry) in chain.iter().enumerate() {
+            let status = if entry.is_current { " (current)" } else { "" };
+            println!("\n  [{i}] {}{status}", entry.id);
+            println!("      recorded: {}", entry.recorded_at.format("%Y-%m-%d %H:%M:%S"));
+            println!("      valid: {} → {}",
+                entry.valid_from.format("%Y-%m-%d %H:%M:%S"),
+                entry.valid_to.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_else(|| "now".to_string()),
+            );
+            if let Some(first_line) = entry.content.lines().next() {
+                let truncated = truncate_str(first_line, 80);
+                if first_line.len() > 80 {
+                    println!("      content: {truncated}...");
+                } else {
+                    println!("      content: {truncated}");
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // Fallback: direct store access
     let (_store, _graph, temporal) = connect_full_store(&config).await?;
 
     let uuid = uuid::Uuid::parse_str(entry_id)
@@ -1108,9 +1159,32 @@ async fn cmd_history(entry_id: &str) -> Result<()> {
 
 async fn cmd_evolution(scope: Option<&str>, since: &str) -> Result<()> {
     let config = load_config()?;
-    let (_store, _graph, temporal) = connect_full_store(&config).await?;
-
     let scope_id = scope.unwrap_or(&config.project.scope_id);
+
+    // Try routing through running server
+    if let Some(client) = server_client::ServerClient::detect(&config).await {
+        println!("(via server at {})\n", client.url());
+        let entries = client.evolution(scope_id, since).await?;
+
+        if entries.is_empty() {
+            println!("No changes in scope '{}' in the last {since}", scope_id);
+            return Ok(());
+        }
+
+        println!("Changes in scope '{}' (last {since}): {} entries\n", scope_id, entries.len());
+        for entry in &entries {
+            let status = if entry.is_current { "active" } else { "superseded" };
+            println!("  {} [{}]", entry.id, status);
+            println!("    valid: {} → {}",
+                entry.valid_from.format("%Y-%m-%d %H:%M"),
+                entry.valid_to.map(|t| t.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_else(|| "now".to_string()),
+            );
+        }
+        return Ok(());
+    }
+
+    // Fallback: direct store access
+    let (_store, _graph, temporal) = connect_full_store(&config).await?;
 
     // Parse duration: "7d", "1d", "30d", "1h"
     let duration = parse_duration(since)?;
@@ -1139,10 +1213,29 @@ async fn cmd_evolution(scope: Option<&str>, since: &str) -> Result<()> {
 
 async fn cmd_graph(entry_id: Option<&str>, scope: Option<&str>, relation: Option<&str>) -> Result<()> {
     let config = load_config()?;
-    let (_store, graph, _temporal) = connect_full_store(&config).await?;
 
     if let Some(id_str) = entry_id {
-        // Show edges for a specific entry
+        // Try routing through running server for entry-specific queries
+        if let Some(client) = server_client::ServerClient::detect(&config).await {
+            println!("(via server at {})\n", client.url());
+            let edges = client.edges(id_str, relation).await?;
+
+            if edges.is_empty() {
+                println!("No edges for entry {id_str}");
+                return Ok(());
+            }
+
+            println!("Edges for entry {} ({} total):\n", id_str, edges.len());
+            for edge in &edges {
+                let direction = if edge.from == id_str { "\u{2192}" } else { "\u{2190}" };
+                let other = if edge.from == id_str { &edge.to } else { &edge.from };
+                println!("  {} {} {} ({})", id_str, direction, other, edge.relation);
+            }
+            return Ok(());
+        }
+
+        // Fallback: direct store access
+        let (_store, graph, _temporal) = connect_full_store(&config).await?;
         let uuid = uuid::Uuid::parse_str(id_str)
             .map_err(|e| anyhow::anyhow!("Invalid UUID: {e}"))?;
 
@@ -1171,7 +1264,8 @@ async fn cmd_graph(entry_id: Option<&str>, scope: Option<&str>, relation: Option
             println!("  {} {} {} ({})", uuid, direction, other, edge.relation);
         }
     } else {
-        // Scope-wide: list all entries in scope that have edges
+        // Scope-wide: list all entries in scope that have edges (always direct)
+        let (_store, graph, _temporal) = connect_full_store(&config).await?;
         let scope_id = scope.unwrap_or(&config.project.scope_id);
         let data_dir = std::path::Path::new(&config.storage.data_dir);
         let entries = corvia_kernel::knowledge_files::read_scope(data_dir, scope_id)?;
@@ -1219,9 +1313,41 @@ async fn cmd_relate(from: &str, relation: &str, to: &str) -> Result<()> {
 
 async fn cmd_reason(scope: Option<&str>, check: Option<&str>, llm: bool) -> Result<()> {
     let config = load_config()?;
-    let (store, graph, _temporal) = connect_full_store(&config).await?;
-
     let scope_id = scope.unwrap_or(&config.project.scope_id);
+
+    // Try routing through running server (deterministic checks only)
+    if !llm {
+        if let Some(client) = server_client::ServerClient::detect(&config).await {
+            println!("(via server at {})\n", client.url());
+            let response = client.reason(scope_id, check).await?;
+
+            if response.findings.is_empty() {
+                println!("No issues found in scope '{scope_id}'.");
+                return Ok(());
+            }
+
+            println!("Findings for scope '{}': {} issues\n", scope_id, response.findings.len());
+            for (i, finding) in response.findings.iter().enumerate() {
+                println!("  [{}] {} (confidence: {:.0}%)", i + 1, finding.check_type, finding.confidence * 100.0);
+                println!("      {}", finding.rationale);
+                if !finding.target_ids.is_empty() {
+                    println!("      targets: {}", finding.target_ids.join(", "));
+                }
+            }
+
+            println!();
+            let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+            for f in &response.findings {
+                *counts.entry(&f.check_type).or_insert(0) += 1;
+            }
+            for (check_type, count) in &counts {
+                println!("  {check_type}: {count}");
+            }
+            return Ok(());
+        }
+    }
+
+    let (store, graph, _temporal) = connect_full_store(&config).await?;
 
     // Load entries for the target scope only
     let data_dir = std::path::Path::new(&config.storage.data_dir);
@@ -1493,6 +1619,24 @@ pub(crate) async fn wire_pipeline_relations(
         }
     }
     relations_stored
+}
+
+fn print_server_search_results(results: &[server_client::SearchResultDto], _show_namespace: bool) {
+    for (i, result) in results.iter().enumerate() {
+        let file = result.source_file.as_deref().unwrap_or("unknown");
+        let lines = match (result.start_line, result.end_line) {
+            (Some(s), Some(e)) => format!(":{s}-{e}"),
+            _ => String::new(),
+        };
+        println!("--- Result {} (score: {:.3}) ---", i + 1, result.score);
+        println!("File: {file}{lines}");
+        let preview: String = result.content.lines().take(5).collect::<Vec<_>>().join("\n");
+        println!("{preview}");
+        if result.content.lines().count() > 5 {
+            println!("  ...");
+        }
+        println!();
+    }
 }
 
 fn print_search_results(results: &[corvia_common::types::SearchResult], show_namespace: bool) {

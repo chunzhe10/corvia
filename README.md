@@ -13,10 +13,10 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License: AGPL-3.0"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/built%20with-Rust-dea584.svg" alt="Built with Rust"></a>
-  <a href="Cargo.toml"><img src="https://img.shields.io/badge/version-0.3.3-green.svg" alt="Version 0.3.3"></a>
+  <a href="Cargo.toml"><img src="https://img.shields.io/badge/version-0.3.4-green.svg" alt="Version 0.3.4"></a>
 </p>
 
-> **Pre-release (v0.3.3).** Core kernel, three-tier storage, multi-agent coordination, temporal
+> **Pre-release (v0.3.4).** Core kernel, three-tier storage, multi-agent coordination, temporal
 > queries, knowledge graph, automated reasoning, RAG pipeline, chunking pipeline, and adapter
 > plugin system are implemented and tested (385+ tests). API surface may change before 1.0.
 
