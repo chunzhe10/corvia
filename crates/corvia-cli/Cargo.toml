@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 corvia-common.workspace = true
 corvia-kernel.workspace = true
+corvia-adapter-git = { path = "../corvia-adapter-git" }
 uuid.workspace = true
 corvia-server.workspace = true
 serde.workspace = true
@@ -38,7 +39,6 @@ postgres = ["corvia-kernel/postgres"]
 tempfile = "3"
 async-trait = "0.1"
 corvia-proto.workspace = true
-corvia-adapter-git = { path = "../corvia-adapter-git" }
 tonic = "0.12"
 tokio-stream = "0.1"
 

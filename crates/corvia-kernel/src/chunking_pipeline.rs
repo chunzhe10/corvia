@@ -13,16 +13,17 @@
 //! priority: adapter overrides > kernel defaults > fallback (D66).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use corvia_common::config::ChunkingConfig;
 use corvia_common::errors::Result;
 use tracing::info;
 
 use crate::chunking_strategy::{
-    ChunkRelation, ChunkingStrategy, ProcessedChunk, ProcessingInfo, RawChunk, SourceFile,
-    SourceMetadata,
+    ChunkRelation, ChunkResult, ChunkingStrategy, ProcessedChunk, ProcessingInfo, RawChunk,
+    SourceFile, SourceMetadata,
 };
+use crate::process_adapter::ProcessAdapter;
 use crate::token_estimator::TokenEstimator;
 
 // ---------------------------------------------------------------------------
@@ -469,7 +470,13 @@ impl ChunkingPipeline {
                 let overlap_text = if prev_content.len() > char_budget {
                     let start = prev_content.len() - char_budget;
                     // Find the nearest char boundary at or after the byte offset.
-                    let start = prev_content.ceil_char_boundary(start);
+                    let start = {
+                        let mut i = start;
+                        while i < prev_content.len() && !prev_content.is_char_boundary(i) {
+                            i += 1;
+                        }
+                        i
+                    };
                     &prev_content[start..]
                 } else {
                     prev_content.as_str()
@@ -637,6 +644,64 @@ fn content_references_symbol(content: &str, symbol: &str) -> bool {
         start = abs_pos + 1;
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// ProcessChunkingStrategy — IPC delegation to adapter processes
+// ---------------------------------------------------------------------------
+
+/// A [`ChunkingStrategy`] that delegates chunking to an adapter process via IPC.
+///
+/// Used by [`register_adapter_chunking`] to register adapter-provided chunking
+/// as overrides in the [`FormatRegistry`].
+struct ProcessChunkingStrategy {
+    adapter: Arc<Mutex<ProcessAdapter>>,
+}
+
+impl ProcessChunkingStrategy {
+    fn new(adapter: Arc<Mutex<ProcessAdapter>>) -> Self {
+        Self { adapter }
+    }
+}
+
+impl ChunkingStrategy for ProcessChunkingStrategy {
+    fn name(&self) -> &str {
+        "process_adapter"
+    }
+
+    fn supported_extensions(&self) -> &[&str] {
+        // This is only used for registration metadata; the registry routes by
+        // extension key, not by asking the strategy.
+        &[]
+    }
+
+    fn chunk(&self, source: &str, meta: &SourceMetadata) -> Result<ChunkResult> {
+        let mut guard = self.adapter.lock().map_err(|e| {
+            corvia_common::errors::CorviaError::Ingestion(format!("Adapter lock poisoned: {e}"))
+        })?;
+        let (chunks, relations) = guard.chunk(source, meta).map_err(|e| {
+            corvia_common::errors::CorviaError::Ingestion(format!("Adapter chunk failed: {e}"))
+        })?;
+        Ok(ChunkResult { chunks, relations })
+    }
+}
+
+/// Register an adapter's chunking extensions in the format registry.
+///
+/// For each extension in `chunking_extensions`, registers a
+/// [`ProcessChunkingStrategy`] as an override in the registry.
+pub fn register_adapter_chunking(
+    registry: &mut FormatRegistry,
+    adapter: Arc<Mutex<ProcessAdapter>>,
+    chunking_extensions: &[String],
+) {
+    if chunking_extensions.is_empty() {
+        return;
+    }
+    let strategy = Arc::new(ProcessChunkingStrategy::new(adapter));
+    for ext in chunking_extensions {
+        registry.register_override(ext, Arc::clone(&strategy) as Arc<dyn ChunkingStrategy>);
+    }
 }
 
 // ---------------------------------------------------------------------------

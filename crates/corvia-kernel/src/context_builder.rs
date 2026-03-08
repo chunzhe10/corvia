@@ -1,4 +1,6 @@
-use corvia_common::agent_types::{AgentPermission, EntryStatus, VisibilityMode};
+use corvia_common::agent_types::{AgentPermission, VisibilityMode};
+#[cfg(test)]
+use corvia_common::agent_types::EntryStatus;
 use corvia_common::errors::Result;
 use corvia_common::types::SearchResult;
 use std::sync::Arc;

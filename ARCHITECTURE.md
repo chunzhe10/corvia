@@ -22,15 +22,17 @@ independent of any specific frontend, adapter, or integration surface.
 │  CLI (corvia binary)  ·  VS Code Extension (planned, M5)           │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Adapters                                                           │
-│  Git/Code (tree-sitter)  ·  Community adapters (IngestionAdapter)  │
+│  Git/Code (tree-sitter) · Basic (filesystem) · Community adapters  │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Kernel                                                             │
-│  Knowledge Store  ·  Agent Coordinator  ·  Embedding Pipeline      │
-│  Context Builder  ·  Merge Worker  ·  Reasoner  ·  Graph Store     │
+│  Knowledge Store  ·  Agent Coordinator  ·  RAG Pipeline            │
+│  Embedding Pipeline · Chunking Pipeline · Context Builder          │
+│  Merge Worker  ·  Reasoner  ·  Graph Store                         │
 ├─────────────────────────────────────────────────────────────────────┤
 │  Storage                                                            │
 │  LiteStore ─── hnsw_rs · petgraph · Redb · Git (JSON files)       │
-│  FullStore ─── SurrealDB · vLLM · Redb · Git (JSON files)         │
+│  FullStore ─── SurrealDB · Redb · Git (JSON files)                │
+│  PostgresStore ─── pgvector · PostgreSQL                           │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -49,24 +51,29 @@ independent of any specific frontend, adapter, or integration surface.
 | `corvia-kernel` | `crates/corvia-kernel` | All kernel subsystems: both storage implementations (LiteStore, SurrealStore), embedding engines, agent coordination, graph store, temporal queries, reasoning, merge worker, context builder |
 | `corvia-server` | `crates/corvia-server` | Axum-based HTTP server exposing REST endpoints under `/v1/` and the MCP JSON-RPC 2.0 endpoint at `/mcp`. Thin orchestration layer that wires kernel types together and handles request/response translation |
 | `corvia` (CLI) | `crates/corvia-cli` | Binary crate. CLI commands (`init`, `ingest`, `search`, `serve`, `reason`, etc.) and workspace management. Orchestrates kernel + server |
-| `corvia-adapter-git` | External (sibling repo) | Git repository ingestion using tree-sitter for code-aware chunking. Supports Rust, JavaScript, TypeScript, and Python. Implements the `IngestionAdapter` trait |
+| `corvia-inference` | `crates/corvia-inference` | gRPC inference server with ONNX Runtime for local embeddings |
+| `corvia-proto` | `crates/corvia-proto` | Protocol Buffers for gRPC inference |
+| `corvia-adapter-git` | `crates/corvia-adapter-git` | Git repository ingestion using tree-sitter for code-aware chunking. Supports Rust, JavaScript, TypeScript, and Python. Implements the `IngestionAdapter` trait |
+| `corvia-adapter-basic` | `crates/corvia-adapter-basic` | Basic filesystem ingestion adapter for non-Git sources |
 
-All workspace crates share `version.workspace = true` from the root `Cargo.toml`. The adapter
-is a separate repository to demonstrate that adapters are independently publishable.
+All workspace crates share `version.workspace = true` from the root `Cargo.toml`.
 
 ## Kernel Subsystems
 
-The kernel contains seven subsystems, each in its own module within `corvia-kernel`:
+The kernel contains ten subsystems, each in its own module within `corvia-kernel`:
 
 | Subsystem | Module | Description |
 |-----------|--------|-------------|
-| **Knowledge Store** | `knowledge_store.rs`, `lite_store.rs` | Read/write knowledge entries with vector search. Two implementations: `SurrealStore` (SurrealDB, HTTP) and `LiteStore` (hnsw_rs + Redb, embedded). Both implement `QueryableStore` |
+| **Knowledge Store** | `knowledge_store.rs`, `lite_store.rs`, `postgres_store.rs` | Read/write knowledge entries with vector search. Three implementations: `LiteStore` (hnsw_rs + Redb, embedded), `SurrealStore` (SurrealDB, HTTP), and `PostgresStore` (pgvector). All implement `QueryableStore` |
 | **Agent Coordinator** | `agent_coordinator.rs`, `agent_registry.rs`, `session_manager.rs`, `staging.rs`, `agent_writer.rs` | Multi-agent lifecycle management. Agent registration with multi-layer identity (three tiers: Registered, MCP Client, Anonymous — chosen over single-tier to support both long-lived agents and one-shot queries without forcing registration). Session state machine (Created → Active → Committing → Merging → Closed), staging isolation, crash recovery (resume/commit/rollback), garbage collection |
-| **Embedding Pipeline** | `embedding_pipeline.rs`, `ollama_engine.rs`, `ollama_provisioner.rs` | Provider-agnostic embedding generation. `VllmEngine` for vLLM (HTTP), `OllamaEngine` for Ollama (HTTP). Both implement `InferenceEngine`. `OllamaProvisioner` auto-downloads models on first use |
-| **Context Builder** | `context_builder.rs` | Scope-aware knowledge retrieval. Enforces agent read isolation — agents only see entries matching their authorized scopes and entry visibility (Pending/Committed/Merged). Uses application-level RBAC rather than database-level ACLs, so LiteStore gets the same isolation guarantees as SurrealDB without requiring a database with built-in permissions |
-| **Merge Worker** | `merge_worker.rs`, `merge_queue.rs`, `commit_pipeline.rs` | LLM-assisted conflict resolution — chosen over last-write-wins or manual merge because knowledge conflicts are semantic, not textual, and an LLM can reason about which version is more accurate. When two agents write to overlapping scopes, the merge worker detects conflicts via embedding similarity and uses an LLM to produce a merged entry. Commit pipeline moves entries from staging to main store |
-| **Reasoner** | `reasoner.rs` | Algorithmic knowledge health checks. Seven check types: `StaleEntry`, `BrokenChain`, `OrphanedNode`, `DanglingImport`, `DependencyCycle` (deterministic, no LLM), plus `SemanticGap` and `Contradiction` (LLM-powered, opt-in). Returns structured `Finding` results with confidence scores, affected entry IDs, and human-readable rationale |
-| **Graph Store** | `graph_store.rs` | Directed knowledge graph. `LiteGraphStore` uses petgraph (in-memory DiGraph) backed by Redb persistence. Supports `relate`, `edges`, `traverse` (BFS), and `shortest_path`. Rebuilds in-memory graph from Redb on startup |
+| **Embedding Pipeline** | `embedding_pipeline.rs`, `ollama_engine.rs`, `grpc_engine.rs`, `ollama_provisioner.rs` | Provider-agnostic embedding generation. `OllamaEngine` for Ollama (HTTP), `GrpcEngine` for the corvia-inference gRPC server. Both implement `InferenceEngine` |
+| **RAG Pipeline** | `rag_pipeline.rs`, `retriever.rs`, `augmenter.rs`, `rag_types.rs` | Retrieval-augmented generation: Retriever → Augmenter → GenerationEngine. Graph-expanded retrieval with configurable oversample and scoring |
+| **Chunking Pipeline** | `chunking_pipeline.rs`, `chunking_strategy.rs`, `chunking_markdown.rs`, `chunking_config_fmt.rs`, `chunking_pdf.rs`, `chunking_fallback.rs` | Format-aware chunking with FormatRegistry routing. Merge small chunks, split oversized ones, add overlap context |
+| **Context Builder** | `context_builder.rs` | Scope-aware knowledge retrieval. Enforces agent read isolation — agents only see entries matching their authorized scopes and entry visibility (Pending/Committed/Merged) |
+| **Merge Worker** | `merge_worker.rs`, `merge_queue.rs`, `commit_pipeline.rs` | LLM-assisted conflict resolution — chosen over last-write-wins or manual merge because knowledge conflicts are semantic, not textual |
+| **Reasoner** | `reasoner.rs` | Algorithmic knowledge health checks. Seven check types: `StaleEntry`, `BrokenChain`, `OrphanedNode`, `DanglingImport`, `DependencyCycle` (deterministic, no LLM), plus `SemanticGap` and `Contradiction` (LLM-powered, opt-in) |
+| **Graph Store** | `graph_store.rs` | Directed knowledge graph. `LiteGraphStore` uses petgraph (in-memory DiGraph) backed by Redb persistence. Supports `relate`, `edges`, `traverse` (BFS), and `shortest_path`. Cross-file relation discovery with graph-expanded scoring |
+| **Adapter System** | `adapter_discovery.rs`, `adapter_protocol.rs`, `process_adapter.rs` | Runtime adapter discovery, JSONL IPC protocol for adapter processes, and ProcessChunkingStrategy for adapter-provided chunking |
 
 ### Session State Machine
 
@@ -88,12 +95,12 @@ Created ──► Active ──► Committing ──► Merging ──► Closed
 
 ## Storage Tiers
 
-corvia has two storage backends that implement the same kernel traits. The **two-tier storage**
+corvia has three storage backends that implement the same kernel traits. The **three-tier storage**
 design exists because requiring Docker for a dev tool kills adoption — but SurrealDB's unified
-vector+graph+temporal queries are genuinely valuable at scale. Rather than choose one, both
-tiers implement the same traits: LiteStore is the full product with zero external dependencies,
-while FullStore (SurrealStore) is an opt-in upgrade for users who need SurrealDB's query
-capabilities or vLLM's GPU-accelerated inference.
+vector+graph+temporal queries are genuinely valuable at scale, and PostgreSQL is the standard
+in production environments. All three tiers implement the same traits: LiteStore is the full
+product with zero external dependencies, while SurrealStore and PostgresStore are opt-in
+upgrades for users who need specific capabilities.
 
 ### LiteStore (default, zero Docker)
 
@@ -165,11 +172,12 @@ adds embeddings after ingestion.
 ```rust
 pub trait IngestionAdapter: Send + Sync {
     fn domain(&self) -> &str;
-    async fn ingest(&self, source_path: &str) -> Result<Vec<KnowledgeEntry>>;
+    fn register_chunking(&self, registry: &mut FormatRegistry);
+    async fn ingest_sources(&self, source_path: &str) -> Result<Vec<SourceFile>>;
 }
 ```
 
-**Implementations:** `GitAdapter` (tree-sitter parsing for Rust, JS, TS, Python).
+**Implementations:** `GitAdapter` (tree-sitter parsing for Rust, JS, TS, Python), `ProcessAdapter` (IPC to external adapter binaries).
 
 ### `TemporalStore`
 
@@ -265,6 +273,8 @@ Corvia implements the Model Context Protocol (version `2024-11-05`) via JSON-RPC
 | `corvia_graph` | `entry_id` | Get all graph edges (both directions) for a knowledge entry |
 | `corvia_reason` | `scope_id`, `check?` | Run reasoning health checks on a scope (omit `check` to run all) |
 | `corvia_agent_status` | *(needs `_meta.agent_id`)* | Get the calling agent's session count and contribution summary |
+| `corvia_context` | `query`, `scope_id`, `limit?` | Retrieve assembled context (RAG retrieval only, no generation) |
+| `corvia_ask` | `question`, `scope_id` | Full RAG: question to AI-generated answer from knowledge |
 
 ## Key Design Decisions
 
@@ -278,7 +288,7 @@ available at [`docs/plans/`](docs/plans/).
 | **AGPL-3.0-only license** | MIT/Apache-2.0 | SaaS protection — prevents cloud providers from offering corvia-as-a-service without contributing back. Dual-license path preserves commercial option (Grafana/MinIO playbook) |
 | **SurrealDB behind `QueryableStore` trait** | Hardcode SurrealDB directly | Trait boundary enabled building LiteStore (zero-Docker) without touching kernel code. Storage became a compile-time choice, not a runtime dependency |
 | **LLM-assisted merge** | Last-write-wins / manual merge | Knowledge conflicts are semantic, not textual — an LLM can reason about which version of "how auth works" is more accurate. Last-write-wins silently loses knowledge |
-| **Two-tier storage (LiteStore + FullStore)** | SurrealDB-only | Requiring Docker for a dev tool kills adoption. LiteStore is the full product at zero cost; FullStore is a power-user upgrade, not a requirement |
+| **Three-tier storage (LiteStore + SurrealStore + PostgresStore)** | Single backend | Requiring Docker for a dev tool kills adoption. LiteStore is the full product at zero cost; SurrealStore and PostgresStore are opt-in upgrades |
 | **petgraph + Redb for graph** | SurrealDB graph queries only | LiteStore needed full traversal (BFS, shortest path, cycles) without any external service. petgraph handles computation in-memory, Redb handles persistence |
 | **Redb compound-key range scans for temporal** | Dedicated time-series DB | Redb is already embedded for coordination. Compound keys `(scope, valid_from, entry_id)` give O(log n) temporal lookups without adding another dependency |
 | **Git-trackable JSON knowledge files** | Database-only storage | Storing knowledge as JSON files designed for Git gives auditability and diffability. `corvia rebuild` reconstructs all indexes from JSON files alone — the database is a cache, the files are truth |

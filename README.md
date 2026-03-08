@@ -13,12 +13,12 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License: AGPL-3.0"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/built%20with-Rust-dea584.svg" alt="Built with Rust"></a>
-  <a href="Cargo.toml"><img src="https://img.shields.io/badge/version-0.3.0-green.svg" alt="Version 0.3.0"></a>
+  <a href="Cargo.toml"><img src="https://img.shields.io/badge/version-0.3.3-green.svg" alt="Version 0.3.3"></a>
 </p>
 
-> **Pre-release (v0.3.0).** Core kernel, two-tier storage, multi-agent coordination, temporal
-> queries, knowledge graph, and automated reasoning are implemented and tested (203 tests).
-> API surface may change before 1.0.
+> **Pre-release (v0.3.3).** Core kernel, three-tier storage, multi-agent coordination, temporal
+> queries, knowledge graph, automated reasoning, RAG pipeline, chunking pipeline, and adapter
+> plugin system are implemented and tested (385+ tests). API surface may change before 1.0.
 
 ---
 
@@ -58,7 +58,7 @@ Organizational memory:  why the auth system was redesigned, which decisions led 
 | **Temporal queries** | Bi-temporal model. Point-in-time snapshots, supersession chains, time-range evolution |
 | **Automated reasoning** | 5 deterministic checks + 2 opt-in LLM checks. Same input, same findings, every time |
 | **Multi-agent coordination** | Session isolation, staging, crash recovery, LLM-assisted merge. No last-write-wins |
-| **Two-tier storage** | LiteStore (zero Docker, embedded) is the full product. SurrealDB is an opt-in upgrade |
+| **Three-tier storage** | LiteStore (zero Docker, embedded) is the full product. SurrealDB and PostgreSQL are opt-in upgrades |
 | **Git as truth** | All knowledge stored as JSON in `.corvia/knowledge/`. `corvia rebuild` reconstructs everything from files alone |
 | **Three integration paths** | Rust crate, REST API (`:8020`), or MCP server for Claude and other agent frameworks |
 
@@ -66,7 +66,7 @@ Organizational memory:  why the auth system was redesigned, which decisions led 
 
 ### Prerequisites
 
-- **Rust 1.85+** (2024 edition)
+- **Rust 1.88+** (2024 edition)
 - **Ollama** with `nomic-embed-text`:
   ```bash
   # https://ollama.com/download
@@ -119,7 +119,7 @@ curl -X POST http://localhost:8020/v1/reason \
 
 ### MCP integration
 
-corvia exposes six tools through JSON-RPC 2.0 at `POST /mcp` for AI agents that support
+corvia exposes eight tools through JSON-RPC 2.0 at `POST /mcp` for AI agents that support
 the Model Context Protocol:
 
 | Tool | Description |
@@ -130,6 +130,8 @@ the Model Context Protocol:
 | `corvia_graph` | Graph edges for an entry |
 | `corvia_reason` | Run health checks on a scope |
 | `corvia_agent_status` | Agent session and contribution summary |
+| `corvia_context` | Retrieve assembled context (RAG retrieval only) |
+| `corvia_ask` | Full RAG: question to AI-generated answer from knowledge |
 
 ## Architecture
 
@@ -138,14 +140,17 @@ Integration Surface:  REST API  ·  MCP Server  ·  Rust crate
                             │
 Frontends:           CLI  ·  VS Code Extension (planned)
                             │
-Adapters:            Git/Code (tree-sitter)  ·  Community adapters
+Adapters:            Git/Code (tree-sitter)  ·  Basic (filesystem)  ·  Community adapters
                             │
-Kernel:              Knowledge Store  ·  Agent Coordinator
-                     Embedding Pipeline  ·  Context Builder
+Inference:           gRPC inference server (ONNX/candle)  ·  Ollama
+                            │
+Kernel:              Knowledge Store  ·  Agent Coordinator  ·  RAG Pipeline
+                     Embedding Pipeline  ·  Context Builder  ·  Chunking Pipeline
                      Merge Worker  ·  Reasoner  ·  Graph Store
                             │
 Storage:             LiteStore ─── hnsw_rs · petgraph · Redb · Git
-                     FullStore ─── SurrealDB · vLLM · Redb · Git
+                     FullStore ─── SurrealDB · Redb · Git
+                     PostgresStore ─── pgvector · PostgreSQL
 ```
 
 ### Workspace crates
@@ -153,10 +158,13 @@ Storage:             LiteStore ─── hnsw_rs · petgraph · Redb · Git
 | Crate | Path | What it does |
 |-------|------|-------------|
 | `corvia-common` | `crates/corvia-common` | Shared types, config, errors, namespace, events |
-| `corvia-kernel` | `crates/corvia-kernel` | Storage, coordination, reasoning, graph, temporal |
+| `corvia-kernel` | `crates/corvia-kernel` | Storage, coordination, reasoning, graph, temporal, RAG, chunking |
 | `corvia-server` | `crates/corvia-server` | Axum HTTP server — REST + MCP protocol |
 | `corvia` (CLI) | `crates/corvia-cli` | CLI binary and workspace management |
-| `corvia-adapter-git` | External crate | Git + tree-sitter code ingestion adapter |
+| `corvia-inference` | `crates/corvia-inference` | gRPC inference server (ONNX Runtime) |
+| `corvia-proto` | `crates/corvia-proto` | Protocol Buffers for gRPC inference |
+| `corvia-adapter-git` | `crates/corvia-adapter-git` | Git + tree-sitter code ingestion adapter |
+| `corvia-adapter-basic` | `crates/corvia-adapter-basic` | Basic filesystem ingestion adapter |
 
 ### Design principles
 
@@ -169,13 +177,14 @@ For detailed internals, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Roadmap
 
-- [x] **M1** — Core kernel + two-tier storage + embedding pipeline
+- [x] **M1** — Core kernel + three-tier storage + embedding pipeline
 - [x] **M2** — Multi-agent coordination, staging, merge worker, crash recovery
-- [x] **M3** — Temporal queries, knowledge graph, automated reasoning *(current)*
-- [ ] **M3.1** — gRPC inference server (ONNX Runtime + candle)
-- [ ] **M3.2** — RAG pipeline (Retriever → Augmenter → GenerationEngine)
-- [ ] **M3.3** — Chunking strategies (AST, Markdown, Config, PDF)
-- [ ] **M4** — Observability (OpenTelemetry)
+- [x] **M3** — Temporal queries, knowledge graph, automated reasoning
+- [x] **M3.1** — gRPC inference server (ONNX Runtime + candle)
+- [x] **M3.2** — RAG pipeline (Retriever → Augmenter → GenerationEngine)
+- [x] **M3.3** — Chunking strategies (AST, Markdown, Config, PDF)
+- [x] **M3.4** — Graph edge improvements + cross-file relation discovery
+- [ ] **M4** — Observability (OpenTelemetry) *(next)*
 - [ ] **M5** — VS Code extension + Python SDK
 - [ ] **M6** — Eval framework (precision@k, MRR, NDCG)
 - [ ] **M7** — 1.0 + PyPI publish

@@ -24,7 +24,7 @@ make test-all                    # Start both DBs + run all tests
 ```bash
 cargo test --workspace
 ```
-Runs 203+ tests. LiteStore tests exercise full functionality. SurrealDB and PostgreSQL
+Runs 385+ tests. LiteStore tests exercise full functionality. SurrealDB and PostgreSQL
 tests auto-skip gracefully when the server is unreachable. No Docker, no Ollama required.
 This is the primary test suite and must always pass.
 
@@ -58,10 +58,13 @@ make test-all                    # Start SurrealDB + PostgreSQL, run all tests
 | Crate | Path | What it does |
 |-------|------|-------------|
 | `corvia-common` | `crates/corvia-common` | Types, config, errors, namespace, events |
-| `corvia-kernel` | `crates/corvia-kernel` | Storage, coordination, reasoning, graph, temporal |
+| `corvia-kernel` | `crates/corvia-kernel` | Storage, coordination, reasoning, graph, temporal, RAG, chunking |
 | `corvia-server` | `crates/corvia-server` | Axum REST + MCP protocol server |
 | `corvia-cli` | `crates/corvia-cli` | CLI binary, workspace management |
-| `corvia-adapter-git` | External crate | Git + tree-sitter ingestion adapter |
+| `corvia-inference` | `crates/corvia-inference` | gRPC inference server (ONNX Runtime) |
+| `corvia-proto` | `crates/corvia-proto` | Protocol Buffers for gRPC inference |
+| `corvia-adapter-git` | `crates/corvia-adapter-git` | Git + tree-sitter code ingestion adapter |
+| `corvia-adapter-basic` | `crates/corvia-adapter-basic` | Basic filesystem ingestion adapter |
 
 ## Key Traits (extend these, don't modify)
 
@@ -73,7 +76,7 @@ make test-all                    # Start SurrealDB + PostgreSQL, run all tests
 
 ## Architecture Decisions to Respect
 
-- **Three-tier storage**: LiteStore is the full product (zero Docker). SurrealStore and PostgresStore are opt-in.
+- **Three-tier storage**: LiteStore is the full product (zero Docker). SurrealStore and PostgresStore are opt-in upgrades.
   PostgresStore requires `--features postgres` at compile time.
 - **Git as truth**: All knowledge stored as JSON in `.corvia/knowledge/`, tracked by Git.
 - **Local-first**: No API keys required. Ollama provides embeddings.
@@ -131,11 +134,17 @@ PostgresStore (`crates/corvia-kernel/src/postgres_store.rs`) is behind the `post
 
 ## Key Files
 
+- `traits.rs` — All kernel trait definitions (QueryableStore, InferenceEngine, TemporalStore, GraphStore, IngestionAdapter)
+- `lite_store.rs` — LiteStore implementation (default, zero-Docker)
 - `knowledge_store.rs` — SurrealStore implementation (FullStore)
-- `lite_store.rs` — LiteStore implementation (default)
 - `postgres_store.rs` — PostgresStore implementation (feature-gated)
-- `traits.rs` — All kernel trait definitions
+- `rag_pipeline.rs` — RAG orchestrator (context + ask modes)
+- `retriever.rs` — Vector + graph-expanded retrieval with visibility filtering
+- `chunking_pipeline.rs` — Format-aware chunking orchestrator with FormatRegistry
 - `reasoner.rs` — 5 deterministic health checks + 2 LLM-assisted checks
 - `graph_store.rs` — petgraph-based graph for LiteStore
+- `adapter_discovery.rs` — Runtime adapter discovery via PATH scan
+- `process_adapter.rs` — IPC wrapper for adapter binaries (JSONL protocol)
 - `staging.rs` — Agent write isolation (branch-per-session)
 - `agent_coordinator.rs` — Multi-agent lifecycle orchestration
+- `grpc_engine.rs` — gRPC client for corvia-inference server
