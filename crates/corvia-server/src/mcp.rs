@@ -12,46 +12,22 @@ use corvia_common::agent_types::*;
 use corvia_common::types::EdgeDirection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::info;
 use uuid::Uuid;
 
 use crate::rest::AppState;
 
-// --- Session store ---
+// --- MCP state (stateless — no session tracking) ---
 
-/// Tracks active MCP sessions (Streamable HTTP transport).
-#[derive(Default)]
-pub struct McpSessions {
-    sessions: RwLock<HashSet<String>>,
-}
+// NOTE: McpSessions removed. The MCP server is fully stateless: no session
+// validation, no session persistence. Agent identity comes from _meta.agent_id
+// in tool calls, not from transport sessions. This eliminates the "invalid or
+// expired session" errors that occurred after server restarts.
 
-impl McpSessions {
-    pub fn new() -> Self {
-        Self { sessions: RwLock::new(HashSet::new()) }
-    }
-
-    async fn create(&self) -> String {
-        let id = Uuid::now_v7().to_string();
-        self.sessions.write().await.insert(id.clone());
-        id
-    }
-
-    async fn is_valid(&self, id: &str) -> bool {
-        self.sessions.read().await.contains(id)
-    }
-
-    async fn remove(&self, id: &str) -> bool {
-        self.sessions.write().await.remove(id)
-    }
-}
-
-/// Shared state for MCP endpoints: app state + session tracker.
+/// Shared state for MCP endpoints.
 pub struct McpState {
     pub app: Arc<AppState>,
-    pub sessions: Arc<McpSessions>,
 }
 
 // --- JSON-RPC 2.0 types ---
@@ -214,7 +190,6 @@ fn tool_definitions() -> Vec<Value> {
 pub fn mcp_router(state: Arc<AppState>) -> Router {
     let mcp_state = Arc::new(McpState {
         app: state,
-        sessions: Arc::new(McpSessions::new()),
     });
     Router::new()
         .route("/mcp", post(handle_mcp_post))
@@ -225,117 +200,168 @@ pub fn mcp_router(state: Arc<AppState>) -> Router {
 
 // --- POST /mcp — main request handler ---
 
+/// A parsed JSON-RPC message: either a single request or a batch.
+enum JsonRpcInput {
+    Single(JsonRpcRequest),
+    Batch(Vec<JsonRpcRequest>),
+}
+
 async fn handle_mcp_post(
     State(state): State<Arc<McpState>>,
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    // Parse the request body as JSON-RPC
-    let req: JsonRpcRequest = match serde_json::from_str(&body) {
-        Ok(r) => r,
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {e}")).into_response();
+    // Parse body as single JSON-RPC request or batch (array)
+    let input = match serde_json::from_str::<JsonRpcRequest>(&body) {
+        Ok(r) => JsonRpcInput::Single(r),
+        Err(_) => match serde_json::from_str::<Vec<JsonRpcRequest>>(&body) {
+            Ok(batch) if !batch.is_empty() => JsonRpcInput::Batch(batch),
+            Ok(_) => {
+                return (StatusCode::BAD_REQUEST, "Empty batch").into_response();
+            }
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, format!("Invalid JSON-RPC: {e}")).into_response();
+            }
+        },
+    };
+
+    // Peek at the first request to check for initialize / session validation
+    let first = match &input {
+        JsonRpcInput::Single(r) => r,
+        JsonRpcInput::Batch(v) => &v[0],
+    };
+    let is_initialize = first.method == "initialize";
+
+    // Stateless: no session validation. All corvia MCP tools are self-contained;
+    // agent identity comes from _meta.agent_id in tool calls, not transport sessions.
+    // Any Mcp-Session-Id header from the client is accepted but not validated.
+
+    // Process request(s)
+    let (responses, is_batch) = match input {
+        JsonRpcInput::Single(req) => {
+            let resp = process_single_request(&state, &req).await;
+            (resp.into_iter().collect::<Vec<_>>(), false)
+        }
+        JsonRpcInput::Batch(reqs) => {
+            let mut responses = Vec::new();
+            for req in &reqs {
+                if let Some(resp) = process_single_request(&state, req).await {
+                    responses.push(resp);
+                }
+            }
+            (responses, true)
         }
     };
 
-    let is_initialize = req.method == "initialize";
-    let is_notification = req.id.is_none() || req.method == "notifications/initialized";
+    // Stateless: return a session ID for protocol compatibility (clients may expect it),
+    // but don't track it. Reuse client-provided ID or generate a fresh one on initialize.
+    let session_header: Option<String> = if is_initialize {
+        Some(Uuid::now_v7().to_string())
+    } else {
+        headers.get(MCP_SESSION_ID)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    };
 
-    // Session validation: all requests after initialize must include a valid session ID
-    if !is_initialize {
-        match headers.get(MCP_SESSION_ID).and_then(|v| v.to_str().ok()) {
-            Some(session_id) if state.sessions.is_valid(session_id).await => {}
-            Some(_) => {
-                // Invalid session ID
-                return (StatusCode::NOT_FOUND, "Invalid or expired session").into_response();
-            }
-            None => {
-                // Missing session ID (and not initialize) — bad request
-                return (StatusCode::BAD_REQUEST, "Missing Mcp-Session-Id header").into_response();
-            }
-        }
-    }
-
-    // Notifications don't get a response body
-    if is_notification && !is_initialize {
+    // All notifications, no responses to send
+    if responses.is_empty() {
         return StatusCode::ACCEPTED.into_response();
     }
 
-    let id = req.id.clone();
-    let response = dispatch(&state.app, req).await;
-    let rpc_response = match response {
-        Ok(result) => JsonRpcResponse::success(id, result),
-        Err((code, msg)) => JsonRpcResponse::error(id, code, msg),
+    // Serialize response body
+    let json_body = if is_batch {
+        serde_json::to_string(&responses).unwrap()
+    } else {
+        serde_json::to_string(&responses[0]).unwrap()
     };
 
-    let json_body = serde_json::to_string(&rpc_response).unwrap();
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/json");
+    // Per MCP Streamable HTTP spec: for single JSON-RPC responses, prefer
+    // application/json when the client accepts it. Only use SSE when the client
+    // exclusively accepts text/event-stream or for streaming scenarios.
+    let accept = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json");
+    let accepts_json = accept.contains("application/json") || accept.contains("*/*");
+    let accepts_sse = accept.contains("text/event-stream");
 
-    // On initialize, create a new session and return the session ID
-    if is_initialize && rpc_response.error.is_none() {
-        let session_id = state.sessions.create().await;
-        info!(session_id = %session_id, "MCP session created");
-        builder = builder.header(MCP_SESSION_ID, &session_id);
-    } else if let Some(session_id) = headers.get(MCP_SESSION_ID) {
-        // Echo back the session ID on all responses
-        builder = builder.header(MCP_SESSION_ID, session_id);
+    // Prefer JSON for single responses; use SSE only if client doesn't accept JSON
+    if accepts_sse && !accepts_json {
+        let sse_body = format!("event: message\ndata: {json_body}\n\n");
+        let mut builder = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache");
+        if let Some(ref sid) = session_header {
+            builder = builder.header(MCP_SESSION_ID, sid.as_str());
+        }
+        builder.body(sse_body.into()).unwrap()
+    } else {
+        let mut builder = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json");
+        if let Some(ref sid) = session_header {
+            builder = builder.header(MCP_SESSION_ID, sid.as_str());
+        }
+        builder.body(json_body.into()).unwrap()
+    }
+}
+
+/// Process a single JSON-RPC request. Returns None for notifications (no response needed).
+async fn process_single_request(
+    state: &McpState,
+    req: &JsonRpcRequest,
+) -> Option<JsonRpcResponse> {
+    let is_notification = req.id.is_none() && req.method != "initialize";
+
+    if is_notification {
+        // Fire-and-forget: dispatch but don't return a response
+        let _ = dispatch(&state.app, req).await;
+        return None;
     }
 
-    builder.body(json_body.into()).unwrap()
+    let response = dispatch(&state.app, req).await;
+    let rpc_response = match response {
+        Ok(result) => JsonRpcResponse::success(req.id.clone(), result),
+        Err((code, msg)) => JsonRpcResponse::error(req.id.clone(), code, msg),
+    };
+    Some(rpc_response)
 }
 
 // --- GET /mcp — SSE stream for server-to-client notifications ---
 
 async fn handle_mcp_get(
-    State(state): State<Arc<McpState>>,
-    headers: HeaderMap,
+    State(_state): State<Arc<McpState>>,
+    _headers: HeaderMap,
 ) -> Response {
-    // Require valid session
-    match headers.get(MCP_SESSION_ID).and_then(|v| v.to_str().ok()) {
-        Some(session_id) if state.sessions.is_valid(session_id).await => {
-            // Return an SSE stream. We don't currently send server-initiated messages,
-            // so this just keeps the connection alive until the client disconnects.
-            let stream = tokio_stream::wrappers::ReceiverStream::new(
-                tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(1).1,
-            );
-            Sse::new(stream)
-                .keep_alive(KeepAlive::default())
-                .into_response()
-        }
-        _ => {
-            (StatusCode::NOT_FOUND, "Invalid or missing session").into_response()
-        }
-    }
+    // Stateless: open an SSE keepalive stream for any client (no session validation).
+    // Corvia doesn't currently push server-initiated messages, but the stream
+    // satisfies MCP clients that open a GET connection for notifications.
+    let (_tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 // --- DELETE /mcp — terminate session ---
 
 async fn handle_mcp_delete(
-    State(state): State<Arc<McpState>>,
+    State(_state): State<Arc<McpState>>,
     headers: HeaderMap,
 ) -> Response {
-    match headers.get(MCP_SESSION_ID).and_then(|v| v.to_str().ok()) {
-        Some(session_id) => {
-            if state.sessions.remove(session_id).await {
-                info!(session_id = %session_id, "MCP session terminated");
-                StatusCode::OK.into_response()
-            } else {
-                (StatusCode::NOT_FOUND, "Session not found").into_response()
-            }
-        }
-        None => {
-            (StatusCode::BAD_REQUEST, "Missing Mcp-Session-Id header").into_response()
-        }
+    // Stateless: accept any DELETE as a no-op (nothing to clean up).
+    if let Some(session_id) = headers.get(MCP_SESSION_ID).and_then(|v| v.to_str().ok()) {
+        info!(session_id = %session_id, "MCP session terminate requested (stateless, no-op)");
     }
+    StatusCode::OK.into_response()
 }
 
 // --- JSON-RPC dispatch ---
 
 async fn dispatch(
     state: &AppState,
-    req: JsonRpcRequest,
+    req: &JsonRpcRequest,
 ) -> Result<Value, (i32, String)> {
     match req.method.as_str() {
         "initialize" => handle_initialize(&req.params),
@@ -354,8 +380,22 @@ fn handle_initialize(params: &Value) -> Result<Value, (i32, String)> {
         info!(client_name = name, client_version = version, "MCP client connected");
     }
 
+    // Negotiate protocol version: echo back client's requested version if we support it,
+    // otherwise default to latest we support. This ensures compatibility with clients
+    // that only support older protocol versions (e.g., Claude Code uses "2024-11-05").
+    let supported_versions = ["2025-03-26", "2024-11-05"];
+    let client_version = params
+        .get("protocolVersion")
+        .and_then(|v| v.as_str())
+        .unwrap_or("2024-11-05");
+    let negotiated = if supported_versions.contains(&client_version) {
+        client_version
+    } else {
+        "2024-11-05"
+    };
+
     Ok(json!({
-        "protocolVersion": "2025-03-26",
+        "protocolVersion": negotiated,
         "capabilities": {
             "tools": {}
         },
@@ -850,17 +890,36 @@ mod tests {
             temporal: store as Arc<dyn TemporalStore>,
             data_dir: dir.to_path_buf(),
             rag: None,
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }
 
     #[tokio::test]
     async fn test_initialize() {
+        // Client sends 2024-11-05 — server should echo it back
         let params = json!({
+            "protocolVersion": "2024-11-05",
             "clientInfo": { "name": "test-client", "version": "1.0" }
         });
         let result = handle_initialize(&params).unwrap();
-        assert_eq!(result["protocolVersion"], "2025-03-26");
+        assert_eq!(result["protocolVersion"], "2024-11-05");
         assert!(result["serverInfo"]["name"].as_str().unwrap() == "corvia");
+
+        // Client sends 2025-03-26 — server should echo it back
+        let params2 = json!({
+            "protocolVersion": "2025-03-26",
+            "clientInfo": { "name": "test-client", "version": "1.0" }
+        });
+        let result2 = handle_initialize(&params2).unwrap();
+        assert_eq!(result2["protocolVersion"], "2025-03-26");
+
+        // Client sends unknown version — server should default to 2024-11-05
+        let params3 = json!({
+            "protocolVersion": "9999-01-01",
+            "clientInfo": { "name": "test-client", "version": "1.0" }
+        });
+        let result3 = handle_initialize(&params3).unwrap();
+        assert_eq!(result3["protocolVersion"], "2024-11-05");
     }
 
     #[tokio::test]
@@ -1117,6 +1176,7 @@ mod tests {
             temporal: store as Arc<dyn TemporalStore>,
             data_dir: dir.path().to_path_buf(),
             rag: Some(rag),
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         });
 
         let args = json!({ "query": "rag-routed", "scope_id": "rag-scope", "limit": 5 });
@@ -1142,7 +1202,7 @@ mod tests {
             method: "unknown/method".into(),
             params: json!({}),
         };
-        let result = dispatch(&state, req).await;
+        let result = dispatch(&state, &req).await;
         assert!(result.is_err());
         let (code, _) = result.unwrap_err();
         assert_eq!(code, METHOD_NOT_FOUND);
