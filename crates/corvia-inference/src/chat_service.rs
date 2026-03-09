@@ -1,80 +1,445 @@
 use corvia_proto::chat_service_server::ChatService;
 use corvia_proto::*;
 use std::collections::HashMap;
+use std::num::NonZeroU32;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 
-/// Stub ChatService implementation.
-/// Currently returns stub responses for actual model inference.
-/// The candle GGUF backend will be implemented in a future task.
+use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::llama_batch::LlamaBatch;
+use llama_cpp_2::model::params::LlamaModelParams;
+use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
+use llama_cpp_2::sampling::LlamaSampler;
+
+// ---------------------------------------------------------------------------
+// Model resolution
+// ---------------------------------------------------------------------------
+
+/// Resolved model coordinates on Hugging Face.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModel {
+    pub repo: String,
+    pub filename: String,
+}
+
+/// Map a short model name (e.g. "llama3.2", "llama3.2:1b") to a HF repo + GGUF filename.
+pub fn resolve_model(name: &str) -> Result<ResolvedModel, Status> {
+    match name {
+        "llama3.2" | "llama3.2:3b" => Ok(ResolvedModel {
+            repo: "bartowski/Llama-3.2-3B-Instruct-GGUF".to_string(),
+            filename: "Llama-3.2-3B-Instruct-Q4_K_M.gguf".to_string(),
+        }),
+        "llama3.2:1b" => Ok(ResolvedModel {
+            repo: "bartowski/Llama-3.2-1B-Instruct-GGUF".to_string(),
+            filename: "Llama-3.2-1B-Instruct-Q4_K_M.gguf".to_string(),
+        }),
+        other => Err(Status::invalid_argument(format!(
+            "Unknown model: '{other}'. Supported: llama3.2, llama3.2:3b, llama3.2:1b"
+        ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Backend initialization (global, once)
+// ---------------------------------------------------------------------------
+
+use std::sync::Once;
+
+static BACKEND_INIT: Once = Once::new();
+/// We leak the backend so it lives for the process lifetime.
+/// LlamaBackend::init() can only succeed once; subsequent calls error.
+fn ensure_backend() {
+    BACKEND_INIT.call_once(|| {
+        // Ignore the AlreadyInitialized error in case of races with doc-tests etc.
+        let _ = LlamaBackend::init();
+        // Route llama.cpp logs into tracing
+        llama_cpp_2::send_logs_to_tracing(llama_cpp_2::LogOptions::default());
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Model entry
+// ---------------------------------------------------------------------------
+
+struct ChatModelEntry {
+    model: Arc<LlamaModel>,
+}
+
+// ---------------------------------------------------------------------------
+// ChatServiceImpl
+// ---------------------------------------------------------------------------
+
+/// Real ChatService implementation backed by llama.cpp via llama-cpp-2.
 #[derive(Clone)]
 pub struct ChatServiceImpl {
     models: Arc<RwLock<HashMap<String, ChatModelEntry>>>,
 }
 
-struct ChatModelEntry {
-    _name: String,
-}
-
 impl ChatServiceImpl {
     pub fn new() -> Self {
+        ensure_backend();
         Self {
             models: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
+    /// Download (if needed) and load a GGUF model into memory.
     pub async fn load_model(&self, name: &str) -> Result<(), Status> {
-        tracing::info!(model = %name, "Loading chat model (stub)...");
-        // TODO: Implement candle GGUF model loading
-        // 1. Resolve HuggingFace repo
-        // 2. Download via hf-hub if not cached
-        // 3. Load GGUF into candle
-        // 4. Load tokenizer
+        let resolved = resolve_model(name)?;
+        let name_owned = name.to_string();
+        tracing::info!(model = %name_owned, repo = %resolved.repo, file = %resolved.filename, "Loading chat model...");
+
+        // Download + load on a blocking thread (both are CPU/IO heavy).
+        let model = tokio::task::spawn_blocking(move || -> Result<Arc<LlamaModel>, Status> {
+            // Download via hf-hub
+            let api = hf_hub::api::sync::Api::new()
+                .map_err(|e| Status::internal(format!("hf-hub API init failed: {e}")))?;
+            let repo = api.model(resolved.repo.clone());
+            let model_path: PathBuf = repo
+                .get(&resolved.filename)
+                .map_err(|e| Status::internal(format!("Model download failed: {e}")))?;
+
+            tracing::info!(path = %model_path.display(), "GGUF file ready, loading into llama.cpp...");
+
+            // We need a backend reference for load_from_file, but it's just a proof token.
+            // Re-init returns AlreadyInitialized which we ignore — we just need the struct.
+            // Actually we can't get the struct back. The API requires &LlamaBackend.
+            // We'll create a temporary one — but init will fail. Let's use a workaround:
+            // The backend is already initialized globally. We need to pass a reference.
+            // Unfortunately LlamaBackend::init() returns Err after the first call.
+            // Looking at the source, load_from_file just takes `_: &LlamaBackend` and ignores it.
+            // But we still need to pass *something*. Let's use a trick: transmute a unit struct.
+            // Actually, LlamaBackend is just `struct LlamaBackend {}` — zero-sized.
+            // We can safely create one via unsafe since the backend IS initialized.
+            let backend: LlamaBackend = unsafe { std::mem::transmute(()) };
+
+            let model_params = LlamaModelParams::default();
+            let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
+                .map_err(|e| Status::internal(format!("Model load failed: {e}")))?;
+
+            // Don't drop the backend (it would deinit llama.cpp)
+            std::mem::forget(backend);
+
+            Ok(Arc::new(model))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))??;
+
         let mut models = self.models.write().await;
         models.insert(
             name.to_string(),
-            ChatModelEntry {
-                _name: name.to_string(),
-            },
+            ChatModelEntry { model },
         );
-        tracing::info!(model = %name, "Chat model registered (stub — no real inference yet)");
+        tracing::info!(model = %name, "Chat model loaded successfully");
         Ok(())
     }
+
+    /// Get a reference to a loaded model.
+    async fn get_model(&self, name: &str) -> Result<Arc<LlamaModel>, Status> {
+        let models = self.models.read().await;
+        models
+            .get(name)
+            .map(|e| Arc::clone(&e.model))
+            .ok_or_else(|| Status::not_found(format!("Chat model '{}' not loaded", name)))
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Shared inference helpers
+// ---------------------------------------------------------------------------
+
+/// Parameters for a generation request, extracted from the proto.
+struct GenerateParams {
+    model: Arc<LlamaModel>,
+    prompt: String,
+    temperature: f32,
+    max_tokens: u32,
+}
+
+/// Result of running inference.
+struct GenerateResult {
+    text: String,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+}
+
+/// Build the prompt string from ChatRequest messages using the model's chat template.
+fn build_prompt(model: &LlamaModel, messages: &[ChatMessage]) -> Result<String, Status> {
+    let template = model
+        .chat_template(None)
+        .map_err(|e| Status::internal(format!("Failed to get chat template: {e}")))?;
+
+    let llama_messages: Vec<LlamaChatMessage> = messages
+        .iter()
+        .map(|m| {
+            LlamaChatMessage::new(m.role.clone(), m.content.clone())
+                .map_err(|e| Status::internal(format!("Invalid chat message: {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    model
+        .apply_chat_template(&template, &llama_messages, true)
+        .map_err(|e| Status::internal(format!("Failed to apply chat template: {e}")))
+}
+
+/// Run full generation (blocking). Returns the generated text and token counts.
+fn generate_blocking(params: &GenerateParams) -> Result<GenerateResult, Status> {
+    let model = &params.model;
+
+    // Tokenize the prompt
+    let prompt_tokens = model
+        .str_to_token(&params.prompt, AddBos::Never)
+        .map_err(|e| Status::internal(format!("Tokenization failed: {e}")))?;
+
+    let n_prompt = prompt_tokens.len();
+    let max_tokens = if params.max_tokens == 0 {
+        512
+    } else {
+        params.max_tokens as usize
+    };
+
+    // Create context
+    let ctx_size = (n_prompt + max_tokens + 64) as u32;
+    let ctx_params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(ctx_size.max(512)))
+        .with_n_batch(512);
+
+    // We need a backend reference. Same trick as in load_model.
+    let backend: LlamaBackend = unsafe { std::mem::transmute(()) };
+    let mut ctx = model
+        .new_context(&backend, ctx_params)
+        .map_err(|e| Status::internal(format!("Context creation failed: {e}")))?;
+    std::mem::forget(backend);
+
+    // Build sampler chain
+    let temperature = if params.temperature <= 0.0 {
+        0.0 // greedy
+    } else {
+        params.temperature
+    };
+
+    let mut sampler = if temperature == 0.0 {
+        LlamaSampler::chain_simple([
+            LlamaSampler::min_p(0.05, 1),
+            LlamaSampler::greedy(),
+        ])
+    } else {
+        LlamaSampler::chain_simple([
+            LlamaSampler::min_p(0.05, 1),
+            LlamaSampler::temp(temperature),
+            LlamaSampler::dist(42),
+        ])
+    };
+
+    // Feed the prompt tokens
+    let mut batch = LlamaBatch::new(ctx_size as usize, 1);
+    for (i, &token) in prompt_tokens.iter().enumerate() {
+        let is_last = i == n_prompt - 1;
+        batch
+            .add(token, i as i32, &[0], is_last)
+            .map_err(|e| Status::internal(format!("Batch add failed: {e}")))?;
+    }
+
+    ctx.decode(&mut batch)
+        .map_err(|e| Status::internal(format!("Prompt decode failed: {e}")))?;
+
+    // Generation loop
+    let mut output = String::new();
+    let mut n_decoded: u32 = 0;
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+
+    loop {
+        if n_decoded as usize >= max_tokens {
+            break;
+        }
+
+        let new_token = sampler.sample(&ctx, -1);
+        sampler.accept(new_token);
+
+        // Check for end of generation
+        if model.is_eog_token(new_token) {
+            break;
+        }
+
+        // Decode token to string
+        let piece = model
+            .token_to_piece(new_token, &mut decoder, true, None)
+            .map_err(|e| Status::internal(format!("Token decode failed: {e}")))?;
+        output.push_str(&piece);
+        n_decoded += 1;
+
+        // Prepare next batch
+        batch.clear();
+        batch
+            .add(new_token, (n_prompt + n_decoded as usize - 1) as i32, &[0], true)
+            .map_err(|e| Status::internal(format!("Batch add failed: {e}")))?;
+
+        ctx.decode(&mut batch)
+            .map_err(|e| Status::internal(format!("Decode failed: {e}")))?;
+    }
+
+    Ok(GenerateResult {
+        text: output,
+        prompt_tokens: n_prompt as u32,
+        completion_tokens: n_decoded,
+    })
+}
+
+/// Run generation token by token, sending each piece through a channel (blocking).
+fn generate_streaming_blocking(
+    params: &GenerateParams,
+    tx: &tokio::sync::mpsc::Sender<Result<ChatChunk, Status>>,
+) -> Result<(), Status> {
+    let model = &params.model;
+
+    let prompt_tokens = model
+        .str_to_token(&params.prompt, AddBos::Never)
+        .map_err(|e| Status::internal(format!("Tokenization failed: {e}")))?;
+
+    let n_prompt = prompt_tokens.len();
+    let max_tokens = if params.max_tokens == 0 {
+        512
+    } else {
+        params.max_tokens as usize
+    };
+
+    let ctx_size = (n_prompt + max_tokens + 64) as u32;
+    let ctx_params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(ctx_size.max(512)))
+        .with_n_batch(512);
+
+    let backend: LlamaBackend = unsafe { std::mem::transmute(()) };
+    let mut ctx = model
+        .new_context(&backend, ctx_params)
+        .map_err(|e| Status::internal(format!("Context creation failed: {e}")))?;
+    std::mem::forget(backend);
+
+    let temperature = if params.temperature <= 0.0 {
+        0.0
+    } else {
+        params.temperature
+    };
+
+    let mut sampler = if temperature == 0.0 {
+        LlamaSampler::chain_simple([
+            LlamaSampler::min_p(0.05, 1),
+            LlamaSampler::greedy(),
+        ])
+    } else {
+        LlamaSampler::chain_simple([
+            LlamaSampler::min_p(0.05, 1),
+            LlamaSampler::temp(temperature),
+            LlamaSampler::dist(42),
+        ])
+    };
+
+    // Feed prompt
+    let mut batch = LlamaBatch::new(ctx_size as usize, 1);
+    for (i, &token) in prompt_tokens.iter().enumerate() {
+        let is_last = i == n_prompt - 1;
+        batch
+            .add(token, i as i32, &[0], is_last)
+            .map_err(|e| Status::internal(format!("Batch add failed: {e}")))?;
+    }
+
+    ctx.decode(&mut batch)
+        .map_err(|e| Status::internal(format!("Prompt decode failed: {e}")))?;
+
+    let mut n_decoded: u32 = 0;
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+
+    loop {
+        if n_decoded as usize >= max_tokens {
+            // Send final chunk
+            let _ = tx.blocking_send(Ok(ChatChunk {
+                delta: String::new(),
+                done: true,
+                prompt_tokens: n_prompt as u32,
+                completion_tokens: n_decoded,
+            }));
+            break;
+        }
+
+        let new_token = sampler.sample(&ctx, -1);
+        sampler.accept(new_token);
+
+        if model.is_eog_token(new_token) {
+            let _ = tx.blocking_send(Ok(ChatChunk {
+                delta: String::new(),
+                done: true,
+                prompt_tokens: n_prompt as u32,
+                completion_tokens: n_decoded,
+            }));
+            break;
+        }
+
+        let piece = model
+            .token_to_piece(new_token, &mut decoder, true, None)
+            .map_err(|e| Status::internal(format!("Token decode failed: {e}")))?;
+
+        n_decoded += 1;
+
+        // Send chunk — if receiver dropped, stop generating
+        if tx
+            .blocking_send(Ok(ChatChunk {
+                delta: piece,
+                done: false,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+            }))
+            .is_err()
+        {
+            break;
+        }
+
+        // Prepare next batch
+        batch.clear();
+        batch
+            .add(new_token, (n_prompt + n_decoded as usize - 1) as i32, &[0], true)
+            .map_err(|e| Status::internal(format!("Batch add failed: {e}")))?;
+
+        ctx.decode(&mut batch)
+            .map_err(|e| Status::internal(format!("Decode failed: {e}")))?;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// gRPC trait impl
+// ---------------------------------------------------------------------------
 
 #[tonic::async_trait]
 impl ChatService for ChatServiceImpl {
     async fn chat(&self, req: Request<ChatRequest>) -> Result<Response<ChatResponse>, Status> {
         let req = req.into_inner();
-        let models = self.models.read().await;
-        if !models.contains_key(&req.model) {
-            return Err(Status::not_found(format!(
-                "Chat model '{}' not loaded",
-                req.model
-            )));
-        }
+        let model = self.get_model(&req.model).await?;
 
-        // TODO: Implement real candle inference
-        // For now, return a stub response indicating the service is scaffolded
-        let last_user_msg = req
-            .messages
-            .iter()
-            .filter(|m| m.role == "user")
-            .last()
-            .map(|m| m.content.clone())
-            .unwrap_or_default();
+        let prompt = build_prompt(&model, &req.messages)?;
+        let temperature = req.temperature;
+        let max_tokens = req.max_tokens;
+
+        let params = GenerateParams {
+            model,
+            prompt,
+            temperature,
+            max_tokens,
+        };
+
+        let result = tokio::task::spawn_blocking(move || generate_blocking(&params))
+            .await
+            .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))??;
 
         Ok(Response::new(ChatResponse {
             message: Some(ChatMessage {
                 role: "assistant".to_string(),
-                content: format!(
-                    "[stub] Chat inference not yet implemented. Received: {}",
-                    &last_user_msg[..last_user_msg.len().min(100)]
-                ),
+                content: result.text,
             }),
-            prompt_tokens: 0,
-            completion_tokens: 0,
+            prompt_tokens: result.prompt_tokens,
+            completion_tokens: result.completion_tokens,
         }))
     }
 
@@ -85,29 +450,81 @@ impl ChatService for ChatServiceImpl {
         req: Request<ChatRequest>,
     ) -> Result<Response<Self::ChatStreamStream>, Status> {
         let req = req.into_inner();
-        let models = self.models.read().await;
-        if !models.contains_key(&req.model) {
-            return Err(Status::not_found(format!(
-                "Chat model '{}' not loaded",
-                req.model
-            )));
-        }
+        let model = self.get_model(&req.model).await?;
 
-        // TODO: Implement real streaming candle inference
+        let prompt = build_prompt(&model, &req.messages)?;
+        let temperature = req.temperature;
+        let max_tokens = req.max_tokens;
+
         let (tx, rx) = tokio::sync::mpsc::channel(32);
-        tokio::spawn(async move {
-            let _ = tx
-                .send(Ok(ChatChunk {
-                    delta: "[stub] Streaming chat not yet implemented".to_string(),
-                    done: true,
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                }))
-                .await;
+
+        tokio::task::spawn_blocking(move || {
+            let params = GenerateParams {
+                model,
+                prompt,
+                temperature,
+                max_tokens,
+            };
+
+            if let Err(e) = generate_streaming_blocking(&params, &tx) {
+                let _ = tx.blocking_send(Err(e));
+            }
         });
 
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_model_llama32_default() {
+        let resolved = resolve_model("llama3.2").unwrap();
+        assert_eq!(resolved.repo, "bartowski/Llama-3.2-3B-Instruct-GGUF");
+        assert_eq!(resolved.filename, "Llama-3.2-3B-Instruct-Q4_K_M.gguf");
+    }
+
+    #[test]
+    fn test_resolve_model_llama32_3b_explicit() {
+        let resolved = resolve_model("llama3.2:3b").unwrap();
+        assert_eq!(resolved.repo, "bartowski/Llama-3.2-3B-Instruct-GGUF");
+        assert_eq!(resolved.filename, "Llama-3.2-3B-Instruct-Q4_K_M.gguf");
+    }
+
+    #[test]
+    fn test_resolve_model_llama32_1b() {
+        let resolved = resolve_model("llama3.2:1b").unwrap();
+        assert_eq!(resolved.repo, "bartowski/Llama-3.2-1B-Instruct-GGUF");
+        assert_eq!(resolved.filename, "Llama-3.2-1B-Instruct-Q4_K_M.gguf");
+    }
+
+    #[test]
+    fn test_resolve_model_default_equals_3b() {
+        let default = resolve_model("llama3.2").unwrap();
+        let explicit = resolve_model("llama3.2:3b").unwrap();
+        assert_eq!(default, explicit);
+    }
+
+    #[test]
+    fn test_resolve_model_unknown() {
+        let result = resolve_model("gpt-4");
+        assert!(result.is_err());
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("gpt-4"));
+    }
+
+    #[test]
+    fn test_resolve_model_empty() {
+        let result = resolve_model("");
+        assert!(result.is_err());
     }
 }
