@@ -1117,6 +1117,7 @@ version = "0.3.4"
 dependencies = [
  "clap",
  "corvia-proto",
+ "encoding_rs",
  "fastembed",
  "hf-hub",
  "llama-cpp-2",
