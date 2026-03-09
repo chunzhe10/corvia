@@ -218,17 +218,23 @@ fn generate_blocking(params: &GenerateParams) -> Result<GenerateResult, Status> 
         ])
     };
 
-    // Feed the prompt tokens
-    let mut batch = LlamaBatch::new(ctx_size as usize, 1);
-    for (i, &token) in prompt_tokens.iter().enumerate() {
-        let is_last = i == n_prompt - 1;
-        batch
-            .add(token, i as i32, &[0], is_last)
-            .map_err(|e| Status::internal(format!("Batch add failed: {e}")))?;
+    // Feed the prompt tokens in chunks of n_batch to avoid exceeding batch size
+    let n_batch = 512;
+    let mut batch = LlamaBatch::new(n_batch, 1);
+    let mut i = 0;
+    while i < n_prompt {
+        batch.clear();
+        let end = (i + n_batch).min(n_prompt);
+        for j in i..end {
+            let is_last = j == n_prompt - 1;
+            batch
+                .add(prompt_tokens[j], j as i32, &[0], is_last)
+                .map_err(|e| Status::internal(format!("Batch add failed: {e}")))?;
+        }
+        ctx.decode(&mut batch)
+            .map_err(|e| Status::internal(format!("Prompt decode failed: {e}")))?;
+        i = end;
     }
-
-    ctx.decode(&mut batch)
-        .map_err(|e| Status::internal(format!("Prompt decode failed: {e}")))?;
 
     // Generation loop
     let mut output = String::new();
@@ -318,17 +324,23 @@ fn generate_streaming_blocking(
         ])
     };
 
-    // Feed prompt
-    let mut batch = LlamaBatch::new(ctx_size as usize, 1);
-    for (i, &token) in prompt_tokens.iter().enumerate() {
-        let is_last = i == n_prompt - 1;
-        batch
-            .add(token, i as i32, &[0], is_last)
-            .map_err(|e| Status::internal(format!("Batch add failed: {e}")))?;
+    // Feed prompt in chunks of n_batch to avoid exceeding batch size
+    let n_batch = 512;
+    let mut batch = LlamaBatch::new(n_batch, 1);
+    let mut i = 0;
+    while i < n_prompt {
+        batch.clear();
+        let end = (i + n_batch).min(n_prompt);
+        for j in i..end {
+            let is_last = j == n_prompt - 1;
+            batch
+                .add(prompt_tokens[j], j as i32, &[0], is_last)
+                .map_err(|e| Status::internal(format!("Batch add failed: {e}")))?;
+        }
+        ctx.decode(&mut batch)
+            .map_err(|e| Status::internal(format!("Prompt decode failed: {e}")))?;
+        i = end;
     }
-
-    ctx.decode(&mut batch)
-        .map_err(|e| Status::internal(format!("Prompt decode failed: {e}")))?;
 
     let mut n_decoded: u32 = 0;
     let mut decoder = encoding_rs::UTF_8.new_decoder();
