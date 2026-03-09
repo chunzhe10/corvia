@@ -46,18 +46,17 @@ pub fn resolve_model(name: &str) -> Result<ResolvedModel, Status> {
 // Backend initialization (global, once)
 // ---------------------------------------------------------------------------
 
-use std::sync::Once;
+use std::sync::OnceLock;
 
-static BACKEND_INIT: Once = Once::new();
-/// We leak the backend so it lives for the process lifetime.
-/// LlamaBackend::init() can only succeed once; subsequent calls error.
-fn ensure_backend() {
-    BACKEND_INIT.call_once(|| {
-        // Ignore the AlreadyInitialized error in case of races with doc-tests etc.
-        let _ = LlamaBackend::init();
-        // Route llama.cpp logs into tracing
+static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
+
+/// Get a static reference to the initialized llama.cpp backend.
+fn backend() -> &'static LlamaBackend {
+    BACKEND.get_or_init(|| {
+        let backend = LlamaBackend::init().expect("Failed to initialize llama.cpp backend");
         llama_cpp_2::send_logs_to_tracing(llama_cpp_2::LogOptions::default());
-    });
+        backend
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -80,7 +79,7 @@ pub struct ChatServiceImpl {
 
 impl ChatServiceImpl {
     pub fn new() -> Self {
-        ensure_backend();
+        let _ = backend(); // Ensure backend is initialized
         Self {
             models: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -104,24 +103,9 @@ impl ChatServiceImpl {
 
             tracing::info!(path = %model_path.display(), "GGUF file ready, loading into llama.cpp...");
 
-            // We need a backend reference for load_from_file, but it's just a proof token.
-            // Re-init returns AlreadyInitialized which we ignore — we just need the struct.
-            // Actually we can't get the struct back. The API requires &LlamaBackend.
-            // We'll create a temporary one — but init will fail. Let's use a workaround:
-            // The backend is already initialized globally. We need to pass a reference.
-            // Unfortunately LlamaBackend::init() returns Err after the first call.
-            // Looking at the source, load_from_file just takes `_: &LlamaBackend` and ignores it.
-            // But we still need to pass *something*. Let's use a trick: transmute a unit struct.
-            // Actually, LlamaBackend is just `struct LlamaBackend {}` — zero-sized.
-            // We can safely create one via unsafe since the backend IS initialized.
-            let backend: LlamaBackend = unsafe { std::mem::transmute(()) };
-
             let model_params = LlamaModelParams::default();
-            let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
+            let model = LlamaModel::load_from_file(backend(), &model_path, &model_params)
                 .map_err(|e| Status::internal(format!("Model load failed: {e}")))?;
-
-            // Don't drop the backend (it would deinit llama.cpp)
-            std::mem::forget(backend);
 
             Ok(Arc::new(model))
         })
@@ -195,8 +179,11 @@ fn generate_blocking(params: &GenerateParams) -> Result<GenerateResult, Status> 
         .map_err(|e| Status::internal(format!("Tokenization failed: {e}")))?;
 
     let n_prompt = prompt_tokens.len();
+    if n_prompt == 0 {
+        return Err(Status::invalid_argument("Prompt is empty after tokenization"));
+    }
     let max_tokens = if params.max_tokens == 0 {
-        512
+        2048
     } else {
         params.max_tokens as usize
     };
@@ -207,12 +194,9 @@ fn generate_blocking(params: &GenerateParams) -> Result<GenerateResult, Status> 
         .with_n_ctx(NonZeroU32::new(ctx_size.max(512)))
         .with_n_batch(512);
 
-    // We need a backend reference. Same trick as in load_model.
-    let backend: LlamaBackend = unsafe { std::mem::transmute(()) };
     let mut ctx = model
-        .new_context(&backend, ctx_params)
+        .new_context(backend(), ctx_params)
         .map_err(|e| Status::internal(format!("Context creation failed: {e}")))?;
-    std::mem::forget(backend);
 
     // Build sampler chain
     let temperature = if params.temperature <= 0.0 {
@@ -301,7 +285,7 @@ fn generate_streaming_blocking(
 
     let n_prompt = prompt_tokens.len();
     let max_tokens = if params.max_tokens == 0 {
-        512
+        2048
     } else {
         params.max_tokens as usize
     };
@@ -311,11 +295,9 @@ fn generate_streaming_blocking(
         .with_n_ctx(NonZeroU32::new(ctx_size.max(512)))
         .with_n_batch(512);
 
-    let backend: LlamaBackend = unsafe { std::mem::transmute(()) };
     let mut ctx = model
-        .new_context(&backend, ctx_params)
+        .new_context(backend(), ctx_params)
         .map_err(|e| Status::internal(format!("Context creation failed: {e}")))?;
-    std::mem::forget(backend);
 
     let temperature = if params.temperature <= 0.0 {
         0.0
