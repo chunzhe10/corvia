@@ -59,12 +59,8 @@ enum Commands {
         store: String,
     },
 
-    /// Start the REST API server
-    Serve {
-        /// Also start MCP server on /mcp endpoint
-        #[arg(long)]
-        mcp: bool,
-    },
+    /// Start the REST API server (includes MCP endpoint)
+    Serve,
 
     /// Ingest a repository (or all workspace repos if no path given)
     Ingest {
@@ -274,7 +270,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Init { store } => cmd_init(&store).await?,
-        Commands::Serve { mcp } => cmd_serve(mcp).await?,
+        Commands::Serve => cmd_serve().await?,
         Commands::Ingest { path } => cmd_ingest(path.as_deref()).await?,
         Commands::Search { query, limit } => cmd_search(&query, limit).await?,
         Commands::Status => cmd_status().await?,
@@ -389,10 +385,20 @@ async fn cmd_init(store: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_serve(mcp: bool) -> Result<()> {
+async fn cmd_serve() -> Result<()> {
     let config = load_config()?;
+
+    // Bind the TCP listener FIRST so the port is occupied immediately.
+    // This prevents "connection refused" errors while the store initializes.
+    let addr = format!("{}:{}", config.server.host, config.server.port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    println!("Corvia server bound to {addr} (initializing...)");
+
+    println!("Checking inference engine...");
     ensure_inference_ready(&config).await?;
+    println!("Opening store (HNSW index rebuild may take 20-30s)...");
     let (store, graph, temporal) = connect_full_store(&config).await?;
+    println!("Store ready");
     let engine: Arc<dyn InferenceEngine> = connect_engine(&config);
 
     // Construct AgentCoordinator
@@ -415,35 +421,59 @@ async fn cmd_serve(mcp: bool) -> Result<()> {
         data_dir,
         config.agent_lifecycle.clone(),
         config.merge.clone(),
-        gen_engine,
+        gen_engine.clone(),
     )?);
     println!("Agent coordination: enabled");
 
     // Construct RAG pipeline — auto-selects retriever based on graph availability.
-    // generator: None until a GenerationEngine adapter is wired (ask mode unavailable).
     let rag = Arc::new(corvia_kernel::create_rag_pipeline(
         store.clone(),
         engine.clone(),
         Some(graph.clone()),
-        None, // GenerationEngine: wired when M3.1 adapter lands
+        Some(gen_engine),
         &config,
     ));
     println!("RAG pipeline: enabled (retriever: {})", rag.retriever_name());
 
     let data_dir = std::path::PathBuf::from(&config.storage.data_dir);
-    let state = Arc::new(corvia_server::rest::AppState { store, engine, coordinator, graph, temporal, data_dir, rag: Some(rag) });
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let state = Arc::new(corvia_server::rest::AppState { store, engine, coordinator, graph, temporal, data_dir, rag: Some(rag), ready: ready.clone() });
     let mut app = corvia_server::rest::router(state.clone());
+    app = app.merge(corvia_server::mcp::mcp_router(state));
+    println!("MCP endpoint: POST/GET/DELETE /mcp (Streamable HTTP)");
 
-    if mcp {
-        app = app.merge(corvia_server::mcp::mcp_router(state));
-        println!("MCP endpoint: POST/GET/DELETE /mcp (Streamable HTTP)");
-    }
-
-    let addr = format!("{}:{}", config.server.host, config.server.port);
+    ready.store(true, std::sync::atomic::Ordering::Relaxed);
     println!("Corvia server listening on {addr}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    println!("Corvia server shut down gracefully");
     Ok(())
+}
+
+/// Wait for SIGINT (Ctrl-C) or SIGTERM for graceful shutdown.
+async fn shutdown_signal() {
+    use tokio::signal;
+
+    let ctrl_c = async {
+        signal::ctrl_c().await.expect("failed to listen for Ctrl-C");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to listen for SIGTERM")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => { println!("\nReceived SIGINT, shutting down..."); }
+        _ = terminate => { println!("\nReceived SIGTERM, shutting down..."); }
+    }
 }
 
 async fn cmd_ingest(path: Option<&str>) -> Result<()> {
