@@ -11,6 +11,7 @@ use corvia_common::types::{EdgeDirection, GraphEdge, KnowledgeEntry, SearchResul
 use corvia_kernel::agent_coordinator::AgentCoordinator;
 use corvia_kernel::traits::{GraphStore, InferenceEngine, QueryableStore, TemporalStore};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::info;
 
@@ -22,6 +23,7 @@ pub struct AppState {
     pub temporal: Arc<dyn TemporalStore>,
     pub data_dir: std::path::PathBuf,
     pub rag: Option<Arc<corvia_kernel::rag_pipeline::RagPipeline>>,
+    pub ready: Arc<AtomicBool>,
 }
 
 // --- Existing memory types ---
@@ -281,8 +283,12 @@ fn coordinator(state: &AppState) -> &AgentCoordinator {
 
 // --- Existing handlers ---
 
-async fn health() -> impl IntoResponse {
-    Json(serde_json::json!({"status": "ok"}))
+async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if state.ready.load(Ordering::Relaxed) {
+        (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"status": "starting", "message": "Rebuilding index, not yet ready"})))
+    }
 }
 
 async fn write_memory(

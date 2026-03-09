@@ -396,7 +396,7 @@ async fn cmd_serve() -> Result<()> {
 
     println!("Checking inference engine...");
     ensure_inference_ready(&config).await?;
-    println!("Opening store (HNSW index rebuild may take 20-30s)...");
+    println!("Opening store...");
     let (store, graph, temporal) = connect_full_store(&config).await?;
     println!("Store ready");
     let engine: Arc<dyn InferenceEngine> = connect_engine(&config);

@@ -6,7 +6,7 @@ use redb::{Database, ReadableTable, TableDefinition};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::knowledge_files;
 use crate::traits::QueryableStore;
@@ -68,19 +68,62 @@ impl LiteStore {
             }
         };
 
-        let hnsw = Hnsw::<f32, DistCosine>::new(
-            MAX_NB_CONNECTION,
-            MAX_ELEMENTS,
-            MAX_LAYER,
-            EF_CONSTRUCTION,
-            DistCosine {},
-        );
+        // Try loading persisted HNSW from disk first (fast path)
+        let hnsw_dir = data_dir.join("hnsw");
+        let hnsw_graph_file = hnsw_dir.join("litestore.hnsw.graph");
+        let hnsw_data_file = hnsw_dir.join("litestore.hnsw.data");
+
+        let (hnsw, loaded_from_disk) = if next_id > 0
+            && hnsw_graph_file.exists()
+            && hnsw_data_file.exists()
+        {
+            let start = std::time::Instant::now();
+            let mut hnswio = HnswIo::new(&hnsw_dir, "litestore");
+            match hnswio.load_hnsw::<f32, DistCosine>() {
+                Ok(loaded) => {
+                    // SAFETY: Without mmap (default ReloadOptions), all point data is
+                    // deserialized into owned Vec<T>, not borrowed from HnswIo.
+                    // The lifetime parameter is a compile-time artifact that doesn't
+                    // reflect actual borrowing in the non-mmap case.
+                    let loaded: Hnsw<'static, f32, DistCosine> =
+                        unsafe { std::mem::transmute(loaded) };
+                    let elapsed = start.elapsed();
+                    info!(
+                        "HNSW loaded from disk in {:.2}s ({} entries)",
+                        elapsed.as_secs_f64(),
+                        next_id
+                    );
+                    (loaded, true)
+                }
+                Err(e) => {
+                    warn!("Failed to load HNSW from disk, will rebuild: {e}");
+                    let fresh = Hnsw::<f32, DistCosine>::new(
+                        MAX_NB_CONNECTION,
+                        MAX_ELEMENTS,
+                        MAX_LAYER,
+                        EF_CONSTRUCTION,
+                        DistCosine {},
+                    );
+                    (fresh, false)
+                }
+            }
+        } else {
+            let fresh = Hnsw::<f32, DistCosine>::new(
+                MAX_NB_CONNECTION,
+                MAX_ELEMENTS,
+                MAX_LAYER,
+                EF_CONSTRUCTION,
+                DistCosine {},
+            );
+            (fresh, false)
+        };
 
         info!(
-            "LiteStore opened at {} (dimensions={}, next_hnsw_id={})",
+            "LiteStore opened at {} (dimensions={}, next_hnsw_id={}, hnsw_from_disk={})",
             data_dir.display(),
             dimensions,
-            next_id
+            next_id,
+            loaded_from_disk
         );
 
         let graph = crate::graph_store::LiteGraphStore::new(Arc::clone(&db))?;
@@ -94,11 +137,22 @@ impl LiteStore {
             graph,
         };
 
-        // Auto-rebuild HNSW from knowledge files if entries exist but index is empty
-        if next_id > 0 {
+        // If HNSW was loaded from disk, rebuild only the temporal index (cheap, from Redb).
+        // If not loaded, fall back to full rebuild from knowledge files (slow).
+        if next_id > 0 && !loaded_from_disk {
+            let start = std::time::Instant::now();
             let rebuilt = store.rebuild_from_files()?;
+            let elapsed = start.elapsed();
             if rebuilt > 0 {
-                info!("Auto-rebuilt HNSW index with {rebuilt} entries from knowledge files");
+                info!(
+                    "Rebuilt HNSW index from {} knowledge files in {:.2}s",
+                    rebuilt,
+                    elapsed.as_secs_f64()
+                );
+                // Persist the rebuilt HNSW so next startup is fast
+                if let Err(e) = store.flush_hnsw() {
+                    warn!("Failed to persist rebuilt HNSW index: {e}");
+                }
             }
         }
 
@@ -266,6 +320,12 @@ impl LiteStore {
         std::fs::create_dir_all(&hnsw_dir)
             .map_err(|e| CorviaError::Storage(format!("Failed to create hnsw dir: {e}")))?;
 
+        // Remove old dump files before writing new ones.
+        // hnsw_rs skips overwrite when datamap_opt is true (set after load_hnsw),
+        // so we clean up first to ensure a fresh dump with the canonical name.
+        let _ = std::fs::remove_file(hnsw_dir.join("litestore.hnsw.graph"));
+        let _ = std::fs::remove_file(hnsw_dir.join("litestore.hnsw.data"));
+
         let hnsw = self
             .hnsw
             .lock()
@@ -388,6 +448,16 @@ impl LiteStore {
         knowledge_files::write_entry(&self.data_dir, &old_entry)?;
 
         Ok(())
+    }
+}
+
+impl Drop for LiteStore {
+    fn drop(&mut self) {
+        if let Err(e) = self.flush_hnsw() {
+            eprintln!("LiteStore: failed to flush HNSW on drop: {e}");
+        } else {
+            eprintln!("LiteStore: HNSW index persisted to disk");
+        }
     }
 }
 
