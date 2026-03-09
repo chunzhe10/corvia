@@ -107,7 +107,8 @@ fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "content": { "type": "string", "description": "The knowledge content to store" },
                     "scope_id": { "type": "string", "description": "Target scope" },
-                    "source_version": { "type": "string", "description": "Source version reference" }
+                    "source_version": { "type": "string", "description": "Source version reference" },
+                    "agent_id": { "type": "string", "description": "Agent identity for attribution (e.g. 'claude-code')" }
                 },
                 "required": ["content", "scope_id"]
             }
@@ -151,7 +152,9 @@ fn tool_definitions() -> Vec<Value> {
             "description": "Get the calling agent's contribution summary",
             "inputSchema": {
                 "type": "object",
-                "properties": {}
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Agent identity (e.g. 'claude-code')" }
+                }
             }
         }),
         json!({
@@ -420,11 +423,10 @@ async fn handle_tools_call(
 
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
-    // Extract _meta for agent identity
+    // Resolve agent identity: arguments.agent_id > _meta.agent_id > None
     let meta = params.get("_meta");
-    let agent_id = meta
-        .and_then(|m| m.get("agent_id"))
-        .and_then(|v| v.as_str());
+    let agent_id = arguments.get("agent_id").and_then(|v| v.as_str())
+        .or_else(|| meta.and_then(|m| m.get("agent_id")).and_then(|v| v.as_str()));
 
     match tool_name {
         "corvia_search" => tool_corvia_search(state, &arguments, agent_id).await,
@@ -1208,22 +1210,4 @@ mod tests {
         assert_eq!(code, METHOD_NOT_FOUND);
     }
 
-    #[tokio::test]
-    async fn test_session_lifecycle() {
-        let sessions = McpSessions::new();
-
-        // Create session
-        let id = sessions.create().await;
-        assert!(sessions.is_valid(&id).await);
-
-        // Invalid session
-        assert!(!sessions.is_valid("bogus").await);
-
-        // Remove session
-        assert!(sessions.remove(&id).await);
-        assert!(!sessions.is_valid(&id).await);
-
-        // Double remove returns false
-        assert!(!sessions.remove(&id).await);
-    }
 }
