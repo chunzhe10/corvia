@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust (serde_json for JSONL, std::process for IPC, walkdir for discovery), existing corvia-kernel traits and pipeline.
 
-**Design doc:** `docs/plans/2026-03-03-adapter-plugin-system-design.md` (approved)
+**Design doc:** `docs/rfcs/2026-03-03-adapter-plugin-system-design.md` (approved)
 **Decisions:** D72-D79 in `docs/local/plans/2026-03-03-adapter-plugin-architecture.md`
 
 ---
@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn test_python_adapter_metadata_compat() {
-        // Matches exact output of examples/adapters/corvia-adapter-basic
+        // Matches exact output of adapters/corvia-adapter-basic/python/corvia-adapter-basic
         let json = r#"{"name":"basic","version":"0.1.0","domain":"filesystem","protocol_version":1,"description":"Basic filesystem adapter","supported_extensions":["rs","py"],"chunking_extensions":[]}"#;
         let meta: AdapterMetadata = serde_json::from_str(json).unwrap();
         assert_eq!(meta.name, "basic");
@@ -2539,7 +2539,7 @@ Add to the `#[cfg(test)] mod tests` in `process_adapter.rs`:
         // Use the Python reference adapter from examples/
         let adapter_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent().unwrap().parent().unwrap()
-            .join("examples/adapters/corvia-adapter-basic");
+            .join("adapters/corvia-adapter-basic/python/corvia-adapter-basic");
 
         if !adapter_path.exists() {
             eprintln!("Skipping: Python adapter not found at {}", adapter_path.display());

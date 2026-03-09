@@ -53,8 +53,8 @@ independent of any specific frontend, adapter, or integration surface.
 | `corvia` (CLI) | `crates/corvia-cli` | Binary crate. CLI commands (`init`, `ingest`, `search`, `serve`, `reason`, etc.) and workspace management. Orchestrates kernel + server |
 | `corvia-inference` | `crates/corvia-inference` | gRPC inference server with ONNX Runtime for local embeddings |
 | `corvia-proto` | `crates/corvia-proto` | Protocol Buffers for gRPC inference |
-| `corvia-adapter-git` | `crates/corvia-adapter-git` | Git repository ingestion using tree-sitter for code-aware chunking. Supports Rust, JavaScript, TypeScript, and Python. Implements the `IngestionAdapter` trait |
-| `corvia-adapter-basic` | `crates/corvia-adapter-basic` | Basic filesystem ingestion adapter for non-Git sources |
+| `corvia-adapter-git` | `adapters/corvia-adapter-git/rust` | Git repository ingestion using tree-sitter for code-aware chunking. Supports Rust, JavaScript, TypeScript, and Python. Implements the `IngestionAdapter` trait |
+| `corvia-adapter-basic` | `adapters/corvia-adapter-basic/rust` | Basic filesystem ingestion adapter for non-Git sources |
 
 All workspace crates share `version.workspace = true` from the root `Cargo.toml`.
 
@@ -281,7 +281,7 @@ Corvia implements the Model Context Protocol (version `2024-11-05`) via JSON-RPC
 corvia's architecture is shaped by documented design decisions made during development. The
 most architecturally significant ones are listed here with the alternative that was considered
 and the reasoning behind the choice. The full decision log with alternatives and rationale is
-available at [`docs/plans/`](docs/plans/).
+available at [`docs/rfcs/`](docs/rfcs/).
 
 | Decision | Alternative rejected | Why this choice wins |
 |----------|---------------------|---------------------|

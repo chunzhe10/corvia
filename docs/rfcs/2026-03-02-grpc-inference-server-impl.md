@@ -8,7 +8,7 @@
 
 **Tech Stack:** tonic (gRPC), prost (protobuf codegen), ort/fastembed (ONNX embeddings), candle-core/candle-transformers (chat/generation), hf-hub (model download)
 
-**Design doc:** `docs/plans/2026-03-02-grpc-inference-server-design.md` (D60)
+**Design doc:** `docs/rfcs/2026-03-02-grpc-inference-server-design.md` (D60)
 
 ---
 

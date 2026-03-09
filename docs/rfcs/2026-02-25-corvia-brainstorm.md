@@ -2,7 +2,7 @@
 
 ## Brainstorming Session: 2026-02-25
 
-Status: **Complete** — Design approved 2026-02-25. Full design doc: `docs/plans/2026-02-25-corvia-design.md`
+Status: **Complete** — Design approved 2026-02-25. Full design doc: `docs/rfcs/2026-02-25-corvia-design.md`
 
 ---
 

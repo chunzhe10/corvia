@@ -28,17 +28,17 @@
 - Create: `crates/corvia-cli/src/main.rs`
 - Create: `docker/docker-compose.yml`
 - Create: `.gitignore`
-- Move: brainstorm/design files into `docs/plans/`
+- Move: brainstorm/design files into `docs/rfcs/`
 
 **Step 1: Initialize git repo and move design docs**
 
 ```bash
 cd /root/corvia
 git init
-mv 2026-02-25-corvia-brainstorm.md docs/plans/
-mv 2026-02-25-corvia-design.md docs/plans/
-mv 2026-02-27-corvia-v0.2.0-brainstorm.md docs/plans/
-mv "organizational reasoning memory system v3.pdf" docs/plans/
+mv 2026-02-25-corvia-brainstorm.md docs/rfcs/
+mv 2026-02-25-corvia-design.md docs/rfcs/
+mv 2026-02-27-corvia-v0.2.0-brainstorm.md docs/rfcs/
+mv "organizational reasoning memory system v3.pdf" docs/rfcs/
 ```
 
 **Step 2: Create workspace Cargo.toml**
@@ -220,7 +220,7 @@ git add -A
 git commit -m "feat: initialize cargo workspace with 4 crates and docker config
 
 Corvia M1 scaffold: corvia-common, corvia-kernel, corvia-server, corvia-cli.
-Existing design docs moved to docs/plans/."
+Existing design docs moved to docs/rfcs/."
 ```
 
 ---

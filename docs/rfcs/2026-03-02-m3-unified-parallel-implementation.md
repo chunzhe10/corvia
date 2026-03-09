@@ -9,9 +9,9 @@
 **Tech Stack:** Rust workspace, async-trait, tonic/prost (M3.1), axum (M3.2), tree-sitter (M3.3)
 
 **Individual plans:**
-- M3.1: `docs/plans/2026-03-02-grpc-inference-server-impl.md` (14 tasks)
-- M3.2: `docs/plans/2026-03-02-m3.2-rag-pipeline-impl.md` (tasks TBD)
-- M3.3: `docs/plans/2026-03-02-m3.3-embedding-chunking-design.md` (impl plan below)
+- M3.1: `docs/rfcs/2026-03-02-grpc-inference-server-impl.md` (14 tasks)
+- M3.2: `docs/rfcs/2026-03-02-m3.2-rag-pipeline-impl.md` (tasks TBD)
+- M3.3: `docs/rfcs/2026-03-02-m3.3-embedding-chunking-design.md` (impl plan below)
 
 ---
 
@@ -589,7 +589,7 @@ git commit -m "feat(kernel): add ChunkingStrategy trait + chunking types (D65)"
 
 **Unblocks:** M3.2 (all RAG pipeline tasks)
 
-Follow Task 1 from `docs/plans/2026-03-02-m3.2-rag-pipeline-impl.md` exactly.
+Follow Task 1 from `docs/rfcs/2026-03-02-m3.2-rag-pipeline-impl.md` exactly.
 That plan defines `RetrievalOpts`, `TokenBudget`, `RetrievalResult`, `RetrievalMetrics`,
 `AugmentedContext`, `AugmentationMetrics`, `GenerationMetrics`, `PipelineTrace`,
 `RagResponse`, and `RagConfig`.
@@ -875,7 +875,7 @@ git tag phase-0-foundation
 
 ### Workstream A: M3.1 — gRPC Inference Server
 
-**Detailed plan:** `docs/plans/2026-03-02-grpc-inference-server-impl.md`
+**Detailed plan:** `docs/rfcs/2026-03-02-grpc-inference-server-impl.md`
 **Tasks:** 14 (numbered 1-14 in that plan)
 **Produces:** corvia-proto crate, corvia-inference binary, GrpcInferenceEngine,
   GrpcChatEngine, GrpcVllmEngine, InferenceProvisioner
@@ -906,7 +906,7 @@ Follow the M3.1 impl plan for detailed step-by-step instructions per task.
 
 ### Workstream B: M3.2 — RAG Pipeline (context mode)
 
-**Detailed plan:** `docs/plans/2026-03-02-m3.2-rag-pipeline-impl.md`
+**Detailed plan:** `docs/rfcs/2026-03-02-m3.2-rag-pipeline-impl.md`
 **Phase 1 scope:** Everything EXCEPT `ask()` mode wiring (that's Phase 2).
 
 | Task | Description | Deps | Files |

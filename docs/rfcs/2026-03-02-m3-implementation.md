@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust, petgraph (new dep), redb (existing), hnsw_rs (existing), surrealdb (existing), tree-sitter (via corvia-adapter-git)
 
-**Design doc:** `docs/plans/2026-03-02-m3-temporal-graph-reasoning-design.md`
+**Design doc:** `docs/rfcs/2026-03-02-m3-temporal-graph-reasoning-design.md`
 
 ---
 

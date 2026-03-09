@@ -3,7 +3,7 @@
 **Status:** Approved
 **Date:** 2026-02-25
 **Author:** Lim Chun Zhe + Claude (brainstorming session)
-**Brainstorm log:** `docs/plans/2026-02-25-corvia-brainstorm.md`
+**Brainstorm log:** `docs/rfcs/2026-02-25-corvia-brainstorm.md`
 **License:** MIT
 
 ---
@@ -480,7 +480,7 @@ If scope must be cut: M1 + M2a + M2b + M3 + M4 + M5a + M7 (drop M5b, M5c, M6).
 
 ## 13. Decisions Log
 
-All 19 decisions from the brainstorming session are documented with alternatives considered and rationale in `docs/plans/2026-02-25-corvia-brainstorm.md`. Key decisions:
+All 19 decisions from the brainstorming session are documented with alternatives considered and rationale in `docs/rfcs/2026-02-25-corvia-brainstorm.md`. Key decisions:
 
 | # | Decision | Choice |
 |---|----------|--------|

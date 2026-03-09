@@ -318,10 +318,10 @@ for line in sys.stdin:
 
     #[test]
     fn test_python_adapter_protocol_conformance() {
-        // Use the Python reference adapter from examples/
+        // Use the Python reference adapter
         let adapter_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent().unwrap().parent().unwrap()
-            .join("examples/adapters/corvia-adapter-basic");
+            .join("adapters/corvia-adapter-basic/python/corvia-adapter-basic");
 
         if !adapter_path.exists() {
             eprintln!("Skipping: Python adapter not found at {}", adapter_path.display());

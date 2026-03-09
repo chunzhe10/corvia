@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Create `scripts/benchmark-post2.sh` — a self-contained bash script that runs vector-only vs graph-expanded retrieval on Corvia's own codebase and saves raw JSON results.
+**Goal:** Create `scripts/benchmark.sh` — a self-contained bash script that runs vector-only vs graph-expanded retrieval on Corvia's own codebase and saves raw JSON results.
 
 **Architecture:** Single bash script with 7 phases (preflight → inference → init → ingest → serve → benchmark → teardown). Uses corvia-inference (fastembed/ONNX) for embeddings, LiteStore for storage, REST API for queries. Saves raw JSON per query pair plus a summary.json for carousel generation.
 
@@ -13,7 +13,7 @@
 ### Task 1: Create the benchmark script with preflight and cleanup
 
 **Files:**
-- Create: `scripts/benchmark-post2.sh`
+- Create: `scripts/benchmark.sh`
 
 **Step 1: Create scripts directory and write the script skeleton**
 
@@ -263,17 +263,17 @@ ls -1 "$RESULTS_DIR"
 
 **Step 2: Make the script executable**
 
-Run: `mkdir -p scripts && chmod +x scripts/benchmark-post2.sh`
+Run: `mkdir -p scripts && chmod +x scripts/benchmark.sh`
 
 **Step 3: Verify the script parses without errors**
 
-Run: `bash -n scripts/benchmark-post2.sh`
+Run: `bash -n scripts/benchmark.sh`
 Expected: No output (clean parse)
 
 **Step 4: Commit**
 
 ```bash
-git add scripts/benchmark-post2.sh
+git add scripts/benchmark.sh
 git commit -m "feat: add Post 2 benchmark script (vector vs graph-expanded retrieval)"
 ```
 
@@ -282,14 +282,14 @@ git commit -m "feat: add Post 2 benchmark script (vector vs graph-expanded retri
 ### Task 2: Dry-run the script and fix issues
 
 **Files:**
-- Modify: `scripts/benchmark-post2.sh`
+- Modify: `scripts/benchmark.sh`
 
 **Step 1: Run preflight only (will fail at Phase 2+ without inference)**
 
 Run from repo root:
 ```bash
 cd /root/corvia-project/corvia-workspace/repos/corvia
-./scripts/benchmark-post2.sh 2>&1 | head -20
+./scripts/benchmark.sh 2>&1 | head -20
 ```
 Expected: "Phase 1: Preflight" passes, "Binaries OK" printed.
 
@@ -297,7 +297,7 @@ Expected: "Phase 1: Preflight" passes, "Binaries OK" printed.
 
 Run:
 ```bash
-./scripts/benchmark-post2.sh
+./scripts/benchmark.sh
 ```
 
 Watch for:
@@ -327,7 +327,7 @@ Expected: `1 2 3 4`
 **Step 5: Commit fixes**
 
 ```bash
-git add scripts/benchmark-post2.sh
+git add scripts/benchmark.sh
 git commit -m "fix: benchmark script adjustments from dry-run"
 ```
 

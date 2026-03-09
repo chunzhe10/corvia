@@ -253,7 +253,7 @@ Both optional. Zero config needed — auto-detection handles everything.
 
 ### Protocol Conformance (unit)
 
-Spawn Python `examples/adapters/corvia-adapter-basic`, send ingest command, validate
+Spawn Python `adapters/corvia-adapter-basic/python/corvia-adapter-basic`, send ingest command, validate
 JSONL response parses into `Vec<SourceFile>`. Proves cross-language protocol correctness.
 
 ### Round-Trip Integration (integration)
@@ -284,4 +284,4 @@ The `main.rs` JSONL wrapper is thin — protocol conformance test covers it.
 | `crates/corvia-adapter-basic/` | NEW crate — filesystem adapter binary |
 | `crates/corvia-adapter-git/` | MOVED from external repo, add main.rs wrapper |
 | `.github/workflows/release.yml` | Build all four binaries |
-| `examples/adapters/corvia-adapter-basic` | Python reference adapter (already exists) |
+| `adapters/corvia-adapter-basic/python/corvia-adapter-basic` | Python reference adapter (already exists) |

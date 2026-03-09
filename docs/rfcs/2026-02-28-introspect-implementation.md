@@ -8,7 +8,7 @@
 
 **Tech Stack:** Existing M1 stack (SurrealDB v3, vLLM, tree-sitter, bollard) + TOML canonical queries + stdin REPL.
 
-**Design doc:** `docs/plans/2026-02-27-corvia-v0.2.0-brainstorm.md` (section "Introspect Design D29-D33")
+**Design doc:** `docs/rfcs/2026-02-27-corvia-v0.2.0-brainstorm.md` (section "Introspect Design D29-D33")
 
 ---
 

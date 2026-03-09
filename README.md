@@ -163,8 +163,8 @@ Storage:             LiteStore ─── hnsw_rs · petgraph · Redb · Git
 | `corvia` (CLI) | `crates/corvia-cli` | CLI binary and workspace management |
 | `corvia-inference` | `crates/corvia-inference` | gRPC inference server (ONNX Runtime) |
 | `corvia-proto` | `crates/corvia-proto` | Protocol Buffers for gRPC inference |
-| `corvia-adapter-git` | `crates/corvia-adapter-git` | Git + tree-sitter code ingestion adapter |
-| `corvia-adapter-basic` | `crates/corvia-adapter-basic` | Basic filesystem ingestion adapter |
+| `corvia-adapter-git` | `adapters/corvia-adapter-git/rust` | Git + tree-sitter code ingestion adapter |
+| `corvia-adapter-basic` | `adapters/corvia-adapter-basic/rust` | Basic filesystem ingestion adapter |
 
 ### Design principles
 

@@ -18,7 +18,7 @@ path = "src/main.rs"
 [dependencies]
 corvia-common.workspace = true
 corvia-kernel.workspace = true
-corvia-adapter-git = { path = "../corvia-adapter-git" }
+corvia-adapter-git = { path = "../../adapters/corvia-adapter-git/rust" }
 uuid.workspace = true
 corvia-server.workspace = true
 serde.workspace = true

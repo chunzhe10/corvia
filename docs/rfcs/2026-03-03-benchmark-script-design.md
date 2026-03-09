@@ -186,7 +186,7 @@ benchmark-results/2026-03-03T14-30-00/
 ## Script Location
 
 ```
-scripts/benchmark-post2.sh
+scripts/benchmark.sh
 ```
 
 Relative to repo root. Executable (`chmod +x`).
