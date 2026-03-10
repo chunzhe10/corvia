@@ -93,10 +93,10 @@ fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "The search query" },
-                    "scope_id": { "type": "string", "description": "Scope to search within" },
+                    "scope_id": { "type": "string", "description": "Scope to search within (defaults to workspace scope if omitted)" },
                     "limit": { "type": "integer", "description": "Maximum results (default 10)" }
                 },
-                "required": ["query", "scope_id"]
+                "required": ["query"]
             }
         }),
         json!({
@@ -106,11 +106,11 @@ fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "content": { "type": "string", "description": "The knowledge content to store" },
-                    "scope_id": { "type": "string", "description": "Target scope" },
+                    "scope_id": { "type": "string", "description": "Target scope (defaults to workspace scope if omitted)" },
                     "source_version": { "type": "string", "description": "Source version reference" },
                     "agent_id": { "type": "string", "description": "Agent identity for attribution (e.g. 'claude-code')" }
                 },
-                "required": ["content", "scope_id"]
+                "required": ["content"]
             }
         }),
         json!({
@@ -141,10 +141,9 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "scope_id": { "type": "string", "description": "Scope to analyze" },
+                    "scope_id": { "type": "string", "description": "Scope to analyze (defaults to workspace scope if omitted)" },
                     "check": { "type": "string", "description": "Specific check type (stale, broken, orphan, dangling, cycle). Omit for all checks." }
-                },
-                "required": ["scope_id"]
+                }
             }
         }),
         json!({
@@ -164,11 +163,11 @@ fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "The search query" },
-                    "scope_id": { "type": "string", "description": "Scope to search within" },
+                    "scope_id": { "type": "string", "description": "Scope to search within (defaults to workspace scope if omitted)" },
                     "limit": { "type": "integer", "description": "Maximum sources (default 10)" },
                     "expand_graph": { "type": "boolean", "description": "Follow graph edges (default true)" }
                 },
-                "required": ["query", "scope_id"]
+                "required": ["query"]
             }
         }),
         json!({
@@ -178,11 +177,11 @@ fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "The question to answer" },
-                    "scope_id": { "type": "string", "description": "Scope to search within" },
+                    "scope_id": { "type": "string", "description": "Scope to search within (defaults to workspace scope if omitted)" },
                     "limit": { "type": "integer", "description": "Maximum sources (default 10)" },
                     "expand_graph": { "type": "boolean", "description": "Follow graph edges (default true)" }
                 },
-                "required": ["query", "scope_id"]
+                "required": ["query"]
             }
         }),
     ]
@@ -443,6 +442,19 @@ async fn handle_tools_call(
 
 // --- Tool implementations ---
 
+/// Resolve scope_id from args, falling back to the workspace default.
+fn resolve_scope_id<'a>(args: &'a Value, state: &'a AppState) -> Result<&'a str, (i32, String)> {
+    if let Some(scope) = args.get("scope_id").and_then(|v| v.as_str()) {
+        return Ok(scope);
+    }
+    if let Some(ref default) = state.default_scope_id {
+        // SAFETY: AppState lives for the duration of the request, so this is fine.
+        // We need to return a &str with lifetime 'a tied to state.
+        return Ok(default.as_str());
+    }
+    Err((INVALID_PARAMS, "Missing 'scope_id' parameter and no workspace default configured".into()))
+}
+
 async fn tool_corvia_search(
     state: &AppState,
     args: &Value,
@@ -450,8 +462,7 @@ async fn tool_corvia_search(
 ) -> Result<Value, (i32, String)> {
     let query = args.get("query").and_then(|v| v.as_str())
         .ok_or((INVALID_PARAMS, "Missing 'query' parameter".into()))?;
-    let scope_id = args.get("scope_id").and_then(|v| v.as_str())
-        .ok_or((INVALID_PARAMS, "Missing 'scope_id' parameter".into()))?;
+    let scope_id = resolve_scope_id(args, state)?;
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
     // Route through RAG pipeline if available (fixes ContextBuilder bypass)
@@ -522,8 +533,7 @@ async fn tool_corvia_write(
 
     let content = args.get("content").and_then(|v| v.as_str())
         .ok_or((INVALID_PARAMS, "Missing 'content' parameter".into()))?;
-    let scope_id = args.get("scope_id").and_then(|v| v.as_str())
-        .ok_or((INVALID_PARAMS, "Missing 'scope_id' parameter".into()))?;
+    let scope_id = resolve_scope_id(args, state)?;
     let source_version = args.get("source_version").and_then(|v| v.as_str()).unwrap_or("mcp");
 
     let coord = &state.coordinator;
@@ -665,8 +675,7 @@ async fn tool_corvia_reason(
     state: &AppState,
     args: &Value,
 ) -> Result<Value, (i32, String)> {
-    let scope_id = args.get("scope_id").and_then(|v| v.as_str())
-        .ok_or((INVALID_PARAMS, "Missing 'scope_id' parameter".into()))?;
+    let scope_id = resolve_scope_id(args, state)?;
     let check_str = args.get("check").and_then(|v| v.as_str());
 
     // Load entries from knowledge files (direct disk read, not HNSW search)
@@ -756,8 +765,7 @@ async fn tool_corvia_context(
 ) -> Result<Value, (i32, String)> {
     let query = args.get("query").and_then(|v| v.as_str())
         .ok_or((INVALID_PARAMS, "Missing 'query' parameter".into()))?;
-    let scope_id = args.get("scope_id").and_then(|v| v.as_str())
-        .ok_or((INVALID_PARAMS, "Missing 'scope_id' parameter".into()))?;
+    let scope_id = resolve_scope_id(args, state)?;
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
     let expand_graph = args.get("expand_graph").and_then(|v| v.as_bool()).unwrap_or(true);
 
@@ -800,8 +808,7 @@ async fn tool_corvia_ask(
 ) -> Result<Value, (i32, String)> {
     let query = args.get("query").and_then(|v| v.as_str())
         .ok_or((INVALID_PARAMS, "Missing 'query' parameter".into()))?;
-    let scope_id = args.get("scope_id").and_then(|v| v.as_str())
-        .ok_or((INVALID_PARAMS, "Missing 'scope_id' parameter".into()))?;
+    let scope_id = resolve_scope_id(args, state)?;
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
     let expand_graph = args.get("expand_graph").and_then(|v| v.as_bool()).unwrap_or(true);
 
@@ -893,6 +900,7 @@ mod tests {
             data_dir: dir.to_path_buf(),
             rag: None,
             ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            default_scope_id: None,
         })
     }
 
@@ -1158,7 +1166,7 @@ mod tests {
             None,
             None,
             &config,
-        ));
+        ).await);
 
         let gen_engine = Arc::new(MockGenerationEngine) as Arc<dyn GenerationEngine>;
         let coordinator = Arc::new(AgentCoordinator::new(
@@ -1179,6 +1187,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             rag: Some(rag),
             ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            default_scope_id: None,
         });
 
         let args = json!({ "query": "rag-routed", "scope_id": "rag-scope", "limit": 5 });

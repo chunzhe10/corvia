@@ -24,6 +24,8 @@ pub struct AppState {
     pub data_dir: std::path::PathBuf,
     pub rag: Option<Arc<corvia_kernel::rag_pipeline::RagPipeline>>,
     pub ready: Arc<AtomicBool>,
+    /// Default scope_id from config, used when MCP clients omit scope_id.
+    pub default_scope_id: Option<String>,
 }
 
 // --- Existing memory types ---

@@ -432,12 +432,13 @@ async fn cmd_serve() -> Result<()> {
         Some(graph.clone()),
         Some(gen_engine),
         &config,
-    ));
+    ).await);
     println!("RAG pipeline: enabled (retriever: {})", rag.retriever_name());
 
     let data_dir = std::path::PathBuf::from(&config.storage.data_dir);
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let state = Arc::new(corvia_server::rest::AppState { store, engine, coordinator, graph, temporal, data_dir, rag: Some(rag), ready: ready.clone() });
+    let default_scope_id = Some(config.project.scope_id.clone());
+    let state = Arc::new(corvia_server::rest::AppState { store, engine, coordinator, graph, temporal, data_dir, rag: Some(rag), ready: ready.clone(), default_scope_id });
     let mut app = corvia_server::rest::router(state.clone());
     app = app.merge(corvia_server::mcp::mcp_router(state));
     println!("MCP endpoint: POST/GET/DELETE /mcp (Streamable HTTP)");
