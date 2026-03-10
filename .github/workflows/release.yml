@@ -8,6 +8,11 @@ on:
 permissions:
   contents: write
 
+env:
+  SCCACHE_GHA_ENABLED: true
+  RUSTC_WRAPPER: sccache
+  CARGO_INCREMENTAL: 0
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -22,14 +27,18 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry and build
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
 
       - name: Build release binaries
         run: cargo build --release -p corvia-cli -p corvia-inference -p corvia-adapter-basic -p corvia-adapter-git
