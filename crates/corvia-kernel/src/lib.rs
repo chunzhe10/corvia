@@ -91,6 +91,7 @@ pub mod chunking_pdf;
 pub mod adapter_protocol;
 pub mod adapter_discovery;
 pub mod process_adapter;
+pub mod ops;
 pub mod grpc_engine;
 pub mod grpc_chat;
 pub mod inference_provisioner;

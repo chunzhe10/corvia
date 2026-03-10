@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 use crate::adapter_protocol::AdapterMetadata;
 
 /// A discovered adapter binary with its parsed metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DiscoveredAdapter {
     pub binary_path: PathBuf,
     pub metadata: AdapterMetadata,
