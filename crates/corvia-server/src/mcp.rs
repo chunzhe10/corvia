@@ -78,6 +78,44 @@ const INTERNAL_ERROR: i32 = -32603;
 /// Uses -32000 from the JSON-RPC implementation-defined server error range (-32000..-32099).
 const SERVICE_UNAVAILABLE: i32 = -32000;
 
+/// Safety tier for MCP control-plane tools.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
+enum ToolTier {
+    ReadOnly,
+    LowRisk,
+    MediumRisk,
+}
+
+/// Check if a tool call has confirmation via _meta.confirmed.
+#[allow(dead_code)]
+fn is_confirmed(meta: Option<&Value>) -> bool {
+    meta.and_then(|m| m.get("confirmed"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Check if dry_run is requested in arguments.
+#[allow(dead_code)]
+fn is_dry_run(args: &Value) -> bool {
+    args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// Return a confirmation-required response for unconfirmed Tier 2+ tools.
+#[allow(dead_code)]
+fn confirmation_response(preview: Value, message: &str) -> Value {
+    json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string(&json!({
+                "confirmation_required": true,
+                "preview": preview,
+                "message": message,
+            })).unwrap()
+        }]
+    })
+}
+
 // --- MCP Streamable HTTP headers ---
 
 const MCP_SESSION_ID: &str = "mcp-session-id";
@@ -182,6 +220,52 @@ fn tool_definitions() -> Vec<Value> {
                     "expand_graph": { "type": "boolean", "description": "Follow graph edges (default true)" }
                 },
                 "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "corvia_system_status",
+            "description": "Get a point-in-time system status snapshot (entry count, active agents, open sessions, merge queue depth)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "scope_id": { "type": "string", "description": "Scope for entry count (defaults to workspace scope if omitted)" }
+                }
+            }
+        }),
+        json!({
+            "name": "corvia_config_get",
+            "description": "Get the current server configuration, optionally filtered to a single section",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "section": { "type": "string", "description": "Config section to retrieve (storage, server, embedding, project, telemetry). Omit for full config." }
+                }
+            }
+        }),
+        json!({
+            "name": "corvia_adapters_list",
+            "description": "List all discovered adapter binaries available on the system",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        json!({
+            "name": "corvia_agents_list",
+            "description": "List all registered agents in the system",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        json!({
+            "name": "corvia_merge_queue",
+            "description": "Get current merge queue status (depth and entries)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "description": "Maximum queue entries to return (default 50)" }
+                }
             }
         }),
     ]
@@ -436,6 +520,11 @@ async fn handle_tools_call(
         "corvia_agent_status" => tool_corvia_agent_status(state, agent_id),
         "corvia_context" => tool_corvia_context(state, &arguments).await,
         "corvia_ask" => tool_corvia_ask(state, &arguments).await,
+        "corvia_system_status" => tool_corvia_system_status(state, &arguments).await,
+        "corvia_config_get" => tool_corvia_config_get(state, &arguments),
+        "corvia_adapters_list" => tool_corvia_adapters_list(state),
+        "corvia_agents_list" => tool_corvia_agents_list(state),
+        "corvia_merge_queue" => tool_corvia_merge_queue(state, &arguments),
         other => Err((METHOD_NOT_FOUND, format!("Unknown tool: {other}"))),
     }
 }
@@ -844,6 +933,134 @@ async fn tool_corvia_ask(
     }))
 }
 
+// --- Tier 1 (ReadOnly) control-plane tool implementations ---
+
+async fn tool_corvia_system_status(
+    state: &AppState,
+    args: &Value,
+) -> Result<Value, (i32, String)> {
+    let scope_id = resolve_scope_id(args, state)?;
+    let status = corvia_kernel::ops::system_status(
+        state.store.clone(),
+        &state.coordinator,
+        scope_id,
+    ).await.map_err(|e| (INTERNAL_ERROR, format!("System status failed: {e}")))?;
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(&json!({
+                "entry_count": status.entry_count,
+                "active_agents": status.active_agents,
+                "open_sessions": status.open_sessions,
+                "merge_queue_depth": status.merge_queue_depth,
+                "scope_id": status.scope_id,
+            })).unwrap()
+        }]
+    }))
+}
+
+fn tool_corvia_config_get(
+    state: &AppState,
+    args: &Value,
+) -> Result<Value, (i32, String)> {
+    let section = args.get("section").and_then(|v| v.as_str());
+    let config = state.config.read()
+        .map_err(|e| (INTERNAL_ERROR, format!("Config lock poisoned: {e}")))?;
+    let result = corvia_kernel::ops::config_get(&config, section)
+        .map_err(|e| (INVALID_PARAMS, format!("{e}")))?;
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(&result).unwrap()
+        }]
+    }))
+}
+
+fn tool_corvia_adapters_list(
+    state: &AppState,
+) -> Result<Value, (i32, String)> {
+    let search_dirs: Vec<String> = {
+        let config = state.config.read()
+            .map_err(|e| (INTERNAL_ERROR, format!("Config lock poisoned: {e}")))?;
+        config.adapters.as_ref()
+            .map(|a| a.search_dirs.clone())
+            .unwrap_or_default()
+    };
+    let adapters = corvia_kernel::ops::adapters_list(&search_dirs);
+    let items: Vec<Value> = adapters.iter().map(|a| {
+        json!({
+            "binary_path": a.binary_path.to_string_lossy(),
+            "name": a.metadata.name,
+            "version": a.metadata.version,
+            "domain": a.metadata.domain,
+            "description": a.metadata.description,
+            "supported_extensions": a.metadata.supported_extensions,
+        })
+    }).collect();
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(&json!({
+                "adapters": items,
+                "count": items.len()
+            })).unwrap()
+        }]
+    }))
+}
+
+fn tool_corvia_agents_list(
+    state: &AppState,
+) -> Result<Value, (i32, String)> {
+    let agents = corvia_kernel::ops::agents_list(&state.coordinator)
+        .map_err(|e| (INTERNAL_ERROR, format!("Agents list failed: {e}")))?;
+    let items: Vec<Value> = agents.iter().map(|a| {
+        json!({
+            "agent_id": a.agent_id,
+            "status": format!("{:?}", a.status),
+            "registered_at": a.registered_at.to_rfc3339(),
+        })
+    }).collect();
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(&json!({
+                "agents": items,
+                "count": items.len()
+            })).unwrap()
+        }]
+    }))
+}
+
+fn tool_corvia_merge_queue(
+    state: &AppState,
+    args: &Value,
+) -> Result<Value, (i32, String)> {
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+    let status = corvia_kernel::ops::merge_queue_status(&state.coordinator, limit)
+        .map_err(|e| (INTERNAL_ERROR, format!("Merge queue status failed: {e}")))?;
+    let items: Vec<Value> = status.entries.iter().map(|e| {
+        json!({
+            "entry_id": e.entry_id.to_string(),
+            "session_id": e.session_id,
+            "enqueued_at": e.enqueued_at.to_rfc3339(),
+        })
+    }).collect();
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(&json!({
+                "depth": status.depth,
+                "entries": items,
+            })).unwrap()
+        }]
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -901,6 +1118,8 @@ mod tests {
             rag: None,
             ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             default_scope_id: None,
+            config: Arc::new(std::sync::RwLock::new(corvia_common::config::CorviaConfig::default())),
+            config_path: dir.join("corvia.toml"),
         })
     }
 
@@ -936,7 +1155,7 @@ mod tests {
     async fn test_tools_list() {
         let result = handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 13);
 
         let names: Vec<&str> = tools.iter()
             .map(|t| t["name"].as_str().unwrap())
@@ -949,6 +1168,11 @@ mod tests {
         assert!(names.contains(&"corvia_agent_status"));
         assert!(names.contains(&"corvia_context"));
         assert!(names.contains(&"corvia_ask"));
+        assert!(names.contains(&"corvia_system_status"));
+        assert!(names.contains(&"corvia_config_get"));
+        assert!(names.contains(&"corvia_adapters_list"));
+        assert!(names.contains(&"corvia_agents_list"));
+        assert!(names.contains(&"corvia_merge_queue"));
     }
 
     #[tokio::test]
@@ -1188,6 +1412,8 @@ mod tests {
             rag: Some(rag),
             ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             default_scope_id: None,
+            config: Arc::new(std::sync::RwLock::new(corvia_common::config::CorviaConfig::default())),
+            config_path: dir.path().join("corvia.toml"),
         });
 
         let args = json!({ "query": "rag-routed", "scope_id": "rag-scope", "limit": 5 });
@@ -1200,6 +1426,62 @@ mod tests {
             parsed["count"].as_u64().unwrap() >= 1,
             "RAG-routed search should return results, got: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_corvia_system_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+        let params = json!({
+            "name": "corvia_system_status",
+            "arguments": { "scope_id": "test" }
+        });
+        let result = handle_tools_call(&state, &params).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["entry_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_corvia_agents_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+        let params = json!({
+            "name": "corvia_agents_list",
+            "arguments": {}
+        });
+        let result = handle_tools_call(&state, &params).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(parsed["agents"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_corvia_merge_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+        let params = json!({
+            "name": "corvia_merge_queue",
+            "arguments": {}
+        });
+        let result = handle_tools_call(&state, &params).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["depth"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_corvia_config_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+        let params = json!({
+            "name": "corvia_config_get",
+            "arguments": {}
+        });
+        let result = handle_tools_call(&state, &params).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(parsed.get("storage").is_some());
     }
 
     #[tokio::test]
