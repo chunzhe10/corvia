@@ -7,6 +7,7 @@ members = [
     "crates/corvia-cli",
     "crates/corvia-proto",
     "crates/corvia-inference",
+    "crates/corvia-telemetry",
     "adapters/corvia-adapter-basic/rust",
     "adapters/corvia-adapter-git/rust",
 ]
@@ -31,5 +32,7 @@ tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v7", "serde"] }
 anyhow = "1"
 thiserror = "2"
+corvia-telemetry = { path = "crates/corvia-telemetry" }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-appender = "0.2"

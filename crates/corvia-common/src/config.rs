@@ -68,6 +68,8 @@ pub struct CorviaConfig {
     pub rag: RagConfig,
     #[serde(default)]
     pub chunking: ChunkingConfig,
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapters: Option<AdaptersConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -276,6 +278,33 @@ impl Default for ChunkingConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryConfig {
+    #[serde(default = "default_telemetry_exporter")]
+    pub exporter: String,
+    #[serde(default)]
+    pub otlp_endpoint: String,
+    #[serde(default = "default_telemetry_log_format")]
+    pub log_format: String,
+    #[serde(default = "default_telemetry_metrics_enabled")]
+    pub metrics_enabled: bool,
+}
+
+fn default_telemetry_exporter() -> String { "stdout".into() }
+fn default_telemetry_log_format() -> String { "text".into() }
+fn default_telemetry_metrics_enabled() -> bool { true }
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            exporter: default_telemetry_exporter(),
+            otlp_endpoint: String::new(),
+            log_format: default_telemetry_log_format(),
+            metrics_enabled: default_telemetry_metrics_enabled(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AdaptersConfig {
     #[serde(default)]
@@ -326,6 +355,7 @@ impl Default for CorviaConfig {
             reasoning: None,
             rag: RagConfig::default(),
             chunking: ChunkingConfig::default(),
+            telemetry: TelemetryConfig::default(),
             adapters: None,
             sources: None,
         }
