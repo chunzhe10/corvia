@@ -9,7 +9,7 @@ dependencies on storage or inference, making it suitable for external adapters.
 ## Modules
 
 - **types** — `KnowledgeEntry`, `SearchResult`, `GraphEdge`, and other core data structures
-- **config** — `CorviaConfig` loaded from `corvia.toml`, storage and embedding settings
+- **config** — `CorviaConfig` loaded from `corvia.toml`, storage, embedding, and telemetry settings (`TelemetryConfig`)
 - **namespace** — Five-segment namespace model (`org:scope:workstream:source:version`)
 - **errors** — Unified error types and `Result` alias
 - **events** — Domain events for inter-subsystem communication

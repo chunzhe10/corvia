@@ -24,7 +24,7 @@ make test-all                    # Start both DBs + run all tests
 ```bash
 cargo test --workspace
 ```
-Runs 385+ tests. LiteStore tests exercise full functionality. SurrealDB and PostgreSQL
+Runs 433+ tests. LiteStore tests exercise full functionality. SurrealDB and PostgreSQL
 tests auto-skip gracefully when the server is unreachable. No Docker, no Ollama required.
 This is the primary test suite and must always pass.
 
@@ -65,10 +65,11 @@ make test-all                    # Start SurrealDB + PostgreSQL, run all tests
 | `corvia-proto` | `crates/corvia-proto` | Protocol Buffers for gRPC inference |
 | `corvia-adapter-git` | `adapters/corvia-adapter-git/rust` | Git + tree-sitter code ingestion adapter |
 | `corvia-adapter-basic` | `adapters/corvia-adapter-basic/rust` | Basic filesystem ingestion adapter |
+| `corvia-telemetry` | `crates/corvia-telemetry` | Structured tracing, span contracts, telemetry init |
 
 ## Key Traits (extend these, don't modify)
 
-- `QueryableStore` — init_schema, insert, search, get, count, delete_scope
+- `QueryableStore` — init_schema, insert, search, get, count, delete_scope, as_any
 - `TemporalStore` — as_of, history, evolution
 - `GraphStore` — relate, edges, traverse, shortest_path, remove_edges
 - `InferenceEngine` — embed (text → vector)
@@ -147,4 +148,6 @@ PostgresStore (`crates/corvia-kernel/src/postgres_store.rs`) is behind the `post
 - `process_adapter.rs` — IPC wrapper for adapter binaries (JSONL protocol)
 - `staging.rs` — Agent write isolation (branch-per-session)
 - `agent_coordinator.rs` — Multi-agent lifecycle orchestration
+- `ops.rs` — Shared kernel operations (system status, config get/set, GC, rebuild)
 - `grpc_engine.rs` — gRPC client for corvia-inference server
+- `crates/corvia-telemetry/src/lib.rs` — Telemetry init, span name constants, exporters

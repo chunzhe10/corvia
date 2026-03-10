@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (no full rebuild on every `corvia serve`)
 - **Stateless MCP**: MCP server is fully stateless — no session management needed,
   agent identity via `agent_id` tool parameter
+- **M4 Observability**: `corvia-telemetry` crate with structured tracing, D45 span name contracts, configurable exporters (stdout, file, OTLP), and `TelemetryGuard` for log flushing
+- **M4 Shared operations**: `ops.rs` module with 12 shared kernel operations callable from CLI and MCP (system_status, agents_list, config_get/set, gc_run, rebuild_index, etc.)
+- **M4 MCP control plane**: 10 new MCP tools across 3 safety tiers — Tier 1 read-only (system_status, config_get, adapters_list, agents_list), Tier 2 low-risk (config_set, gc_run, rebuild_index), Tier 3 medium-risk (agent_suspend, merge_retry, merge_queue)
+- **M4 Kernel instrumentation**: `#[tracing::instrument]` spans on agent_coordinator, merge_worker, lite_store, rag_pipeline using D45 span contracts
+- **M4 CLI metrics**: `corvia status --metrics` flag for extended telemetry, agent counts, adapter discovery, and coordination status
+- **M4 Config hot-reload**: `AppState` wraps `CorviaConfig` in `Arc<RwLock<>>` for runtime config updates via MCP
+- **TelemetryConfig**: New config section in `corvia.toml` with exporter, log_format, and metrics_enabled settings
 
 ### Changed
 
@@ -27,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `corvia-inference` batch-feeds prompts to avoid llama.cpp assertion failures
 - Eliminated unsafe transmute in corvia-inference, fixed defaults
 - Adapter paths corrected in documentation
+- `rebuild_index` now uses existing `LiteStore` reference via `as_any()` downcasting instead of opening a duplicate Redb lock
+- Fixed duplicate `corvia.merge.process` span name — added `corvia.merge.process_entry` for per-entry granularity
+- Fixed `corvia_config_set` MCP tool description listing wrong (restart-required) sections
+- Removed always-zero `GcReport` fields (`closed_sessions_cleaned`, `inactive_agents_cleaned`)
 
 ## [0.3.4] - 2026-03-08
 

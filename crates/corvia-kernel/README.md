@@ -33,6 +33,7 @@ so callers never need to know which tier is active.
 - **Reasoning** — `reasoner` (5 deterministic + 2 LLM-powered health checks)
 - **Graph** — `graph_store` (petgraph-based overlay for LiteStore)
 - **Adapters** — `adapter_discovery`, `adapter_protocol`, `process_adapter`
+- **Shared Operations** — `ops` (system status, config get/set, GC, rebuild index — shared between CLI and MCP)
 - **Introspection** — `introspect` (self-validation pipeline)
 
 ## Usage

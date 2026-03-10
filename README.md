@@ -13,12 +13,12 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License: AGPL-3.0"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/built%20with-Rust-dea584.svg" alt="Built with Rust"></a>
-  <a href="Cargo.toml"><img src="https://img.shields.io/badge/version-0.3.4-green.svg" alt="Version 0.3.4"></a>
+  <a href="Cargo.toml"><img src="https://img.shields.io/badge/version-0.3.6-green.svg" alt="Version 0.3.6"></a>
 </p>
 
-> **Pre-release (v0.3.4).** Core kernel, three-tier storage, multi-agent coordination, temporal
-> queries, knowledge graph, automated reasoning, RAG pipeline, chunking pipeline, and adapter
-> plugin system are implemented and tested (385+ tests). API surface may change before 1.0.
+> **Pre-release (v0.3.6).** Core kernel, three-tier storage, multi-agent coordination, temporal
+> queries, knowledge graph, automated reasoning, RAG pipeline, chunking pipeline, adapter
+> plugin system, observability, control plane, and CLI metrics are implemented and tested (433+ tests). API surface may change before 1.0.
 
 ---
 
@@ -60,6 +60,8 @@ Organizational memory:  why the auth system was redesigned, which decisions led 
 | **Multi-agent coordination** | Session isolation, staging, crash recovery, LLM-assisted merge. No last-write-wins |
 | **Three-tier storage** | LiteStore (zero Docker, embedded) is the full product. SurrealDB and PostgreSQL are opt-in upgrades |
 | **Git as truth** | All knowledge stored as JSON in `.corvia/knowledge/`. `corvia rebuild` reconstructs everything from files alone |
+| **Observability** | Structured tracing across all kernel subsystems. Configurable exporters (stdout, file, OTLP). CLI metrics via `corvia status --metrics` |
+| **MCP control plane** | 18 MCP tools across 3 safety tiers (read-only, low-risk, medium-risk). Config hot-reload, GC, index rebuild |
 | **Three integration paths** | Rust crate, REST API (`:8020`), or MCP server for Claude and other agent frameworks |
 
 ## Quick start
@@ -95,6 +97,7 @@ corvia graph <entry-id>                  # graph relationships
 corvia relate <from-id> depends_on <to-id>   # create an edge
 corvia serve                             # REST API on :8020
 corvia serve --mcp                       # + MCP endpoint for agents
+corvia status --metrics                   # extended metrics (entries, agents, latency)
 corvia demo                              # ingest corvia's own source code
 ```
 
@@ -119,8 +122,10 @@ curl -X POST http://localhost:8020/v1/reason \
 
 ### MCP integration
 
-corvia exposes eight tools through JSON-RPC 2.0 at `POST /mcp` for AI agents that support
-the Model Context Protocol:
+corvia exposes eighteen tools across three safety tiers through JSON-RPC 2.0 at `POST /mcp`
+for AI agents that support the Model Context Protocol:
+
+**Tier 1 — Read-only (auto-approved):**
 
 | Tool | Description |
 |------|-------------|
@@ -132,6 +137,26 @@ the Model Context Protocol:
 | `corvia_agent_status` | Agent session and contribution summary |
 | `corvia_context` | Retrieve assembled context (RAG retrieval only) |
 | `corvia_ask` | Full RAG: question to AI-generated answer from knowledge |
+| `corvia_system_status` | Entry counts, agents, sessions, merge queue depth |
+| `corvia_config_get` | Read any config section as JSON |
+| `corvia_adapters_list` | Discovered adapter binaries |
+| `corvia_agents_list` | All registered agents with status |
+
+**Tier 2 — Low-risk mutation (single confirmation):**
+
+| Tool | Description |
+|------|-------------|
+| `corvia_config_set` | Update a hot-reloadable config value |
+| `corvia_gc_run` | Trigger garbage collection |
+| `corvia_rebuild_index` | Rebuild HNSW vector index from files |
+
+**Tier 3 — Medium-risk (confirmation + dry-run):**
+
+| Tool | Description |
+|------|-------------|
+| `corvia_agent_suspend` | Suspend an agent and close its sessions |
+| `corvia_merge_retry` | Retry failed merge queue entries |
+| `corvia_merge_queue` | Inspect merge queue status |
 
 ## Architecture
 
@@ -147,6 +172,8 @@ Inference:           gRPC inference server (ONNX/candle)  ·  Ollama
 Kernel:              Knowledge Store  ·  Agent Coordinator  ·  RAG Pipeline
                      Embedding Pipeline  ·  Context Builder  ·  Chunking Pipeline
                      Merge Worker  ·  Reasoner  ·  Graph Store
+                            │
+Telemetry:           corvia-telemetry (structured tracing, span contracts)
                             │
 Storage:             LiteStore ─── hnsw_rs · petgraph · Redb · Git
                      FullStore ─── SurrealDB · Redb · Git
@@ -164,6 +191,7 @@ Storage:             LiteStore ─── hnsw_rs · petgraph · Redb · Git
 | `corvia-inference` | `crates/corvia-inference` | gRPC inference server (ONNX Runtime) |
 | `corvia-proto` | `crates/corvia-proto` | Protocol Buffers for gRPC inference |
 | `corvia-adapter-git` | `adapters/corvia-adapter-git/rust` | Git + tree-sitter code ingestion adapter |
+| `corvia-telemetry` | `crates/corvia-telemetry` | Structured tracing initialization, span name contracts |
 | `corvia-adapter-basic` | `adapters/corvia-adapter-basic/rust` | Basic filesystem ingestion adapter |
 
 ### Design principles
@@ -184,7 +212,7 @@ For detailed internals, see [ARCHITECTURE.md](ARCHITECTURE.md).
 - [x] **M3.2** — RAG pipeline (Retriever → Augmenter → GenerationEngine)
 - [x] **M3.3** — Chunking strategies (AST, Markdown, Config, PDF)
 - [x] **M3.4** — Graph edge improvements + cross-file relation discovery
-- [ ] **M4** — Observability (OpenTelemetry) *(next)*
+- [x] **M4** — Observability + control plane (structured tracing, 18 MCP tools, CLI metrics)
 - [ ] **M5** — VS Code extension + Python SDK
 - [ ] **M6** — Eval framework (precision@k, MRR, NDCG)
 - [ ] **M7** — 1.0 + PyPI publish

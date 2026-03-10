@@ -9,7 +9,7 @@ over HTTP. Typically started via `corvia serve` rather than used as a library.
 ## Protocols
 
 - **REST** — Axum HTTP API on port `8020` with endpoints for knowledge ingestion, semantic search, graph queries, temporal history, reasoning, and agent coordination
-- **MCP** — JSON-RPC 2.0 Model Context Protocol at `POST /mcp` for AI agent tool use
+- **MCP** — JSON-RPC 2.0 Model Context Protocol at `POST /mcp` with 18 tools across 3 safety tiers (read-only, low-risk mutation, medium-risk mutation)
 
 ## License
 

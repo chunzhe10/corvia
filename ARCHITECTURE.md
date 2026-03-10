@@ -29,6 +29,9 @@ independent of any specific frontend, adapter, or integration surface.
 │  Embedding Pipeline · Chunking Pipeline · Context Builder          │
 │  Merge Worker  ·  Reasoner  ·  Graph Store                         │
 ├─────────────────────────────────────────────────────────────────────┤
+│  Telemetry                                                          │
+│  corvia-telemetry (tracing init, span contracts, exporters)        │
+├─────────────────────────────────────────────────────────────────────┤
 │  Storage                                                            │
 │  LiteStore ─── hnsw_rs · petgraph · Redb · Git (JSON files)       │
 │  FullStore ─── SurrealDB · Redb · Git (JSON files)                │
@@ -55,12 +58,13 @@ independent of any specific frontend, adapter, or integration surface.
 | `corvia-proto` | `crates/corvia-proto` | Protocol Buffers for gRPC inference |
 | `corvia-adapter-git` | `adapters/corvia-adapter-git/rust` | Git repository ingestion using tree-sitter for code-aware chunking. Supports Rust, JavaScript, TypeScript, and Python. Implements the `IngestionAdapter` trait |
 | `corvia-adapter-basic` | `adapters/corvia-adapter-basic/rust` | Basic filesystem ingestion adapter for non-Git sources |
+| `corvia-telemetry` | `crates/corvia-telemetry` | Telemetry initialization (`init_telemetry()`), D45 span name constants (`spans::*`), configurable exporters (stdout, file, OTLP), `TelemetryGuard` for log flushing |
 
 All workspace crates share `version.workspace = true` from the root `Cargo.toml`.
 
 ## Kernel Subsystems
 
-The kernel contains ten subsystems, each in its own module within `corvia-kernel`:
+The kernel contains eleven subsystems, each in its own module within `corvia-kernel`:
 
 | Subsystem | Module | Description |
 |-----------|--------|-------------|
@@ -74,6 +78,7 @@ The kernel contains ten subsystems, each in its own module within `corvia-kernel
 | **Reasoner** | `reasoner.rs` | Algorithmic knowledge health checks. Seven check types: `StaleEntry`, `BrokenChain`, `OrphanedNode`, `DanglingImport`, `DependencyCycle` (deterministic, no LLM), plus `SemanticGap` and `Contradiction` (LLM-powered, opt-in) |
 | **Graph Store** | `graph_store.rs` | Directed knowledge graph. `LiteGraphStore` uses petgraph (in-memory DiGraph) backed by Redb persistence. Supports `relate`, `edges`, `traverse` (BFS), and `shortest_path`. Cross-file relation discovery with graph-expanded scoring |
 | **Adapter System** | `adapter_discovery.rs`, `adapter_protocol.rs`, `process_adapter.rs` | Runtime adapter discovery, JSONL IPC protocol for adapter processes, and ProcessChunkingStrategy for adapter-provided chunking |
+| **Shared Operations** | `ops.rs` | Shared kernel operations callable from CLI and MCP. System status, agent/session listing, merge queue inspection, config get/set with hot-reload, GC, index rebuild |
 
 ### Session State Machine
 
@@ -143,10 +148,13 @@ pub trait QueryableStore: Send + Sync {
     async fn count(&self, scope_id: &str) -> Result<u64>;
     async fn init_schema(&self) -> Result<()>;
     async fn delete_scope(&self, scope_id: &str) -> Result<()>;
+    fn as_any(&self) -> &dyn Any;
 }
 ```
 
-**Implementations:** `LiteStore` (hnsw_rs + Redb), `SurrealStore` (SurrealDB HTTP client).
+The `as_any()` method enables downcasting for store-specific operations (e.g., `LiteStore::rebuild_from_files`).
+
+**Implementations:** `LiteStore`, `SurrealStore`, `PostgresStore`.
 
 ### `InferenceEngine`
 
@@ -265,16 +273,41 @@ Corvia implements the Model Context Protocol (version `2024-11-05`) via JSON-RPC
 `POST /mcp`. Enabled with `corvia serve --mcp`. Supports `initialize`, `tools/list`, and
 `tools/call` methods.
 
+Tools use a three-tier safety model. Tier 1 tools execute immediately. Tier 2 tools require
+`_meta.confirmed: true`. Tier 3 tools require confirmation and support `dry_run` mode.
+
+**Tier 1 — Read-only (auto-approved):**
+
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `corvia_search` | `query`, `scope_id`, `limit?` | Semantic similarity search over knowledge entries |
-| `corvia_write` | `content`, `scope_id`, `source_version?` | Write a knowledge entry (requires `_meta.agent_id` — anonymous clients are read-only) |
-| `corvia_history` | `entry_id` | Get the supersession history chain for a knowledge entry |
-| `corvia_graph` | `entry_id` | Get all graph edges (both directions) for a knowledge entry |
-| `corvia_reason` | `scope_id`, `check?` | Run reasoning health checks on a scope (omit `check` to run all) |
-| `corvia_agent_status` | *(needs `_meta.agent_id`)* | Get the calling agent's session count and contribution summary |
-| `corvia_context` | `query`, `scope_id`, `limit?` | Retrieve assembled context (RAG retrieval only, no generation) |
-| `corvia_ask` | `question`, `scope_id` | Full RAG: question to AI-generated answer from knowledge |
+| `corvia_search` | `query`, `scope_id`, `limit?` | Semantic similarity search |
+| `corvia_write` | `content`, `scope_id`, `agent_id?`, `source_version?` | Write a knowledge entry |
+| `corvia_history` | `entry_id` | Supersession history chain |
+| `corvia_graph` | `entry_id` | Graph edges (both directions) |
+| `corvia_reason` | `scope_id`, `check?` | Reasoning health checks |
+| `corvia_agent_status` | `agent_id?` | Agent contribution summary |
+| `corvia_context` | `query`, `scope_id`, `limit?` | RAG context retrieval (no generation) |
+| `corvia_ask` | `query`, `scope_id`, `limit?` | Full RAG with AI-generated answer |
+| `corvia_system_status` | `scope_id` | Entry counts, agents, sessions, merge queue |
+| `corvia_config_get` | `section?` | Read config section as JSON |
+| `corvia_adapters_list` | *(none)* | Discovered adapter binaries |
+| `corvia_agents_list` | *(none)* | All registered agents |
+
+**Tier 2 — Low-risk mutation (single confirmation):**
+
+| Tool | Parameters | Description |
+|------|-----------|-------------|
+| `corvia_config_set` | `section`, `key`, `value` | Update hot-reloadable config value |
+| `corvia_gc_run` | *(none)* | Trigger garbage collection |
+| `corvia_rebuild_index` | *(none)* | Rebuild HNSW vector index |
+
+**Tier 3 — Medium-risk (confirmation + dry-run):**
+
+| Tool | Parameters | Description |
+|------|-----------|-------------|
+| `corvia_agent_suspend` | `agent_id` | Suspend agent, close sessions |
+| `corvia_merge_retry` | `entry_ids` | Retry failed merge entries |
+| `corvia_merge_queue` | *(none)* | Inspect merge queue |
 
 ## Key Design Decisions
 
@@ -295,6 +328,7 @@ available at [`docs/rfcs/`](docs/rfcs/).
 | **Staging hybrid (branches + shared HNSW)** | Full git branch isolation | Pure branch isolation prevents cross-agent search during staging. Shared HNSW lets agents see each other's work-in-progress while writes stay isolated until commit |
 | **Multi-layer agent identity** | Single registration model | Forcing registration blocks MCP clients and anonymous queries. Three tiers (Registered, MCP Client, Anonymous) let any agent framework integrate with appropriate write permissions |
 | **Python SDK via PyO3 (planned)** | HTTP-only Python client | Embedding the Rust kernel in Python (like Polars) gives zero-latency access to all kernel operations — not just what the REST API exposes |
+| **Three-tier MCP safety model** | Single confirmation for all mutations | Graduated risk — read-only tools execute freely, low-risk mutations need one confirmation, medium-risk mutations support dry-run preview. Prevents accidental destructive operations without adding friction to safe queries |
 
 ## Data Model
 
