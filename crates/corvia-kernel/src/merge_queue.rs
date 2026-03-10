@@ -136,6 +136,48 @@ impl MergeQueue {
         Ok(())
     }
 
+    /// Reset retry_count to 0 and clear last_error for a queued entry,
+    /// so the merge worker will pick it up again on its next cycle.
+    /// Returns `Ok(true)` if the entry was found and reset, `Ok(false)` if not found.
+    pub fn reset_retry(&self, entry_id: &Uuid) -> Result<bool> {
+        let key = entry_id.to_string();
+        let read_txn = self.db.begin_read()
+            .map_err(|e| CorviaError::Agent(format!("Failed to begin read txn: {e}")))?;
+        let table = read_txn.open_table(MERGE_QUEUE)
+            .map_err(|e| CorviaError::Agent(format!("Failed to open merge_queue: {e}")))?;
+
+        let val = match table.get(key.as_str())
+            .map_err(|e| CorviaError::Agent(format!("Failed to get queue entry: {e}")))? {
+            Some(v) => v,
+            None => return Ok(false),
+        };
+        let bytes: &[u8] = val.value();
+        let mut entry: MergeQueueEntry = serde_json::from_slice(bytes)
+            .map_err(|e| CorviaError::Agent(format!("Failed to deserialize queue entry: {e}")))?;
+
+        drop(val);
+        drop(table);
+        drop(read_txn);
+
+        entry.retry_count = 0;
+        entry.last_error = None;
+
+        let updated_bytes = serde_json::to_vec(&entry)
+            .map_err(|e| CorviaError::Agent(format!("Failed to serialize queue entry: {e}")))?;
+
+        let write_txn = self.db.begin_write()
+            .map_err(|e| CorviaError::Agent(format!("Failed to begin write txn: {e}")))?;
+        {
+            let mut table = write_txn.open_table(MERGE_QUEUE)
+                .map_err(|e| CorviaError::Agent(format!("Failed to open merge_queue: {e}")))?;
+            table.insert(key.as_str(), updated_bytes.as_slice())
+                .map_err(|e| CorviaError::Agent(format!("Failed to update queue entry: {e}")))?;
+        }
+        write_txn.commit()
+            .map_err(|e| CorviaError::Agent(format!("Failed to commit retry reset: {e}")))?;
+        Ok(true)
+    }
+
     /// Return the number of entries in the queue.
     pub fn depth(&self) -> Result<u64> {
         let read_txn = self.db.begin_read()
@@ -195,6 +237,34 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].retry_count, 1);
         assert_eq!(entries[0].last_error, Some("Ollama down".into()));
+    }
+
+    #[test]
+    fn test_reset_retry() {
+        let queue = test_queue();
+        let id = uuid::Uuid::now_v7();
+        queue.enqueue(id, "test::agent", "sess", "scope").unwrap();
+        queue.mark_failed(&id, "error").unwrap();
+
+        // Verify failed state
+        let entries = queue.list(10).unwrap();
+        assert_eq!(entries[0].retry_count, 1);
+        assert_eq!(entries[0].last_error, Some("error".into()));
+
+        // Reset
+        assert!(queue.reset_retry(&id).unwrap());
+
+        // Verify reset
+        let entries = queue.list(10).unwrap();
+        assert_eq!(entries[0].retry_count, 0);
+        assert!(entries[0].last_error.is_none());
+    }
+
+    #[test]
+    fn test_reset_retry_nonexistent() {
+        let queue = test_queue();
+        let id = uuid::Uuid::now_v7();
+        assert!(!queue.reset_retry(&id).unwrap());
     }
 
     #[test]

@@ -26,6 +26,10 @@ pub struct AppState {
     pub ready: Arc<AtomicBool>,
     /// Default scope_id from config, used when MCP clients omit scope_id.
     pub default_scope_id: Option<String>,
+    /// Live config for hot-reload via MCP control plane.
+    pub config: Arc<std::sync::RwLock<corvia_common::config::CorviaConfig>>,
+    /// Path to the config file on disk.
+    pub config_path: std::path::PathBuf,
 }
 
 // --- Existing memory types ---

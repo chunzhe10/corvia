@@ -272,9 +272,14 @@ async fn main() -> Result<()> {
     } else {
         corvia_common::config::TelemetryConfig::default()
     };
-    if let Err(e) = corvia_telemetry::init_telemetry(&telem_cfg) {
-        eprintln!("Warning: telemetry init failed: {e}");
-    }
+    // Hold the guard for the process lifetime so file logs flush on exit.
+    let _telemetry_guard = match corvia_telemetry::init_telemetry(&telem_cfg) {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            eprintln!("Warning: telemetry init failed: {e}");
+            None
+        }
+    };
 
     let cli = Cli::parse();
 
@@ -681,27 +686,27 @@ async fn cmd_status(metrics: bool) -> Result<()> {
         }
     }
 
-    // Show agent coordination status if available
+    // Show agent coordination status if available (open registry once, reuse for --metrics)
     let data_dir = std::path::Path::new(&config.storage.data_dir);
     let coord_db_path = data_dir.join("coordination.redb");
-    if coord_db_path.exists() {
-        use corvia_kernel::agent_registry::AgentRegistry;
-        match AgentRegistry::open(data_dir) {
-            Ok(registry) => {
-                let agents = registry.list_active().unwrap_or_default();
-                let sessions = corvia_kernel::session_manager::SessionManager::from_db(registry.db().clone())
-                    .map(|sm| sm.list_open().unwrap_or_default().len())
-                    .unwrap_or(0);
-                let queue_depth = corvia_kernel::merge_queue::MergeQueue::from_db(registry.db().clone())
-                    .map(|mq| mq.depth().unwrap_or(0))
-                    .unwrap_or(0);
-                println!("\nAgent coordination:");
-                println!("  Active agents: {}", agents.len());
-                println!("  Open sessions: {sessions}");
-                println!("  Merge queue depth: {queue_depth}");
-            }
-            Err(_) => {} // coordination not initialized yet
-        }
+    let registry = if coord_db_path.exists() {
+        corvia_kernel::agent_registry::AgentRegistry::open(data_dir).ok()
+    } else {
+        None
+    };
+
+    if let Some(ref reg) = registry {
+        let active = reg.list_active().unwrap_or_default();
+        let sessions = corvia_kernel::session_manager::SessionManager::from_db(reg.db().clone())
+            .map(|sm| sm.list_open().unwrap_or_default().len())
+            .unwrap_or(0);
+        let queue_depth = corvia_kernel::merge_queue::MergeQueue::from_db(reg.db().clone())
+            .map(|mq| mq.depth().unwrap_or(0))
+            .unwrap_or(0);
+        println!("\nAgent coordination:");
+        println!("  Active agents: {}", active.len());
+        println!("  Open sessions: {sessions}");
+        println!("  Merge queue depth: {queue_depth}");
     }
 
     // Extended metrics output (only when --metrics is passed)
@@ -728,24 +733,18 @@ async fn cmd_status(metrics: bool) -> Result<()> {
         // Telemetry exporter
         println!("  Telemetry exporter: {}", config.telemetry.exporter);
 
-        // Agent counts (registered + active)
-        if coord_db_path.exists() {
-            use corvia_kernel::agent_registry::AgentRegistry;
-            match AgentRegistry::open(data_dir) {
-                Ok(registry) => {
-                    let all_agents = registry.list_all().unwrap_or_default();
-                    let active_agents = registry.list_active().unwrap_or_default();
-                    println!("  Registered agents: {}", all_agents.len());
-                    println!("  Active agents: {}", active_agents.len());
-                }
-                Err(_) => {
-                    println!("  Registered agents: 0");
-                    println!("  Active agents: 0");
-                }
+        // Agent counts (reuse already-opened registry)
+        match &registry {
+            Some(reg) => {
+                let all_agents = reg.list_all().unwrap_or_default();
+                let active_agents = reg.list_active().unwrap_or_default();
+                println!("  Registered agents: {}", all_agents.len());
+                println!("  Active agents: {}", active_agents.len());
             }
-        } else {
-            println!("  Registered agents: 0");
-            println!("  Active agents: 0");
+            None => {
+                println!("  Registered agents: 0");
+                println!("  Active agents: 0");
+            }
         }
 
         // Discovered adapters
@@ -768,11 +767,9 @@ async fn cmd_rebuild() -> Result<()> {
     match config.storage.store_type {
         corvia_common::config::StoreType::Lite => {
             println!("Rebuilding LiteStore indexes from knowledge files...");
-            let store = corvia_kernel::lite_store::LiteStore::open(
-                std::path::Path::new(&config.storage.data_dir),
-                config.embedding.dimensions,
-            )?;
-            let count = store.rebuild_from_files()?;
+            let data_dir = std::path::Path::new(&config.storage.data_dir);
+            let store = corvia_kernel::lite_store::LiteStore::open(data_dir, config.embedding.dimensions)?;
+            let count = corvia_kernel::ops::rebuild_index(&store)?;
             println!("Rebuilt {count} entries.");
         }
         corvia_common::config::StoreType::Surrealdb => {

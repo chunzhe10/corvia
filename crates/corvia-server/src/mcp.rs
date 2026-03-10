@@ -78,15 +78,6 @@ const INTERNAL_ERROR: i32 = -32603;
 /// Uses -32000 from the JSON-RPC implementation-defined server error range (-32000..-32099).
 const SERVICE_UNAVAILABLE: i32 = -32000;
 
-/// Safety tier for MCP control-plane tools.
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)]
-enum ToolTier {
-    ReadOnly,
-    LowRisk,
-    MediumRisk,
-}
-
 /// Check if a tool call has confirmation via _meta.confirmed.
 fn is_confirmed(meta: Option<&Value>) -> bool {
     meta.and_then(|m| m.get("confirmed"))
@@ -235,7 +226,7 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "section": { "type": "string", "description": "Config section to retrieve (storage, server, embedding, project, telemetry). Omit for full config." }
+                    "section": { "type": "string", "description": "Config section to retrieve. Valid sections: storage, server, embedding, project, telemetry (restart-required), agent_lifecycle, merge, rag, chunking, reasoning, adapters (hot-reloadable). Omit for full config." }
                 }
             }
         }),
@@ -272,7 +263,7 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "section": { "type": "string", "description": "Config section (storage, server, embedding, project, telemetry)" },
+                    "section": { "type": "string", "description": "Config section (hot-reloadable only: agent_lifecycle, merge, rag, chunking, reasoning, adapters). Restart-required sections (storage, server, embedding, project, telemetry) are rejected." },
                     "key": { "type": "string", "description": "Config key within the section" },
                     "value": { "description": "New value to set" }
                 },
@@ -282,7 +273,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "corvia_gc_run",
-            "description": "Run garbage collection to clean up orphaned staging branches, closed sessions, and inactive agents. Requires confirmation via _meta.confirmed.",
+            "description": "Run garbage collection to clean up orphaned staging branches. Requires confirmation via _meta.confirmed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -1176,7 +1167,7 @@ async fn tool_corvia_gc_run(
     if !is_confirmed(meta) {
         return Ok(confirmation_response(
             json!({ "action": "garbage_collection" }),
-            "Run garbage collection? This will clean up orphaned branches, closed sessions, and inactive agents.",
+            "Run garbage collection? This will clean up orphaned staging branches.",
         ));
     }
 
@@ -1188,8 +1179,6 @@ async fn tool_corvia_gc_run(
             "type": "text",
             "text": serde_json::to_string(&json!({
                 "orphans_rolled_back": report.orphans_rolled_back,
-                "closed_sessions_cleaned": report.closed_sessions_cleaned,
-                "inactive_agents_cleaned": report.inactive_agents_cleaned,
             })).unwrap()
         }]
     }))
@@ -1214,7 +1203,11 @@ async fn tool_corvia_rebuild_index(
         ));
     }
 
-    let entries_indexed = corvia_kernel::ops::rebuild_index(&state.data_dir, dimensions)
+    let lite_store = state.store.as_any()
+        .downcast_ref::<corvia_kernel::lite_store::LiteStore>()
+        .ok_or_else(|| (INTERNAL_ERROR, "Rebuild index is only supported for LiteStore".to_string()))?;
+
+    let entries_indexed = corvia_kernel::ops::rebuild_index(lite_store)
         .map_err(|e| (INTERNAL_ERROR, format!("Rebuild index failed: {e}")))?;
 
     Ok(json!({
@@ -1776,14 +1769,14 @@ mod tests {
         // Call without _meta.confirmed — should get confirmation_required
         let params = json!({
             "name": "corvia_config_set",
-            "arguments": { "section": "storage", "key": "backend", "value": "lite" }
+            "arguments": { "section": "rag", "key": "default_limit", "value": 20 }
         });
         let result = handle_tools_call(&state, &params).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["confirmation_required"], true);
-        assert_eq!(parsed["preview"]["section"], "storage");
-        assert_eq!(parsed["preview"]["key"], "backend");
+        assert_eq!(parsed["preview"]["section"], "rag");
+        assert_eq!(parsed["preview"]["key"], "default_limit");
     }
 
     #[tokio::test]
@@ -1796,17 +1789,38 @@ mod tests {
         let config_toml = toml::to_string_pretty(&default_config).unwrap();
         std::fs::write(state.config_path.clone(), &config_toml).unwrap();
 
+        // Use a hot-reloadable section (rag), not a restart-required one (storage)
         let params = json!({
             "name": "corvia_config_set",
             "_meta": { "confirmed": true },
-            "arguments": { "section": "storage", "key": "backend", "value": "lite" }
+            "arguments": { "section": "rag", "key": "default_limit", "value": 20 }
         });
         let result = handle_tools_call(&state, &params).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["status"], "updated");
-        assert_eq!(parsed["section"], "storage");
-        assert_eq!(parsed["key"], "backend");
+        assert_eq!(parsed["section"], "rag");
+        assert_eq!(parsed["key"], "default_limit");
+    }
+
+    #[tokio::test]
+    async fn test_config_set_rejects_restart_required_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+
+        // Write config file
+        let default_config = corvia_common::config::CorviaConfig::default();
+        let config_toml = toml::to_string_pretty(&default_config).unwrap();
+        std::fs::write(state.config_path.clone(), &config_toml).unwrap();
+
+        // Try to set a restart-required section with confirmation
+        let params = json!({
+            "name": "corvia_config_set",
+            "_meta": { "confirmed": true },
+            "arguments": { "section": "storage", "key": "data_dir", "value": "/new" }
+        });
+        let result = handle_tools_call(&state, &params).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -1839,8 +1853,6 @@ mod tests {
         let text = result["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["orphans_rolled_back"], 0);
-        assert_eq!(parsed["closed_sessions_cleaned"], 0);
-        assert_eq!(parsed["inactive_agents_cleaned"], 0);
     }
 
     #[tokio::test]

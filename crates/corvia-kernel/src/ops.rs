@@ -91,27 +91,16 @@ pub fn merge_queue_status(
     Ok(MergeQueueStatus { depth, entries })
 }
 
-/// Retry failed merge queue entries by resetting their retry count.
-///
-/// Re-enqueues the specified entries so the merge worker will pick them up
-/// again. Returns the number of entries successfully reset.
+/// Retry failed merge queue entries by resetting their retry count and
+/// clearing the last error, so the merge worker picks them up again.
+/// Returns the number of entries successfully reset.
 pub fn merge_retry(
     coordinator: &AgentCoordinator,
     entry_ids: &[uuid::Uuid],
 ) -> Result<usize> {
     let mut retried = 0usize;
-    let entries = coordinator.merge_queue.list(usize::MAX)?;
     for id in entry_ids {
-        // Find the entry in the queue; if it exists, clear its error
-        // by marking it failed with an empty string (resets for retry).
-        if entries.iter().any(|e| e.entry_id == *id) {
-            // Re-enqueue by removing and re-adding (mark_complete + enqueue)
-            // Actually, the simplest approach: just reset the error so the
-            // merge worker picks it up again. mark_failed increments retry_count
-            // but the merge worker processes all entries regardless of retry_count.
-            // For a true "retry", we just need the entry to still be in the queue,
-            // which it already is if it failed. So this is a no-op for entries
-            // that are already queued. The real value is confirming they exist.
+        if coordinator.merge_queue.reset_retry(id)? {
             retried += 1;
         }
     }
@@ -131,8 +120,16 @@ pub fn adapters_list(extra_dirs: &[String]) -> Vec<DiscoveredAdapter> {
 // Config
 // ---------------------------------------------------------------------------
 
-/// Structural config sections that can be individually queried.
-const STRUCTURAL_SECTIONS: &[&str] = &["storage", "server", "embedding", "project", "telemetry"];
+/// Config sections that require a server restart (not hot-reloadable).
+const RESTART_REQUIRED_SECTIONS: &[&str] = &["storage", "server", "embedding", "project", "telemetry"];
+
+/// Config sections that are hot-reloadable at runtime.
+const HOT_RELOADABLE_SECTIONS: &[&str] = &["agent_lifecycle", "merge", "rag", "chunking", "reasoning", "adapters"];
+
+/// All valid config sections.
+fn all_sections() -> Vec<&'static str> {
+    RESTART_REQUIRED_SECTIONS.iter().chain(HOT_RELOADABLE_SECTIONS.iter()).copied().collect()
+}
 
 /// Return the config as JSON, optionally filtered to a single section.
 pub fn config_get(config: &CorviaConfig, section: Option<&str>) -> Result<serde_json::Value> {
@@ -142,10 +139,11 @@ pub fn config_get(config: &CorviaConfig, section: Option<&str>) -> Result<serde_
     match section {
         None => Ok(full),
         Some(s) => {
-            if !STRUCTURAL_SECTIONS.contains(&s) {
+            let all = all_sections();
+            if !all.contains(&s) {
                 return Err(CorviaError::Config(format!(
                     "Unknown config section '{s}'. Valid sections: {}",
-                    STRUCTURAL_SECTIONS.join(", ")
+                    all.join(", ")
                 )));
             }
             full.get(s)
@@ -157,8 +155,9 @@ pub fn config_get(config: &CorviaConfig, section: Option<&str>) -> Result<serde_
 
 /// Set a config value and persist to disk.
 ///
-/// Reads the TOML file, updates the value at `section.key`, writes back,
-/// and returns the updated config.
+/// Only hot-reloadable sections can be updated at runtime. Non-hot-reloadable
+/// sections (storage, server, embedding, project, telemetry) are rejected
+/// with an error requiring a server restart.
 pub fn config_set(
     config_path: &std::path::Path,
     config: &mut CorviaConfig,
@@ -166,10 +165,16 @@ pub fn config_set(
     key: &str,
     value: serde_json::Value,
 ) -> Result<CorviaConfig> {
-    if !STRUCTURAL_SECTIONS.contains(&section) {
+    if RESTART_REQUIRED_SECTIONS.contains(&section) {
+        return Err(CorviaError::Config(format!(
+            "Section '{section}' is not hot-reloadable; requires server restart"
+        )));
+    }
+    let all = all_sections();
+    if !all.contains(&section) {
         return Err(CorviaError::Config(format!(
             "Unknown config section '{section}'. Valid sections: {}",
-            STRUCTURAL_SECTIONS.join(", ")
+            all.join(", ")
         )));
     }
 
@@ -212,7 +217,7 @@ pub fn config_set(
 /// Convert a serde_json::Value to a toml::Value.
 fn json_to_toml(json: &serde_json::Value) -> Result<toml::Value> {
     match json {
-        serde_json::Value::Null => Ok(toml::Value::String("".into())),
+        serde_json::Value::Null => Err(CorviaError::Config("Cannot set null value in TOML config".into())),
         serde_json::Value::Bool(b) => Ok(toml::Value::Boolean(*b)),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
@@ -254,8 +259,11 @@ pub async fn gc_run(coordinator: &AgentCoordinator) -> Result<GcReport> {
 
 /// Rebuild the HNSW index from knowledge JSON files on disk.
 /// Returns the number of entries re-indexed.
-pub fn rebuild_index(data_dir: &std::path::Path, dimensions: usize) -> Result<usize> {
-    let store = LiteStore::open(data_dir, dimensions)?;
+///
+/// Accepts an existing `&LiteStore` reference to avoid opening a second
+/// Redb database (which would fail with an exclusive-lock error when the
+/// server already holds the file lock).
+pub fn rebuild_index(store: &LiteStore) -> Result<usize> {
     store.rebuild_from_files()
 }
 
@@ -383,5 +391,82 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Unknown config section"));
+    }
+
+    #[test]
+    fn test_config_get_hot_reloadable_section() {
+        let config = CorviaConfig::default();
+        // "rag" is a hot-reloadable section — should be queryable
+        let result = config_get(&config, Some("rag"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_config_set_rejects_restart_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("corvia.toml");
+        let mut config = CorviaConfig::default();
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let result = config_set(
+            &config_path, &mut config, "storage", "data_dir",
+            serde_json::json!("/new/path"),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not hot-reloadable"));
+    }
+
+    #[test]
+    fn test_config_set_rejects_null_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("corvia.toml");
+        let mut config = CorviaConfig::default();
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let result = config_set(
+            &config_path, &mut config, "rag", "default_limit",
+            serde_json::Value::Null,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("null"));
+    }
+
+    #[tokio::test]
+    async fn test_merge_retry_resets_failed_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, coord) = setup_coordinator(dir.path()).await;
+
+        // Enqueue an entry and mark it failed
+        let id = uuid::Uuid::now_v7();
+        coord.merge_queue.enqueue(id, "test::agent", "sess", "scope").unwrap();
+        coord.merge_queue.mark_failed(&id, "Ollama down").unwrap();
+
+        // Verify it's failed
+        let entries = coord.merge_queue.list(10).unwrap();
+        assert_eq!(entries[0].retry_count, 1);
+        assert!(entries[0].last_error.is_some());
+
+        // Retry it
+        let count = merge_retry(&coord, &[id]).unwrap();
+        assert_eq!(count, 1);
+
+        // Verify reset
+        let entries = coord.merge_queue.list(10).unwrap();
+        assert_eq!(entries[0].retry_count, 0);
+        assert!(entries[0].last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_merge_retry_nonexistent_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, coord) = setup_coordinator(dir.path()).await;
+
+        let id = uuid::Uuid::now_v7();
+        let count = merge_retry(&coord, &[id]).unwrap();
+        assert_eq!(count, 0);
     }
 }

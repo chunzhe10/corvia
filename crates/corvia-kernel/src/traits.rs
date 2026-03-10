@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use corvia_common::errors::Result;
 use corvia_common::types::{EdgeDirection, GraphEdge, KnowledgeEntry, SearchResult};
+use std::any::Any;
 
 /// Queryable store for knowledge entries (D15).
 /// SurrealDB is the first implementation. Trait-bounded for future swap.
@@ -23,6 +24,9 @@ pub trait QueryableStore: Send + Sync {
 
     /// Delete all entries in a scope. Used for test/demo teardown.
     async fn delete_scope(&self, scope_id: &str) -> Result<()>;
+
+    /// Downcast support for store-specific operations (e.g., LiteStore::rebuild_from_files).
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// Embedding and inference provider (D5).

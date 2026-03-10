@@ -316,6 +316,10 @@ impl super::traits::QueryableStore for SurrealStore {
         info!("Deleted all entries for scope '{scope_id}'");
         Ok(())
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[async_trait]

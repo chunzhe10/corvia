@@ -49,7 +49,7 @@ impl MergeWorker {
     }
 
     /// Process a single merge queue entry.
-    #[tracing::instrument(name = "corvia.merge.process", skip(self, queue_entry), fields(entry_id = %queue_entry.entry_id))]
+    #[tracing::instrument(name = "corvia.merge.process_entry", skip(self, queue_entry), fields(entry_id = %queue_entry.entry_id))]
     pub async fn process_one(&self, queue_entry: &MergeQueueEntry) -> Result<()> {
         // Check max retries
         if queue_entry.retry_count >= self.merge_config.max_retries {

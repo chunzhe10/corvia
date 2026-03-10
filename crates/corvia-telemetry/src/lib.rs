@@ -9,6 +9,7 @@ pub mod spans {
     pub const ENTRY_INSERT: &str = "corvia.entry.insert";
     pub const SESSION_COMMIT: &str = "corvia.session.commit";
     pub const MERGE_PROCESS: &str = "corvia.merge.process";
+    pub const MERGE_PROCESS_ENTRY: &str = "corvia.merge.process_entry";
     pub const MERGE_CONFLICT: &str = "corvia.merge.conflict";
     pub const MERGE_LLM_RESOLVE: &str = "corvia.merge.llm_resolve";
     pub const GC_RUN: &str = "corvia.gc.run";
@@ -20,18 +21,32 @@ pub mod spans {
     pub const RAG_ASK: &str = "corvia.rag.ask";
 }
 
+/// Opaque handle that keeps the telemetry pipeline alive.
+/// Hold this in your top-level scope (e.g. `main`); dropping it flushes
+/// any buffered log output before the process exits.
+pub struct TelemetryGuard {
+    // The NonBlocking writer's WorkerGuard. When dropped, it flushes
+    // pending writes. Only `Some` when exporter = "file".
+    _file_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
+}
+
 /// Initialize the tracing subscriber pipeline based on config.
-pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
+///
+/// Returns a [`TelemetryGuard`] that **must** be held for the lifetime of
+/// the process. Dropping the guard flushes buffered file output.
+pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<TelemetryGuard> {
     use tracing_subscriber::{fmt, EnvFilter, prelude::*};
 
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
+    let mut file_guard = None;
+
     match config.exporter.as_str() {
         "file" => {
             let file_appender = tracing_appender::rolling::daily("logs", "corvia.log");
-            let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-            std::mem::forget(_guard);
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+            file_guard = Some(guard);
 
             if config.log_format == "json" {
                 tracing_subscriber::registry()
@@ -67,7 +82,7 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
         }
     }
 
-    Ok(())
+    Ok(TelemetryGuard { _file_guard: file_guard })
 }
 
 #[cfg(test)]
@@ -79,7 +94,8 @@ mod tests {
         let all = [
             spans::AGENT_REGISTER, spans::SESSION_CREATE, spans::ENTRY_WRITE,
             spans::ENTRY_EMBED, spans::ENTRY_INSERT, spans::SESSION_COMMIT,
-            spans::MERGE_PROCESS, spans::MERGE_CONFLICT, spans::MERGE_LLM_RESOLVE,
+            spans::MERGE_PROCESS, spans::MERGE_PROCESS_ENTRY,
+            spans::MERGE_CONFLICT, spans::MERGE_LLM_RESOLVE,
             spans::GC_RUN, spans::SEARCH, spans::STORE_INSERT, spans::STORE_SEARCH,
             spans::STORE_GET, spans::RAG_CONTEXT, spans::RAG_ASK,
         ];

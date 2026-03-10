@@ -718,6 +718,10 @@ impl super::traits::QueryableStore for LiteStore {
         info!("Deleted scope '{}' ({} entries)", scope_id, uuids_to_delete.len());
         Ok(())
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[async_trait]

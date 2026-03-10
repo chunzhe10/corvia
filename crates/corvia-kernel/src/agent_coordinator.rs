@@ -28,8 +28,6 @@ pub struct ConnectResponse {
 #[derive(Debug, Clone, Default)]
 pub struct GcReport {
     pub orphans_rolled_back: usize,
-    pub closed_sessions_cleaned: usize,
-    pub inactive_agents_cleaned: usize,
 }
 
 /// The top-level orchestrator that ties all agent coordination components together.

@@ -111,7 +111,7 @@ impl Augmenter for StructuredAugmenter {
 
         // --- Skill matching and injection ---
         let mut skills_used: Vec<String> = Vec::new();
-        let system_prompt = if let (Some(registry), Some(ref query_emb)) =
+        let system_prompt = if let (Some(registry), Some(query_emb)) =
             (&self.skill_registry, &budget.query_embedding)
         {
             let skills_budget =
@@ -285,6 +285,7 @@ mod tests {
         let budget = TokenBudget {
             max_context_tokens: Some(4096),
             reserve_for_answer: 0.2,
+            ..Default::default()
         };
 
         let ctx = aug.augment("How does auth work?", &results, &budget).unwrap();
@@ -326,6 +327,7 @@ mod tests {
         let budget = TokenBudget {
             max_context_tokens: Some(100),
             reserve_for_answer: 0.2,
+            ..Default::default()
         };
 
         let ctx = aug.augment("test query", &results, &budget).unwrap();
