@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-03-10
+
+### Added
+
+- **Real chat inference**: `corvia-inference` now runs real chat completion via
+  llama-cpp-2/hf-hub instead of a stub, wired into the RAG pipeline for `ask()` mode
+- **HNSW persistence**: LiteStore persists the HNSW index to disk for fast startup
+  (no full rebuild on every `corvia serve`)
+- **Stateless MCP**: MCP server is fully stateless — no session management needed,
+  agent identity via `agent_id` tool parameter
+
+### Changed
+
+- MCP server is always enabled on `corvia serve` (removed `--mcp` flag)
+- `corvia_write` and `corvia_agent_status` accept `agent_id` as a regular tool
+  parameter instead of requiring `_meta.agent_id`
+
+### Fixed
+
+- `corvia-inference` batch-feeds prompts to avoid llama.cpp assertion failures
+- Eliminated unsafe transmute in corvia-inference, fixed defaults
+- Adapter paths corrected in documentation
+
 ## [0.3.4] - 2026-03-08
 
 ### Added
@@ -95,6 +118,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **M1 Core kernel**: LiteStore + SurrealStore, Ollama embedding pipeline,
   REST API, MCP server, CLI
 
+[0.3.5]: https://github.com/corvia/corvia/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/corvia/corvia/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/corvia/corvia/compare/v0.3.1...v0.3.3
 [0.3.1]: https://github.com/corvia/corvia/compare/v0.3.0...v0.3.1

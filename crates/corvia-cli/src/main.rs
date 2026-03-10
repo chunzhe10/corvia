@@ -11,7 +11,7 @@
 //! | `init` | Initialize a new Corvia store (`--store lite\|surrealdb\|postgres`) |
 //! | `ingest` | Ingest a Git repository (or all workspace repos) |
 //! | `search` | Semantic search across ingested knowledge |
-//! | `serve` | Start the REST API and optional MCP server |
+//! | `serve` | Start the REST API and MCP server |
 //! | `reason` | Run health checks and reasoning over a scope |
 //! | `history` | Show the supersession chain for an entry |
 //! | `evolution` | Show entries that changed within a time range |
