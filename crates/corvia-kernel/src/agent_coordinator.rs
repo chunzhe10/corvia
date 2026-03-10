@@ -323,7 +323,7 @@ impl AgentCoordinator {
     /// Process one batch of merge queue entries, then close completed sessions.
     /// Can be called manually or from a background polling loop (see `MergeWorker::run()`).
     pub async fn process_merge_queue(&self) -> Result<()> {
-        let entries = self.merge_queue.dequeue_batch(10)?;
+        let entries = self.merge_queue.list(10)?;
         // Collect unique session IDs for post-processing
         let mut session_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for entry in &entries {

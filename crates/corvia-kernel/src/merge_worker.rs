@@ -209,7 +209,7 @@ impl MergeWorker {
     /// Run the merge worker loop: dequeue batch, process each, sleep if empty.
     pub async fn run(&self) {
         loop {
-            match self.queue.dequeue_batch(10) {
+            match self.queue.list(10) {
                 Ok(entries) if entries.is_empty() => {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
@@ -324,7 +324,7 @@ mod tests {
         // Enqueue entry B
         queue.enqueue(entry_b.id, "test::agent", &session.session_id, "scope-a").unwrap();
 
-        let queue_entry = queue.dequeue_batch(1).unwrap().into_iter().next().unwrap();
+        let queue_entry = queue.list(1).unwrap().into_iter().next().unwrap();
         worker.process_one(&queue_entry).await.unwrap();
 
         // Entry B should now be Merged
@@ -396,11 +396,11 @@ mod tests {
 
         queue.enqueue(entry_b.id, "test::agent", &session.session_id, "scope-a").unwrap();
 
-        let queue_entry = queue.dequeue_batch(1).unwrap().into_iter().next().unwrap();
+        let queue_entry = queue.list(1).unwrap().into_iter().next().unwrap();
         worker.process_one(&queue_entry).await.unwrap();
 
         // Entry should still be in queue with retry_count=1
-        let entries = queue.dequeue_batch(1).unwrap();
+        let entries = queue.list(1).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].retry_count, 1);
         assert!(entries[0].last_error.is_some());
@@ -425,7 +425,7 @@ mod tests {
         queue.mark_failed(&entry.id, "fail 2").unwrap();
         queue.mark_failed(&entry.id, "fail 3").unwrap();
 
-        let queue_entry = queue.dequeue_batch(1).unwrap().into_iter().next().unwrap();
+        let queue_entry = queue.list(1).unwrap().into_iter().next().unwrap();
         assert_eq!(queue_entry.retry_count, 3);
 
         worker.process_one(&queue_entry).await.unwrap();

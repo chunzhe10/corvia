@@ -57,8 +57,8 @@ impl MergeQueue {
         Ok(())
     }
 
-    /// Dequeue a batch of entries, sorted by enqueued_at (oldest first).
-    pub fn dequeue_batch(&self, limit: usize) -> Result<Vec<MergeQueueEntry>> {
+    /// List a batch of entries, sorted by enqueued_at (oldest first). Read-only (non-destructive).
+    pub fn list(&self, limit: usize) -> Result<Vec<MergeQueueEntry>> {
         let read_txn = self.db.begin_read()
             .map_err(|e| CorviaError::Agent(format!("Failed to begin read txn: {e}")))?;
         let table = read_txn.open_table(MERGE_QUEUE)
@@ -164,7 +164,7 @@ mod tests {
         let queue = test_queue();
         let id = uuid::Uuid::now_v7();
         queue.enqueue(id, "test::agent", "test::agent/sess-abc", "scope").unwrap();
-        let entries = queue.dequeue_batch(10).unwrap();
+        let entries = queue.list(10).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].entry_id, id);
     }
@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn test_dequeue_empty() {
         let queue = test_queue();
-        let entries = queue.dequeue_batch(10).unwrap();
+        let entries = queue.list(10).unwrap();
         assert!(entries.is_empty());
     }
 
@@ -182,7 +182,7 @@ mod tests {
         let id = uuid::Uuid::now_v7();
         queue.enqueue(id, "test::agent", "sess", "scope").unwrap();
         queue.mark_complete(&id).unwrap();
-        assert!(queue.dequeue_batch(10).unwrap().is_empty());
+        assert!(queue.list(10).unwrap().is_empty());
     }
 
     #[test]
@@ -191,7 +191,7 @@ mod tests {
         let id = uuid::Uuid::now_v7();
         queue.enqueue(id, "test::agent", "sess", "scope").unwrap();
         queue.mark_failed(&id, "Ollama down").unwrap();
-        let entries = queue.dequeue_batch(10).unwrap();
+        let entries = queue.list(10).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].retry_count, 1);
         assert_eq!(entries[0].last_error, Some("Ollama down".into()));
