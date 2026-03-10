@@ -88,7 +88,6 @@ enum ToolTier {
 }
 
 /// Check if a tool call has confirmation via _meta.confirmed.
-#[allow(dead_code)]
 fn is_confirmed(meta: Option<&Value>) -> bool {
     meta.and_then(|m| m.get("confirmed"))
         .and_then(|v| v.as_bool())
@@ -96,13 +95,11 @@ fn is_confirmed(meta: Option<&Value>) -> bool {
 }
 
 /// Check if dry_run is requested in arguments.
-#[allow(dead_code)]
 fn is_dry_run(args: &Value) -> bool {
     args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
 /// Return a confirmation-required response for unconfirmed Tier 2+ tools.
-#[allow(dead_code)]
 fn confirmation_response(preview: Value, message: &str) -> Value {
     json!({
         "content": [{
@@ -267,6 +264,72 @@ fn tool_definitions() -> Vec<Value> {
                     "limit": { "type": "integer", "description": "Maximum queue entries to return (default 50)" }
                 }
             }
+        }),
+        // --- Tier 2 (LowRisk) tools — require _meta.confirmed ---
+        json!({
+            "name": "corvia_config_set",
+            "description": "Update a configuration value. Requires confirmation via _meta.confirmed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "section": { "type": "string", "description": "Config section (storage, server, embedding, project, telemetry)" },
+                    "key": { "type": "string", "description": "Config key within the section" },
+                    "value": { "description": "New value to set" }
+                },
+                "required": ["section", "key", "value"]
+            },
+            "annotations": { "tier": "LowRisk" }
+        }),
+        json!({
+            "name": "corvia_gc_run",
+            "description": "Run garbage collection to clean up orphaned staging branches, closed sessions, and inactive agents. Requires confirmation via _meta.confirmed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            },
+            "annotations": { "tier": "LowRisk" }
+        }),
+        json!({
+            "name": "corvia_rebuild_index",
+            "description": "Rebuild the HNSW vector index from knowledge files on disk. Requires confirmation via _meta.confirmed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "dimensions": { "type": "integer", "description": "Vector dimensions (defaults from config)" }
+                }
+            },
+            "annotations": { "tier": "LowRisk" }
+        }),
+        // --- Tier 3 (MediumRisk) tools — require _meta.confirmed + support dry_run ---
+        json!({
+            "name": "corvia_agent_suspend",
+            "description": "Suspend an agent, preventing it from writing new entries. Requires confirmation via _meta.confirmed. Supports dry_run.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "The agent ID to suspend" },
+                    "dry_run": { "type": "boolean", "description": "If true, preview the action without executing" }
+                },
+                "required": ["agent_id"]
+            },
+            "annotations": { "tier": "MediumRisk" }
+        }),
+        json!({
+            "name": "corvia_merge_retry",
+            "description": "Retry failed merge queue entries. Requires confirmation via _meta.confirmed. Supports dry_run.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "entry_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "UUIDs of merge queue entries to retry"
+                    },
+                    "dry_run": { "type": "boolean", "description": "If true, preview the action without executing" }
+                },
+                "required": ["entry_ids"]
+            },
+            "annotations": { "tier": "MediumRisk" }
         }),
     ]
 }
@@ -525,6 +588,13 @@ async fn handle_tools_call(
         "corvia_adapters_list" => tool_corvia_adapters_list(state),
         "corvia_agents_list" => tool_corvia_agents_list(state),
         "corvia_merge_queue" => tool_corvia_merge_queue(state, &arguments),
+        // Tier 2 (LowRisk) — require _meta.confirmed
+        "corvia_config_set" => tool_corvia_config_set(state, &arguments, meta).await,
+        "corvia_gc_run" => tool_corvia_gc_run(state, meta).await,
+        "corvia_rebuild_index" => tool_corvia_rebuild_index(state, &arguments, meta).await,
+        // Tier 3 (MediumRisk) — require _meta.confirmed + support dry_run
+        "corvia_agent_suspend" => tool_corvia_agent_suspend(state, &arguments, meta).await,
+        "corvia_merge_retry" => tool_corvia_merge_retry(state, &arguments, meta).await,
         other => Err((METHOD_NOT_FOUND, format!("Unknown tool: {other}"))),
     }
 }
@@ -1061,6 +1131,194 @@ fn tool_corvia_merge_queue(
     }))
 }
 
+// --- Tier 2 (LowRisk) control-plane tool implementations ---
+
+async fn tool_corvia_config_set(
+    state: &AppState,
+    args: &Value,
+    meta: Option<&Value>,
+) -> Result<Value, (i32, String)> {
+    let section = args.get("section").and_then(|v| v.as_str())
+        .ok_or((INVALID_PARAMS, "Missing 'section' parameter".into()))?;
+    let key = args.get("key").and_then(|v| v.as_str())
+        .ok_or((INVALID_PARAMS, "Missing 'key' parameter".into()))?;
+    let value = args.get("value")
+        .ok_or((INVALID_PARAMS, "Missing 'value' parameter".into()))?;
+
+    if !is_confirmed(meta) {
+        return Ok(confirmation_response(
+            json!({ "section": section, "key": key, "new_value": value }),
+            &format!("Update config {section}.{key}?"),
+        ));
+    }
+
+    let mut config = state.config.write()
+        .map_err(|e| (INTERNAL_ERROR, format!("Config lock poisoned: {e}")))?;
+    corvia_kernel::ops::config_set(&state.config_path, &mut config, section, key, value.clone())
+        .map_err(|e| (INTERNAL_ERROR, format!("Config set failed: {e}")))?;
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string(&json!({
+                "status": "updated",
+                "section": section,
+                "key": key,
+            })).unwrap()
+        }]
+    }))
+}
+
+async fn tool_corvia_gc_run(
+    state: &AppState,
+    meta: Option<&Value>,
+) -> Result<Value, (i32, String)> {
+    if !is_confirmed(meta) {
+        return Ok(confirmation_response(
+            json!({ "action": "garbage_collection" }),
+            "Run garbage collection? This will clean up orphaned branches, closed sessions, and inactive agents.",
+        ));
+    }
+
+    let report = corvia_kernel::ops::gc_run(&state.coordinator).await
+        .map_err(|e| (INTERNAL_ERROR, format!("GC failed: {e}")))?;
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string(&json!({
+                "orphans_rolled_back": report.orphans_rolled_back,
+                "closed_sessions_cleaned": report.closed_sessions_cleaned,
+                "inactive_agents_cleaned": report.inactive_agents_cleaned,
+            })).unwrap()
+        }]
+    }))
+}
+
+async fn tool_corvia_rebuild_index(
+    state: &AppState,
+    args: &Value,
+    meta: Option<&Value>,
+) -> Result<Value, (i32, String)> {
+    let dimensions = args.get("dimensions").and_then(|v| v.as_u64()).map(|d| d as usize)
+        .unwrap_or_else(|| {
+            state.config.read()
+                .map(|c| c.embedding.dimensions)
+                .unwrap_or(768)
+        });
+
+    if !is_confirmed(meta) {
+        return Ok(confirmation_response(
+            json!({ "data_dir": state.data_dir.to_string_lossy(), "dimensions": dimensions }),
+            "Rebuild HNSW index from knowledge files on disk?",
+        ));
+    }
+
+    let entries_indexed = corvia_kernel::ops::rebuild_index(&state.data_dir, dimensions)
+        .map_err(|e| (INTERNAL_ERROR, format!("Rebuild index failed: {e}")))?;
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string(&json!({
+                "status": "rebuilt",
+                "entries_indexed": entries_indexed,
+            })).unwrap()
+        }]
+    }))
+}
+
+// --- Tier 3 (MediumRisk) control-plane tool implementations ---
+
+async fn tool_corvia_agent_suspend(
+    state: &AppState,
+    args: &Value,
+    meta: Option<&Value>,
+) -> Result<Value, (i32, String)> {
+    let agent_id = args.get("agent_id").and_then(|v| v.as_str())
+        .ok_or((INVALID_PARAMS, "Missing 'agent_id' parameter".into()))?;
+
+    if !is_confirmed(meta) {
+        return Ok(confirmation_response(
+            json!({ "agent_id": agent_id }),
+            &format!("Suspend agent '{agent_id}'? This will prevent it from writing new entries."),
+        ));
+    }
+
+    if is_dry_run(args) {
+        return Ok(json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::to_string(&json!({
+                    "dry_run": true,
+                    "would_suspend": agent_id,
+                })).unwrap()
+            }]
+        }));
+    }
+
+    corvia_kernel::ops::agent_suspend(&state.coordinator, agent_id)
+        .map_err(|e| (INTERNAL_ERROR, format!("Agent suspend failed: {e}")))?;
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string(&json!({
+                "status": "suspended",
+                "agent_id": agent_id,
+            })).unwrap()
+        }]
+    }))
+}
+
+async fn tool_corvia_merge_retry(
+    state: &AppState,
+    args: &Value,
+    meta: Option<&Value>,
+) -> Result<Value, (i32, String)> {
+    let entry_ids_raw = args.get("entry_ids").and_then(|v| v.as_array())
+        .ok_or((INVALID_PARAMS, "Missing 'entry_ids' parameter (array of UUID strings)".into()))?;
+
+    let entry_ids: Vec<uuid::Uuid> = entry_ids_raw.iter()
+        .map(|v| {
+            let s = v.as_str().ok_or((INVALID_PARAMS, "entry_ids must be strings".into()))?;
+            uuid::Uuid::parse_str(s).map_err(|e| (INVALID_PARAMS, format!("Invalid UUID '{s}': {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if !is_confirmed(meta) {
+        return Ok(confirmation_response(
+            json!({ "entry_ids": entry_ids_raw, "count": entry_ids.len() }),
+            &format!("Retry {} failed merge queue entries?", entry_ids.len()),
+        ));
+    }
+
+    if is_dry_run(args) {
+        return Ok(json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::to_string(&json!({
+                    "dry_run": true,
+                    "would_retry": entry_ids.len(),
+                })).unwrap()
+            }]
+        }));
+    }
+
+    let count = corvia_kernel::ops::merge_retry(&state.coordinator, &entry_ids)
+        .map_err(|e| (INTERNAL_ERROR, format!("Merge retry failed: {e}")))?;
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string(&json!({
+                "status": "retried",
+                "count": count,
+            })).unwrap()
+        }]
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1155,7 +1413,7 @@ mod tests {
     async fn test_tools_list() {
         let result = handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 18);
 
         let names: Vec<&str> = tools.iter()
             .map(|t| t["name"].as_str().unwrap())
@@ -1173,6 +1431,13 @@ mod tests {
         assert!(names.contains(&"corvia_adapters_list"));
         assert!(names.contains(&"corvia_agents_list"));
         assert!(names.contains(&"corvia_merge_queue"));
+        // Tier 2
+        assert!(names.contains(&"corvia_config_set"));
+        assert!(names.contains(&"corvia_gc_run"));
+        assert!(names.contains(&"corvia_rebuild_index"));
+        // Tier 3
+        assert!(names.contains(&"corvia_agent_suspend"));
+        assert!(names.contains(&"corvia_merge_retry"));
     }
 
     #[tokio::test]
@@ -1499,6 +1764,169 @@ mod tests {
         assert!(result.is_err());
         let (code, _) = result.unwrap_err();
         assert_eq!(code, METHOD_NOT_FOUND);
+    }
+
+    // --- Tier 2 confirmation tests ---
+
+    #[tokio::test]
+    async fn test_config_set_requires_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+
+        // Call without _meta.confirmed — should get confirmation_required
+        let params = json!({
+            "name": "corvia_config_set",
+            "arguments": { "section": "storage", "key": "backend", "value": "lite" }
+        });
+        let result = handle_tools_call(&state, &params).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["confirmation_required"], true);
+        assert_eq!(parsed["preview"]["section"], "storage");
+        assert_eq!(parsed["preview"]["key"], "backend");
+    }
+
+    #[tokio::test]
+    async fn test_config_set_with_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+
+        // Write a full valid TOML config so config_set can read/write/re-parse it
+        let default_config = corvia_common::config::CorviaConfig::default();
+        let config_toml = toml::to_string_pretty(&default_config).unwrap();
+        std::fs::write(state.config_path.clone(), &config_toml).unwrap();
+
+        let params = json!({
+            "name": "corvia_config_set",
+            "_meta": { "confirmed": true },
+            "arguments": { "section": "storage", "key": "backend", "value": "lite" }
+        });
+        let result = handle_tools_call(&state, &params).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["status"], "updated");
+        assert_eq!(parsed["section"], "storage");
+        assert_eq!(parsed["key"], "backend");
+    }
+
+    #[tokio::test]
+    async fn test_gc_run_requires_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+
+        let params = json!({
+            "name": "corvia_gc_run",
+            "arguments": {}
+        });
+        let result = handle_tools_call(&state, &params).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["confirmation_required"], true);
+        assert_eq!(parsed["preview"]["action"], "garbage_collection");
+    }
+
+    #[tokio::test]
+    async fn test_gc_run_with_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+
+        let params = json!({
+            "name": "corvia_gc_run",
+            "_meta": { "confirmed": true },
+            "arguments": {}
+        });
+        let result = handle_tools_call(&state, &params).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["orphans_rolled_back"], 0);
+        assert_eq!(parsed["closed_sessions_cleaned"], 0);
+        assert_eq!(parsed["inactive_agents_cleaned"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_rebuild_index_requires_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+
+        let params = json!({
+            "name": "corvia_rebuild_index",
+            "arguments": {}
+        });
+        let result = handle_tools_call(&state, &params).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["confirmation_required"], true);
+        assert!(parsed["preview"]["dimensions"].as_u64().unwrap() > 0);
+    }
+
+    // --- Tier 3 confirmation + dry_run tests ---
+
+    #[tokio::test]
+    async fn test_agent_suspend_requires_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+
+        let params = json!({
+            "name": "corvia_agent_suspend",
+            "arguments": { "agent_id": "test-agent" }
+        });
+        let result = handle_tools_call(&state, &params).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["confirmation_required"], true);
+        assert_eq!(parsed["preview"]["agent_id"], "test-agent");
+    }
+
+    #[tokio::test]
+    async fn test_agent_suspend_dry_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+
+        let params = json!({
+            "name": "corvia_agent_suspend",
+            "_meta": { "confirmed": true },
+            "arguments": { "agent_id": "test-agent", "dry_run": true }
+        });
+        let result = handle_tools_call(&state, &params).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["dry_run"], true);
+        assert_eq!(parsed["would_suspend"], "test-agent");
+    }
+
+    #[tokio::test]
+    async fn test_merge_retry_requires_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+
+        let id = uuid::Uuid::now_v7().to_string();
+        let params = json!({
+            "name": "corvia_merge_retry",
+            "arguments": { "entry_ids": [id] }
+        });
+        let result = handle_tools_call(&state, &params).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["confirmation_required"], true);
+        assert_eq!(parsed["preview"]["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_merge_retry_dry_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+
+        let id = uuid::Uuid::now_v7().to_string();
+        let params = json!({
+            "name": "corvia_merge_retry",
+            "_meta": { "confirmed": true },
+            "arguments": { "entry_ids": [id], "dry_run": true }
+        });
+        let result = handle_tools_call(&state, &params).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["dry_run"], true);
+        assert_eq!(parsed["would_retry"], 1);
     }
 
 }

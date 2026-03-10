@@ -14,6 +14,7 @@ categories = ["web-programming::http-server", "development-tools"]
 [dependencies]
 corvia-common.workspace = true
 corvia-kernel.workspace = true
+corvia-telemetry.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -28,3 +29,4 @@ tokio-stream = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+toml = "0.8"
