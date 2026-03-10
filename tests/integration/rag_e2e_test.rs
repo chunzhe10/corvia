@@ -67,7 +67,7 @@ async fn test_rag_pipeline_context_mode_e2e() {
         None,
         None,
         &config,
-    );
+    ).await;
 
     // Without graph, should use VectorRetriever.
     assert_eq!(pipeline.retriever_name(), "vector");
@@ -148,7 +148,7 @@ async fn test_rag_pipeline_with_graph_e2e() {
         Some(store.clone() as Arc<dyn GraphStore>),
         None,
         &config,
-    );
+    ).await;
 
     assert_eq!(pipeline.retriever_name(), "graph_expand");
 
@@ -191,7 +191,7 @@ async fn test_rag_pipeline_ask_without_generator_e2e() {
         None,
         None,
         &config,
-    );
+    ).await;
 
     let result = pipeline.ask("question", "empty-scope", None).await;
     assert!(result.is_err(), "ask() without generator should fail");

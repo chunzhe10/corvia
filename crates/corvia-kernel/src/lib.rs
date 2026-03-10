@@ -94,12 +94,14 @@ pub mod process_adapter;
 pub mod grpc_engine;
 pub mod grpc_chat;
 pub mod inference_provisioner;
+pub mod skill_registry;
 #[cfg(feature = "postgres")]
 pub mod postgres_store;
 
 use corvia_common::config::{CorviaConfig, InferenceProvider, StoreType};
 use corvia_common::errors::Result;
 use std::sync::Arc;
+use tracing::{info, warn};
 
 /// Create the appropriate InferenceEngine based on config.
 pub fn create_engine(config: &CorviaConfig) -> Arc<dyn traits::InferenceEngine> {
@@ -283,9 +285,12 @@ pub async fn create_full_store(
 /// [`GraphStore`](traits::GraphStore) is available,
 /// [`VectorRetriever`](retriever::VectorRetriever) otherwise.
 ///
+/// When `skills_enabled` is true in the config, loads skill files from
+/// `skills_dirs` and embeds their descriptions for query-time matching.
+///
 /// This is the main entry point for constructing a ready-to-use
 /// [`RagPipeline`](rag_pipeline::RagPipeline) from the kernel's factory layer.
-pub fn create_rag_pipeline(
+pub async fn create_rag_pipeline(
     store: Arc<dyn traits::QueryableStore>,
     engine: Arc<dyn traits::InferenceEngine>,
     graph: Option<Arc<dyn traits::GraphStore>>,
@@ -301,13 +306,52 @@ pub fn create_rag_pipeline(
         )),
         None => Arc::new(retriever::VectorRetriever::new(store.clone(), engine.clone())),
     };
-    let aug: Arc<dyn augmenter::Augmenter> = if config.rag.system_prompt.is_empty() {
-        Arc::new(augmenter::StructuredAugmenter::new())
+
+    let system_prompt = if config.rag.system_prompt.is_empty() {
+        String::new()
     } else {
-        Arc::new(augmenter::StructuredAugmenter::with_system_prompt(
-            config.rag.system_prompt.clone(),
-        ))
+        config.rag.system_prompt.clone()
     };
+
+    // Load skill registry when enabled.
+    let skill_reg = if config.rag.skills_enabled {
+        match skill_registry::SkillRegistry::load(&config.rag.skills_dirs, engine.clone()).await {
+            Ok(reg) if !reg.is_empty() => {
+                info!(count = reg.len(), "skill registry loaded");
+                Some(Arc::new(reg))
+            }
+            Ok(_) => {
+                info!("skills enabled but no skill files found");
+                None
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to load skills, continuing without");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let aug: Arc<dyn augmenter::Augmenter> = match skill_reg {
+        Some(reg) => {
+            let prompt = if system_prompt.is_empty() {
+                "You are a knowledge assistant. Answer questions using only the provided context. \
+                 Cite sources using [N] notation.".to_string()
+            } else {
+                system_prompt
+            };
+            Arc::new(augmenter::StructuredAugmenter::with_skills(prompt, reg))
+        }
+        None => {
+            if system_prompt.is_empty() {
+                Arc::new(augmenter::StructuredAugmenter::new())
+            } else {
+                Arc::new(augmenter::StructuredAugmenter::with_system_prompt(system_prompt))
+            }
+        }
+    };
+
     rag_pipeline::RagPipeline::new(ret, aug, generator, config.rag.clone())
 }
 
@@ -388,7 +432,7 @@ mod tests {
             ),
         );
 
-        let pipeline = create_rag_pipeline(store, engine, None, None, &config);
+        let pipeline = create_rag_pipeline(store, engine, None, None, &config).await;
         assert_eq!(pipeline.retriever_name(), "vector");
     }
 
@@ -408,7 +452,7 @@ mod tests {
             ),
         );
 
-        let pipeline = create_rag_pipeline(store, engine, Some(graph), None, &config);
+        let pipeline = create_rag_pipeline(store, engine, Some(graph), None, &config).await;
         assert_eq!(pipeline.retriever_name(), "graph_expand");
     }
 }

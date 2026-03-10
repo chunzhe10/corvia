@@ -198,6 +198,23 @@ pub struct RagConfig {
     pub system_prompt: String,
     #[serde(default = "default_graph_oversample")]
     pub graph_oversample_factor: usize,
+    /// Master toggle for the dynamic skill system. When false, no skills are
+    /// loaded or matched — identical to pre-skill behavior. Default: false.
+    #[serde(default)]
+    pub skills_enabled: bool,
+    /// Directories to load skill files from. Globs `*.md` in each directory.
+    /// Later directories override same-named skills. Default: `["skills"]`.
+    #[serde(default = "default_skills_dirs")]
+    pub skills_dirs: Vec<String>,
+    /// Maximum number of skills injected per query. Default: 3.
+    #[serde(default = "default_max_skills")]
+    pub max_skills: usize,
+    /// Minimum cosine similarity between query and skill description to select. Default: 0.3.
+    #[serde(default = "default_skill_threshold")]
+    pub skill_threshold: f32,
+    /// Fraction of context window reserved for skill content. Default: 0.15.
+    #[serde(default = "default_reserve_for_skills")]
+    pub reserve_for_skills: f32,
 }
 
 fn default_rag_limit() -> usize { 10 }
@@ -206,6 +223,10 @@ fn default_graph_depth() -> usize { 2 }
 fn default_graph_alpha() -> f32 { 0.3 }
 fn default_reserve_for_answer() -> f32 { 0.2 }
 fn default_graph_oversample() -> usize { 3 }
+fn default_skills_dirs() -> Vec<String> { vec!["skills".into()] }
+fn default_max_skills() -> usize { 3 }
+fn default_skill_threshold() -> f32 { 0.3 }
+fn default_reserve_for_skills() -> f32 { 0.15 }
 
 impl Default for RagConfig {
     fn default() -> Self {
@@ -218,6 +239,11 @@ impl Default for RagConfig {
             max_context_tokens: 0,
             system_prompt: String::new(),
             graph_oversample_factor: default_graph_oversample(),
+            skills_enabled: false,
+            skills_dirs: default_skills_dirs(),
+            max_skills: default_max_skills(),
+            skill_threshold: default_skill_threshold(),
+            reserve_for_skills: default_reserve_for_skills(),
         }
     }
 }

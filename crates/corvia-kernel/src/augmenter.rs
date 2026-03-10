@@ -10,9 +10,11 @@
 
 use corvia_common::errors::Result;
 use corvia_common::types::SearchResult;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::rag_types::{AugmentationMetrics, AugmentedContext, TokenBudget};
+use crate::skill_registry::SkillRegistry;
 
 /// Default system prompt for the knowledge assistant.
 const DEFAULT_SYSTEM_PROMPT: &str =
@@ -56,6 +58,7 @@ pub trait Augmenter: Send + Sync {
 /// ```
 pub struct StructuredAugmenter {
     system_prompt: String,
+    skill_registry: Option<Arc<SkillRegistry>>,
 }
 
 impl StructuredAugmenter {
@@ -63,6 +66,7 @@ impl StructuredAugmenter {
     pub fn new() -> Self {
         Self {
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
+            skill_registry: None,
         }
     }
 
@@ -70,6 +74,15 @@ impl StructuredAugmenter {
     pub fn with_system_prompt(system_prompt: impl Into<String>) -> Self {
         Self {
             system_prompt: system_prompt.into(),
+            skill_registry: None,
+        }
+    }
+
+    /// Create a new StructuredAugmenter with skills support.
+    pub fn with_skills(system_prompt: impl Into<String>, registry: Arc<SkillRegistry>) -> Self {
+        Self {
+            system_prompt: system_prompt.into(),
+            skill_registry: Some(registry),
         }
     }
 }
@@ -95,9 +108,47 @@ impl Augmenter for StructuredAugmenter {
 
         // Resolve the effective token budget.
         let effective_budget = budget.max_context_tokens.unwrap_or(DEFAULT_TOKEN_BUDGET);
-        // Reserve tokens for answer generation.
-        let context_budget =
-            (effective_budget as f32 * (1.0 - budget.reserve_for_answer)) as usize;
+
+        // --- Skill matching and injection ---
+        let mut skills_used: Vec<String> = Vec::new();
+        let system_prompt = if let (Some(registry), Some(ref query_emb)) =
+            (&self.skill_registry, &budget.query_embedding)
+        {
+            let skills_budget =
+                (effective_budget as f32 * budget.reserve_for_skills) as usize;
+            if skills_budget > 0 && budget.max_skills > 0 {
+                let matches =
+                    registry.match_skills(query_emb, budget.skill_threshold, budget.max_skills);
+                let mut skill_parts: Vec<String> = Vec::new();
+                let mut skill_tokens_used: usize = 0;
+                for m in &matches {
+                    let tokens = estimate_tokens(&m.skill.content);
+                    if skill_tokens_used + tokens > skills_budget {
+                        break;
+                    }
+                    skill_parts.push(m.skill.content.clone());
+                    skills_used.push(m.skill.name.clone());
+                    skill_tokens_used += tokens;
+                }
+                if skill_parts.is_empty() {
+                    self.system_prompt.clone()
+                } else {
+                    let mut prompt = skill_parts.join("\n\n");
+                    prompt.push_str("\n\n---\n");
+                    prompt.push_str(&self.system_prompt);
+                    prompt
+                }
+            } else {
+                self.system_prompt.clone()
+            }
+        } else {
+            self.system_prompt.clone()
+        };
+
+        // Reserve tokens for answer generation (skills budget already carved out).
+        let context_budget = (effective_budget as f32
+            * (1.0 - budget.reserve_for_answer - budget.reserve_for_skills))
+            as usize;
 
         // Handle empty results.
         if results.is_empty() {
@@ -107,7 +158,7 @@ impl Augmenter for StructuredAugmenter {
                      Cite sources using [N] notation.\nQuestion: {query}"
                 );
             return Ok(AugmentedContext {
-                system_prompt: self.system_prompt.clone(),
+                system_prompt,
                 context,
                 sources: Vec::new(),
                 metrics: AugmentationMetrics {
@@ -117,6 +168,7 @@ impl Augmenter for StructuredAugmenter {
                     sources_included: 0,
                     sources_truncated: 0,
                     augmenter_name: self.name().to_string(),
+                    skills_used,
                 },
             });
         }
@@ -175,7 +227,7 @@ impl Augmenter for StructuredAugmenter {
         let total_token_estimate = tokens_used + footer_tokens;
 
         Ok(AugmentedContext {
-            system_prompt: self.system_prompt.clone(),
+            system_prompt,
             context,
             sources: included_sources,
             metrics: AugmentationMetrics {
@@ -185,6 +237,7 @@ impl Augmenter for StructuredAugmenter {
                 sources_included: results.len() - sources_truncated,
                 sources_truncated,
                 augmenter_name: self.name().to_string(),
+                skills_used,
             },
         })
     }

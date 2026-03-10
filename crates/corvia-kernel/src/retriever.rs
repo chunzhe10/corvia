@@ -49,6 +49,7 @@ fn check_rbac_scope(
                         post_filter_count: 0,
                         retriever_name: retriever_name.to_string(),
                     },
+                    query_embedding: None,
                 });
             }
         }
@@ -142,6 +143,7 @@ impl Retriever for VectorRetriever {
                 post_filter_count,
                 retriever_name: self.name().to_string(),
             },
+            query_embedding: Some(embedding),
         })
     }
 }
@@ -406,6 +408,7 @@ impl Retriever for GraphExpandRetriever {
                 post_filter_count,
                 retriever_name: self.name().to_string(),
             },
+            query_embedding: Some(embedding),
         })
     }
 }

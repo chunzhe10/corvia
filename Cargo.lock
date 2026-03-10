@@ -1142,6 +1142,7 @@ dependencies = [
  "corvia-common",
  "corvia-proto",
  "futures-util",
+ "glob",
  "hnsw_rs",
  "pdf-extract",
  "petgraph",

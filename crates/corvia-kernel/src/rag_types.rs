@@ -43,6 +43,14 @@ pub struct TokenBudget {
     pub max_context_tokens: Option<usize>,
     /// Fraction of context window reserved for answer generation.
     pub reserve_for_answer: f32,
+    /// Fraction of context window reserved for skill content. 0.0 = skills disabled.
+    pub reserve_for_skills: f32,
+    /// Query embedding for skill matching. None = skip skill matching.
+    pub query_embedding: Option<Vec<f32>>,
+    /// Maximum number of skills to inject.
+    pub max_skills: usize,
+    /// Minimum cosine similarity to select a skill.
+    pub skill_threshold: f32,
 }
 
 impl Default for TokenBudget {
@@ -50,6 +58,10 @@ impl Default for TokenBudget {
         Self {
             max_context_tokens: None,
             reserve_for_answer: 0.2,
+            reserve_for_skills: 0.0,
+            query_embedding: None,
+            max_skills: 0,
+            skill_threshold: 0.3,
         }
     }
 }
@@ -59,6 +71,8 @@ impl Default for TokenBudget {
 pub struct RetrievalResult {
     pub results: Vec<SearchResult>,
     pub metrics: RetrievalMetrics,
+    /// Query embedding produced during retrieval, reused for skill matching.
+    pub query_embedding: Option<Vec<f32>>,
 }
 
 /// Metrics from the retrieval stage.
@@ -91,6 +105,9 @@ pub struct AugmentationMetrics {
     pub sources_included: usize,
     pub sources_truncated: usize,
     pub augmenter_name: String,
+    /// Names of dynamic skills injected into the system prompt.
+    #[serde(default)]
+    pub skills_used: Vec<String>,
 }
 
 // Re-export from traits — single definition used by both GenerationEngine and RAG pipeline.

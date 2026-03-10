@@ -132,6 +132,18 @@ impl RagPipeline {
         let budget = TokenBudget {
             max_context_tokens,
             reserve_for_answer: self.config.reserve_for_answer,
+            reserve_for_skills: if self.config.skills_enabled {
+                self.config.reserve_for_skills
+            } else {
+                0.0
+            },
+            query_embedding: if self.config.skills_enabled {
+                retrieval.query_embedding.clone()
+            } else {
+                None
+            },
+            max_skills: self.config.max_skills,
+            skill_threshold: self.config.skill_threshold,
         };
 
         let augmented = self
