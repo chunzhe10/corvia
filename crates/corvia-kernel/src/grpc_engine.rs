@@ -51,6 +51,7 @@ impl GrpcInferenceEngine {
 
 #[async_trait]
 impl super::traits::InferenceEngine for GrpcInferenceEngine {
+    #[tracing::instrument(name = "corvia.entry.embed", skip(self, text))]
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let mut client = self.connect().await?;
         let request = tonic::Request::new(EmbedRequest {

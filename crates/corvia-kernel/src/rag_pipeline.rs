@@ -55,6 +55,7 @@ impl RagPipeline {
     }
 
     /// Context-only mode: retrieve + augment, no generation.
+    #[tracing::instrument(name = "corvia.rag.context", skip(self, query, opts), fields(scope_id))]
     pub async fn context(
         &self,
         query: &str,
@@ -65,6 +66,7 @@ impl RagPipeline {
     }
 
     /// Full RAG: retrieve + augment + generate.
+    #[tracing::instrument(name = "corvia.rag.ask", skip(self, query, opts), fields(scope_id))]
     pub async fn ask(
         &self,
         query: &str,

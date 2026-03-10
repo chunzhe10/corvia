@@ -49,6 +49,7 @@ impl MergeWorker {
     }
 
     /// Process a single merge queue entry.
+    #[tracing::instrument(name = "corvia.merge.process", skip(self, queue_entry), fields(entry_id = %queue_entry.entry_id))]
     pub async fn process_one(&self, queue_entry: &MergeQueueEntry) -> Result<()> {
         // Check max retries
         if queue_entry.retry_count >= self.merge_config.max_retries {
@@ -116,6 +117,7 @@ impl MergeWorker {
 
     /// Detect if a queued entry conflicts with any existing Merged entry.
     /// Returns the conflicting entry if similarity > threshold in the same scope.
+    #[tracing::instrument(name = "corvia.merge.conflict", skip(self, entry), fields(entry_id = %entry.id, scope_id = %entry.scope_id))]
     pub async fn detect_conflict(
         &self,
         entry: &KnowledgeEntry,
@@ -169,6 +171,7 @@ impl MergeWorker {
     }
 
     /// LLM merge: use GenerationEngine to merge two conflicting entries.
+    #[tracing::instrument(name = "corvia.merge.llm_resolve", skip(self, new_entry, existing), fields(new_id = %new_entry.id, existing_id = %existing.id))]
     async fn llm_merge(
         &self,
         new_entry: &KnowledgeEntry,

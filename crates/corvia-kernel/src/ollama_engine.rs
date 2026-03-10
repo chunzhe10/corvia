@@ -54,6 +54,7 @@ impl OllamaEngine {
 
 #[async_trait]
 impl super::traits::InferenceEngine for OllamaEngine {
+    #[tracing::instrument(name = "corvia.entry.embed", skip(self, text))]
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let results = self.embed_batch(&[text.to_string()]).await?;
         results.into_iter().next()

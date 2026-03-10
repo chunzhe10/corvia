@@ -500,6 +500,7 @@ impl super::traits::QueryableStore for LiteStore {
         Ok(())
     }
 
+    #[tracing::instrument(name = "corvia.store.insert", skip(self, entry), fields(entry_id = %entry.id, scope_id = %entry.scope_id))]
     async fn insert(&self, entry: &KnowledgeEntry) -> Result<()> {
         let embedding = entry
             .embedding
@@ -529,6 +530,7 @@ impl super::traits::QueryableStore for LiteStore {
         Ok(())
     }
 
+    #[tracing::instrument(name = "corvia.store.search", skip(self, embedding), fields(scope_id))]
     async fn search(
         &self,
         embedding: &[f32],
@@ -604,6 +606,7 @@ impl super::traits::QueryableStore for LiteStore {
         Ok(results)
     }
 
+    #[tracing::instrument(name = "corvia.store.get", skip(self))]
     async fn get(&self, id: &uuid::Uuid) -> Result<Option<KnowledgeEntry>> {
         let uuid_str = id.to_string();
         let read_txn = self

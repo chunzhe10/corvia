@@ -106,6 +106,7 @@ impl AgentCoordinator {
     }
 
     /// Register an agent from an identity.
+    #[tracing::instrument(name = "corvia.agent.register", skip(self, identity, permissions), fields(display_name))]
     pub fn register_agent(
         &self,
         identity: &AgentIdentity,
@@ -148,6 +149,7 @@ impl AgentCoordinator {
     }
 
     /// Create a new session for an agent.
+    #[tracing::instrument(name = "corvia.session.create", skip(self), fields(agent_id, with_staging))]
     pub fn create_session(&self, agent_id: &str, with_staging: bool) -> Result<SessionRecord> {
         let session = self.sessions.create(agent_id, with_staging)?;
         self.sessions.transition(&session.session_id, SessionState::Active)?;
@@ -169,6 +171,7 @@ impl AgentCoordinator {
 
     /// Write a knowledge entry within a session.
     /// Checks RBAC: the session's agent must have write permission for the scope.
+    #[tracing::instrument(name = "corvia.entry.write", skip(self, content, scope_id, source_version), fields(session_id))]
     pub async fn write_entry(
         &self,
         session_id: &str,
@@ -207,6 +210,7 @@ impl AgentCoordinator {
     }
 
     /// Commit a session — transitions through the commit pipeline.
+    #[tracing::instrument(name = "corvia.session.commit", skip(self), fields(session_id))]
     pub async fn commit_session(&self, session_id: &str) -> Result<()> {
         self.commit_pipeline.commit_session(session_id).await
     }
@@ -285,6 +289,7 @@ impl AgentCoordinator {
     }
 
     /// Run garbage collection: Active past timeout → Stale, Stale past grace → Orphaned → rollback.
+    #[tracing::instrument(name = "corvia.gc.run", skip(self))]
     pub async fn gc(&self) -> Result<GcReport> {
         let mut report = GcReport::default();
 
@@ -322,6 +327,7 @@ impl AgentCoordinator {
 
     /// Process one batch of merge queue entries, then close completed sessions.
     /// Can be called manually or from a background polling loop (see `MergeWorker::run()`).
+    #[tracing::instrument(name = "corvia.merge.process", skip(self))]
     pub async fn process_merge_queue(&self) -> Result<()> {
         let entries = self.merge_queue.list(10)?;
         // Collect unique session IDs for post-processing
