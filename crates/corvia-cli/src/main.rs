@@ -79,7 +79,11 @@ enum Commands {
     },
 
     /// Show status of Corvia services
-    Status,
+    Status {
+        /// Show extended metrics (store type, inference, telemetry, agents, adapters)
+        #[arg(long)]
+        metrics: bool,
+    },
 
     /// Run Introspect: self-ingest + self-query validation
     Test {
@@ -259,12 +263,18 @@ enum WorkspaceCommands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "corvia=info".into()),
-        )
-        .init();
+    // Load telemetry config if available; otherwise use defaults (stdout + text).
+    let telemetry_config = CorviaConfig::config_path();
+    let telem_cfg = if telemetry_config.exists() {
+        CorviaConfig::load(&telemetry_config)
+            .map(|c| c.telemetry)
+            .unwrap_or_default()
+    } else {
+        corvia_common::config::TelemetryConfig::default()
+    };
+    if let Err(e) = corvia_telemetry::init_telemetry(&telem_cfg) {
+        eprintln!("Warning: telemetry init failed: {e}");
+    }
 
     let cli = Cli::parse();
 
@@ -273,7 +283,7 @@ async fn main() -> Result<()> {
         Commands::Serve => cmd_serve().await?,
         Commands::Ingest { path } => cmd_ingest(path.as_deref()).await?,
         Commands::Search { query, limit } => cmd_search(&query, limit).await?,
-        Commands::Status => cmd_status().await?,
+        Commands::Status { metrics } => cmd_status(metrics).await?,
         Commands::Test { check_only, keep, ci } => cmd_test(check_only, keep, ci).await?,
         Commands::Demo { keep } => cmd_demo(keep).await?,
         Commands::Rebuild => cmd_rebuild().await?,
@@ -438,7 +448,13 @@ async fn cmd_serve() -> Result<()> {
     let data_dir = std::path::PathBuf::from(&config.storage.data_dir);
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let default_scope_id = Some(config.project.scope_id.clone());
-    let state = Arc::new(corvia_server::rest::AppState { store, engine, coordinator, graph, temporal, data_dir, rag: Some(rag), ready: ready.clone(), default_scope_id });
+    let config_path = CorviaConfig::config_path();
+    let state = Arc::new(corvia_server::rest::AppState {
+        store, engine, coordinator, graph, temporal, data_dir,
+        rag: Some(rag), ready: ready.clone(), default_scope_id,
+        config: Arc::new(std::sync::RwLock::new(config.clone())),
+        config_path,
+    });
     let mut app = corvia_server::rest::router(state.clone());
     app = app.merge(corvia_server::mcp::mcp_router(state));
     println!("MCP endpoint: POST/GET/DELETE /mcp (Streamable HTTP)");
@@ -617,7 +633,7 @@ async fn cmd_search(query: &str, limit: usize) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_status() -> Result<()> {
+async fn cmd_status(metrics: bool) -> Result<()> {
     let config = load_config()?;
 
     if config.is_workspace() {
@@ -685,6 +701,61 @@ async fn cmd_status() -> Result<()> {
                 println!("  Merge queue depth: {queue_depth}");
             }
             Err(_) => {} // coordination not initialized yet
+        }
+    }
+
+    // Extended metrics output (only when --metrics is passed)
+    if metrics {
+        println!("\nExtended metrics:");
+
+        // Store type
+        let store_type = match config.storage.store_type {
+            corvia_common::config::StoreType::Lite => "lite",
+            corvia_common::config::StoreType::Surrealdb => "surrealdb",
+            corvia_common::config::StoreType::Postgres => "postgres",
+        };
+        println!("  Store type: {store_type}");
+
+        // Inference provider and URL
+        let provider = match config.embedding.provider {
+            corvia_common::config::InferenceProvider::Ollama => "ollama",
+            corvia_common::config::InferenceProvider::Vllm => "vllm",
+            corvia_common::config::InferenceProvider::Corvia => "corvia",
+        };
+        println!("  Inference provider: {provider}");
+        println!("  Inference URL: {}", config.embedding.url);
+
+        // Telemetry exporter
+        println!("  Telemetry exporter: {}", config.telemetry.exporter);
+
+        // Agent counts (registered + active)
+        if coord_db_path.exists() {
+            use corvia_kernel::agent_registry::AgentRegistry;
+            match AgentRegistry::open(data_dir) {
+                Ok(registry) => {
+                    let all_agents = registry.list_all().unwrap_or_default();
+                    let active_agents = registry.list_active().unwrap_or_default();
+                    println!("  Registered agents: {}", all_agents.len());
+                    println!("  Active agents: {}", active_agents.len());
+                }
+                Err(_) => {
+                    println!("  Registered agents: 0");
+                    println!("  Active agents: 0");
+                }
+            }
+        } else {
+            println!("  Registered agents: 0");
+            println!("  Active agents: 0");
+        }
+
+        // Discovered adapters
+        let extra_dirs = config.adapters.as_ref()
+            .map(|a| a.search_dirs.clone())
+            .unwrap_or_default();
+        let adapters = corvia_kernel::ops::adapters_list(&extra_dirs);
+        println!("  Discovered adapters: {}", adapters.len());
+        for adapter in &adapters {
+            println!("    - {} ({})", adapter.metadata.name, adapter.binary_path.display());
         }
     }
 
