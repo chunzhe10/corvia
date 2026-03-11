@@ -13,6 +13,7 @@ use corvia_kernel::traits::{GraphStore, InferenceEngine, QueryableStore, Tempora
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tower_http::trace::TraceLayer;
 use tracing::info;
 
 pub struct AppState {
@@ -278,6 +279,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/context", post(rag_context))
         .route("/v1/ask", post(rag_ask))
         .route("/health", get(health))
+        .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
