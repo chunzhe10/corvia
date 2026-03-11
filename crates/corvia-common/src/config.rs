@@ -284,6 +284,10 @@ pub struct TelemetryConfig {
     pub exporter: String,
     #[serde(default)]
     pub otlp_endpoint: String,
+    #[serde(default = "default_telemetry_otlp_protocol")]
+    pub otlp_protocol: String,
+    #[serde(default = "default_telemetry_service_name")]
+    pub service_name: String,
     #[serde(default = "default_telemetry_log_format")]
     pub log_format: String,
     #[serde(default = "default_telemetry_metrics_enabled")]
@@ -291,6 +295,8 @@ pub struct TelemetryConfig {
 }
 
 fn default_telemetry_exporter() -> String { "stdout".into() }
+fn default_telemetry_otlp_protocol() -> String { "grpc".into() }
+fn default_telemetry_service_name() -> String { "corvia".into() }
 fn default_telemetry_log_format() -> String { "text".into() }
 fn default_telemetry_metrics_enabled() -> bool { true }
 
@@ -299,6 +305,8 @@ impl Default for TelemetryConfig {
         Self {
             exporter: default_telemetry_exporter(),
             otlp_endpoint: String::new(),
+            otlp_protocol: default_telemetry_otlp_protocol(),
+            service_name: default_telemetry_service_name(),
             log_format: default_telemetry_log_format(),
             metrics_enabled: default_telemetry_metrics_enabled(),
         }
@@ -867,6 +875,29 @@ adapter = "confluence"
         let loaded: CorviaConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(loaded.adapters.unwrap().default, Some("basic".into()));
         assert_eq!(loaded.sources.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_telemetry_config_new_fields() {
+        let config = TelemetryConfig::default();
+        assert_eq!(config.service_name, "corvia");
+        assert_eq!(config.otlp_protocol, "grpc");
+    }
+
+    #[test]
+    fn test_telemetry_config_deserialize_new_fields() {
+        let toml_str = r#"
+            exporter = "otlp"
+            otlp_endpoint = "http://localhost:4317"
+            otlp_protocol = "grpc"
+            service_name = "corvia-inference"
+            log_format = "json"
+            metrics_enabled = true
+        "#;
+        let config: TelemetryConfig = toml::de::from_str(toml_str).unwrap();
+        assert_eq!(config.service_name, "corvia-inference");
+        assert_eq!(config.otlp_protocol, "grpc");
+        assert_eq!(config.otlp_endpoint, "http://localhost:4317");
     }
 
     #[test]

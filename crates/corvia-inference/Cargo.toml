@@ -9,7 +9,10 @@ name = "corvia-inference"
 path = "src/main.rs"
 
 [dependencies]
+corvia-common = { workspace = true }
 corvia-proto.workspace = true
+corvia-telemetry = { workspace = true }
+opentelemetry = { workspace = true }
 tonic.workspace = true
 prost = "0.13"
 tokio.workspace = true

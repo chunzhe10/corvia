@@ -13,6 +13,7 @@ use corvia_common::types::EdgeDirection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
+use tower_http::trace::TraceLayer;
 use tracing::info;
 use uuid::Uuid;
 
@@ -335,6 +336,7 @@ pub fn mcp_router(state: Arc<AppState>) -> Router {
         .route("/mcp", post(handle_mcp_post))
         .route("/mcp", get(handle_mcp_get))
         .route("/mcp", delete(handle_mcp_delete))
+        .layer(TraceLayer::new_for_http())
         .with_state(mcp_state)
 }
 
