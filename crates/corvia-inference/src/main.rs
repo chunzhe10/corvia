@@ -3,9 +3,12 @@ mod embedding_service;
 mod model_manager;
 
 use clap::Parser;
+use corvia_common::config::TelemetryConfig;
 use corvia_proto::chat_service_server::ChatServiceServer;
 use corvia_proto::embedding_service_server::EmbeddingServiceServer;
 use corvia_proto::model_manager_server::ModelManagerServer;
+use corvia_telemetry::propagation::MetadataExtractor;
+use opentelemetry::global;
 use tonic::transport::Server;
 
 #[derive(Parser)]
@@ -26,14 +29,28 @@ enum Commands {
     },
 }
 
+/// Tonic interceptor that extracts W3C trace context from incoming gRPC metadata.
+fn accept_trace(
+    request: tonic::Request<()>,
+) -> std::result::Result<tonic::Request<()>, tonic::Status> {
+    let parent_cx = global::get_text_map_propagator(|propagator| {
+        propagator.extract(&MetadataExtractor(request.metadata()))
+    });
+    // Attach the parent context so spans created in this request inherit it.
+    // The guard is intentionally dropped — tracing-opentelemetry captures the
+    // current OTel context at span creation time, so child spans created
+    // immediately after will pick up the parent.
+    parent_cx.attach();
+    Ok(request)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "corvia_inference=info".into()),
-        )
-        .init();
+    let telemetry_config = TelemetryConfig {
+        service_name: "corvia-inference".into(),
+        ..Default::default()
+    };
+    let _telemetry_guard = corvia_telemetry::init_telemetry(&telemetry_config)?;
 
     let cli = Cli::parse();
 
@@ -47,12 +64,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 chat_svc.clone(),
             );
 
-            tracing::info!("corvia-inference listening on {addr}");
+            tracing::info!(port, "inference_server_starting");
 
             Server::builder()
                 .add_service(ModelManagerServer::new(model_mgr))
-                .add_service(EmbeddingServiceServer::new(embed_svc))
-                .add_service(ChatServiceServer::new(chat_svc))
+                .add_service(EmbeddingServiceServer::with_interceptor(embed_svc, accept_trace))
+                .add_service(ChatServiceServer::with_interceptor(chat_svc, accept_trace))
                 .serve(addr)
                 .await?;
         }
