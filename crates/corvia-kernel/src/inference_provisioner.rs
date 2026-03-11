@@ -80,7 +80,7 @@ impl InferenceProvisioner {
     }
 
     /// Load models on the server.
-    pub async fn load_models(&self, embed_model: &str, chat_model: &str) -> Result<()> {
+    pub async fn load_models(&self, embed_model: &str, chat_model: Option<&str>) -> Result<()> {
         let mut client = ModelManagerClient::connect(self.endpoint_url())
             .await
             .map_err(|e| CorviaError::Infra(format!("gRPC connect failed: {e}")))?;
@@ -102,28 +102,30 @@ impl InferenceProvisioner {
         }
         info!("Loaded embedding model: {embed_model}");
 
-        // Load chat model
-        let resp = client
-            .load_model(tonic::Request::new(LoadModelRequest {
-                name: chat_model.to_string(),
-                model_type: "chat".to_string(),
-            }))
-            .await
-            .map_err(|e| CorviaError::Infra(format!("LoadModel failed: {e}")))?;
-        let resp = resp.into_inner();
-        if !resp.success {
-            return Err(CorviaError::Infra(format!(
-                "Failed to load chat model: {}",
-                resp.error
-            )));
+        // Load chat model (optional — skipped when [merge] is not configured)
+        if let Some(chat_model) = chat_model {
+            let resp = client
+                .load_model(tonic::Request::new(LoadModelRequest {
+                    name: chat_model.to_string(),
+                    model_type: "chat".to_string(),
+                }))
+                .await
+                .map_err(|e| CorviaError::Infra(format!("LoadModel failed: {e}")))?;
+            let resp = resp.into_inner();
+            if !resp.success {
+                return Err(CorviaError::Infra(format!(
+                    "Failed to load chat model: {}",
+                    resp.error
+                )));
+            }
+            info!("Loaded chat model: {chat_model}");
         }
-        info!("Loaded chat model: {chat_model}");
 
         Ok(())
     }
 
     /// Full provisioning: start if not running → wait → load models.
-    pub async fn ensure_ready(&self, embed_model: &str, chat_model: &str) -> Result<()> {
+    pub async fn ensure_ready(&self, embed_model: &str, chat_model: Option<&str>) -> Result<()> {
         if !self.is_running().await {
             if !Self::is_installed() {
                 return Err(CorviaError::Infra(

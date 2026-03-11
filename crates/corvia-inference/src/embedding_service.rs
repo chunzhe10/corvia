@@ -42,6 +42,12 @@ impl EmbeddingServiceImpl {
             "bge-large-en-v1.5" | "BAAI/bge-large-en-v1.5" => {
                 Ok(fastembed::EmbeddingModel::BGELargeENV15)
             }
+            "all-MiniLM-L6-v2" | "sentence-transformers/all-MiniLM-L6-v2" => {
+                Ok(fastembed::EmbeddingModel::AllMiniLML6V2)
+            }
+            "all-MiniLM-L12-v2" | "sentence-transformers/all-MiniLM-L12-v2" => {
+                Ok(fastembed::EmbeddingModel::AllMiniLML12V2)
+            }
             other => Err(Status::not_found(format!("Unknown embedding model: {other}"))),
         }
     }

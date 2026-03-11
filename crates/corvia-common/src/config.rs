@@ -58,8 +58,8 @@ pub struct CorviaConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub agent_lifecycle: AgentLifecycleConfig,
-    #[serde(default)]
-    pub merge: MergeConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge: Option<MergeConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -350,7 +350,7 @@ impl Default for CorviaConfig {
                 port: 8020,
             },
             agent_lifecycle: AgentLifecycleConfig::default(),
-            merge: MergeConfig::default(),
+            merge: None,
             workspace: None,
             reasoning: None,
             rag: RagConfig::default(),

@@ -490,6 +490,94 @@ pub async fn ingest_workspace(
     Ok(())
 }
 
+/// Clean build artifacts (target/ directories) from workspace repos.
+///
+/// Scans each repo for a Cargo `target/` directory and removes it, reporting
+/// the space freed. This is a workspace-level GC complement to the kernel-level
+/// session GC (`corvia_gc_run`).
+pub fn clean_build_artifacts(root: &Path) -> Result<CleanReport> {
+    let config_path = root.join("corvia.toml");
+    let config = CorviaConfig::load(&config_path)?;
+    let ws = config
+        .workspace
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Not a workspace — no [workspace] section in corvia.toml"))?;
+
+    let mut report = CleanReport::default();
+
+    for repo in &ws.repos {
+        let repo_path = resolve_repo_path(root, &ws.repos_dir, repo);
+        let target_dir = repo_path.join("target");
+        if !target_dir.exists() {
+            continue;
+        }
+
+        let size = dir_size(&target_dir);
+        println!(
+            "  Cleaning {}/target/ ({})...",
+            repo.name,
+            human_bytes(size)
+        );
+
+        match std::fs::remove_dir_all(&target_dir) {
+            Ok(()) => {
+                report.dirs_cleaned += 1;
+                report.bytes_freed += size;
+            }
+            Err(e) => {
+                println!("    Warning: failed to remove {}: {}", target_dir.display(), e);
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+/// Report from build-artifact cleanup.
+#[derive(Debug, Default)]
+pub struct CleanReport {
+    pub dirs_cleaned: usize,
+    pub bytes_freed: u64,
+}
+
+/// Recursively compute the size of a directory in bytes.
+fn dir_size(path: &Path) -> u64 {
+    walkdir(path)
+}
+
+fn walkdir(path: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if ft.is_file() || ft.is_symlink() {
+                total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            } else if ft.is_dir() {
+                total += walkdir(&entry.path());
+            }
+        }
+    }
+    total
+}
+
+pub fn human_bytes(bytes: u64) -> String {
+    const GB: u64 = 1_073_741_824;
+    const MB: u64 = 1_048_576;
+    const KB: u64 = 1_024;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 /// Display workspace status including config, repo state, and entry counts.
 pub async fn workspace_status(root: &Path) -> Result<()> {
     let config_path = root.join("corvia.toml");

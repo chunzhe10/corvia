@@ -259,6 +259,8 @@ enum WorkspaceCommands {
         #[arg(long)]
         fresh: bool,
     },
+    /// Clean build artifacts (target/ directories) from workspace repos
+    Clean,
 }
 
 #[tokio::main]
@@ -379,9 +381,15 @@ async fn cmd_init(store: &str) -> Result<()> {
                     let provisioner = corvia_kernel::inference_provisioner::InferenceProvisioner::new(
                         &config.embedding.url,
                     );
-                    provisioner.ensure_ready(&config.embedding.model, &config.merge.model).await?;
-                    println!("  Corvia inference ready (embed: {}, chat: {})",
-                        config.embedding.model, config.merge.model);
+                    let chat_model = config.merge.as_ref().map(|m| m.model.as_str());
+                    provisioner.ensure_ready(&config.embedding.model, chat_model).await?;
+                    if let Some(cm) = chat_model {
+                        println!("  Corvia inference ready (embed: {}, chat: {})",
+                            config.embedding.model, cm);
+                    } else {
+                        println!("  Corvia inference ready (embed: {}, chat: disabled)",
+                            config.embedding.model);
+                    }
                 }
                 corvia_common::config::InferenceProvider::Ollama => {
                     println!("  Provisioning Ollama...");
@@ -416,27 +424,36 @@ async fn cmd_serve() -> Result<()> {
     println!("Store ready");
     let engine: Arc<dyn InferenceEngine> = connect_engine(&config);
 
-    // Construct AgentCoordinator
+    // Construct generation engine (optional — only when [merge] is configured)
     let data_dir = std::path::Path::new(&config.storage.data_dir);
-    let gen_engine: std::sync::Arc<dyn corvia_kernel::traits::GenerationEngine> = match config.merge.provider {
-        corvia_common::config::InferenceProvider::Corvia => {
-            std::sync::Arc::new(corvia_kernel::grpc_chat::GrpcChatEngine::new(&config.embedding.url, &config.merge.model))
-        }
-        corvia_common::config::InferenceProvider::Ollama => {
-            std::sync::Arc::new(corvia_kernel::ollama_chat::OllamaChatEngine::new(&config.embedding.url, &config.merge.model))
-        }
-        corvia_common::config::InferenceProvider::Vllm => {
-            // vLLM chat not yet implemented — fall back to Ollama
-            std::sync::Arc::new(corvia_kernel::ollama_chat::OllamaChatEngine::new(&config.embedding.url, &config.merge.model))
-        }
-    };
+    let gen_engine: Option<std::sync::Arc<dyn corvia_kernel::traits::GenerationEngine>> =
+        config.merge.as_ref().map(|merge| -> std::sync::Arc<dyn corvia_kernel::traits::GenerationEngine> {
+            match merge.provider {
+                corvia_common::config::InferenceProvider::Corvia => {
+                    std::sync::Arc::new(corvia_kernel::grpc_chat::GrpcChatEngine::new(&config.embedding.url, &merge.model))
+                }
+                corvia_common::config::InferenceProvider::Ollama => {
+                    std::sync::Arc::new(corvia_kernel::ollama_chat::OllamaChatEngine::new(&config.embedding.url, &merge.model))
+                }
+                corvia_common::config::InferenceProvider::Vllm => {
+                    // vLLM chat not yet implemented — fall back to Ollama
+                    std::sync::Arc::new(corvia_kernel::ollama_chat::OllamaChatEngine::new(&config.embedding.url, &merge.model))
+                }
+            }
+        });
+    let merge_config = config.merge.clone().unwrap_or_default();
+    let coordinator_gen_engine: std::sync::Arc<dyn corvia_kernel::traits::GenerationEngine> =
+        gen_engine.clone().unwrap_or_else(|| {
+            // Fallback no-op: coordinator needs a GenerationEngine but it won't be used for ask()
+            std::sync::Arc::new(corvia_kernel::grpc_chat::GrpcChatEngine::new(&config.embedding.url, "disabled"))
+        });
     let coordinator = Arc::new(AgentCoordinator::new(
         store.clone(),
         engine.clone(),
         data_dir,
         config.agent_lifecycle.clone(),
-        config.merge.clone(),
-        gen_engine.clone(),
+        merge_config,
+        coordinator_gen_engine,
     )?);
     println!("Agent coordination: enabled");
 
@@ -445,10 +462,13 @@ async fn cmd_serve() -> Result<()> {
         store.clone(),
         engine.clone(),
         Some(graph.clone()),
-        Some(gen_engine),
+        gen_engine,
         &config,
     ).await);
     println!("RAG pipeline: enabled (retriever: {})", rag.retriever_name());
+    if config.merge.is_none() {
+        println!("  ask() mode: disabled (no [merge] configured)");
+    }
 
     let data_dir = std::path::PathBuf::from(&config.storage.data_dir);
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1179,6 +1199,21 @@ async fn cmd_workspace(command: WorkspaceCommands) -> Result<()> {
             workspace::ingest_workspace(&root, repo.as_deref(), fresh).await?;
             Ok(())
         }
+        WorkspaceCommands::Clean => {
+            let root = std::env::current_dir()?;
+            println!("Cleaning build artifacts...");
+            let report = workspace::clean_build_artifacts(&root)?;
+            if report.dirs_cleaned == 0 {
+                println!("No build artifacts found.");
+            } else {
+                println!(
+                    "\nCleaned {} target dir(s), freed {}.",
+                    report.dirs_cleaned,
+                    workspace::human_bytes(report.bytes_freed)
+                );
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1553,7 +1588,8 @@ async fn ensure_inference_ready(config: &CorviaConfig) -> Result<()> {
             let provisioner = corvia_kernel::inference_provisioner::InferenceProvisioner::new(
                 &config.embedding.url,
             );
-            provisioner.ensure_ready(&config.embedding.model, &config.merge.model).await?;
+            let chat_model = config.merge.as_ref().map(|m| m.model.as_str());
+            provisioner.ensure_ready(&config.embedding.model, chat_model).await?;
         }
         corvia_common::config::InferenceProvider::Ollama => {
             let provisioner = OllamaProvisioner::new(&config.embedding.url);
