@@ -14,3 +14,4 @@ benchmark-results/
 # Model cache (corvia-inference downloads)
 .fastembed_cache/
 .worktrees/
+.claude/
