@@ -1,3 +1,5 @@
+pub mod propagation;
+
 use corvia_common::config::TelemetryConfig;
 
 /// Span name constants matching the D45 observability contract.
