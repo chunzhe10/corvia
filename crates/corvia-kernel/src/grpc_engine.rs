@@ -2,8 +2,11 @@ use async_trait::async_trait;
 use corvia_common::errors::{CorviaError, Result};
 use corvia_proto::embedding_service_client::EmbeddingServiceClient;
 use corvia_proto::{EmbedBatchRequest, EmbedRequest};
+use corvia_telemetry::propagation::MetadataInjector;
+use opentelemetry::global;
 use tonic::transport::Channel;
 use tracing::warn;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 const MAX_EMBED_CHARS: usize = 4000;
 
@@ -35,7 +38,7 @@ impl GrpcInferenceEngine {
 
     fn truncate(text: &str) -> String {
         if text.len() > MAX_EMBED_CHARS {
-            warn!("Truncating input from {} to {} bytes", text.len(), MAX_EMBED_CHARS);
+            warn!(input_len = text.len(), max_len = MAX_EMBED_CHARS, "embedding_input_truncated");
             // Find the last char boundary at or before MAX_EMBED_CHARS to avoid
             // panicking on multi-byte UTF-8 (e.g. CJK, emoji).
             let mut end = MAX_EMBED_CHARS;
@@ -54,20 +57,29 @@ impl super::traits::InferenceEngine for GrpcInferenceEngine {
     #[tracing::instrument(name = "corvia.entry.embed", skip(self, text))]
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let mut client = self.connect().await?;
-        let request = tonic::Request::new(EmbedRequest {
+        let mut request = tonic::Request::new(EmbedRequest {
             model: self.model.clone(),
             text: Self::truncate(text),
+        });
+        let cx = tracing::Span::current().context();
+        global::get_text_map_propagator(|propagator| {
+            propagator.inject_context(&cx, &mut MetadataInjector(request.metadata_mut()));
         });
         let response = client.embed(request).await
             .map_err(|e| CorviaError::Embedding(format!("gRPC Embed failed: {e}")))?;
         Ok(response.into_inner().embedding)
     }
 
+    #[tracing::instrument(name = "corvia.entry.embed_batch", skip(self, texts), fields(batch_size = texts.len()))]
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let mut client = self.connect().await?;
-        let request = tonic::Request::new(EmbedBatchRequest {
+        let mut request = tonic::Request::new(EmbedBatchRequest {
             model: self.model.clone(),
             texts: texts.iter().map(|t| Self::truncate(t)).collect(),
+        });
+        let cx = tracing::Span::current().context();
+        global::get_text_map_propagator(|propagator| {
+            propagator.inject_context(&cx, &mut MetadataInjector(request.metadata_mut()));
         });
         let response = client.embed_batch(request).await
             .map_err(|e| CorviaError::Embedding(format!("gRPC EmbedBatch failed: {e}")))?;

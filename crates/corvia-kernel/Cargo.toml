@@ -15,6 +15,8 @@ categories = ["database-implementations", "data-structures"]
 corvia-common.workspace = true
 corvia-proto.workspace = true
 corvia-telemetry = { workspace = true }
+opentelemetry = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 tonic = "0.12"
 serde.workspace = true
 serde_json.workspace = true
