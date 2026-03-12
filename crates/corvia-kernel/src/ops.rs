@@ -124,7 +124,7 @@ pub fn adapters_list(extra_dirs: &[String]) -> Vec<DiscoveredAdapter> {
 const RESTART_REQUIRED_SECTIONS: &[&str] = &["storage", "server", "embedding", "project", "telemetry"];
 
 /// Config sections that are hot-reloadable at runtime.
-const HOT_RELOADABLE_SECTIONS: &[&str] = &["agent_lifecycle", "merge", "rag", "chunking", "reasoning", "adapters"];
+const HOT_RELOADABLE_SECTIONS: &[&str] = &["agent_lifecycle", "merge", "rag", "chunking", "reasoning", "adapters", "inference"];
 
 /// All valid config sections.
 fn all_sections() -> Vec<&'static str> {
