@@ -143,8 +143,9 @@ pub fn normalize_level(level: &str) -> &'static str {
 /// Extract HH:MM:SS from an ISO timestamp string
 pub fn short_timestamp(ts: &str) -> String {
     if let Some(t_pos) = ts.find('T') {
+        // 'T' is ASCII so t_pos + 1 is always a valid char boundary
         let rest = &ts[t_pos + 1..];
-        if rest.len() >= 8 {
+        if rest.len() >= 8 && rest.is_char_boundary(8) {
             return rest[..8].to_string();
         }
     }
@@ -259,10 +260,21 @@ pub fn collect_traces_from_lines(lines: &[&str]) -> TracesData {
     }
 }
 
-/// Read the last `n` lines from a file
+/// Maximum file size to read (50 MB) — skip larger files to prevent DoS
+const MAX_LOG_FILE_SIZE: u64 = 50 * 1024 * 1024;
+
+/// Read the last `n` lines from a file.
+/// Files larger than 50 MB are skipped entirely.
 pub fn tail_lines(path: &Path, n: usize) -> Vec<String> {
-    use std::fs::File;
+    use std::fs::{self, File};
     use std::io::{BufRead, BufReader};
+
+    // Check file size before reading
+    if let Ok(meta) = fs::metadata(path) {
+        if meta.len() > MAX_LOG_FILE_SIZE {
+            return Vec::new();
+        }
+    }
 
     let file = match File::open(path) {
         Ok(f) => f,

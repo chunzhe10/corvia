@@ -79,12 +79,12 @@ async fn status_handler(
         .depth()
         .unwrap_or(0);
 
-    // Config summary
-    let cfg = state.config.read().unwrap();
+    // Config summary (poisoned lock safe)
+    let cfg = state.config.read().unwrap_or_else(|e| e.into_inner());
     let config = config_summary(&cfg);
     drop(cfg);
 
-    // Traces from log files
+    // Traces from log files (bounded: 500 lines/file, 50MB max file size)
     let log_dir = traces::log_dir();
     let traces_data = traces::collect_traces(&log_dir);
     let traces = if traces_data.spans.is_empty() && traces_data.recent_events.is_empty() {
@@ -138,7 +138,7 @@ async fn logs_handler(
     Query(params): Query<LogsQuery>,
 ) -> Json<LogsResponse> {
     let log_dir_path = traces::log_dir();
-    let limit = params.limit.unwrap_or(100);
+    let limit = params.limit.unwrap_or(100).min(1000);
 
     let mut entries: Vec<LogEntry> = Vec::new();
 
@@ -218,14 +218,13 @@ async fn logs_handler(
 async fn config_handler(
     State(state): State<Arc<AppState>>,
 ) -> Json<DashboardConfig> {
-    let cfg = state.config.read().unwrap();
+    let cfg = state.config.read().unwrap_or_else(|e| e.into_inner());
     Json(config_summary(&cfg))
 }
 
 /// Query params for /api/dashboard/graph
 #[derive(Debug, serde::Deserialize)]
 pub struct GraphQuery {
-    pub scope: Option<String>,
     pub entry_id: Option<String>,
 }
 
