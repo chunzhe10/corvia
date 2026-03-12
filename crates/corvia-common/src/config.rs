@@ -70,6 +70,8 @@ pub struct CorviaConfig {
     pub chunking: ChunkingConfig,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    #[serde(default)]
+    pub inference: InferenceConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapters: Option<AdaptersConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -101,6 +103,35 @@ fn default_data_dir() -> String {
 }
 
 fn default_device() -> String { "auto".into() }
+fn default_kv_quant() -> String { "q8".into() }
+fn default_flash_attention() -> bool { true }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceConfig {
+    /// Device preference: "auto" (default), "gpu", or "cpu".
+    #[serde(default = "default_device")]
+    pub device: String,
+    /// Backend override: "cuda", "openvino", or "" (auto-select).
+    #[serde(default)]
+    pub backend: String,
+    /// KV cache quantization: "q8" (default), "q4", "none".
+    #[serde(default = "default_kv_quant")]
+    pub kv_quant: String,
+    /// Enable flash attention (default: true).
+    #[serde(default = "default_flash_attention")]
+    pub flash_attention: bool,
+}
+
+impl Default for InferenceConfig {
+    fn default() -> Self {
+        Self {
+            device: default_device(),
+            backend: String::new(),
+            kv_quant: default_kv_quant(),
+            flash_attention: default_flash_attention(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingConfig {
@@ -109,12 +140,6 @@ pub struct EmbeddingConfig {
     pub model: String,
     pub url: String,
     pub dimensions: usize,
-    /// Device preference: "auto" (default), "gpu", or "cpu".
-    #[serde(default = "default_device")]
-    pub device: String,
-    /// Backend override: "cuda", "openvino", or "" (auto-select).
-    #[serde(default)]
-    pub backend: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -360,8 +385,6 @@ impl Default for CorviaConfig {
                 model: "nomic-embed-text".into(),
                 url: "http://127.0.0.1:11434".into(),
                 dimensions: 768,
-                device: "auto".into(),
-                backend: String::new(),
             },
             server: ServerConfig {
                 host: "127.0.0.1".into(),
@@ -374,6 +397,7 @@ impl Default for CorviaConfig {
             rag: RagConfig::default(),
             chunking: ChunkingConfig::default(),
             telemetry: TelemetryConfig::default(),
+            inference: InferenceConfig::default(),
             adapters: None,
             sources: None,
         }
@@ -404,8 +428,6 @@ impl CorviaConfig {
                 model: "nomic-ai/nomic-embed-text-v1.5".into(),
                 url: "http://127.0.0.1:8001".into(),
                 dimensions: 768,
-                device: "auto".into(),
-                backend: String::new(),
             },
             ..Self::default()
         }
@@ -429,8 +451,6 @@ impl CorviaConfig {
                 model: "nomic-ai/nomic-embed-text-v1.5".into(),
                 url: "http://127.0.0.1:8001".into(),
                 dimensions: 768,
-                device: "auto".into(),
-                backend: String::new(),
             },
             ..Self::default()
         }
@@ -974,5 +994,90 @@ port = 8020
         let config: CorviaConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.rag.default_limit, 10);
         assert_eq!(config.chunking.max_tokens, 512);
+    }
+
+    #[test]
+    fn test_inference_config_defaults() {
+        let config = InferenceConfig::default();
+        assert_eq!(config.device, "auto");
+        assert!(config.backend.is_empty());
+        assert_eq!(config.kv_quant, "q8");
+        assert!(config.flash_attention);
+    }
+
+    #[test]
+    fn test_corvia_config_has_inference_defaults() {
+        let config = CorviaConfig::default();
+        assert_eq!(config.inference.device, "auto");
+        assert_eq!(config.inference.kv_quant, "q8");
+        assert!(config.inference.flash_attention);
+    }
+
+    #[test]
+    fn test_inference_config_from_toml() {
+        let toml_str = r#"
+[project]
+name = "test"
+scope_id = "test"
+
+[storage]
+data_dir = ".corvia"
+
+[embedding]
+model = "nomic-embed-text"
+url = "http://127.0.0.1:11434"
+dimensions = 768
+
+[server]
+host = "127.0.0.1"
+port = 8020
+
+[inference]
+device = "gpu"
+backend = "cuda"
+kv_quant = "q4"
+flash_attention = false
+"#;
+        let config: CorviaConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.inference.device, "gpu");
+        assert_eq!(config.inference.backend, "cuda");
+        assert_eq!(config.inference.kv_quant, "q4");
+        assert!(!config.inference.flash_attention);
+    }
+
+    #[test]
+    fn test_inference_config_omitted_still_parses() {
+        let toml_str = r#"
+[project]
+name = "test"
+scope_id = "test"
+
+[storage]
+data_dir = ".corvia"
+
+[embedding]
+model = "nomic-embed-text"
+url = "http://127.0.0.1:11434"
+dimensions = 768
+
+[server]
+host = "127.0.0.1"
+port = 8020
+"#;
+        let config: CorviaConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.inference.device, "auto");
+        assert_eq!(config.inference.kv_quant, "q8");
+        assert!(config.inference.flash_attention);
+    }
+
+    #[test]
+    fn test_inference_config_roundtrip() {
+        let mut config = CorviaConfig::default();
+        config.inference.kv_quant = "q4".into();
+        config.inference.flash_attention = false;
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let loaded: CorviaConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(loaded.inference.kv_quant, "q4");
+        assert!(!loaded.inference.flash_attention);
     }
 }

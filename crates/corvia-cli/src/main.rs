@@ -413,8 +413,8 @@ async fn cmd_init(store: &str) -> Result<()> {
                     provisioner.ensure_ready(
                         &config.embedding.model,
                         chat_model,
-                        &config.embedding.device,
-                        &config.embedding.backend,
+                        &config.inference.device,
+                        &config.inference.backend,
                     ).await?;
                     if let Some(cm) = chat_model {
                         println!("  Corvia inference ready (embed: {}, chat: {})",
@@ -1675,8 +1675,8 @@ async fn ensure_inference_ready(config: &CorviaConfig) -> Result<()> {
             provisioner.ensure_ready(
                 &config.embedding.model,
                 chat_model,
-                &config.embedding.device,
-                &config.embedding.backend,
+                &config.inference.device,
+                &config.inference.backend,
             ).await?;
         }
         corvia_common::config::InferenceProvider::Ollama => {
