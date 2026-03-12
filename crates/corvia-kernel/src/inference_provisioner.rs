@@ -1,6 +1,6 @@
 use corvia_common::errors::{CorviaError, Result};
 use corvia_proto::model_manager_client::ModelManagerClient;
-use corvia_proto::{HealthRequest, LoadModelRequest};
+use corvia_proto::{HealthRequest, ListModelsRequest, LoadModelRequest, ReloadModelsRequest};
 use tracing::info;
 
 /// Provisions the corvia-inference gRPC server.
@@ -80,7 +80,13 @@ impl InferenceProvisioner {
     }
 
     /// Load models on the server.
-    pub async fn load_models(&self, embed_model: &str, chat_model: Option<&str>) -> Result<()> {
+    pub async fn load_models(
+        &self,
+        embed_model: &str,
+        chat_model: Option<&str>,
+        device: &str,
+        backend: &str,
+    ) -> Result<()> {
         let mut client = ModelManagerClient::connect(self.endpoint_url())
             .await
             .map_err(|e| CorviaError::Infra(format!("gRPC connect failed: {e}")))?;
@@ -90,8 +96,8 @@ impl InferenceProvisioner {
             .load_model(tonic::Request::new(LoadModelRequest {
                 name: embed_model.to_string(),
                 model_type: "embedding".to_string(),
-                device: "auto".to_string(),
-                backend: String::new(),
+                device: device.to_string(),
+                backend: backend.to_string(),
             }))
             .await
             .map_err(|e| CorviaError::Infra(format!("LoadModel failed: {e}")))?;
@@ -102,7 +108,12 @@ impl InferenceProvisioner {
                 resp.error
             )));
         }
-        info!("Loaded embedding model: {embed_model}");
+        info!(
+            model = embed_model,
+            device = resp.actual_device,
+            backend = resp.actual_backend,
+            "Loaded embedding model"
+        );
 
         // Load chat model (optional — skipped when [merge] is not configured)
         if let Some(chat_model) = chat_model {
@@ -110,8 +121,8 @@ impl InferenceProvisioner {
                 .load_model(tonic::Request::new(LoadModelRequest {
                     name: chat_model.to_string(),
                     model_type: "chat".to_string(),
-                    device: "auto".to_string(),
-                    backend: String::new(),
+                    device: device.to_string(),
+                    backend: backend.to_string(),
                 }))
                 .await
                 .map_err(|e| CorviaError::Infra(format!("LoadModel failed: {e}")))?;
@@ -122,14 +133,69 @@ impl InferenceProvisioner {
                     resp.error
                 )));
             }
-            info!("Loaded chat model: {chat_model}");
+            info!(
+                model = chat_model,
+                device = resp.actual_device,
+                backend = resp.actual_backend,
+                "Loaded chat model"
+            );
         }
 
         Ok(())
     }
 
+    /// Reload all currently loaded models with a new device/backend.
+    pub async fn reload_models(&self, device: &str, backend: &str) -> Result<()> {
+        let mut client = ModelManagerClient::connect(self.endpoint_url())
+            .await
+            .map_err(|e| CorviaError::Infra(format!("gRPC connect failed: {e}")))?;
+
+        let resp = client
+            .reload_models(tonic::Request::new(ReloadModelsRequest {
+                device: device.to_string(),
+                backend: backend.to_string(),
+                reprobe_gpu: true,
+            }))
+            .await
+            .map_err(|e| CorviaError::Infra(format!("ReloadModels failed: {e}")))?;
+        let resp = resp.into_inner();
+        if !resp.success {
+            return Err(CorviaError::Infra(format!(
+                "Reload failed: {}",
+                resp.error
+            )));
+        }
+        for r in &resp.results {
+            if r.success {
+                info!(model = %r.name, device = %r.actual_device, backend = %r.actual_backend, "Reloaded");
+            } else {
+                tracing::error!(model = %r.name, error = %r.error, "Reload failed");
+            }
+        }
+        Ok(())
+    }
+
+    /// List currently loaded models with their device/backend info.
+    pub async fn list_models(&self) -> Result<Vec<corvia_proto::ModelStatus>> {
+        let mut client = ModelManagerClient::connect(self.endpoint_url())
+            .await
+            .map_err(|e| CorviaError::Infra(format!("gRPC connect failed: {e}")))?;
+
+        let resp = client
+            .list_models(tonic::Request::new(ListModelsRequest {}))
+            .await
+            .map_err(|e| CorviaError::Infra(format!("ListModels failed: {e}")))?;
+        Ok(resp.into_inner().models)
+    }
+
     /// Full provisioning: start if not running → wait → load models.
-    pub async fn ensure_ready(&self, embed_model: &str, chat_model: Option<&str>) -> Result<()> {
+    pub async fn ensure_ready(
+        &self,
+        embed_model: &str,
+        chat_model: Option<&str>,
+        device: &str,
+        backend: &str,
+    ) -> Result<()> {
         if !self.is_running().await {
             if !Self::is_installed() {
                 return Err(CorviaError::Infra(
@@ -140,7 +206,7 @@ impl InferenceProvisioner {
             self.start()?;
             self.wait_ready(15).await?;
         }
-        self.load_models(embed_model, chat_model).await?;
+        self.load_models(embed_model, chat_model, device, backend).await?;
         Ok(())
     }
 }

@@ -13,6 +13,8 @@ pub struct ModelEntry {
     pub name: String,
     pub model_type: String,
     pub loaded: bool,
+    pub device: String,
+    pub backend: String,
 }
 
 pub struct ModelManagerService {
@@ -22,12 +24,12 @@ pub struct ModelManagerService {
     embed_svc: EmbeddingServiceImpl,
     /// Delegates chat model loads to the actual ChatService.
     chat_svc: ChatServiceImpl,
-    /// Probed GPU capabilities (cached at startup).
-    gpu: GpuCapabilities,
+    /// Probed GPU capabilities (re-probeable at runtime).
+    gpu: Arc<std::sync::RwLock<GpuCapabilities>>,
 }
 
 impl ModelManagerService {
-    pub fn new(embed_svc: EmbeddingServiceImpl, chat_svc: ChatServiceImpl, gpu: GpuCapabilities) -> Self {
+    pub fn new(embed_svc: EmbeddingServiceImpl, chat_svc: ChatServiceImpl, gpu: Arc<std::sync::RwLock<GpuCapabilities>>) -> Self {
         Self {
             models: Arc::new(RwLock::new(HashMap::new())),
             embed_svc,
@@ -62,6 +64,8 @@ impl ModelManager for ModelManagerService {
                 model_type: m.model_type.clone(),
                 loaded: m.loaded,
                 memory_bytes: 0,
+                device: m.device.clone(),
+                backend: m.backend.clone(),
             })
             .collect();
         Ok(Response::new(ListModelsResponse { models: statuses }))
@@ -88,16 +92,19 @@ impl ModelManager for ModelManagerService {
             }
         };
 
-        // Resolve backend
-        let resolved = match backend::resolve_backend(&req.device, &req.backend, model_type, &self.gpu) {
-            Ok(r) => r,
-            Err(e) => {
-                return Ok(Response::new(LoadModelResponse {
-                    success: false,
-                    error: e,
-                    actual_device: String::new(),
-                    actual_backend: String::new(),
-                }));
+        // Resolve backend (scope lock before any .await)
+        let resolved = {
+            let gpu = self.gpu.read().map_err(|e| Status::internal(format!("GPU lock poisoned: {e}")))?;
+            match backend::resolve_backend(&req.device, &req.backend, model_type, &gpu) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Ok(Response::new(LoadModelResponse {
+                        success: false,
+                        error: e,
+                        actual_device: String::new(),
+                        actual_backend: String::new(),
+                    }));
+                }
             }
         };
 
@@ -129,6 +136,8 @@ impl ModelManager for ModelManagerService {
                         name: req.name,
                         model_type: req.model_type,
                         loaded: true,
+                        device: actual_device.clone(),
+                        backend: actual_backend.clone(),
                     },
                 );
                 Ok(Response::new(LoadModelResponse {
@@ -155,5 +164,127 @@ impl ModelManager for ModelManagerService {
         let mut models = self.models.write().await;
         models.remove(&name);
         Ok(Response::new(UnloadModelResponse { success: true }))
+    }
+
+    async fn reload_models(
+        &self,
+        req: Request<ReloadModelsRequest>,
+    ) -> Result<Response<ReloadModelsResponse>, Status> {
+        let req = req.into_inner();
+        tracing::info!(device = %req.device, backend = %req.backend, reprobe = req.reprobe_gpu, "reload_models requested");
+
+        // Optionally re-probe GPU capabilities
+        if req.reprobe_gpu {
+            let new_gpu = GpuCapabilities::probe();
+            tracing::info!(cuda = new_gpu.cuda_available, openvino = new_gpu.openvino_available, "GPU capabilities re-probed");
+            let mut gpu = self.gpu.write().map_err(|e| Status::internal(format!("GPU lock poisoned: {e}")))?;
+            *gpu = new_gpu;
+        }
+
+        // Snapshot currently loaded models
+        let snapshot: Vec<ModelEntry> = {
+            let models = self.models.read().await;
+            models.values().filter(|m| m.loaded).cloned().collect()
+        };
+
+        if snapshot.is_empty() {
+            return Ok(Response::new(ReloadModelsResponse {
+                success: true,
+                error: String::new(),
+                results: vec![],
+            }));
+        }
+
+        let mut results = Vec::new();
+        let mut all_success = true;
+
+        for entry in &snapshot {
+            let model_type = match entry.model_type.as_str() {
+                "embedding" => ModelType::Embedding,
+                "chat" => ModelType::Chat,
+                _ => {
+                    results.push(ModelReloadResult {
+                        name: entry.name.clone(),
+                        model_type: entry.model_type.clone(),
+                        success: false,
+                        error: format!("Unknown model_type: '{}'", entry.model_type),
+                        actual_device: String::new(),
+                        actual_backend: String::new(),
+                    });
+                    all_success = false;
+                    continue;
+                }
+            };
+
+            let resolved = {
+                let gpu = self.gpu.read().map_err(|e| Status::internal(format!("GPU lock poisoned: {e}")))?;
+                match backend::resolve_backend(&req.device, &req.backend, model_type, &gpu) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        results.push(ModelReloadResult {
+                            name: entry.name.clone(),
+                            model_type: entry.model_type.clone(),
+                            success: false,
+                            error: e,
+                            actual_device: String::new(),
+                            actual_backend: String::new(),
+                        });
+                        all_success = false;
+                        continue;
+                    }
+                }
+            };
+
+            let actual_device = resolved.device.to_string();
+            let actual_backend = resolved.backend.to_string();
+
+            tracing::info!(model = %entry.name, device = %actual_device, backend = %actual_backend, "Reloading model...");
+
+            let load_result = match model_type {
+                ModelType::Embedding => self.embed_svc.load_model(&entry.name, resolved).await,
+                ModelType::Chat => self.chat_svc.load_model(&entry.name, resolved).await,
+            };
+
+            match load_result {
+                Ok(()) => {
+                    let mut models = self.models.write().await;
+                    models.insert(
+                        entry.name.clone(),
+                        ModelEntry {
+                            name: entry.name.clone(),
+                            model_type: entry.model_type.clone(),
+                            loaded: true,
+                            device: actual_device.clone(),
+                            backend: actual_backend.clone(),
+                        },
+                    );
+                    results.push(ModelReloadResult {
+                        name: entry.name.clone(),
+                        model_type: entry.model_type.clone(),
+                        success: true,
+                        error: String::new(),
+                        actual_device,
+                        actual_backend,
+                    });
+                }
+                Err(status) => {
+                    all_success = false;
+                    results.push(ModelReloadResult {
+                        name: entry.name.clone(),
+                        model_type: entry.model_type.clone(),
+                        success: false,
+                        error: status.message().to_string(),
+                        actual_device,
+                        actual_backend,
+                    });
+                }
+            }
+        }
+
+        Ok(Response::new(ReloadModelsResponse {
+            success: all_success,
+            error: if all_success { String::new() } else { "Some models failed to reload".into() },
+            results,
+        }))
     }
 }

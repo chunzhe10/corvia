@@ -100,6 +100,8 @@ fn default_data_dir() -> String {
     ".corvia".into()
 }
 
+fn default_device() -> String { "auto".into() }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingConfig {
     #[serde(default)]
@@ -107,6 +109,12 @@ pub struct EmbeddingConfig {
     pub model: String,
     pub url: String,
     pub dimensions: usize,
+    /// Device preference: "auto" (default), "gpu", or "cpu".
+    #[serde(default = "default_device")]
+    pub device: String,
+    /// Backend override: "cuda", "openvino", or "" (auto-select).
+    #[serde(default)]
+    pub backend: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,6 +360,8 @@ impl Default for CorviaConfig {
                 model: "nomic-embed-text".into(),
                 url: "http://127.0.0.1:11434".into(),
                 dimensions: 768,
+                device: "auto".into(),
+                backend: String::new(),
             },
             server: ServerConfig {
                 host: "127.0.0.1".into(),
@@ -394,6 +404,8 @@ impl CorviaConfig {
                 model: "nomic-ai/nomic-embed-text-v1.5".into(),
                 url: "http://127.0.0.1:8001".into(),
                 dimensions: 768,
+                device: "auto".into(),
+                backend: String::new(),
             },
             ..Self::default()
         }
@@ -417,6 +429,8 @@ impl CorviaConfig {
                 model: "nomic-ai/nomic-embed-text-v1.5".into(),
                 url: "http://127.0.0.1:8001".into(),
                 dimensions: 768,
+                device: "auto".into(),
+                backend: String::new(),
             },
             ..Self::default()
         }

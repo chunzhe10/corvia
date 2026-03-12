@@ -59,13 +59,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Serve { port } => {
             let addr = format!("0.0.0.0:{port}").parse()?;
 
-            // Probe GPU capabilities once at startup
+            // Probe GPU capabilities once at startup (wrapped for runtime re-probing)
             let gpu = backend::GpuCapabilities::probe();
             tracing::info!(
                 cuda = gpu.cuda_available,
                 openvino = gpu.openvino_available,
                 "GPU capabilities"
             );
+            let gpu = std::sync::Arc::new(std::sync::RwLock::new(gpu));
 
             let embed_svc = embedding_service::EmbeddingServiceImpl::new();
             let chat_svc = chat_service::ChatServiceImpl::new();

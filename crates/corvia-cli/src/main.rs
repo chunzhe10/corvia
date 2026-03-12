@@ -195,6 +195,12 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Manage the corvia-inference server (reload models, show status)
+    Inference {
+        #[command(subcommand)]
+        command: InferenceCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -206,6 +212,21 @@ enum AgentCommands {
         /// Agent ID (e.g., "myproject::indexer")
         agent_id: String,
     },
+}
+
+#[derive(Subcommand)]
+enum InferenceCommands {
+    /// Reload all loaded models with a different device/backend
+    Reload {
+        /// Device: "auto", "gpu", or "cpu"
+        #[arg(long, default_value = "auto")]
+        device: String,
+        /// Backend override: "cuda", "openvino", or "" (auto-select)
+        #[arg(long, default_value = "")]
+        backend: String,
+    },
+    /// Show loaded models and their device/backend
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -303,6 +324,10 @@ async fn main() -> Result<()> {
         Commands::Reason { scope, check, llm } => cmd_reason(scope.as_deref(), check.as_deref(), llm).await?,
         Commands::Migrate { to, dry_run } => upgrade::cmd_migrate(&to, dry_run).await?,
         Commands::Upgrade { dry_run } => upgrade::cmd_migrate("surrealdb", dry_run).await?,
+        Commands::Inference { command } => match command {
+            InferenceCommands::Reload { device, backend } => cmd_inference_reload(&device, &backend).await?,
+            InferenceCommands::Status => cmd_inference_status().await?,
+        },
     }
 
     Ok(())
@@ -382,7 +407,12 @@ async fn cmd_init(store: &str) -> Result<()> {
                         &config.embedding.url,
                     );
                     let chat_model = config.merge.as_ref().map(|m| m.model.as_str());
-                    provisioner.ensure_ready(&config.embedding.model, chat_model).await?;
+                    provisioner.ensure_ready(
+                        &config.embedding.model,
+                        chat_model,
+                        &config.embedding.device,
+                        &config.embedding.backend,
+                    ).await?;
                     if let Some(cm) = chat_model {
                         println!("  Corvia inference ready (embed: {}, chat: {})",
                             config.embedding.model, cm);
@@ -1557,6 +1587,50 @@ fn parse_duration(s: &str) -> Result<chrono::Duration> {
 }
 
 /// Truncate a string to at most `max_chars` characters, respecting UTF-8 char boundaries.
+async fn cmd_inference_reload(device: &str, backend: &str) -> Result<()> {
+    let config = load_config()?;
+    let grpc_url = match config.embedding.provider {
+        corvia_common::config::InferenceProvider::Corvia => config.embedding.url.clone(),
+        _ => anyhow::bail!("inference reload requires provider = \"corvia\" in corvia.toml"),
+    };
+    let provisioner = corvia_kernel::inference_provisioner::InferenceProvisioner::new(&grpc_url);
+    if !provisioner.is_running().await {
+        anyhow::bail!("corvia-inference server is not running at {grpc_url}");
+    }
+    println!("Reloading models with device={device}, backend={backend}...");
+    provisioner.reload_models(device, backend).await?;
+    println!("Reload complete.");
+    Ok(())
+}
+
+async fn cmd_inference_status() -> Result<()> {
+    let config = load_config()?;
+    let grpc_url = match config.embedding.provider {
+        corvia_common::config::InferenceProvider::Corvia => config.embedding.url.clone(),
+        _ => anyhow::bail!("inference status requires provider = \"corvia\" in corvia.toml"),
+    };
+    let provisioner = corvia_kernel::inference_provisioner::InferenceProvisioner::new(&grpc_url);
+    if !provisioner.is_running().await {
+        println!("corvia-inference: not running ({})", grpc_url);
+        return Ok(());
+    }
+    let models = provisioner.list_models().await?;
+    if models.is_empty() {
+        println!("corvia-inference: running, no models loaded");
+        return Ok(());
+    }
+    println!("corvia-inference: running ({} model(s) loaded)\n", models.len());
+    println!("{:<35} {:<12} {:<8} {:<10}", "MODEL", "TYPE", "DEVICE", "BACKEND");
+    println!("{}", "-".repeat(65));
+    for m in &models {
+        println!(
+            "{:<35} {:<12} {:<8} {:<10}",
+            m.name, m.model_type, m.device, m.backend
+        );
+    }
+    Ok(())
+}
+
 fn truncate_str(s: &str, max_chars: usize) -> &str {
     match s.char_indices().nth(max_chars) {
         Some((byte_idx, _)) => &s[..byte_idx],
@@ -1592,7 +1666,12 @@ async fn ensure_inference_ready(config: &CorviaConfig) -> Result<()> {
                 &config.embedding.url,
             );
             let chat_model = config.merge.as_ref().map(|m| m.model.as_str());
-            provisioner.ensure_ready(&config.embedding.model, chat_model).await?;
+            provisioner.ensure_ready(
+                &config.embedding.model,
+                chat_model,
+                &config.embedding.device,
+                &config.embedding.backend,
+            ).await?;
         }
         corvia_common::config::InferenceProvider::Ollama => {
             let provisioner = OllamaProvisioner::new(&config.embedding.url);

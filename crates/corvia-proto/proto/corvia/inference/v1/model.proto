@@ -5,6 +5,7 @@ service ModelManager {
   rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
   rpc LoadModel(LoadModelRequest) returns (LoadModelResponse);
   rpc UnloadModel(UnloadModelRequest) returns (UnloadModelResponse);
+  rpc ReloadModels(ReloadModelsRequest) returns (ReloadModelsResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
 }
 
@@ -18,6 +19,8 @@ message ModelStatus {
   string model_type = 2;
   bool loaded = 3;
   uint64 memory_bytes = 4;
+  string device = 5;              // "gpu" | "cpu"
+  string backend = 6;             // "cuda", "openvino", "cpu"
 }
 
 message LoadModelRequest {
@@ -35,6 +38,25 @@ message LoadModelResponse {
 
 message UnloadModelRequest { string name = 1; }
 message UnloadModelResponse { bool success = 1; }
+
+message ReloadModelsRequest {
+  string device = 1;             // "auto" | "gpu" | "cpu"
+  string backend = 2;            // optional: "cuda", "openvino", ""
+  bool reprobe_gpu = 3;          // re-run GPU detection before reloading
+}
+message ReloadModelsResponse {
+  bool success = 1;
+  string error = 2;
+  repeated ModelReloadResult results = 3;
+}
+message ModelReloadResult {
+  string name = 1;
+  string model_type = 2;
+  bool success = 3;
+  string error = 4;
+  string actual_device = 5;      // "gpu" | "cpu"
+  string actual_backend = 6;     // "cuda", "openvino", "cpu"
+}
 
 message HealthRequest {}
 message HealthResponse {
