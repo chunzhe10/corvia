@@ -5,8 +5,9 @@ pub mod traces;
 
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
-use axum::routing::get;
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use corvia_common::dashboard::{
@@ -22,6 +23,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/dashboard/logs", get(logs_handler))
         .route("/api/dashboard/config", get(config_handler))
         .route("/api/dashboard/graph", get(graph_handler))
+        .route("/api/dashboard/agents", get(agents_handler))
+        .route("/api/dashboard/agents/{agent_id}/sessions", get(agent_sessions_handler))
+        .route("/api/dashboard/merge/queue", get(merge_queue_handler))
+        .route("/api/dashboard/merge/retry", post(merge_retry_handler))
+        .route("/api/dashboard/health", get(health_handler))
+        .route("/api/dashboard/rag/context", post(rag_context_handler))
+        .route("/api/dashboard/rag/ask", post(rag_ask_handler))
         .with_state(state)
 }
 
@@ -261,4 +269,215 @@ async fn graph_handler(
         .collect();
 
     Ok(Json(serde_json::json!({ "edges": edge_dtos })))
+}
+
+// ---------------------------------------------------------------------------
+// Agent endpoints
+// ---------------------------------------------------------------------------
+
+/// GET /api/dashboard/agents
+/// Returns all registered agents.
+async fn agents_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let agents = corvia_kernel::ops::agents_list(&state.coordinator)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to list agents: {e}")))?;
+
+    Ok(Json(serde_json::json!(agents)))
+}
+
+/// GET /api/dashboard/agents/{agent_id}/sessions
+/// Returns all sessions for a given agent.
+async fn agent_sessions_handler(
+    State(state): State<Arc<AppState>>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let sessions = corvia_kernel::ops::sessions_list(&state.coordinator, &agent_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to list sessions: {e}")))?;
+
+    Ok(Json(serde_json::json!(sessions)))
+}
+
+// ---------------------------------------------------------------------------
+// Merge queue endpoints
+// ---------------------------------------------------------------------------
+
+/// Query params for /api/dashboard/merge/queue
+#[derive(Debug, serde::Deserialize)]
+pub struct MergeQueueQuery {
+    /// Max entries to return (default 50)
+    pub limit: Option<usize>,
+}
+
+/// GET /api/dashboard/merge/queue
+/// Returns merge queue depth and entries.
+async fn merge_queue_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<MergeQueueQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let limit = params.limit.unwrap_or(50);
+    let status = corvia_kernel::ops::merge_queue_status(&state.coordinator, limit)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get merge queue: {e}")))?;
+
+    Ok(Json(serde_json::json!(status)))
+}
+
+/// Request body for /api/dashboard/merge/retry
+#[derive(Debug, serde::Deserialize)]
+pub struct MergeRetryRequest {
+    pub entry_ids: Vec<String>,
+}
+
+/// POST /api/dashboard/merge/retry
+/// Retry failed merge queue entries.
+async fn merge_retry_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<MergeRetryRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let ids: Vec<uuid::Uuid> = req
+        .entry_ids
+        .iter()
+        .map(|s| s.parse::<uuid::Uuid>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid UUID: {e}")))?;
+
+    let retried = corvia_kernel::ops::merge_retry(&state.coordinator, &ids)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Merge retry failed: {e}")))?;
+
+    Ok(Json(serde_json::json!({ "retried": retried })))
+}
+
+// ---------------------------------------------------------------------------
+// Health endpoint
+// ---------------------------------------------------------------------------
+
+/// Query params for /api/dashboard/health
+#[derive(Debug, serde::Deserialize)]
+pub struct HealthQuery {
+    /// Optional single check to run (e.g. "stale", "broken", "orphan", "dangling", "cycle")
+    pub check: Option<String>,
+}
+
+/// GET /api/dashboard/health
+/// Run reasoner health checks on the default scope.
+async fn health_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HealthQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let scope_id = state
+        .default_scope_id
+        .as_deref()
+        .unwrap_or("corvia");
+
+    // Load entries from knowledge files (direct disk read)
+    let entries = corvia_kernel::knowledge_files::read_scope(&state.data_dir, scope_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load entries: {e}")))?;
+
+    let reasoner = corvia_kernel::reasoner::Reasoner::new(&*state.store, &*state.graph);
+
+    let findings = if let Some(ref check_str) = params.check {
+        let check_type = check_str.parse::<corvia_kernel::reasoner::CheckType>()
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        reasoner.run_check(&entries, scope_id, check_type).await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Health check failed: {e}")))?
+    } else {
+        reasoner.run_all(&entries, scope_id).await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Health check failed: {e}")))?
+    };
+
+    let items: Vec<serde_json::Value> = findings
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "check_type": f.check_type.as_str(),
+                "confidence": f.confidence,
+                "rationale": f.rationale,
+                "target_ids": f.target_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "scope_id": scope_id,
+        "findings": items,
+        "count": items.len(),
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// RAG endpoint
+// ---------------------------------------------------------------------------
+
+/// Request body for /api/dashboard/rag/ask
+#[derive(Debug, serde::Deserialize)]
+pub struct RagAskRequest {
+    pub query: String,
+    pub scope_id: String,
+}
+
+/// POST /api/dashboard/rag/context
+/// Thin wrapper around the RAG pipeline context-only endpoint.
+async fn rag_context_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RagAskRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let rag = state.rag.as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "RAG pipeline not configured".into()))?;
+
+    let opts = corvia_kernel::rag_types::RetrievalOpts {
+        limit: 10,
+        expand_graph: true,
+        ..Default::default()
+    };
+
+    let response = rag.context(&req.query, &req.scope_id, Some(opts)).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("RAG context failed: {e}")))?;
+
+    let sources: Vec<serde_json::Value> = response.context.sources.iter().map(|s| {
+        serde_json::json!({
+            "content": s.entry.content,
+            "score": s.score,
+            "source_file": s.entry.metadata.source_file,
+            "language": s.entry.metadata.language,
+        })
+    }).collect();
+
+    Ok(Json(serde_json::json!({
+        "sources": sources,
+        "trace": response.trace,
+    })))
+}
+
+/// POST /api/dashboard/rag/ask
+/// Thin wrapper around the RAG pipeline ask endpoint.
+async fn rag_ask_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RagAskRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let rag = state.rag.as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "RAG pipeline not configured".into()))?;
+
+    let opts = corvia_kernel::rag_types::RetrievalOpts {
+        limit: 10,
+        expand_graph: true,
+        ..Default::default()
+    };
+
+    let response = rag.ask(&req.query, &req.scope_id, Some(opts)).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("RAG failed: {e}")))?;
+
+    let sources: Vec<serde_json::Value> = response.context.sources.iter().map(|s| {
+        serde_json::json!({
+            "content": s.entry.content,
+            "score": s.score,
+            "source_file": s.entry.metadata.source_file,
+            "language": s.entry.metadata.language,
+        })
+    }).collect();
+
+    Ok(Json(serde_json::json!({
+        "answer": response.answer,
+        "sources": sources,
+        "trace": response.trace,
+    })))
 }
