@@ -20,3 +20,4 @@
 
 pub mod rest;
 pub mod mcp;
+pub mod dashboard;

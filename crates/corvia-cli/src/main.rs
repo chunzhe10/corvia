@@ -481,8 +481,11 @@ async fn cmd_serve() -> Result<()> {
         config_path,
     });
     let mut app = corvia_server::rest::router(state.clone());
-    app = app.merge(corvia_server::mcp::mcp_router(state));
+    app = app.merge(corvia_server::mcp::mcp_router(state.clone()));
+    app = app.merge(corvia_server::dashboard::router(state));
+    app = app.layer(tower_http::cors::CorsLayer::permissive());
     println!("MCP endpoint: POST/GET/DELETE /mcp (Streamable HTTP)");
+    println!("Dashboard API: GET /api/dashboard/{{status,traces,logs,config,graph}}");
 
     ready.store(true, std::sync::atomic::Ordering::Relaxed);
     println!("Corvia server listening on {addr}");
