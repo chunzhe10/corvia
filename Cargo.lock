@@ -1125,6 +1125,7 @@ dependencies = [
  "fastembed",
  "hf-hub",
  "llama-cpp-2",
+ "llama-cpp-sys-2",
  "opentelemetry",
  "ort",
  "prost 0.13.5",
