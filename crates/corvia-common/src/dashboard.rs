@@ -88,11 +88,24 @@ pub struct LogsResponse {
     pub total: usize,
 }
 
-/// GET /api/dashboard/traces response (same shape as TracesData)
+/// Pre-aggregated module-level statistics (computed server-side to reduce client work)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModuleStats {
+    pub count: u64,
+    pub count_1h: u64,
+    pub avg_ms: f64,
+    pub errors: u64,
+    pub span_count: u32,
+}
+
+/// GET /api/dashboard/traces response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TracesResponse {
     pub spans: HashMap<String, SpanStats>,
     pub recent_events: Vec<TraceEvent>,
+    /// Pre-aggregated per-module stats (agent, entry, merge, storage, rag, inference, gc)
+    #[serde(default)]
+    pub modules: HashMap<String, ModuleStats>,
 }
 
 #[cfg(test)]

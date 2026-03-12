@@ -11,7 +11,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use corvia_common::dashboard::{
-    DashboardConfig, DashboardStatusResponse, LogEntry, LogsResponse, TracesResponse,
+    DashboardConfig, DashboardStatusResponse, LogEntry, LogsResponse, ModuleStats, TracesResponse,
 };
 use crate::rest::AppState;
 
@@ -113,16 +113,39 @@ async fn status_handler(
 }
 
 /// GET /api/dashboard/traces
-/// Returns span statistics and recent events from structured logs.
+/// Returns span statistics, recent events, and pre-aggregated module stats.
 async fn traces_handler(
     State(_state): State<Arc<AppState>>,
 ) -> Json<TracesResponse> {
     let log_dir = traces::log_dir();
     let data = traces::collect_traces(&log_dir);
 
+    // Pre-aggregate per-module stats server-side so the client doesn't
+    // have to recompute this on every poll cycle.
+    let mut modules = std::collections::HashMap::<String, ModuleStats>::new();
+    for module in &["agent", "entry", "merge", "storage", "rag", "inference", "gc"] {
+        modules.insert(module.to_string(), ModuleStats::default());
+    }
+    for (span_name, stats) in &data.spans {
+        let module = traces::span_to_module(span_name);
+        if let Some(ms) = modules.get_mut(module) {
+            ms.count += stats.count;
+            ms.count_1h += stats.count_1h;
+            ms.avg_ms += stats.avg_ms * stats.count as f64;
+            ms.errors += stats.errors;
+            ms.span_count += 1;
+        }
+    }
+    for ms in modules.values_mut() {
+        if ms.count > 0 {
+            ms.avg_ms = (ms.avg_ms / ms.count as f64).round();
+        }
+    }
+
     Json(TracesResponse {
         spans: data.spans,
         recent_events: data.recent_events,
+        modules,
     })
 }
 
