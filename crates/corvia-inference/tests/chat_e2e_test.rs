@@ -85,6 +85,8 @@ async fn test_chat_e2e_generates_response() {
         .load_model(LoadModelRequest {
             name: TEST_MODEL.to_string(),
             model_type: "chat".to_string(),
+            device: "auto".to_string(),
+            backend: String::new(),
         })
         .await
         .expect("load_model RPC failed")
@@ -143,6 +145,8 @@ async fn test_chat_stream_e2e() {
         .load_model(LoadModelRequest {
             name: TEST_MODEL.to_string(),
             model_type: "chat".to_string(),
+            device: "auto".to_string(),
+            backend: String::new(),
         })
         .await
         .expect("load_model failed")

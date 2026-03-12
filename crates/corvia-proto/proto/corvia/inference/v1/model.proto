@@ -22,11 +22,15 @@ message ModelStatus {
 
 message LoadModelRequest {
   string name = 1;
-  string model_type = 2;
+  string model_type = 2;        // "embedding" | "chat"
+  string device = 3;            // "auto" | "gpu" | "cpu" (default: "auto")
+  string backend = 4;           // optional override: "cuda", "openvino", "vulkan", ""
 }
 message LoadModelResponse {
   bool success = 1;
   string error = 2;
+  string actual_device = 3;     // "gpu" | "cpu"
+  string actual_backend = 4;    // "cuda", "openvino", "vulkan", "cpu"
 }
 
 message UnloadModelRequest { string name = 1; }

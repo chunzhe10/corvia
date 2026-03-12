@@ -90,6 +90,8 @@ impl InferenceProvisioner {
             .load_model(tonic::Request::new(LoadModelRequest {
                 name: embed_model.to_string(),
                 model_type: "embedding".to_string(),
+                device: "auto".to_string(),
+                backend: String::new(),
             }))
             .await
             .map_err(|e| CorviaError::Infra(format!("LoadModel failed: {e}")))?;
@@ -108,6 +110,8 @@ impl InferenceProvisioner {
                 .load_model(tonic::Request::new(LoadModelRequest {
                     name: chat_model.to_string(),
                     model_type: "chat".to_string(),
+                    device: "auto".to_string(),
+                    backend: String::new(),
                 }))
                 .await
                 .map_err(|e| CorviaError::Infra(format!("LoadModel failed: {e}")))?;

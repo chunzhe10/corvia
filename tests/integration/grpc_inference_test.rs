@@ -166,6 +166,8 @@ async fn test_grpc_model_lifecycle() {
         .load_model(tonic::Request::new(LoadModelRequest {
             name: model_name.into(),
             model_type: "embedding".into(),
+            device: "auto".into(),
+            backend: String::new(),
         }))
         .await
         .unwrap();
@@ -211,6 +213,8 @@ async fn test_grpc_chat_stub() {
     mgr.load_model(tonic::Request::new(LoadModelRequest {
         name: "test-chat".into(),
         model_type: "chat".into(),
+        device: "auto".into(),
+        backend: String::new(),
     }))
     .await
     .unwrap();

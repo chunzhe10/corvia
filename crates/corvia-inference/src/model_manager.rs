@@ -94,11 +94,15 @@ impl ModelManager for ModelManagerService {
                 Ok(Response::new(LoadModelResponse {
                     success: true,
                     error: String::new(),
+                    actual_device: String::new(),
+                    actual_backend: String::new(),
                 }))
             }
             Err(status) => Ok(Response::new(LoadModelResponse {
                 success: false,
                 error: status.message().to_string(),
+                actual_device: String::new(),
+                actual_backend: String::new(),
             })),
         }
     }
