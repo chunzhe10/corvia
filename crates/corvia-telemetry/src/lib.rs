@@ -24,6 +24,9 @@ pub mod spans {
     pub const STORE_GET: &str = "corvia.store.get";
     pub const RAG_CONTEXT: &str = "corvia.rag.context";
     pub const RAG_ASK: &str = "corvia.rag.ask";
+    pub const INFERENCE_LOAD: &str = "corvia.inference.load";
+    pub const INFERENCE_RELOAD: &str = "corvia.inference.reload";
+    pub const INFERENCE_CONFIG_RELOAD: &str = "corvia.inference.config_reload";
 }
 
 /// Opaque handle that keeps the telemetry pipeline alive.
@@ -160,6 +163,9 @@ mod tests {
             spans::STORE_GET,
             spans::RAG_CONTEXT,
             spans::RAG_ASK,
+            spans::INFERENCE_LOAD,
+            spans::INFERENCE_RELOAD,
+            spans::INFERENCE_CONFIG_RELOAD,
         ];
         for name in &all {
             assert!(
