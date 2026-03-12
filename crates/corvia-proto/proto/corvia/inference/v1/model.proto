@@ -21,6 +21,8 @@ message ModelStatus {
   uint64 memory_bytes = 4;
   string device = 5;              // "gpu" | "cpu"
   string backend = 6;             // "cuda", "openvino", "cpu"
+  string kv_quant = 7;            // current KV quant setting
+  bool flash_attention = 8;       // current flash attention setting
 }
 
 message LoadModelRequest {
@@ -28,6 +30,8 @@ message LoadModelRequest {
   string model_type = 2;        // "embedding" | "chat"
   string device = 3;            // "auto" | "gpu" | "cpu" (default: "auto")
   string backend = 4;           // optional override: "cuda", "openvino", "vulkan", ""
+  string kv_quant = 5;          // "q8", "q4", "none", "" (use default)
+  bool flash_attention = 6;     // enable flash attention
 }
 message LoadModelResponse {
   bool success = 1;
@@ -44,6 +48,8 @@ message ReloadModelsRequest {
   string backend = 2;            // optional: "cuda", "openvino", ""
   bool reprobe_gpu = 3;          // re-run GPU detection before reloading
   string name = 4;               // optional: reload only this model (empty = all)
+  string kv_quant = 5;           // "q8", "q4", "none", ""
+  bool flash_attention = 6;      // enable flash attention
 }
 message ReloadModelsResponse {
   bool success = 1;
