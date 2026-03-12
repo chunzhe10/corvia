@@ -168,6 +168,8 @@ async fn test_grpc_model_lifecycle() {
             model_type: "embedding".into(),
             device: "auto".into(),
             backend: String::new(),
+            kv_quant: String::new(),
+            flash_attention: false,
         }))
         .await
         .unwrap();
@@ -215,6 +217,8 @@ async fn test_grpc_chat_stub() {
         model_type: "chat".into(),
         device: "auto".into(),
         backend: String::new(),
+        kv_quant: String::new(),
+        flash_attention: false,
     }))
     .await
     .unwrap();

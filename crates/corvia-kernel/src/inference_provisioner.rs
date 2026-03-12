@@ -86,6 +86,8 @@ impl InferenceProvisioner {
         chat_model: Option<&str>,
         device: &str,
         backend: &str,
+        kv_quant: &str,
+        flash_attention: bool,
     ) -> Result<()> {
         let mut client = ModelManagerClient::connect(self.endpoint_url())
             .await
@@ -98,6 +100,8 @@ impl InferenceProvisioner {
                 model_type: "embedding".to_string(),
                 device: device.to_string(),
                 backend: backend.to_string(),
+                kv_quant: kv_quant.to_string(),
+                flash_attention,
             }))
             .await
             .map_err(|e| CorviaError::Infra(format!("LoadModel failed: {e}")))?;
@@ -123,6 +127,8 @@ impl InferenceProvisioner {
                     model_type: "chat".to_string(),
                     device: device.to_string(),
                     backend: backend.to_string(),
+                    kv_quant: kv_quant.to_string(),
+                    flash_attention,
                 }))
                 .await
                 .map_err(|e| CorviaError::Infra(format!("LoadModel failed: {e}")))?;
@@ -146,7 +152,7 @@ impl InferenceProvisioner {
 
     /// Reload loaded models with a new device/backend.
     /// If `model_name` is Some, only that model is reloaded; otherwise all.
-    pub async fn reload_models(&self, device: &str, backend: &str, model_name: Option<&str>) -> Result<()> {
+    pub async fn reload_models(&self, device: &str, backend: &str, kv_quant: &str, flash_attention: bool, model_name: Option<&str>) -> Result<()> {
         let mut client = ModelManagerClient::connect(self.endpoint_url())
             .await
             .map_err(|e| CorviaError::Infra(format!("gRPC connect failed: {e}")))?;
@@ -157,6 +163,8 @@ impl InferenceProvisioner {
                 backend: backend.to_string(),
                 reprobe_gpu: true,
                 name: model_name.unwrap_or_default().to_string(),
+                kv_quant: kv_quant.to_string(),
+                flash_attention,
             }))
             .await
             .map_err(|e| CorviaError::Infra(format!("ReloadModels failed: {e}")))?;
@@ -197,6 +205,8 @@ impl InferenceProvisioner {
         chat_model: Option<&str>,
         device: &str,
         backend: &str,
+        kv_quant: &str,
+        flash_attention: bool,
     ) -> Result<()> {
         if !self.is_running().await {
             if !Self::is_installed() {
@@ -208,7 +218,7 @@ impl InferenceProvisioner {
             self.start()?;
             self.wait_ready(15).await?;
         }
-        self.load_models(embed_model, chat_model, device, backend).await?;
+        self.load_models(embed_model, chat_model, device, backend, kv_quant, flash_attention).await?;
         Ok(())
     }
 }

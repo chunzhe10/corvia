@@ -216,17 +216,26 @@ enum AgentCommands {
 
 #[derive(Subcommand)]
 enum InferenceCommands {
-    /// Reload loaded models with a different device/backend
+    /// Reload loaded models with a different device/backend/kv-quant
     Reload {
         /// Device: "auto", "gpu", or "cpu"
-        #[arg(long, default_value = "auto")]
-        device: String,
+        #[arg(long)]
+        device: Option<String>,
         /// Backend override: "cuda", "openvino", or "" (auto-select)
-        #[arg(long, default_value = "")]
-        backend: String,
+        #[arg(long)]
+        backend: Option<String>,
         /// Reload only this model (omit to reload all)
         #[arg(long)]
         model: Option<String>,
+        /// KV cache quantization: "q8", "q4", "none"
+        #[arg(long)]
+        kv_quant: Option<String>,
+        /// Enable/disable flash attention
+        #[arg(long)]
+        flash_attention: Option<bool>,
+        /// Don't persist changes to corvia.toml
+        #[arg(long)]
+        no_persist: bool,
     },
     /// Show loaded models and their device/backend
     Status,
@@ -328,7 +337,8 @@ async fn main() -> Result<()> {
         Commands::Migrate { to, dry_run } => upgrade::cmd_migrate(&to, dry_run).await?,
         Commands::Upgrade { dry_run } => upgrade::cmd_migrate("surrealdb", dry_run).await?,
         Commands::Inference { command } => match command {
-            InferenceCommands::Reload { device, backend, model } => cmd_inference_reload(&device, &backend, model.as_deref()).await?,
+            InferenceCommands::Reload { device, backend, model, kv_quant, flash_attention, no_persist } =>
+                cmd_inference_reload(device.as_deref(), backend.as_deref(), model.as_deref(), kv_quant.as_deref(), flash_attention, no_persist).await?,
             InferenceCommands::Status => cmd_inference_status().await?,
         },
     }
@@ -415,6 +425,8 @@ async fn cmd_init(store: &str) -> Result<()> {
                         chat_model,
                         &config.inference.device,
                         &config.inference.backend,
+                        &config.inference.kv_quant,
+                        config.inference.flash_attention,
                     ).await?;
                     if let Some(cm) = chat_model {
                         println!("  Corvia inference ready (embed: {}, chat: {})",
@@ -1589,22 +1601,53 @@ fn parse_duration(s: &str) -> Result<chrono::Duration> {
     }
 }
 
-/// Truncate a string to at most `max_chars` characters, respecting UTF-8 char boundaries.
-async fn cmd_inference_reload(device: &str, backend: &str, model: Option<&str>) -> Result<()> {
-    let config = load_config()?;
+async fn cmd_inference_reload(
+    device: Option<&str>,
+    backend: Option<&str>,
+    model: Option<&str>,
+    kv_quant: Option<&str>,
+    flash_attention: Option<bool>,
+    no_persist: bool,
+) -> Result<()> {
+    let mut config = load_config()?;
     let grpc_url = match config.embedding.provider {
         corvia_common::config::InferenceProvider::Corvia => config.embedding.url.clone(),
         _ => anyhow::bail!("inference reload requires provider = \"corvia\" in corvia.toml"),
     };
+
+    // Apply overrides to config
+    if let Some(d) = device {
+        config.inference.device = d.to_string();
+    }
+    if let Some(b) = backend {
+        config.inference.backend = b.to_string();
+    }
+    if let Some(kv) = kv_quant {
+        config.inference.kv_quant = kv.to_string();
+    }
+    if let Some(fa) = flash_attention {
+        config.inference.flash_attention = fa;
+    }
+
+    // Persist to config file unless --no-persist
+    if !no_persist {
+        let config_path = corvia_common::config::CorviaConfig::config_path();
+        config.save(&config_path)?;
+        println!("Updated corvia.toml [inference] section");
+    }
+
+    // Trigger gRPC reload
     let provisioner = corvia_kernel::inference_provisioner::InferenceProvisioner::new(&grpc_url);
     if !provisioner.is_running().await {
-        anyhow::bail!("corvia-inference server is not running at {grpc_url}");
+        anyhow::bail!("corvia-inference is not running at {grpc_url}");
     }
-    match model {
-        Some(name) => println!("Reloading model '{name}' with device={device}, backend={backend}..."),
-        None => println!("Reloading all models with device={device}, backend={backend}..."),
-    }
-    provisioner.reload_models(device, backend, model).await?;
+    provisioner.reload_models(
+        &config.inference.device,
+        &config.inference.backend,
+        &config.inference.kv_quant,
+        config.inference.flash_attention,
+        model,
+    ).await?;
     println!("Reload complete.");
     Ok(())
 }
@@ -1626,12 +1669,17 @@ async fn cmd_inference_status() -> Result<()> {
         return Ok(());
     }
     println!("corvia-inference: running ({} model(s) loaded)\n", models.len());
-    println!("{:<35} {:<12} {:<8} {:<10}", "MODEL", "TYPE", "DEVICE", "BACKEND");
-    println!("{}", "-".repeat(65));
+    println!("{:<30} {:<10} {:<8} {:<10} {:<8} {:<6}", "MODEL", "TYPE", "DEVICE", "BACKEND", "KV_QUANT", "FLASH");
+    println!("{}", "-".repeat(72));
     for m in &models {
         println!(
-            "{:<35} {:<12} {:<8} {:<10}",
-            m.name, m.model_type, m.device, m.backend
+            "{:<30} {:<10} {:<8} {:<10} {:<8} {:<6}",
+            truncate_str(&m.name, 29),
+            m.model_type,
+            m.device,
+            m.backend,
+            if m.kv_quant.is_empty() { "f16" } else { &m.kv_quant },
+            if m.flash_attention { "on" } else { "off" },
         );
     }
     Ok(())
@@ -1677,6 +1725,8 @@ async fn ensure_inference_ready(config: &CorviaConfig) -> Result<()> {
                 chat_model,
                 &config.inference.device,
                 &config.inference.backend,
+                &config.inference.kv_quant,
+                config.inference.flash_attention,
             ).await?;
         }
         corvia_common::config::InferenceProvider::Ollama => {
