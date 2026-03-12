@@ -3,6 +3,8 @@
 /// Probes hardware once at startup and caches availability.
 /// `resolve_backend()` maps (device, backend, model_type) → ResolvedBackend.
 
+use llama_cpp_2::context::params::KvCacheType;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Device {
     Gpu,
@@ -159,6 +161,18 @@ fn resolve_gpu_preferred(
     })
 }
 
+/// Resolve a KV cache quantization string to its llama-cpp-2 type.
+///
+/// Accepts: "q8"/"q8_0" → Q8_0, "q4"/"q4_0" → Q4_0, "none"/"f16"/"" → F16.
+pub fn resolve_kv_quant(raw: &str) -> Result<KvCacheType, String> {
+    match raw.to_lowercase().as_str() {
+        "q8" | "q8_0" => Ok(KvCacheType::Q8_0),
+        "q4" | "q4_0" => Ok(KvCacheType::Q4_0),
+        "none" | "f16" | "" => Ok(KvCacheType::F16),
+        other => Err(format!("Unknown kv_quant: '{other}'. Expected 'q8', 'q4', or 'none'.")),
+    }
+}
+
 impl std::fmt::Display for Device {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -311,5 +325,64 @@ mod tests {
         let gpu = GpuCapabilities::new(true, true);
         let r = resolve_backend("tpu", "", ModelType::Embedding, &gpu);
         assert!(r.is_err());
+    }
+
+    // --- KV quant resolution ---
+
+    use llama_cpp_2::context::params::KvCacheType;
+
+    #[test]
+    fn kv_quant_q8() {
+        let r = resolve_kv_quant("q8").unwrap();
+        assert_eq!(r, KvCacheType::Q8_0);
+    }
+
+    #[test]
+    fn kv_quant_q8_0() {
+        let r = resolve_kv_quant("q8_0").unwrap();
+        assert_eq!(r, KvCacheType::Q8_0);
+    }
+
+    #[test]
+    fn kv_quant_q4() {
+        let r = resolve_kv_quant("q4").unwrap();
+        assert_eq!(r, KvCacheType::Q4_0);
+    }
+
+    #[test]
+    fn kv_quant_q4_0() {
+        let r = resolve_kv_quant("q4_0").unwrap();
+        assert_eq!(r, KvCacheType::Q4_0);
+    }
+
+    #[test]
+    fn kv_quant_none() {
+        let r = resolve_kv_quant("none").unwrap();
+        assert_eq!(r, KvCacheType::F16);
+    }
+
+    #[test]
+    fn kv_quant_f16() {
+        let r = resolve_kv_quant("f16").unwrap();
+        assert_eq!(r, KvCacheType::F16);
+    }
+
+    #[test]
+    fn kv_quant_empty_defaults_to_f16() {
+        let r = resolve_kv_quant("").unwrap();
+        assert_eq!(r, KvCacheType::F16);
+    }
+
+    #[test]
+    fn kv_quant_case_insensitive() {
+        let r = resolve_kv_quant("Q8").unwrap();
+        assert_eq!(r, KvCacheType::Q8_0);
+    }
+
+    #[test]
+    fn kv_quant_unknown() {
+        let r = resolve_kv_quant("q2");
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("Unknown kv_quant"));
     }
 }
