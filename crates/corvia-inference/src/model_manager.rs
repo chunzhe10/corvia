@@ -1,12 +1,12 @@
+use crate::backend::{self, GpuCapabilities, ModelType};
+use crate::chat_service::ChatServiceImpl;
+use crate::embedding_service::EmbeddingServiceImpl;
 use corvia_proto::model_manager_server::ModelManager;
 use corvia_proto::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
-
-use crate::chat_service::ChatServiceImpl;
-use crate::embedding_service::EmbeddingServiceImpl;
 
 #[derive(Clone)]
 pub struct ModelEntry {
@@ -22,14 +22,17 @@ pub struct ModelManagerService {
     embed_svc: EmbeddingServiceImpl,
     /// Delegates chat model loads to the actual ChatService.
     chat_svc: ChatServiceImpl,
+    /// Probed GPU capabilities (cached at startup).
+    gpu: GpuCapabilities,
 }
 
 impl ModelManagerService {
-    pub fn new(embed_svc: EmbeddingServiceImpl, chat_svc: ChatServiceImpl) -> Self {
+    pub fn new(embed_svc: EmbeddingServiceImpl, chat_svc: ChatServiceImpl, gpu: GpuCapabilities) -> Self {
         Self {
             models: Arc::new(RwLock::new(HashMap::new())),
             embed_svc,
             chat_svc,
+            gpu,
         }
     }
 }
@@ -69,15 +72,52 @@ impl ModelManager for ModelManagerService {
         req: Request<LoadModelRequest>,
     ) -> Result<Response<LoadModelResponse>, Status> {
         let req = req.into_inner();
-        tracing::info!(model = %req.name, model_type = %req.model_type, "load_model requested");
+        tracing::info!(model = %req.name, model_type = %req.model_type,
+            device = %req.device, backend = %req.backend, "load_model requested");
 
-        // Delegate to the appropriate service based on model_type
-        let result = match req.model_type.as_str() {
-            "embedding" => self.embed_svc.load_model(&req.name).await,
-            "chat" => self.chat_svc.load_model(&req.name).await,
-            other => Err(Status::invalid_argument(format!(
-                "Unknown model_type: '{other}'. Expected 'embedding' or 'chat'."
-            ))),
+        let model_type = match req.model_type.as_str() {
+            "embedding" => ModelType::Embedding,
+            "chat" => ModelType::Chat,
+            other => {
+                return Ok(Response::new(LoadModelResponse {
+                    success: false,
+                    error: format!("Unknown model_type: '{other}'. Expected 'embedding' or 'chat'."),
+                    actual_device: String::new(),
+                    actual_backend: String::new(),
+                }));
+            }
+        };
+
+        // Resolve backend
+        let resolved = match backend::resolve_backend(&req.device, &req.backend, model_type, &self.gpu) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(Response::new(LoadModelResponse {
+                    success: false,
+                    error: e,
+                    actual_device: String::new(),
+                    actual_backend: String::new(),
+                }));
+            }
+        };
+
+        let actual_device = resolved.device.to_string();
+        let actual_backend = resolved.backend.to_string();
+
+        if resolved.fallback_used {
+            tracing::warn!(
+                model = %req.name,
+                requested_device = %req.device,
+                actual_device = %actual_device,
+                actual_backend = %actual_backend,
+                "GPU not available, fell back to CPU"
+            );
+        }
+
+        // Delegate to appropriate service
+        let result = match model_type {
+            ModelType::Embedding => self.embed_svc.load_model(&req.name, resolved).await,
+            ModelType::Chat => self.chat_svc.load_model(&req.name, resolved).await,
         };
 
         match result {
@@ -94,15 +134,15 @@ impl ModelManager for ModelManagerService {
                 Ok(Response::new(LoadModelResponse {
                     success: true,
                     error: String::new(),
-                    actual_device: String::new(),
-                    actual_backend: String::new(),
+                    actual_device,
+                    actual_backend,
                 }))
             }
             Err(status) => Ok(Response::new(LoadModelResponse {
                 success: false,
                 error: status.message().to_string(),
-                actual_device: String::new(),
-                actual_backend: String::new(),
+                actual_device,
+                actual_backend,
             })),
         }
     }

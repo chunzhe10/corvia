@@ -1126,6 +1126,7 @@ dependencies = [
  "hf-hub",
  "llama-cpp-2",
  "opentelemetry",
+ "ort",
  "prost 0.13.5",
  "serde",
  "serde_json",

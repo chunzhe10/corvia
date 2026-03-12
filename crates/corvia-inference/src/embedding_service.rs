@@ -1,13 +1,29 @@
+use crate::backend::{BackendKind, ResolvedBackend};
 use corvia_proto::embedding_service_server::EmbeddingService;
 use corvia_proto::*;
+use ort::execution_providers::{CUDAExecutionProvider, OpenVINOExecutionProvider, ExecutionProviderDispatch};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
+
+/// Build ONNX Runtime execution providers based on resolved backend.
+fn build_execution_providers(backend: &ResolvedBackend) -> Vec<ExecutionProviderDispatch> {
+    match backend.backend {
+        BackendKind::Cuda => vec![CUDAExecutionProvider::default().build()],
+        BackendKind::OpenVino => vec![
+            OpenVINOExecutionProvider::default()
+                .with_device_type("GPU")
+                .build(),
+        ],
+        BackendKind::Cpu => vec![], // ort defaults to CPU EP
+    }
+}
 
 /// A loaded embedding model with its enum variant for metadata lookups.
 struct LoadedModel {
     engine: fastembed::TextEmbedding,
     variant: fastembed::EmbeddingModel,
+    backend: ResolvedBackend,
 }
 
 #[derive(Clone)]
@@ -53,17 +69,18 @@ impl EmbeddingServiceImpl {
     }
 
     /// Load an embedding model by name. Downloads from HuggingFace if not cached.
-    pub async fn load_model(&self, name: &str) -> Result<(), Status> {
+    pub async fn load_model(&self, name: &str, backend: ResolvedBackend) -> Result<(), Status> {
         let model_enum = Self::resolve_model(name)?;
-
         let name_owned = name.to_string();
-        tracing::info!(model = %name_owned, "Loading embedding model...");
+        tracing::info!(model = %name_owned, device = %backend.device, backend_kind = %backend.backend, "Loading embedding model...");
 
+        let eps = build_execution_providers(&backend);
         let model_enum_for_spawn = model_enum.clone();
         let engine = tokio::task::spawn_blocking(move || {
             fastembed::TextEmbedding::try_new(
                 fastembed::InitOptions::new(model_enum_for_spawn)
-                    .with_show_download_progress(true),
+                    .with_show_download_progress(true)
+                    .with_execution_providers(eps),
             )
         })
         .await
@@ -78,10 +95,20 @@ impl EmbeddingServiceImpl {
                 LoadedModel {
                     engine,
                     variant: model_enum,
+                    backend,
                 },
             );
         tracing::info!(model = %name_owned, "Embedding model loaded");
         Ok(())
+    }
+
+    /// Get the resolved backend for a loaded model.
+    pub fn get_backend(&self, name: &str) -> Option<ResolvedBackend> {
+        self.models
+            .lock()
+            .ok()?
+            .get(name)
+            .map(|m| m.backend.clone())
     }
 }
 
@@ -188,5 +215,44 @@ impl EmbeddingService for EmbeddingServiceImpl {
             dimensions,
             loaded,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{BackendKind, Device, ResolvedBackend};
+
+    #[test]
+    fn test_build_execution_providers_cpu() {
+        let backend = ResolvedBackend {
+            device: Device::Cpu,
+            backend: BackendKind::Cpu,
+            fallback_used: false,
+        };
+        let eps = build_execution_providers(&backend);
+        assert!(eps.is_empty(), "CPU backend should produce no EPs (ort defaults to CPU)");
+    }
+
+    #[test]
+    fn test_build_execution_providers_cuda() {
+        let backend = ResolvedBackend {
+            device: Device::Gpu,
+            backend: BackendKind::Cuda,
+            fallback_used: false,
+        };
+        let eps = build_execution_providers(&backend);
+        assert_eq!(eps.len(), 1, "CUDA backend should produce exactly one EP");
+    }
+
+    #[test]
+    fn test_build_execution_providers_openvino() {
+        let backend = ResolvedBackend {
+            device: Device::Gpu,
+            backend: BackendKind::OpenVino,
+            fallback_used: false,
+        };
+        let eps = build_execution_providers(&backend);
+        assert_eq!(eps.len(), 1, "OpenVINO backend should produce exactly one EP");
     }
 }

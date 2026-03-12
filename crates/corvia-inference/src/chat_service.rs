@@ -1,3 +1,4 @@
+use crate::backend::{BackendKind, ResolvedBackend};
 use corvia_proto::chat_service_server::ChatService;
 use corvia_proto::*;
 use std::collections::HashMap;
@@ -50,8 +51,16 @@ use std::sync::OnceLock;
 
 static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
 
+/// Configure llama.cpp model params based on resolved backend.
+fn build_model_params(backend: &ResolvedBackend) -> LlamaModelParams {
+    match backend.backend {
+        BackendKind::Cuda => LlamaModelParams::default().with_n_gpu_layers(999),
+        _ => LlamaModelParams::default(), // CPU: n_gpu_layers = 0
+    }
+}
+
 /// Get a static reference to the initialized llama.cpp backend.
-fn backend() -> &'static LlamaBackend {
+fn llama_backend() -> &'static LlamaBackend {
     BACKEND.get_or_init(|| {
         let backend = LlamaBackend::init().expect("Failed to initialize llama.cpp backend");
         llama_cpp_2::send_logs_to_tracing(llama_cpp_2::LogOptions::default());
@@ -65,6 +74,7 @@ fn backend() -> &'static LlamaBackend {
 
 struct ChatModelEntry {
     model: Arc<LlamaModel>,
+    backend: ResolvedBackend,
 }
 
 // ---------------------------------------------------------------------------
@@ -79,18 +89,20 @@ pub struct ChatServiceImpl {
 
 impl ChatServiceImpl {
     pub fn new() -> Self {
-        let _ = backend(); // Ensure backend is initialized
+        let _ = llama_backend(); // Ensure backend is initialized
         Self {
             models: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     /// Download (if needed) and load a GGUF model into memory.
-    pub async fn load_model(&self, name: &str) -> Result<(), Status> {
+    pub async fn load_model(&self, name: &str, backend: ResolvedBackend) -> Result<(), Status> {
         let resolved = resolve_model(name)?;
         let name_owned = name.to_string();
-        tracing::info!(model = %name_owned, repo = %resolved.repo, file = %resolved.filename, "Loading chat model...");
+        tracing::info!(model = %name_owned, repo = %resolved.repo, file = %resolved.filename,
+            device = %backend.device, backend_kind = %backend.backend, "Loading chat model...");
 
+        let backend_clone = backend.clone();
         // Download + load on a blocking thread (both are CPU/IO heavy).
         let model = tokio::task::spawn_blocking(move || -> Result<Arc<LlamaModel>, Status> {
             // Download via hf-hub
@@ -103,8 +115,8 @@ impl ChatServiceImpl {
 
             tracing::info!(path = %model_path.display(), "GGUF file ready, loading into llama.cpp...");
 
-            let model_params = LlamaModelParams::default();
-            let model = LlamaModel::load_from_file(backend(), &model_path, &model_params)
+            let model_params = build_model_params(&backend_clone);
+            let model = LlamaModel::load_from_file(llama_backend(), &model_path, &model_params)
                 .map_err(|e| Status::internal(format!("Model load failed: {e}")))?;
 
             Ok(Arc::new(model))
@@ -115,10 +127,16 @@ impl ChatServiceImpl {
         let mut models = self.models.write().await;
         models.insert(
             name.to_string(),
-            ChatModelEntry { model },
+            ChatModelEntry { model, backend },
         );
         tracing::info!(model = %name, "Chat model loaded successfully");
         Ok(())
+    }
+
+    /// Get the resolved backend for a loaded model.
+    pub async fn get_backend(&self, name: &str) -> Option<ResolvedBackend> {
+        let models = self.models.read().await;
+        models.get(name).map(|e| e.backend.clone())
     }
 
     /// Get a reference to a loaded model.
@@ -195,7 +213,7 @@ fn generate_blocking(params: &GenerateParams) -> Result<GenerateResult, Status> 
         .with_n_batch(512);
 
     let mut ctx = model
-        .new_context(backend(), ctx_params)
+        .new_context(llama_backend(), ctx_params)
         .map_err(|e| Status::internal(format!("Context creation failed: {e}")))?;
 
     // Build sampler chain
@@ -302,7 +320,7 @@ fn generate_streaming_blocking(
         .with_n_batch(512);
 
     let mut ctx = model
-        .new_context(backend(), ctx_params)
+        .new_context(llama_backend(), ctx_params)
         .map_err(|e| Status::internal(format!("Context creation failed: {e}")))?;
 
     let temperature = if params.temperature <= 0.0 {
@@ -478,6 +496,29 @@ impl ChatService for ChatServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{BackendKind, Device, ResolvedBackend};
+
+    #[test]
+    fn test_build_model_params_cpu() {
+        let backend = ResolvedBackend {
+            device: Device::Cpu,
+            backend: BackendKind::Cpu,
+            fallback_used: false,
+        };
+        let params = build_model_params(&backend);
+        let _ = params;
+    }
+
+    #[test]
+    fn test_build_model_params_cuda() {
+        let backend = ResolvedBackend {
+            device: Device::Gpu,
+            backend: BackendKind::Cuda,
+            fallback_used: false,
+        };
+        let params = build_model_params(&backend);
+        let _ = params;
+    }
 
     #[test]
     fn test_resolve_model_llama32_default() {

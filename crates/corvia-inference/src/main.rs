@@ -1,3 +1,4 @@
+mod backend;
 mod chat_service;
 mod embedding_service;
 mod model_manager;
@@ -57,11 +58,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Serve { port } => {
             let addr = format!("0.0.0.0:{port}").parse()?;
+
+            // Probe GPU capabilities once at startup
+            let gpu = backend::GpuCapabilities::probe();
+            tracing::info!(
+                cuda = gpu.cuda_available,
+                openvino = gpu.openvino_available,
+                "GPU capabilities"
+            );
+
             let embed_svc = embedding_service::EmbeddingServiceImpl::new();
             let chat_svc = chat_service::ChatServiceImpl::new();
             let model_mgr = model_manager::ModelManagerService::new(
                 embed_svc.clone(),
                 chat_svc.clone(),
+                gpu,
             );
 
             tracing::info!(port, "inference_server_starting");

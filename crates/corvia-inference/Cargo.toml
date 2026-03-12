@@ -22,7 +22,14 @@ clap = { version = "4", features = ["derive"] }
 serde.workspace = true
 serde_json.workspace = true
 fastembed = "5"
+# Direct ort dep with EP features — Cargo unifies with fastembed's internal ort.
+# CUDA and OpenVINO EPs are runtime-loaded (no toolkit needed at build time).
+ort = { version = "=2.0.0-rc.11", features = ["openvino", "cuda"] }
 tokio-stream = "0.1"
 llama-cpp-2 = "0.1"
 hf-hub = "0.4"
 encoding_rs = "0.8.35"
+
+[features]
+default = []
+cuda = ["llama-cpp-2/cuda"]
