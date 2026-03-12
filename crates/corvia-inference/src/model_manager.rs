@@ -1,4 +1,5 @@
-use crate::backend::{self, GpuCapabilities, ModelType};
+use crate::backend::{self, GpuCapabilities, ModelType, resolve_kv_quant};
+use llama_cpp_2::context::params::KvCacheType;
 use crate::chat_service::ChatServiceImpl;
 use crate::embedding_service::EmbeddingServiceImpl;
 use corvia_proto::model_manager_server::ModelManager;
@@ -15,6 +16,8 @@ pub struct ModelEntry {
     pub loaded: bool,
     pub device: String,
     pub backend: String,
+    pub kv_quant: String,
+    pub flash_attention: bool,
 }
 
 pub struct ModelManagerService {
@@ -66,6 +69,8 @@ impl ModelManager for ModelManagerService {
                 memory_bytes: 0,
                 device: m.device.clone(),
                 backend: m.backend.clone(),
+                kv_quant: m.kv_quant.clone(),
+                flash_attention: m.flash_attention,
             })
             .collect();
         Ok(Response::new(ListModelsResponse { models: statuses }))
@@ -108,6 +113,24 @@ impl ModelManager for ModelManagerService {
             }
         };
 
+        // Resolve KV quant
+        let kv_cache_type = match resolve_kv_quant(&req.kv_quant) {
+            Ok(t) => t,
+            Err(e) => {
+                return Ok(Response::new(LoadModelResponse {
+                    success: false,
+                    error: e,
+                    actual_device: String::new(),
+                    actual_backend: String::new(),
+                }));
+            }
+        };
+
+        // Log if KV quant set on embedding model (ignored by ONNX)
+        if model_type == ModelType::Embedding && kv_cache_type != KvCacheType::F16 {
+            tracing::debug!(model = %req.name, kv_quant = %req.kv_quant, "KV quant ignored for embedding model");
+        }
+
         let actual_device = resolved.device.to_string();
         let actual_backend = resolved.backend.to_string();
 
@@ -124,7 +147,7 @@ impl ModelManager for ModelManagerService {
         // Delegate to appropriate service
         let result = match model_type {
             ModelType::Embedding => self.embed_svc.load_model(&req.name, resolved).await,
-            ModelType::Chat => self.chat_svc.load_model(&req.name, resolved).await,
+            ModelType::Chat => self.chat_svc.load_model(&req.name, resolved, kv_cache_type, req.flash_attention).await,
         };
 
         match result {
@@ -138,6 +161,8 @@ impl ModelManager for ModelManagerService {
                         loaded: true,
                         device: actual_device.clone(),
                         backend: actual_backend.clone(),
+                        kv_quant: req.kv_quant,
+                        flash_attention: req.flash_attention,
                     },
                 );
                 Ok(Response::new(LoadModelResponse {
@@ -239,6 +264,22 @@ impl ModelManager for ModelManagerService {
                 }
             };
 
+            let kv_cache_type = match resolve_kv_quant(&req.kv_quant) {
+                Ok(t) => t,
+                Err(e) => {
+                    results.push(ModelReloadResult {
+                        name: entry.name.clone(),
+                        model_type: entry.model_type.clone(),
+                        success: false,
+                        error: e,
+                        actual_device: String::new(),
+                        actual_backend: String::new(),
+                    });
+                    all_success = false;
+                    continue;
+                }
+            };
+
             let actual_device = resolved.device.to_string();
             let actual_backend = resolved.backend.to_string();
 
@@ -246,7 +287,7 @@ impl ModelManager for ModelManagerService {
 
             let load_result = match model_type {
                 ModelType::Embedding => self.embed_svc.load_model(&entry.name, resolved).await,
-                ModelType::Chat => self.chat_svc.load_model(&entry.name, resolved).await,
+                ModelType::Chat => self.chat_svc.load_model(&entry.name, resolved, kv_cache_type, req.flash_attention).await,
             };
 
             match load_result {
@@ -260,6 +301,8 @@ impl ModelManager for ModelManagerService {
                             loaded: true,
                             device: actual_device.clone(),
                             backend: actual_backend.clone(),
+                            kv_quant: req.kv_quant.clone(),
+                            flash_attention: req.flash_attention,
                         },
                     );
                     results.push(ModelReloadResult {
