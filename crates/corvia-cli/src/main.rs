@@ -216,7 +216,7 @@ enum AgentCommands {
 
 #[derive(Subcommand)]
 enum InferenceCommands {
-    /// Reload all loaded models with a different device/backend
+    /// Reload loaded models with a different device/backend
     Reload {
         /// Device: "auto", "gpu", or "cpu"
         #[arg(long, default_value = "auto")]
@@ -224,6 +224,9 @@ enum InferenceCommands {
         /// Backend override: "cuda", "openvino", or "" (auto-select)
         #[arg(long, default_value = "")]
         backend: String,
+        /// Reload only this model (omit to reload all)
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Show loaded models and their device/backend
     Status,
@@ -325,7 +328,7 @@ async fn main() -> Result<()> {
         Commands::Migrate { to, dry_run } => upgrade::cmd_migrate(&to, dry_run).await?,
         Commands::Upgrade { dry_run } => upgrade::cmd_migrate("surrealdb", dry_run).await?,
         Commands::Inference { command } => match command {
-            InferenceCommands::Reload { device, backend } => cmd_inference_reload(&device, &backend).await?,
+            InferenceCommands::Reload { device, backend, model } => cmd_inference_reload(&device, &backend, model.as_deref()).await?,
             InferenceCommands::Status => cmd_inference_status().await?,
         },
     }
@@ -1587,7 +1590,7 @@ fn parse_duration(s: &str) -> Result<chrono::Duration> {
 }
 
 /// Truncate a string to at most `max_chars` characters, respecting UTF-8 char boundaries.
-async fn cmd_inference_reload(device: &str, backend: &str) -> Result<()> {
+async fn cmd_inference_reload(device: &str, backend: &str, model: Option<&str>) -> Result<()> {
     let config = load_config()?;
     let grpc_url = match config.embedding.provider {
         corvia_common::config::InferenceProvider::Corvia => config.embedding.url.clone(),
@@ -1597,8 +1600,11 @@ async fn cmd_inference_reload(device: &str, backend: &str) -> Result<()> {
     if !provisioner.is_running().await {
         anyhow::bail!("corvia-inference server is not running at {grpc_url}");
     }
-    println!("Reloading models with device={device}, backend={backend}...");
-    provisioner.reload_models(device, backend).await?;
+    match model {
+        Some(name) => println!("Reloading model '{name}' with device={device}, backend={backend}..."),
+        None => println!("Reloading all models with device={device}, backend={backend}..."),
+    }
+    provisioner.reload_models(device, backend, model).await?;
     println!("Reload complete.");
     Ok(())
 }

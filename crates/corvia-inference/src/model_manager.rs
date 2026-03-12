@@ -181,10 +181,14 @@ impl ModelManager for ModelManagerService {
             *gpu = new_gpu;
         }
 
-        // Snapshot currently loaded models
+        // Snapshot currently loaded models (optionally filtered by name)
         let snapshot: Vec<ModelEntry> = {
             let models = self.models.read().await;
-            models.values().filter(|m| m.loaded).cloned().collect()
+            models.values()
+                .filter(|m| m.loaded)
+                .filter(|m| req.name.is_empty() || m.name == req.name)
+                .cloned()
+                .collect()
         };
 
         if snapshot.is_empty() {

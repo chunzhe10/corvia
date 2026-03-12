@@ -43,6 +43,7 @@ message ReloadModelsRequest {
   string device = 1;             // "auto" | "gpu" | "cpu"
   string backend = 2;            // optional: "cuda", "openvino", ""
   bool reprobe_gpu = 3;          // re-run GPU detection before reloading
+  string name = 4;               // optional: reload only this model (empty = all)
 }
 message ReloadModelsResponse {
   bool success = 1;

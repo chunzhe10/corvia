@@ -144,8 +144,9 @@ impl InferenceProvisioner {
         Ok(())
     }
 
-    /// Reload all currently loaded models with a new device/backend.
-    pub async fn reload_models(&self, device: &str, backend: &str) -> Result<()> {
+    /// Reload loaded models with a new device/backend.
+    /// If `model_name` is Some, only that model is reloaded; otherwise all.
+    pub async fn reload_models(&self, device: &str, backend: &str, model_name: Option<&str>) -> Result<()> {
         let mut client = ModelManagerClient::connect(self.endpoint_url())
             .await
             .map_err(|e| CorviaError::Infra(format!("gRPC connect failed: {e}")))?;
@@ -155,6 +156,7 @@ impl InferenceProvisioner {
                 device: device.to_string(),
                 backend: backend.to_string(),
                 reprobe_gpu: true,
+                name: model_name.unwrap_or_default().to_string(),
             }))
             .await
             .map_err(|e| CorviaError::Infra(format!("ReloadModels failed: {e}")))?;
