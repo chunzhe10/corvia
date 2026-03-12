@@ -1,4 +1,6 @@
 use crate::backend::{BackendKind, ResolvedBackend};
+use llama_cpp_2::context::params::KvCacheType;
+use llama_cpp_sys_2::{LLAMA_FLASH_ATTN_TYPE_ENABLED, LLAMA_FLASH_ATTN_TYPE_DISABLED};
 use corvia_proto::chat_service_server::ChatService;
 use corvia_proto::*;
 use std::collections::HashMap;
@@ -75,6 +77,8 @@ fn llama_backend() -> &'static LlamaBackend {
 struct ChatModelEntry {
     model: Arc<LlamaModel>,
     backend: ResolvedBackend,
+    kv_cache_type: KvCacheType,
+    flash_attention: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -96,7 +100,7 @@ impl ChatServiceImpl {
     }
 
     /// Download (if needed) and load a GGUF model into memory.
-    pub async fn load_model(&self, name: &str, backend: ResolvedBackend) -> Result<(), Status> {
+    pub async fn load_model(&self, name: &str, backend: ResolvedBackend, kv_cache_type: KvCacheType, flash_attention: bool) -> Result<(), Status> {
         let resolved = resolve_model(name)?;
         let name_owned = name.to_string();
         tracing::info!(model = %name_owned, repo = %resolved.repo, file = %resolved.filename,
@@ -127,7 +131,7 @@ impl ChatServiceImpl {
         let mut models = self.models.write().await;
         models.insert(
             name.to_string(),
-            ChatModelEntry { model, backend },
+            ChatModelEntry { model, backend, kv_cache_type, flash_attention },
         );
         tracing::info!(model = %name, "Chat model loaded successfully");
         Ok(())
@@ -139,12 +143,12 @@ impl ChatServiceImpl {
         models.get(name).map(|e| e.backend.clone())
     }
 
-    /// Get a reference to a loaded model.
-    async fn get_model(&self, name: &str) -> Result<Arc<LlamaModel>, Status> {
+    /// Get a loaded model with its KV cache settings.
+    async fn get_model_with_settings(&self, name: &str) -> Result<(Arc<LlamaModel>, KvCacheType, bool), Status> {
         let models = self.models.read().await;
         models
             .get(name)
-            .map(|e| Arc::clone(&e.model))
+            .map(|e| (Arc::clone(&e.model), e.kv_cache_type, e.flash_attention))
             .ok_or_else(|| Status::not_found(format!("Chat model '{}' not loaded", name)))
     }
 }
@@ -159,6 +163,8 @@ struct GenerateParams {
     prompt: String,
     temperature: f32,
     max_tokens: u32,
+    kv_cache_type: KvCacheType,
+    flash_attention: bool,
 }
 
 /// Result of running inference.
@@ -187,6 +193,25 @@ fn build_prompt(model: &LlamaModel, messages: &[ChatMessage]) -> Result<String, 
         .map_err(|e| Status::internal(format!("Failed to apply chat template: {e}")))
 }
 
+/// Build LlamaContextParams with KV cache quantization and flash attention.
+fn build_context_params(ctx_size: u32, kv_cache_type: KvCacheType, flash_attention: bool) -> LlamaContextParams {
+    let flash_policy = if flash_attention && kv_cache_type == KvCacheType::Q4_0 {
+        tracing::warn!("Flash attention not compatible with Q4 KV cache, disabling");
+        LLAMA_FLASH_ATTN_TYPE_DISABLED
+    } else if flash_attention {
+        LLAMA_FLASH_ATTN_TYPE_ENABLED
+    } else {
+        LLAMA_FLASH_ATTN_TYPE_DISABLED
+    };
+
+    LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(ctx_size.max(512)))
+        .with_n_batch(512)
+        .with_type_k(kv_cache_type)
+        .with_type_v(kv_cache_type)
+        .with_flash_attention_policy(flash_policy)
+}
+
 /// Run full generation (blocking). Returns the generated text and token counts.
 fn generate_blocking(params: &GenerateParams) -> Result<GenerateResult, Status> {
     let model = &params.model;
@@ -208,9 +233,7 @@ fn generate_blocking(params: &GenerateParams) -> Result<GenerateResult, Status> 
 
     // Create context
     let ctx_size = (n_prompt + max_tokens + 64) as u32;
-    let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(ctx_size.max(512)))
-        .with_n_batch(512);
+    let ctx_params = build_context_params(ctx_size, params.kv_cache_type, params.flash_attention);
 
     let mut ctx = model
         .new_context(llama_backend(), ctx_params)
@@ -315,9 +338,7 @@ fn generate_streaming_blocking(
     };
 
     let ctx_size = (n_prompt + max_tokens + 64) as u32;
-    let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(ctx_size.max(512)))
-        .with_n_batch(512);
+    let ctx_params = build_context_params(ctx_size, params.kv_cache_type, params.flash_attention);
 
     let mut ctx = model
         .new_context(llama_backend(), ctx_params)
@@ -428,7 +449,7 @@ fn generate_streaming_blocking(
 impl ChatService for ChatServiceImpl {
     async fn chat(&self, req: Request<ChatRequest>) -> Result<Response<ChatResponse>, Status> {
         let req = req.into_inner();
-        let model = self.get_model(&req.model).await?;
+        let (model, kv_cache_type, flash_attention) = self.get_model_with_settings(&req.model).await?;
 
         let prompt = build_prompt(&model, &req.messages)?;
         let temperature = req.temperature;
@@ -439,6 +460,8 @@ impl ChatService for ChatServiceImpl {
             prompt,
             temperature,
             max_tokens,
+            kv_cache_type,
+            flash_attention,
         };
 
         let result = tokio::task::spawn_blocking(move || generate_blocking(&params))
@@ -462,7 +485,7 @@ impl ChatService for ChatServiceImpl {
         req: Request<ChatRequest>,
     ) -> Result<Response<Self::ChatStreamStream>, Status> {
         let req = req.into_inner();
-        let model = self.get_model(&req.model).await?;
+        let (model, kv_cache_type, flash_attention) = self.get_model_with_settings(&req.model).await?;
 
         let prompt = build_prompt(&model, &req.messages)?;
         let temperature = req.temperature;
@@ -476,6 +499,8 @@ impl ChatService for ChatServiceImpl {
                 prompt,
                 temperature,
                 max_tokens,
+                kv_cache_type,
+                flash_attention,
             };
 
             if let Err(e) = generate_streaming_blocking(&params, &tx) {
