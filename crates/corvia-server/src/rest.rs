@@ -31,6 +31,8 @@ pub struct AppState {
     pub config: Arc<std::sync::RwLock<corvia_common::config::CorviaConfig>>,
     /// Path to the config file on disk.
     pub config_path: std::path::PathBuf,
+    /// Semantic cluster hierarchy for LOD graph rendering.
+    pub cluster_store: Arc<crate::dashboard::clustering::ClusterStore>,
 }
 
 // --- Existing memory types ---

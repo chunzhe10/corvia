@@ -549,12 +549,45 @@ async fn cmd_serve() -> Result<()> {
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let default_scope_id = Some(config.project.scope_id.clone());
     let config_path = CorviaConfig::config_path();
+    let cluster_store = Arc::new(corvia_server::dashboard::clustering::ClusterStore::new());
     let state = Arc::new(corvia_server::rest::AppState {
         store, engine, coordinator, graph, temporal, data_dir,
         rag: Some(rag), ready: ready.clone(), default_scope_id,
         config: Arc::new(std::sync::RwLock::new(config.clone())),
         config_path,
+        cluster_store: cluster_store.clone(),
     });
+    // Background cluster recompute every 60s
+    {
+        let cluster_store_bg = state.cluster_store.clone();
+        let data_dir_bg = state.data_dir.clone();
+        let scope_id_bg = state.default_scope_id.clone().unwrap_or_else(|| "corvia".into());
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                match corvia_kernel::knowledge_files::read_scope(&data_dir_bg, &scope_id_bg) {
+                    Ok(entries) => {
+                        let pairs: Vec<(String, Vec<f32>)> = entries
+                            .iter()
+                            .filter_map(|e| {
+                                e.embedding
+                                    .as_ref()
+                                    .map(|emb| (e.id.to_string(), emb.clone()))
+                            })
+                            .collect();
+                        if cluster_store_bg.maybe_recompute(&pairs) {
+                            tracing::info!(
+                                "Cluster hierarchy recomputed ({} entries)",
+                                pairs.len()
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!("Cluster recompute failed: {e}"),
+                }
+            }
+        });
+    }
+
     let mut app = corvia_server::rest::router(state.clone());
     app = app.merge(corvia_server::mcp::mcp_router(state.clone()));
     app = app.merge(corvia_server::dashboard::router(state));

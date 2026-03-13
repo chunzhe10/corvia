@@ -1,5 +1,7 @@
 //! Dashboard REST API — `/api/dashboard/*` endpoints.
 
+pub mod activity;
+pub mod clustering;
 pub mod health;
 pub mod traces;
 
@@ -7,13 +9,14 @@ use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use corvia_common::dashboard::{
     DashboardConfig, DashboardStatusResponse, LogEntry, LogsResponse, ModuleStats, TracesResponse,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use crate::rest::AppState;
 
 /// Dashboard REST API router — mounts at /api/dashboard/*
@@ -24,7 +27,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/dashboard/logs", get(logs_handler))
         .route("/api/dashboard/config", get(config_handler))
         .route("/api/dashboard/graph", get(graph_handler))
-        .route("/api/dashboard/graph/scope", get(graph_scope_handler))
+        .route("/api/dashboard/graph/scope", get(clustered_graph_handler))
         .route("/api/dashboard/agents", get(agents_handler))
         .route("/api/dashboard/agents/{agent_id}/sessions", get(agent_sessions_handler))
         .route("/api/dashboard/merge/queue", get(merge_queue_handler))
@@ -401,6 +404,178 @@ async fn graph_scope_handler(
         "nodes": nodes,
         "edges": all_edges,
     })))
+}
+
+// ---------------------------------------------------------------------------
+// Clustered graph endpoint (LOD)
+// ---------------------------------------------------------------------------
+
+/// Query params for /api/dashboard/graph/scope with LOD support.
+#[derive(Debug, Deserialize)]
+pub struct ClusteredGraphParams {
+    pub level: Option<u8>,
+    pub parent: Option<String>,
+}
+
+/// GET /api/dashboard/graph/scope
+/// When `level` is provided, returns clustered graph at the specified LOD level.
+/// When no `level` is provided, falls through to legacy behavior (all nodes + edges).
+async fn clustered_graph_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ClusteredGraphParams>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // No level param: legacy behavior (backward compatible)
+    let level = match params.level {
+        None => return graph_scope_handler(State(state)).await.map(|j| j.into_response()),
+        Some(l) => l,
+    };
+
+    let hierarchy = match state.cluster_store.current() {
+        Some(h) => h,
+        None => {
+            // Degraded mode: cluster store not yet computed.
+            // Try an immediate computation.
+            let scope_id = state.default_scope_id.as_deref().unwrap_or("corvia");
+            let entries = corvia_kernel::knowledge_files::read_scope(&state.data_dir, scope_id)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load entries: {e}")))?;
+            let pairs: Vec<(String, Vec<f32>)> = entries
+                .iter()
+                .filter_map(|e| e.embedding.as_ref().map(|emb| (e.id.to_string(), emb.clone())))
+                .collect();
+            if state.cluster_store.maybe_recompute(&pairs) {
+                tracing::info!("Cluster hierarchy computed on-demand ({} entries)", pairs.len());
+            }
+            match state.cluster_store.current() {
+                Some(h) => h,
+                None => {
+                    return Ok(Json(serde_json::json!({
+                        "nodes": [], "edges": [], "degraded": true
+                    })).into_response());
+                }
+            }
+        }
+    };
+
+    match level {
+        0 => {
+            // Super-clusters as nodes
+            let scope_id = state.default_scope_id.as_deref().unwrap_or("corvia");
+            let entries = corvia_kernel::knowledge_files::read_scope(&state.data_dir, scope_id)
+                .unwrap_or_default();
+            let entry_map: std::collections::HashMap<String, &corvia_common::types::KnowledgeEntry> =
+                entries.iter().map(|e| (e.id.to_string(), e)).collect();
+
+            let nodes: Vec<serde_json::Value> = hierarchy.super_clusters.iter().map(|sc| {
+                // Find best label from the nearest-centroid entry
+                let label = sc.entry_ids.iter()
+                    .find_map(|id| entry_map.get(id.as_str()))
+                    .and_then(|e| {
+                        e.metadata.source_file.clone()
+                            .or_else(|| Some(e.content.chars().take(60).collect()))
+                    })
+                    .unwrap_or_else(|| sc.label.clone());
+
+                serde_json::json!({
+                    "id": sc.cluster_id,
+                    "label": label,
+                    "level": 0,
+                    "entry_count": sc.entry_ids.len(),
+                })
+            }).collect();
+
+            // Compute inter-cluster edge counts
+            let mut edges = Vec::new();
+            for (i, sc_a) in hierarchy.super_clusters.iter().enumerate() {
+                for sc_b in hierarchy.super_clusters.iter().skip(i + 1) {
+                    // Count graph edges that cross between these two clusters
+                    let mut cross_count = 0u32;
+                    for entry_id_str in &sc_a.entry_ids {
+                        if let Ok(uuid) = entry_id_str.parse::<uuid::Uuid>() {
+                            let entry_edges = state
+                                .graph
+                                .edges(&uuid, corvia_common::types::EdgeDirection::Both)
+                                .await
+                                .unwrap_or_default();
+                            for edge in &entry_edges {
+                                let other_id = if edge.from == uuid {
+                                    edge.to.to_string()
+                                } else {
+                                    edge.from.to_string()
+                                };
+                                if sc_b.entry_ids.contains(&other_id) {
+                                    cross_count += 1;
+                                }
+                            }
+                        }
+                    }
+                    if cross_count > 0 {
+                        edges.push(serde_json::json!({
+                            "from": sc_a.cluster_id,
+                            "to": sc_b.cluster_id,
+                            "weight": cross_count,
+                        }));
+                    }
+                }
+            }
+
+            Ok(Json(serde_json::json!({ "nodes": nodes, "edges": edges })).into_response())
+        }
+        1 => {
+            // Sub-clusters within a parent super-cluster
+            let parent_id = params.parent.as_deref().unwrap_or("");
+            let nodes: Vec<serde_json::Value> = hierarchy.sub_clusters.iter()
+                .filter(|sc| sc.parent_id.as_deref() == Some(parent_id))
+                .map(|sc| serde_json::json!({
+                    "id": sc.cluster_id,
+                    "label": sc.label,
+                    "level": 1,
+                    "entry_count": sc.entry_ids.len(),
+                    "parent_id": sc.parent_id,
+                }))
+                .collect();
+            Ok(Json(serde_json::json!({ "nodes": nodes, "edges": [] })).into_response())
+        }
+        2 => {
+            // Individual entries within a parent cluster
+            let parent_id = params.parent.as_deref().unwrap_or("");
+            let cluster = hierarchy.sub_clusters.iter()
+                .find(|sc| sc.cluster_id == parent_id)
+                .or_else(|| hierarchy.super_clusters.iter().find(|sc| sc.cluster_id == parent_id));
+
+            let scope_id = state.default_scope_id.as_deref().unwrap_or("corvia");
+            let entries = corvia_kernel::knowledge_files::read_scope(&state.data_dir, scope_id)
+                .unwrap_or_default();
+            let entry_map: std::collections::HashMap<String, &corvia_common::types::KnowledgeEntry> =
+                entries.iter().map(|e| (e.id.to_string(), e)).collect();
+
+            let entry_ids = cluster.map(|c| &c.entry_ids);
+            let nodes: Vec<serde_json::Value> = entry_ids
+                .into_iter()
+                .flat_map(|ids| ids.iter())
+                .filter_map(|id| {
+                    entry_map.get(id.as_str()).map(|e| {
+                        let label = e.metadata.source_file.clone()
+                            .unwrap_or_else(|| e.content.chars().take(80).collect());
+                        serde_json::json!({
+                            "id": id,
+                            "label": label,
+                            "level": 2,
+                            "preview": e.content.chars().take(200).collect::<String>(),
+                            "source_file": e.metadata.source_file,
+                            "language": e.metadata.language,
+                            "content_role": e.metadata.content_role,
+                            "source_origin": e.metadata.source_origin,
+                        })
+                    })
+                })
+                .collect();
+
+            Ok(Json(serde_json::json!({ "nodes": nodes, "edges": [], "level": 2 })).into_response())
+        }
+        _ => {
+            Ok(Json(serde_json::json!({ "error": "Invalid level. Use 0, 1, or 2." })).into_response())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
