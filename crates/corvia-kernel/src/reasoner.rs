@@ -619,6 +619,53 @@ pub fn check_coverage_gap(entries: &[KnowledgeEntry]) -> Vec<Finding> {
     }
 }
 
+/// Check for potential contradictions between current entries from different source origins.
+///
+/// Uses cosine similarity on pre-computed embeddings. Entries with high similarity
+/// (>= threshold) from different `source_origin` values are flagged, since they
+/// likely describe the same topic but may contain conflicting information.
+pub fn check_temporal_contradiction(
+    entries: &[KnowledgeEntry],
+    threshold: f32,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let current: Vec<&KnowledgeEntry> = entries.iter().filter(|e| e.is_current()).collect();
+
+    for i in 0..current.len() {
+        for j in (i + 1)..current.len() {
+            let a = current[i];
+            let b = current[j];
+
+            // Must have different source_origin
+            if a.metadata.source_origin == b.metadata.source_origin {
+                continue;
+            }
+
+            // Must both have embeddings for similarity check
+            let (Some(ea), Some(eb)) = (&a.embedding, &b.embedding) else {
+                continue;
+            };
+
+            let sim = cosine_similarity(ea, eb);
+            if sim >= threshold {
+                findings.push(Finding::new(
+                    CheckType::TemporalContradiction,
+                    &a.scope_id,
+                    vec![a.id, b.id],
+                    sim,
+                    format!(
+                        "High similarity ({:.2}) between entries from '{}' and '{}' — possible contradiction",
+                        sim,
+                        a.metadata.source_origin.as_deref().unwrap_or("unknown"),
+                        b.metadata.source_origin.as_deref().unwrap_or("unknown"),
+                    ),
+                ));
+            }
+        }
+    }
+    findings
+}
+
 /// Compute cosine similarity between two embedding vectors.
 /// Both vectors must have the same dimensionality.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -1195,6 +1242,49 @@ mod tests {
             blocked_paths: vec!["docs/superpowers/*".into()],
             repo_docs_pattern: Some("docs/".into()),
         }
+    }
+
+    // ---- TemporalContradiction check ----
+
+    #[test]
+    fn test_temporal_contradiction_skips_without_embeddings() {
+        let mut e1 = KnowledgeEntry::new("auth uses JWT".into(), "test".into(), "v1".into());
+        e1.metadata.source_origin = Some("repo:backend".into());
+        let mut e2 = KnowledgeEntry::new("auth uses session cookies".into(), "test".into(), "v2".into());
+        e2.metadata.source_origin = Some("repo:frontend".into());
+        // No embeddings
+        let findings = check_temporal_contradiction(&[e1, e2], 0.85);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn test_temporal_contradiction_flags_similar_cross_origin() {
+        let fake_embedding = vec![0.1, 0.2, 0.3, 0.4];
+        let mut e1 = KnowledgeEntry::new("auth uses JWT".into(), "test".into(), "v1".into());
+        e1.metadata.source_origin = Some("repo:backend".into());
+        e1.embedding = Some(fake_embedding.clone());
+
+        let mut e2 = KnowledgeEntry::new("auth uses session cookies".into(), "test".into(), "v2".into());
+        e2.metadata.source_origin = Some("repo:frontend".into());
+        e2.embedding = Some(fake_embedding);
+
+        let findings = check_temporal_contradiction(&[e1, e2], 0.85);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].check_type, CheckType::TemporalContradiction);
+    }
+
+    #[test]
+    fn test_temporal_contradiction_ignores_same_origin() {
+        let fake_embedding = vec![0.1, 0.2, 0.3, 0.4];
+        let mut e1 = KnowledgeEntry::new("v1".into(), "test".into(), "v1".into());
+        e1.metadata.source_origin = Some("repo:backend".into());
+        e1.embedding = Some(fake_embedding.clone());
+        let mut e2 = KnowledgeEntry::new("v2".into(), "test".into(), "v2".into());
+        e2.metadata.source_origin = Some("repo:backend".into());
+        e2.embedding = Some(fake_embedding);
+
+        let findings = check_temporal_contradiction(&[e1, e2], 0.85);
+        assert!(findings.is_empty());
     }
 
     // ---- CoverageGap check ----
