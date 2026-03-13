@@ -853,6 +853,7 @@ impl CodeChunk {
             chunk_type: Some(self.chunk_type.clone()),
             start_line: Some(self.start_line),
             end_line: Some(self.end_line),
+            ..Default::default()
         })
     }
 }

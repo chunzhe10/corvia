@@ -608,6 +608,7 @@ async fn cmd_ingest(path: Option<&str>) -> Result<()> {
                     chunk_type: Some(pc.chunk_type.clone()),
                     start_line: Some(pc.start_line),
                     end_line: Some(pc.end_line),
+                    ..Default::default()
                 };
                 entry
             })

@@ -446,6 +446,7 @@ pub async fn ingest_workspace(
                     chunk_type: Some(pc.chunk_type.clone()),
                     start_line: Some(pc.start_line),
                     end_line: Some(pc.end_line),
+                    ..Default::default()
                 };
                 entry
             })

@@ -401,6 +401,7 @@ fn main() {
             chunk_type: Some(pc.chunk_type.clone()),
             start_line: Some(pc.start_line),
             end_line: Some(pc.end_line),
+            ..Default::default()
         };
         // Assign deterministic embeddings (vary by index for diversity)
         let x = if i % 3 == 0 { 1.0 } else { 0.0 };

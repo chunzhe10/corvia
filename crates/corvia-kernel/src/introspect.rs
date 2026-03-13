@@ -203,8 +203,7 @@ impl Introspect {
                     source_file: Some(sf.metadata.file_path.clone()),
                     language: sf.metadata.language.clone(),
                     chunk_type: Some("file".into()),
-                    start_line: None,
-                    end_line: None,
+                    ..Default::default()
                 };
                 entry
             })
@@ -252,8 +251,7 @@ impl Introspect {
                     source_file: Some(sf.metadata.file_path.clone()),
                     language: sf.metadata.language.clone(),
                     chunk_type: Some("file".into()),
-                    start_line: None,
-                    end_line: None,
+                    ..Default::default()
                 };
                 entry
             })
