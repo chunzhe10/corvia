@@ -32,6 +32,8 @@ message LoadModelRequest {
   string backend = 4;           // optional override: "cuda", "openvino", "vulkan", ""
   string kv_quant = 5;          // "q8", "q4", "none", "" (use default)
   bool flash_attention = 6;     // enable flash attention
+  string hf_repo = 7;           // HF repo (e.g. "bartowski/Qwen_Qwen3-8B-GGUF"); if set, skips internal resolve
+  string hf_filename = 8;       // GGUF filename (e.g. "Qwen3-8B-Q4_K_M.gguf"); used with hf_repo
 }
 message LoadModelResponse {
   bool success = 1;

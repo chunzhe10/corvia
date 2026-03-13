@@ -89,6 +89,8 @@ async fn test_chat_e2e_generates_response() {
             backend: String::new(),
             kv_quant: String::new(),
             flash_attention: false,
+            hf_repo: String::new(),
+            hf_filename: String::new(),
         })
         .await
         .expect("load_model RPC failed")
@@ -151,6 +153,8 @@ async fn test_chat_stream_e2e() {
             backend: String::new(),
             kv_quant: String::new(),
             flash_attention: false,
+            hf_repo: String::new(),
+            hf_filename: String::new(),
         })
         .await
         .expect("load_model failed")

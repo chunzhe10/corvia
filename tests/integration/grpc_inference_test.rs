@@ -170,6 +170,8 @@ async fn test_grpc_model_lifecycle() {
             backend: String::new(),
             kv_quant: String::new(),
             flash_attention: false,
+            hf_repo: String::new(),
+            hf_filename: String::new(),
         }))
         .await
         .unwrap();
@@ -219,6 +221,8 @@ async fn test_grpc_chat_stub() {
         backend: String::new(),
         kv_quant: String::new(),
         flash_attention: false,
+        hf_repo: String::new(),
+        hf_filename: String::new(),
     }))
     .await
     .unwrap();

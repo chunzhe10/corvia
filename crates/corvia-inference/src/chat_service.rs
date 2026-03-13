@@ -29,6 +29,8 @@ pub struct ResolvedModel {
 }
 
 /// Map a short model name (e.g. "llama3.2", "llama3.2:1b") to a HF repo + GGUF filename.
+/// This is the hardcoded fallback — keep in sync with `default_chat_models()` in
+/// `corvia-common/src/config.rs`. Config-driven resolution is preferred when available.
 pub fn resolve_model(name: &str) -> Result<ResolvedModel, Status> {
     match name {
         "llama3.2" | "llama3.2:3b" => Ok(ResolvedModel {
@@ -39,8 +41,12 @@ pub fn resolve_model(name: &str) -> Result<ResolvedModel, Status> {
             repo: "bartowski/Llama-3.2-1B-Instruct-GGUF".to_string(),
             filename: "Llama-3.2-1B-Instruct-Q4_K_M.gguf".to_string(),
         }),
+        "qwen3" | "qwen3:8b" => Ok(ResolvedModel {
+            repo: "bartowski/Qwen_Qwen3-8B-GGUF".to_string(),
+            filename: "Qwen3-8B-Q4_K_M.gguf".to_string(),
+        }),
         other => Err(Status::invalid_argument(format!(
-            "Unknown model: '{other}'. Supported: llama3.2, llama3.2:3b, llama3.2:1b"
+            "Unknown model: '{other}'. Supported: qwen3, qwen3:8b, llama3.2, llama3.2:3b, llama3.2:1b"
         ))),
     }
 }
@@ -100,8 +106,14 @@ impl ChatServiceImpl {
     }
 
     /// Download (if needed) and load a GGUF model into memory.
-    pub async fn load_model(&self, name: &str, backend: ResolvedBackend, kv_cache_type: KvCacheType, flash_attention: bool) -> Result<(), Status> {
-        let resolved = resolve_model(name)?;
+    /// When `hf_repo` and `hf_filename` are provided (non-empty), they override
+    /// the internal `resolve_model` lookup — enabling config-driven model selection.
+    pub async fn load_model(&self, name: &str, backend: ResolvedBackend, kv_cache_type: KvCacheType, flash_attention: bool, hf_repo: &str, hf_filename: &str) -> Result<(), Status> {
+        let resolved = if !hf_repo.is_empty() && !hf_filename.is_empty() {
+            ResolvedModel { repo: hf_repo.to_string(), filename: hf_filename.to_string() }
+        } else {
+            resolve_model(name)?
+        };
         let name_owned = name.to_string();
         tracing::info!(model = %name_owned, repo = %resolved.repo, file = %resolved.filename,
             device = %backend.device, backend_kind = %backend.backend, "Loading chat model...");
@@ -586,5 +598,18 @@ mod tests {
     fn test_resolve_model_empty() {
         let result = resolve_model("");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_model_qwen3_default() {
+        let resolved = resolve_model("qwen3").unwrap();
+        assert_eq!(resolved.repo, "bartowski/Qwen_Qwen3-8B-GGUF");
+        assert_eq!(resolved.filename, "Qwen3-8B-Q4_K_M.gguf");
+    }
+
+    #[test]
+    fn test_resolve_model_qwen3_8b_explicit() {
+        let resolved = resolve_model("qwen3:8b").unwrap();
+        assert_eq!(resolved, resolve_model("qwen3").unwrap());
     }
 }

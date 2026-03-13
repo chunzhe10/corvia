@@ -451,18 +451,18 @@ async fn cmd_init(store: &str) -> Result<()> {
                     let provisioner = corvia_kernel::inference_provisioner::InferenceProvisioner::new(
                         &config.embedding.url,
                     );
-                    let chat_model = config.merge.as_ref().map(|m| m.model.as_str());
+                    let chat_coords = resolve_chat_model_coords(&config);
                     provisioner.ensure_ready(
                         &config.embedding.model,
-                        chat_model,
+                        chat_coords.as_ref(),
                         &config.inference.device,
                         &config.inference.backend,
                         &config.inference.kv_quant,
                         config.inference.flash_attention,
                     ).await?;
-                    if let Some(cm) = chat_model {
+                    if let Some(ref cc) = chat_coords {
                         println!("  Corvia inference ready (embed: {}, chat: {})",
-                            config.embedding.model, cm);
+                            config.embedding.model, cc.name);
                     } else {
                         println!("  Corvia inference ready (embed: {}, chat: disabled)",
                             config.embedding.model);
@@ -2035,6 +2035,22 @@ fn connect_engine(config: &CorviaConfig) -> Arc<dyn InferenceEngine> {
     corvia_kernel::create_engine(config)
 }
 
+/// Resolve chat model coordinates from config registry.
+/// Falls back to empty HF coords (server-side resolve) if the model name isn't in the registry.
+fn resolve_chat_model_coords(config: &CorviaConfig) -> Option<corvia_kernel::inference_provisioner::ChatModelCoords> {
+    let merge = config.merge.as_ref()?;
+    let name = &merge.model;
+    let coords = config.inference.chat_models.get(name);
+    if coords.is_none() {
+        eprintln!("  Warning: chat model '{name}' not in [inference.chat_models] registry, falling back to server-side resolve");
+    }
+    Some(corvia_kernel::inference_provisioner::ChatModelCoords {
+        name: name.clone(),
+        hf_repo: coords.map(|c| c.repo.clone()).unwrap_or_default(),
+        hf_filename: coords.map(|c| c.filename.clone()).unwrap_or_default(),
+    })
+}
+
 /// Ensure the inference backend is ready (model loaded).
 /// For Ollama: checks server + model availability.
 /// For Corvia: ensures gRPC server is running + model loaded.
@@ -2045,10 +2061,10 @@ async fn ensure_inference_ready(config: &CorviaConfig) -> Result<()> {
             let provisioner = corvia_kernel::inference_provisioner::InferenceProvisioner::new(
                 &config.embedding.url,
             );
-            let chat_model = config.merge.as_ref().map(|m| m.model.as_str());
+            let chat_coords = resolve_chat_model_coords(config);
             provisioner.ensure_ready(
                 &config.embedding.model,
-                chat_model,
+                chat_coords.as_ref(),
                 &config.inference.device,
                 &config.inference.backend,
                 &config.inference.kv_quant,

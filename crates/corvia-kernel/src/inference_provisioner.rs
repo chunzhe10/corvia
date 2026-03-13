@@ -3,6 +3,14 @@ use corvia_proto::model_manager_client::ModelManagerClient;
 use corvia_proto::{HealthRequest, ListModelsRequest, LoadModelRequest, ReloadModelsRequest};
 use tracing::info;
 
+/// Resolved HF coordinates for a chat model.
+#[derive(Debug)]
+pub struct ChatModelCoords {
+    pub name: String,
+    pub hf_repo: String,
+    pub hf_filename: String,
+}
+
 /// Provisions the corvia-inference gRPC server.
 /// Consistent with OllamaProvisioner: install → start → wait → load models.
 pub struct InferenceProvisioner {
@@ -83,7 +91,7 @@ impl InferenceProvisioner {
     pub async fn load_models(
         &self,
         embed_model: &str,
-        chat_model: Option<&str>,
+        chat_model: Option<&ChatModelCoords>,
         device: &str,
         backend: &str,
         kv_quant: &str,
@@ -102,6 +110,8 @@ impl InferenceProvisioner {
                 backend: backend.to_string(),
                 kv_quant: kv_quant.to_string(),
                 flash_attention,
+                hf_repo: String::new(),
+                hf_filename: String::new(),
             }))
             .await
             .map_err(|e| CorviaError::Infra(format!("LoadModel failed: {e}")))?;
@@ -120,15 +130,17 @@ impl InferenceProvisioner {
         );
 
         // Load chat model (optional — skipped when [merge] is not configured)
-        if let Some(chat_model) = chat_model {
+        if let Some(coords) = chat_model {
             let resp = client
                 .load_model(tonic::Request::new(LoadModelRequest {
-                    name: chat_model.to_string(),
+                    name: coords.name.clone(),
                     model_type: "chat".to_string(),
                     device: device.to_string(),
                     backend: backend.to_string(),
                     kv_quant: kv_quant.to_string(),
                     flash_attention,
+                    hf_repo: coords.hf_repo.clone(),
+                    hf_filename: coords.hf_filename.clone(),
                 }))
                 .await
                 .map_err(|e| CorviaError::Infra(format!("LoadModel failed: {e}")))?;
@@ -140,7 +152,7 @@ impl InferenceProvisioner {
                 )));
             }
             info!(
-                model = chat_model,
+                model = %coords.name,
                 device = resp.actual_device,
                 backend = resp.actual_backend,
                 "Loaded chat model"
@@ -202,7 +214,7 @@ impl InferenceProvisioner {
     pub async fn ensure_ready(
         &self,
         embed_model: &str,
-        chat_model: Option<&str>,
+        chat_model: Option<&ChatModelCoords>,
         device: &str,
         backend: &str,
         kv_quant: &str,

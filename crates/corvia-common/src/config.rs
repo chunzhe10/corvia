@@ -128,6 +128,41 @@ fn default_device() -> String { "auto".into() }
 fn default_kv_quant() -> String { "q8".into() }
 fn default_flash_attention() -> bool { true }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatModelDef {
+    /// HuggingFace repository (e.g. "bartowski/Qwen_Qwen3-8B-GGUF").
+    pub repo: String,
+    /// GGUF filename (e.g. "Qwen3-8B-Q4_K_M.gguf").
+    pub filename: String,
+}
+
+/// Default chat model registry. Keep in sync with `resolve_model()` in
+/// `corvia-inference/src/chat_service.rs` (the hardcoded fallback).
+fn default_chat_models() -> std::collections::HashMap<String, ChatModelDef> {
+    let mut m = std::collections::HashMap::new();
+    m.insert("qwen3".into(), ChatModelDef {
+        repo: "bartowski/Qwen_Qwen3-8B-GGUF".into(),
+        filename: "Qwen3-8B-Q4_K_M.gguf".into(),
+    });
+    m.insert("qwen3:8b".into(), ChatModelDef {
+        repo: "bartowski/Qwen_Qwen3-8B-GGUF".into(),
+        filename: "Qwen3-8B-Q4_K_M.gguf".into(),
+    });
+    m.insert("llama3.2".into(), ChatModelDef {
+        repo: "bartowski/Llama-3.2-3B-Instruct-GGUF".into(),
+        filename: "Llama-3.2-3B-Instruct-Q4_K_M.gguf".into(),
+    });
+    m.insert("llama3.2:3b".into(), ChatModelDef {
+        repo: "bartowski/Llama-3.2-3B-Instruct-GGUF".into(),
+        filename: "Llama-3.2-3B-Instruct-Q4_K_M.gguf".into(),
+    });
+    m.insert("llama3.2:1b".into(), ChatModelDef {
+        repo: "bartowski/Llama-3.2-1B-Instruct-GGUF".into(),
+        filename: "Llama-3.2-1B-Instruct-Q4_K_M.gguf".into(),
+    });
+    m
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceConfig {
     /// Device preference: "auto" (default), "gpu", or "cpu".
@@ -142,6 +177,9 @@ pub struct InferenceConfig {
     /// Enable flash attention (default: true).
     #[serde(default = "default_flash_attention")]
     pub flash_attention: bool,
+    /// Chat model registry: short name → HF repo + GGUF filename.
+    #[serde(default = "default_chat_models")]
+    pub chat_models: std::collections::HashMap<String, ChatModelDef>,
 }
 
 impl Default for InferenceConfig {
@@ -151,6 +189,7 @@ impl Default for InferenceConfig {
             backend: String::new(),
             kv_quant: default_kv_quant(),
             flash_attention: default_flash_attention(),
+            chat_models: default_chat_models(),
         }
     }
 }
@@ -1103,6 +1142,35 @@ port = 8020
         let loaded: CorviaConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(loaded.inference.kv_quant, "q4");
         assert!(!loaded.inference.flash_attention);
+    }
+
+    #[test]
+    fn test_chat_models_config_defaults_and_roundtrip() {
+        let config = InferenceConfig::default();
+        assert!(config.chat_models.contains_key("qwen3"));
+        assert!(config.chat_models.contains_key("llama3.2"));
+        assert!(config.chat_models.contains_key("llama3.2:1b"));
+        assert_eq!(config.chat_models["qwen3"].repo, "bartowski/Qwen_Qwen3-8B-GGUF");
+
+        // Roundtrip through TOML
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let loaded: InferenceConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(loaded.chat_models.len(), config.chat_models.len());
+        assert_eq!(loaded.chat_models["qwen3"], config.chat_models["qwen3"]);
+    }
+
+    #[test]
+    fn test_chat_models_config_from_toml() {
+        let toml_str = r#"
+[chat_models.custom-model]
+repo = "user/Custom-Model-GGUF"
+filename = "Custom-Model-Q4_K_M.gguf"
+"#;
+        let loaded: InferenceConfig = toml::from_str(toml_str).unwrap();
+        assert!(loaded.chat_models.contains_key("custom-model"));
+        assert_eq!(loaded.chat_models["custom-model"].repo, "user/Custom-Model-GGUF");
+        // Explicit config replaces defaults — only the custom model should be present
+        assert!(!loaded.chat_models.contains_key("qwen3"));
     }
 
     #[test]

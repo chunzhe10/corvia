@@ -18,6 +18,10 @@ pub struct ModelEntry {
     pub backend: String,
     pub kv_quant: String,
     pub flash_attention: bool,
+    /// HF repo for config-driven resolution (empty = use server-side resolve on reload).
+    pub hf_repo: String,
+    /// HF GGUF filename for config-driven resolution.
+    pub hf_filename: String,
 }
 
 pub struct ModelManagerService {
@@ -147,7 +151,7 @@ impl ModelManager for ModelManagerService {
         // Delegate to appropriate service
         let result = match model_type {
             ModelType::Embedding => self.embed_svc.load_model(&req.name, resolved).await,
-            ModelType::Chat => self.chat_svc.load_model(&req.name, resolved, kv_cache_type, req.flash_attention).await,
+            ModelType::Chat => self.chat_svc.load_model(&req.name, resolved, kv_cache_type, req.flash_attention, &req.hf_repo, &req.hf_filename).await,
         };
 
         match result {
@@ -163,6 +167,8 @@ impl ModelManager for ModelManagerService {
                         backend: actual_backend.clone(),
                         kv_quant: req.kv_quant,
                         flash_attention: req.flash_attention,
+                        hf_repo: req.hf_repo,
+                        hf_filename: req.hf_filename,
                     },
                 );
                 Ok(Response::new(LoadModelResponse {
@@ -287,7 +293,7 @@ impl ModelManager for ModelManagerService {
 
             let load_result = match model_type {
                 ModelType::Embedding => self.embed_svc.load_model(&entry.name, resolved).await,
-                ModelType::Chat => self.chat_svc.load_model(&entry.name, resolved, kv_cache_type, req.flash_attention).await,
+                ModelType::Chat => self.chat_svc.load_model(&entry.name, resolved, kv_cache_type, req.flash_attention, &entry.hf_repo, &entry.hf_filename).await,
             };
 
             match load_result {
@@ -303,6 +309,8 @@ impl ModelManager for ModelManagerService {
                             backend: actual_backend.clone(),
                             kv_quant: req.kv_quant.clone(),
                             flash_attention: req.flash_attention,
+                            hf_repo: entry.hf_repo.clone(),
+                            hf_filename: entry.hf_filename.clone(),
                         },
                     );
                     results.push(ModelReloadResult {
