@@ -839,8 +839,8 @@ async fn refresh_summary_handler(
     State(state): State<Arc<AppState>>,
     Path(agent_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Verify agent exists
-    let _agent = state.coordinator.registry.get(&agent_id)
+    // Get existing agent record (needed for prior topic_tags to detect drift)
+    let agent = state.coordinator.registry.get(&agent_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Agent {agent_id} not found")))?;
 
@@ -860,23 +860,41 @@ async fn refresh_summary_handler(
     if let Some(hierarchy) = state.cluster_store.current() {
         // Compute topic tags from all embeddings (simplified — ideally filter by agent entries)
         let all_embeddings: Vec<Vec<f32>> = pairs.iter().map(|(_, e)| e.clone()).collect();
-        let topic_tags = clustering::compute_topic_tags(&hierarchy, &all_embeddings);
+        let new_topic_tags = clustering::compute_topic_tags(&hierarchy, &all_embeddings);
 
         let sessions = state.coordinator.sessions.list_by_agent(&agent_id)
             .unwrap_or_default();
 
+        // Detect drift: compare existing topic_tags with new last_topics
+        let historical_tags = agent.activity_summary
+            .as_ref()
+            .map(|s| &s.topic_tags[..])
+            .unwrap_or(&[]);
+        let drifted = clustering::is_topic_drifted(historical_tags, &new_topic_tags);
+
+        // Preserve historical topic_tags if they exist, update last_topics to current
+        let topic_tags = if historical_tags.is_empty() {
+            new_topic_tags.clone()
+        } else {
+            historical_tags.to_vec()
+        };
+
         let summary = corvia_common::agent_types::ActivitySummary {
             entry_count: entries.len() as u64,
-            topic_tags: topic_tags.clone(),
-            last_topics: topic_tags,
+            topic_tags,
+            last_topics: new_topic_tags,
             last_active: chrono::Utc::now(),
             session_count: sessions.len() as u64,
-            drifted: false,
+            drifted,
         };
 
         let _ = state.coordinator.registry.set_activity_summary(&agent_id, &summary);
 
-        Ok(Json(serde_json::json!({ "status": "refreshed", "agent_id": agent_id })))
+        Ok(Json(serde_json::json!({
+            "status": "refreshed",
+            "agent_id": agent_id,
+            "drifted": drifted,
+        })))
     } else {
         Ok(Json(serde_json::json!({ "status": "skipped", "reason": "cluster store not yet computed" })))
     }
