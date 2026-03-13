@@ -87,8 +87,33 @@ pub async fn activity_feed_handler(
         })
         .collect();
 
-    // Get the current cluster hierarchy (may be None if not yet computed)
+    // Ensure cluster hierarchy is computed with human-readable labels
+    if state.cluster_store.is_degraded() {
+        let pairs: Vec<(String, Vec<f32>)> = entries
+            .iter()
+            .filter_map(|e| e.embedding.as_ref().map(|emb| (e.id.to_string(), emb.clone())))
+            .collect();
+        let label_map: std::collections::HashMap<String, String> = entries
+            .iter()
+            .map(|e| {
+                let label = e.metadata.source_file.clone()
+                    .unwrap_or_else(|| e.content.chars().take(60).collect());
+                (e.id.to_string(), label)
+            })
+            .collect();
+        state.cluster_store.maybe_recompute_with_labels(&pairs, &label_map);
+    }
     let hierarchy = state.cluster_store.current();
+
+    // Build entry label map for resolving UUID cluster labels to human-readable names
+    let entry_labels: std::collections::HashMap<String, String> = entries
+        .iter()
+        .map(|e| {
+            let label = e.metadata.source_file.clone()
+                .unwrap_or_else(|| e.content.chars().take(60).collect());
+            (e.id.to_string(), label)
+        })
+        .collect();
 
     let mut items: Vec<ActivityItem> = entries
         .iter()
@@ -97,12 +122,18 @@ pub async fn activity_feed_handler(
         .map(|entry| {
             let entry_id_str = entry.id.to_string();
 
-            // Topic tags from ClusterStore
+            // Topic tags from ClusterStore — resolve UUID labels via entry_labels map
             let topic_tags = hierarchy
                 .as_ref()
                 .and_then(|h| {
                     h.cluster_for_entry(&entry_id_str)
-                        .map(|sc| vec![sc.label.clone()])
+                        .map(|sc| {
+                            let label = entry_labels
+                                .get(&sc.label)
+                                .cloned()
+                                .unwrap_or_else(|| sc.label.clone());
+                            vec![label]
+                        })
                 })
                 .unwrap_or_default();
 
@@ -146,9 +177,19 @@ pub async fn activity_feed_handler(
     // Apply semantic grouping
     group_activity_items(&mut items);
 
-    // Collect available topics from all super-clusters
+    // Collect available topics from all super-clusters — resolve labels
     let topics: Vec<String> = hierarchy
-        .map(|h| h.super_clusters.iter().map(|sc| sc.label.clone()).collect())
+        .map(|h| {
+            h.super_clusters
+                .iter()
+                .map(|sc| {
+                    entry_labels
+                        .get(&sc.label)
+                        .cloned()
+                        .unwrap_or_else(|| sc.label.clone())
+                })
+                .collect()
+        })
         .unwrap_or_default();
 
     // Apply topic filter (after grouping so group metadata is intact)

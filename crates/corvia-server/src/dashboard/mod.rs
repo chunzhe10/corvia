@@ -446,7 +446,15 @@ async fn clustered_graph_handler(
                 .iter()
                 .filter_map(|e| e.embedding.as_ref().map(|emb| (e.id.to_string(), emb.clone())))
                 .collect();
-            if state.cluster_store.maybe_recompute(&pairs) {
+            let label_map: std::collections::HashMap<String, String> = entries
+                .iter()
+                .map(|e| {
+                    let label = e.metadata.source_file.clone()
+                        .unwrap_or_else(|| e.content.chars().take(60).collect());
+                    (e.id.to_string(), label)
+                })
+                .collect();
+            if state.cluster_store.maybe_recompute_with_labels(&pairs, &label_map) {
                 tracing::info!("Cluster hierarchy computed on-demand ({} entries)", pairs.len());
             }
             match state.cluster_store.current() {
@@ -854,9 +862,17 @@ async fn refresh_summary_handler(
     let pairs: Vec<(String, Vec<f32>)> = entries.iter()
         .filter_map(|e| e.embedding.as_ref().map(|emb| (e.id.to_string(), emb.clone())))
         .collect();
+    let label_map: std::collections::HashMap<String, String> = entries
+        .iter()
+        .map(|e| {
+            let label = e.metadata.source_file.clone()
+                .unwrap_or_else(|| e.content.chars().take(60).collect());
+            (e.id.to_string(), label)
+        })
+        .collect();
 
     // Ensure cluster store is current
-    state.cluster_store.maybe_recompute(&pairs);
+    state.cluster_store.maybe_recompute_with_labels(&pairs, &label_map);
 
     if let Some(hierarchy) = state.cluster_store.current() {
         // Compute topic tags from all embeddings (simplified — ideally filter by agent entries)

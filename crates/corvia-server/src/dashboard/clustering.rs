@@ -258,7 +258,19 @@ pub struct ClusterHierarchy {
 
 impl ClusterHierarchy {
     /// Build hierarchy from (entry_id, embedding) pairs.
+    /// Optional `labels` map resolves entry_ids to human-readable labels (source_file or content preview).
+    /// Without labels, entry IDs are used as cluster labels.
     pub fn build(entries: &[(String, Vec<f32>)], k_min: usize, k_max: usize) -> Self {
+        Self::build_with_labels(entries, k_min, k_max, &std::collections::HashMap::new())
+    }
+
+    /// Build hierarchy with human-readable labels for clusters.
+    pub fn build_with_labels(
+        entries: &[(String, Vec<f32>)],
+        k_min: usize,
+        k_max: usize,
+        labels: &std::collections::HashMap<String, String>,
+    ) -> Self {
         let embeddings: Vec<Vec<f32>> = entries.iter().map(|(_, e)| e.clone()).collect();
         let k_max = k_max.min(entries.len());
         let k_min = k_min.min(k_max);
@@ -288,7 +300,7 @@ impl ClusterHierarchy {
                     .collect::<Vec<_>>(),
             );
 
-            // Label from nearest entry to centroid
+            // Label from nearest entry to centroid — resolve via labels map
             let nearest_idx = member_indices
                 .iter()
                 .min_by(|&&a, &&b| {
@@ -298,7 +310,11 @@ impl ClusterHierarchy {
                 })
                 .copied()
                 .unwrap();
-            let label = entries[nearest_idx].0.clone();
+            let nearest_id = &entries[nearest_idx].0;
+            let label = labels
+                .get(nearest_id)
+                .cloned()
+                .unwrap_or_else(|| nearest_id.clone());
 
             super_clusters.push(ClusterNode {
                 cluster_id: format!("sc-{c}"),
@@ -368,9 +384,15 @@ impl ClusterHierarchy {
                     .copied()
                     .unwrap();
 
+                let nearest_id = &sc_entries[nearest_idx].0;
+                let sub_label = labels
+                    .get(nearest_id)
+                    .cloned()
+                    .unwrap_or_else(|| nearest_id.clone());
+
                 sub_clusters.push(ClusterNode {
                     cluster_id: format!("{}-sub-{s}", sc.cluster_id),
-                    label: sc_entries[nearest_idx].0.clone(),
+                    label: sub_label,
                     level: 1,
                     parent_id: Some(sc.cluster_id.clone()),
                     entry_ids,
@@ -469,6 +491,15 @@ impl ClusterStore {
 
     /// Update hierarchy if entry count changed. Returns true if recomputed.
     pub fn maybe_recompute(&self, entries: &[(String, Vec<f32>)]) -> bool {
+        self.maybe_recompute_with_labels(entries, &std::collections::HashMap::new())
+    }
+
+    /// Update hierarchy with human-readable labels. Returns true if recomputed.
+    pub fn maybe_recompute_with_labels(
+        &self,
+        entries: &[(String, Vec<f32>)],
+        labels: &std::collections::HashMap<String, String>,
+    ) -> bool {
         let current_count = entries.len();
         let last = *self.last_entry_count.read().unwrap();
         if current_count == last && !self.is_degraded() {
@@ -478,7 +509,7 @@ impl ClusterStore {
             return false;
         }
 
-        let hierarchy = ClusterHierarchy::build(entries, 3, 12);
+        let hierarchy = ClusterHierarchy::build_with_labels(entries, 3, 12, labels);
         *self.hierarchy.write().unwrap() = Some(hierarchy);
         *self.last_entry_count.write().unwrap() = current_count;
         true
