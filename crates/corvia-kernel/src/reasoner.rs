@@ -581,6 +581,44 @@ pub fn check_misplaced_doc(
     findings
 }
 
+/// Check if a scope has only memory-role entries with no formal documentation.
+///
+/// Flags when entries exist with `content_role = "memory"` but none with
+/// `design`, `decision`, or `plan` roles — suggesting knowledge exists only
+/// as transient memory without formalization.
+pub fn check_coverage_gap(entries: &[KnowledgeEntry]) -> Vec<Finding> {
+    let memory_only: Vec<&KnowledgeEntry> = entries
+        .iter()
+        .filter(|e| e.metadata.content_role.as_deref() == Some("memory"))
+        .collect();
+
+    let has_formal = entries.iter().any(|e| {
+        matches!(
+            e.metadata.content_role.as_deref(),
+            Some("design" | "decision" | "plan")
+        )
+    });
+
+    if !memory_only.is_empty() && !has_formal {
+        let scope_id = entries
+            .first()
+            .map(|e| e.scope_id.as_str())
+            .unwrap_or("unknown");
+        vec![Finding::new(
+            CheckType::CoverageGap,
+            scope_id,
+            memory_only.iter().map(|e| e.id).collect(),
+            0.7,
+            format!(
+                "{} memory entries found but no design/decision/plan docs — consider formalizing",
+                memory_only.len()
+            ),
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Compute cosine similarity between two embedding vectors.
 /// Both vectors must have the same dimensionality.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -1158,6 +1196,37 @@ mod tests {
             repo_docs_pattern: Some("docs/".into()),
         }
     }
+
+    // ---- CoverageGap check ----
+
+    fn make_entry_with_role(role: &str, content: &str) -> KnowledgeEntry {
+        let mut e = KnowledgeEntry::new(content.into(), "test".into(), "v1".into());
+        e.metadata.content_role = Some(role.into());
+        e
+    }
+
+    #[test]
+    fn test_coverage_gap_check() {
+        let entries = vec![
+            make_entry_with_role("memory", "topic A discussion"),
+            make_entry_with_role("memory", "topic A notes"),
+        ];
+        let findings = check_coverage_gap(&entries);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].check_type, CheckType::CoverageGap);
+    }
+
+    #[test]
+    fn test_coverage_gap_no_flag_when_design_exists() {
+        let entries = vec![
+            make_entry_with_role("memory", "topic A discussion"),
+            make_entry_with_role("design", "topic A design spec"),
+        ];
+        let findings = check_coverage_gap(&entries);
+        assert!(findings.is_empty());
+    }
+
+    // ---- MisplacedDoc check ----
 
     #[test]
     fn test_misplaced_doc_check_blocked() {
