@@ -95,6 +95,18 @@ pub enum AgentStatus {
     Suspended,
 }
 
+/// Activity summary for an agent — auto-generated from embedding clustering.
+/// Updated on session close, GC sweep, or manual refresh.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivitySummary {
+    pub entry_count: u64,
+    pub topic_tags: Vec<String>,
+    pub last_topics: Vec<String>,
+    pub last_active: DateTime<Utc>,
+    pub session_count: u64,
+    pub drifted: bool,
+}
+
 /// Persistent agent record stored in Redb.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRecord {
@@ -105,6 +117,10 @@ pub struct AgentRecord {
     pub permissions: AgentPermission,
     pub last_seen: DateTime<Utc>,
     pub status: AgentStatus,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub activity_summary: Option<ActivitySummary>,
 }
 
 /// Session state machine per D45 Part 5.
@@ -272,10 +288,51 @@ mod tests {
             },
             last_seen: chrono::Utc::now(),
             status: AgentStatus::Active,
+            description: None,
+            activity_summary: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         let deser: AgentRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(record.agent_id, deser.agent_id);
+    }
+
+    #[test]
+    fn test_agent_record_with_description_and_summary() {
+        let summary = ActivitySummary {
+            entry_count: 12,
+            topic_tags: vec!["graph store".into(), "edge handling".into()],
+            last_topics: vec!["merge pipeline".into()],
+            last_active: chrono::Utc::now(),
+            session_count: 3,
+            drifted: true,
+        };
+        let record = AgentRecord {
+            agent_id: "test::agent".into(),
+            display_name: "Test Agent".into(),
+            identity_type: IdentityType::Registered,
+            registered_at: chrono::Utc::now(),
+            permissions: AgentPermission::ReadOnly,
+            last_seen: chrono::Utc::now(),
+            status: AgentStatus::Active,
+            description: Some("working on graph refactor".into()),
+            activity_summary: Some(summary),
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let deser: AgentRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.description.as_deref(), Some("working on graph refactor"));
+        let s = deser.activity_summary.unwrap();
+        assert_eq!(s.entry_count, 12);
+        assert_eq!(s.topic_tags.len(), 2);
+        assert!(s.drifted);
+    }
+
+    #[test]
+    fn test_agent_record_backward_compat_deserialization() {
+        // Old records without description/activity_summary should deserialize with defaults
+        let json = r#"{"agent_id":"test","display_name":"Test","identity_type":"Registered","registered_at":"2026-01-01T00:00:00Z","permissions":"ReadOnly","last_seen":"2026-01-01T00:00:00Z","status":"Active"}"#;
+        let record: AgentRecord = serde_json::from_str(json).unwrap();
+        assert!(record.description.is_none());
+        assert!(record.activity_summary.is_none());
     }
 
     #[test]

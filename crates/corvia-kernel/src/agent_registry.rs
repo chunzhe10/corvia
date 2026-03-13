@@ -77,6 +77,8 @@ impl AgentRegistry {
                 permissions,
                 last_seen: now,
                 status: AgentStatus::Active,
+                description: None,
+                activity_summary: None,
             };
 
             let bytes = serde_json::to_vec(&record)
@@ -125,6 +127,22 @@ impl AgentRegistry {
         let mut record = self.get(agent_id)?
             .ok_or_else(|| CorviaError::NotFound(format!("Agent {agent_id} not found")))?;
         record.status = status;
+        self.put(&record)
+    }
+
+    /// Update agent description.
+    pub fn set_description(&self, agent_id: &str, description: &str) -> Result<()> {
+        let mut record = self.get(agent_id)?
+            .ok_or_else(|| CorviaError::NotFound(format!("Agent {agent_id} not found")))?;
+        record.description = Some(description.to_string());
+        self.put(&record)
+    }
+
+    /// Update agent activity summary.
+    pub fn set_activity_summary(&self, agent_id: &str, summary: &ActivitySummary) -> Result<()> {
+        let mut record = self.get(agent_id)?
+            .ok_or_else(|| CorviaError::NotFound(format!("Agent {agent_id} not found")))?;
+        record.activity_summary = Some(summary.clone());
         self.put(&record)
     }
 
@@ -245,5 +263,32 @@ mod tests {
     fn test_get_nonexistent_returns_none() {
         let reg = test_registry();
         assert!(reg.get("nobody").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_agent_description_and_summary() {
+        let reg = test_registry();
+        reg.register("test::agent", "Test Agent", IdentityType::Registered,
+            AgentPermission::ReadOnly).unwrap();
+
+        // Set description
+        reg.set_description("test::agent", "working on graph refactor").unwrap();
+        let agent = reg.get("test::agent").unwrap().unwrap();
+        assert_eq!(agent.description.as_deref(), Some("working on graph refactor"));
+
+        // Set activity summary
+        let summary = ActivitySummary {
+            entry_count: 12,
+            topic_tags: vec!["graph store".into(), "edge handling".into()],
+            last_topics: vec!["merge pipeline".into()],
+            last_active: chrono::Utc::now(),
+            session_count: 3,
+            drifted: false,
+        };
+        reg.set_activity_summary("test::agent", &summary).unwrap();
+        let agent = reg.get("test::agent").unwrap().unwrap();
+        let summary = agent.activity_summary.as_ref().expect("activity_summary should be set");
+        assert_eq!(summary.entry_count, 12);
+        assert_eq!(summary.topic_tags.len(), 2);
     }
 }
