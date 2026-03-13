@@ -447,7 +447,7 @@ impl Retriever for GraphExpandRetriever {
 
 /// Post-filter search results by metadata fields (Option A from docs workflow spec).
 /// Applied after vector search, before returning to caller.
-pub fn post_filter_metadata(
+pub(crate) fn post_filter_metadata(
     results: Vec<SearchResult>,
     content_role: Option<&str>,
     source_origin: Option<&str>,
@@ -502,6 +502,19 @@ mod filter_tests {
         ];
         let filtered = super::post_filter_metadata(results, None, Some("repo:corvia"));
         assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn test_post_filter_combined() {
+        let results = vec![
+            make_result(Some("design"), Some("repo:corvia"), 0.9),
+            make_result(Some("code"), Some("repo:corvia"), 0.8),
+            make_result(Some("design"), Some("workspace"), 0.7),
+        ];
+        let filtered = super::post_filter_metadata(results, Some("design"), Some("repo:corvia"));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].entry.metadata.content_role.as_deref(), Some("design"));
+        assert_eq!(filtered[0].entry.metadata.source_origin.as_deref(), Some("repo:corvia"));
     }
 
     #[test]
