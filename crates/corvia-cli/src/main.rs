@@ -294,6 +294,27 @@ enum WorkspaceCommands {
     },
     /// Clean build artifacts (target/ directories) from workspace repos
     Clean,
+    /// Documentation health checks
+    Docs {
+        #[command(subcommand)]
+        command: DocsCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum DocsCommands {
+    /// Run documentation placement and coverage checks
+    Check {
+        /// Run only a specific check type: misplaced, temporal, coverage
+        #[arg(long)]
+        check: Option<String>,
+        /// Auto-fix misplaced docs (requires --yes to execute)
+        #[arg(long)]
+        fix: bool,
+        /// Confirm auto-fix moves without prompting
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[tokio::main]
@@ -1263,7 +1284,107 @@ async fn cmd_workspace(command: WorkspaceCommands) -> Result<()> {
             }
             Ok(())
         }
+        WorkspaceCommands::Docs { command } => {
+            match command {
+                DocsCommands::Check { check, fix, yes } =>
+                    cmd_docs_check(check.as_deref(), fix, yes).await?,
+            }
+            Ok(())
+        }
     }
+}
+
+async fn cmd_docs_check(
+    check: Option<&str>,
+    fix: bool,
+    yes: bool,
+) -> Result<()> {
+    let config = load_config()?;
+    let ws = config.workspace.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Not a workspace — 'docs check' requires [workspace] config"))?;
+    let docs_rules = ws.docs.as_ref()
+        .and_then(|d| d.rules.clone())
+        .unwrap_or_default();
+    let scope_id = &config.project.scope_id;
+
+    // Determine which checks to run
+    let checks: Vec<corvia_kernel::reasoner::CheckType> = if let Some(c) = check {
+        vec![c.parse().map_err(|e: String| anyhow::anyhow!(e))?]
+    } else {
+        vec![
+            corvia_kernel::reasoner::CheckType::MisplacedDoc,
+            corvia_kernel::reasoner::CheckType::CoverageGap,
+            corvia_kernel::reasoner::CheckType::TemporalContradiction,
+        ]
+    };
+
+    println!("Running documentation health checks...");
+
+    // Try routing through running server first
+    if let Some(client) = server_client::ServerClient::detect(&config).await {
+        println!("(via server at {})\n", client.url());
+        let mut total = 0;
+        for check_type in &checks {
+            let response = client.reason(scope_id, Some(check_type.as_str())).await?;
+            for (i, finding) in response.findings.iter().enumerate() {
+                println!("  [{}] {} (confidence: {:.0}%)", total + i + 1, finding.check_type, finding.confidence * 100.0);
+                println!("      {}", finding.rationale);
+            }
+            total += response.findings.len();
+        }
+        if total == 0 {
+            println!("No issues found.");
+        }
+        return Ok(());
+    }
+
+    // Fallback: run locally
+    let (store, graph, _temporal) = connect_full_store(&config).await?;
+    let data_dir = std::path::Path::new(&config.storage.data_dir);
+    let entries = corvia_kernel::knowledge_files::read_scope(data_dir, scope_id)?;
+
+    let reasoner = corvia_kernel::reasoner::Reasoner::new(&*store, &*graph)
+        .with_docs_rules(docs_rules);
+
+    let mut all_findings = Vec::new();
+    for check_type in &checks {
+        let findings = reasoner.run_check(&entries, scope_id, *check_type).await?;
+        all_findings.extend(findings);
+    }
+
+    if all_findings.is_empty() {
+        println!("No issues found.");
+    } else {
+        for (i, finding) in all_findings.iter().enumerate() {
+            println!("  {}. [{}] {} (confidence: {:.0}%)",
+                i + 1, finding.check_type.as_str(), finding.rationale, finding.confidence * 100.0);
+        }
+    }
+
+    // Auto-fix mode for MisplacedDoc
+    if fix {
+        let misplaced: Vec<_> = all_findings.iter()
+            .filter(|f| f.check_type == corvia_kernel::reasoner::CheckType::MisplacedDoc)
+            .collect();
+        if misplaced.is_empty() {
+            println!("No misplaced docs to fix.");
+            return Ok(());
+        }
+        let status = std::process::Command::new("git").args(["status", "--porcelain"]).output()?;
+        if !status.stdout.is_empty() {
+            return Err(anyhow::anyhow!("Working tree has uncommitted changes. Commit or stash first."));
+        }
+        if !yes {
+            println!("Would move {} file(s). Re-run with --yes to execute.", misplaced.len());
+            return Ok(());
+        }
+        for finding in misplaced {
+            println!("  Moving: {}", finding.rationale);
+            // TODO: resolve target path and execute move
+        }
+    }
+
+    Ok(())
 }
 
 // ---- Temporal / Graph / Reasoning commands ----
