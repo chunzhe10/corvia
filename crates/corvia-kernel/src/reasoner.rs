@@ -544,6 +544,43 @@ impl<'a> Reasoner<'a> {
     }
 }
 
+/// Check for doc files placed in blocked paths per workspace rules.
+///
+/// Compares each entry's `source_file` against the `blocked_paths` globs
+/// in the `DocsRulesConfig`. Any match is a misplaced doc.
+pub fn check_misplaced_doc(
+    entries: &[KnowledgeEntry],
+    rules: &corvia_common::config::DocsRulesConfig,
+) -> Vec<Finding> {
+    let blocked: Vec<glob::Pattern> = rules
+        .blocked_paths
+        .iter()
+        .filter_map(|p| glob::Pattern::new(p).ok())
+        .collect();
+
+    let mut findings = Vec::new();
+    for entry in entries {
+        let Some(ref source_file) = entry.metadata.source_file else {
+            continue;
+        };
+        for pattern in &blocked {
+            if pattern.matches(source_file) {
+                findings.push(Finding::new(
+                    CheckType::MisplacedDoc,
+                    &entry.scope_id,
+                    vec![entry.id],
+                    1.0,
+                    format!(
+                        "File '{}' is in blocked path '{}'",
+                        source_file, pattern
+                    ),
+                ));
+            }
+        }
+    }
+    findings
+}
+
 /// Compute cosine similarity between two embedding vectors.
 /// Both vectors must have the same dimensionality.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -1111,6 +1148,37 @@ mod tests {
     fn test_check_type_as_str_llm_variants() {
         assert_eq!(CheckType::SemanticGap.as_str(), "semantic_gap");
         assert_eq!(CheckType::Contradiction.as_str(), "contradiction");
+    }
+
+    // ---- MisplacedDoc check ----
+
+    fn test_docs_rules() -> corvia_common::config::DocsRulesConfig {
+        corvia_common::config::DocsRulesConfig {
+            blocked_paths: vec!["docs/superpowers/*".into()],
+            repo_docs_pattern: Some("docs/".into()),
+        }
+    }
+
+    #[test]
+    fn test_misplaced_doc_check_blocked() {
+        let mut e = KnowledgeEntry::new("design doc".into(), "test".into(), "v1".into());
+        e.metadata.content_role = Some("design".into());
+        e.metadata.source_file = Some("docs/superpowers/specs/design.md".into());
+        e.metadata.source_origin = Some("repo:corvia".into());
+
+        let findings = check_misplaced_doc(&[e], &test_docs_rules());
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].check_type, CheckType::MisplacedDoc);
+    }
+
+    #[test]
+    fn test_misplaced_doc_check_allowed() {
+        let mut e = KnowledgeEntry::new("design doc".into(), "test".into(), "v1".into());
+        e.metadata.content_role = Some("design".into());
+        e.metadata.source_file = Some("repos/corvia/docs/design.md".into());
+
+        let findings = check_misplaced_doc(&[e], &test_docs_rules());
+        assert!(findings.is_empty());
     }
 
     #[test]
