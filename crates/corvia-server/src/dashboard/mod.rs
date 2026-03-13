@@ -363,12 +363,32 @@ async fn graph_scope_handler(
             let preview = entry
                 .map(|e| truncate_str(&e.content, 200))
                 .unwrap_or_default();
+            // Derive cluster group from source_file path
+            let group = entry
+                .and_then(|e| e.metadata.source_file.as_deref())
+                .map(|sf| {
+                    let parts: Vec<&str> = sf.split('/').collect();
+                    if parts.first() == Some(&"crates") && parts.len() >= 2 {
+                        parts[1].to_string()
+                    } else if parts.first() == Some(&"adapters") && parts.len() >= 2 {
+                        parts[1].to_string()
+                    } else if parts.first() == Some(&"docs") {
+                        "docs".to_string()
+                    } else if parts.first() == Some(&"tests") {
+                        "tests".to_string()
+                    } else {
+                        parts.first().unwrap_or(&"other").to_string()
+                    }
+                })
+                .unwrap_or_else(|| "other".to_string());
+
             serde_json::json!({
                 "id": id.to_string(),
                 "label": label,
                 "preview": preview,
                 "source_file": entry.and_then(|e| e.metadata.source_file.as_deref()),
                 "language": entry.and_then(|e| e.metadata.language.as_deref()),
+                "group": group,
             })
         })
         .collect();
