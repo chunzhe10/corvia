@@ -648,6 +648,50 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_topic_tags_from_embeddings() {
+        // Build a hierarchy with 2 known clusters
+        let entries: Vec<(String, Vec<f32>)> = vec![
+            ("a1".into(), vec![0.0, 0.0]),
+            ("a2".into(), vec![0.1, 0.0]),
+            ("a3".into(), vec![0.0, 0.1]),
+            ("b1".into(), vec![10.0, 10.0]),
+            ("b2".into(), vec![10.1, 10.0]),
+            ("b3".into(), vec![10.0, 10.1]),
+        ];
+        let hierarchy = ClusterHierarchy::build(&entries, 2, 4);
+
+        // Agent wrote entries near cluster A
+        let agent_embeddings = vec![vec![0.05, 0.05], vec![0.02, 0.03]];
+        let tags = compute_topic_tags(&hierarchy, &agent_embeddings);
+        assert!(!tags.is_empty());
+        assert!(tags.len() <= 5);
+    }
+
+    #[test]
+    fn test_topic_drift_detected() {
+        let historical = vec!["graph store".to_string(), "edge handling".to_string()];
+        let current = vec![
+            "merge pipeline".to_string(),
+            "conflict resolution".to_string(),
+        ];
+        assert!(is_topic_drifted(&historical, &current));
+    }
+
+    #[test]
+    fn test_no_drift_when_overlap() {
+        let historical = vec!["graph store".to_string(), "edge handling".to_string()];
+        let current = vec!["graph store".to_string(), "traversal".to_string()];
+        assert!(!is_topic_drifted(&historical, &current));
+    }
+
+    #[test]
+    fn test_no_drift_when_empty() {
+        assert!(!is_topic_drifted(&[], &["foo".to_string()]));
+        assert!(!is_topic_drifted(&["foo".to_string()], &[]));
+        assert!(!is_topic_drifted(&[], &[]));
+    }
+
+    #[test]
     fn test_cluster_for_entry() {
         // Use 8 entries with 2 tight clusters — forces k=2 via silhouette
         let entries: Vec<(String, Vec<f32>)> = vec![
