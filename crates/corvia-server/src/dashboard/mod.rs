@@ -29,7 +29,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/dashboard/graph", get(graph_handler))
         .route("/api/dashboard/graph/scope", get(clustered_graph_handler))
         .route("/api/dashboard/agents", get(agents_handler))
+        .route("/api/dashboard/agents/reconnectable", get(reconnectable_agents_handler))
         .route("/api/dashboard/agents/{agent_id}/sessions", get(agent_sessions_handler))
+        .route("/api/dashboard/agents/{agent_id}/connect", post(connect_agent_handler))
+        .route("/api/dashboard/agents/{agent_id}/refresh-summary", post(refresh_summary_handler))
         .route("/api/dashboard/merge/queue", get(merge_queue_handler))
         .route("/api/dashboard/merge/retry", post(merge_retry_handler))
         .route("/api/dashboard/health", get(health_handler))
@@ -787,6 +790,96 @@ async fn rag_ask_handler(
         "sources": sources,
         "trace": response.trace,
     })))
+}
+
+// ---------------------------------------------------------------------------
+// Agent reconnect / connect / refresh-summary endpoints
+// ---------------------------------------------------------------------------
+
+/// GET /api/dashboard/agents/reconnectable
+/// Returns agents with stale or orphaned sessions, sorted by last_seen.
+async fn reconnectable_agents_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let agents = state.coordinator.list_reconnectable()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to list reconnectable agents: {e}")))?;
+    Ok(Json(serde_json::json!(agents)))
+}
+
+/// Request body for POST /api/dashboard/agents/{agent_id}/connect
+#[derive(Debug, Deserialize)]
+pub struct ConnectAgentRequest {
+    pub description: Option<String>,
+}
+
+/// POST /api/dashboard/agents/{agent_id}/connect
+/// Connect to an existing agent, optionally updating its description.
+async fn connect_agent_handler(
+    State(state): State<Arc<AppState>>,
+    Path(agent_id): Path<String>,
+    Json(body): Json<ConnectAgentRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Update description if provided
+    if let Some(ref desc) = body.description {
+        let _ = state.coordinator.registry.set_description(&agent_id, desc);
+    }
+    let response = state.coordinator.connect(&agent_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to connect agent: {e}")))?;
+
+    Ok(Json(serde_json::json!({
+        "agent_id": response.agent_id,
+        "active_sessions": response.active_sessions.len(),
+        "recoverable_sessions": response.recoverable_sessions.len(),
+    })))
+}
+
+/// POST /api/dashboard/agents/{agent_id}/refresh-summary
+/// Recompute activity summary for an agent using ClusterStore topic tags.
+async fn refresh_summary_handler(
+    State(state): State<Arc<AppState>>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Verify agent exists
+    let _agent = state.coordinator.registry.get(&agent_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Agent {agent_id} not found")))?;
+
+    // Load entries from knowledge files and compute topic tags
+    let scope_id = state.default_scope_id.as_deref().unwrap_or("corvia");
+    let entries = corvia_kernel::knowledge_files::read_scope(&state.data_dir, scope_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load entries: {e}")))?;
+
+    // Get embeddings for entries (all entries for now — filtering by agent would require metadata)
+    let pairs: Vec<(String, Vec<f32>)> = entries.iter()
+        .filter_map(|e| e.embedding.as_ref().map(|emb| (e.id.to_string(), emb.clone())))
+        .collect();
+
+    // Ensure cluster store is current
+    state.cluster_store.maybe_recompute(&pairs);
+
+    if let Some(hierarchy) = state.cluster_store.current() {
+        // Compute topic tags from all embeddings (simplified — ideally filter by agent entries)
+        let all_embeddings: Vec<Vec<f32>> = pairs.iter().map(|(_, e)| e.clone()).collect();
+        let topic_tags = clustering::compute_topic_tags(&hierarchy, &all_embeddings);
+
+        let sessions = state.coordinator.sessions.list_by_agent(&agent_id)
+            .unwrap_or_default();
+
+        let summary = corvia_common::agent_types::ActivitySummary {
+            entry_count: entries.len() as u64,
+            topic_tags: topic_tags.clone(),
+            last_topics: topic_tags,
+            last_active: chrono::Utc::now(),
+            session_count: sessions.len() as u64,
+            drifted: false,
+        };
+
+        let _ = state.coordinator.registry.set_activity_summary(&agent_id, &summary);
+
+        Ok(Json(serde_json::json!({ "status": "refreshed", "agent_id": agent_id })))
+    } else {
+        Ok(Json(serde_json::json!({ "status": "skipped", "reason": "cluster store not yet computed" })))
+    }
 }
 
 // ---------------------------------------------------------------------------

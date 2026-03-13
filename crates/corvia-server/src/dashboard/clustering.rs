@@ -402,6 +402,43 @@ impl ClusterHierarchy {
 }
 
 // ---------------------------------------------------------------------------
+// Topic tag extraction from embeddings
+// ---------------------------------------------------------------------------
+
+/// Compute topic tags for a set of embeddings by finding the nearest super-cluster
+/// centroid for each. Returns the top 5 cluster labels by frequency.
+pub fn compute_topic_tags(hierarchy: &ClusterHierarchy, embeddings: &[Vec<f32>]) -> Vec<String> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for emb in embeddings {
+        let nearest = hierarchy
+            .super_clusters
+            .iter()
+            .min_by(|a, b| {
+                euclidean_dist_sq(emb, &a.centroid)
+                    .partial_cmp(&euclidean_dist_sq(emb, &b.centroid))
+                    .unwrap()
+            });
+        if let Some(sc) = nearest {
+            *counts.entry(sc.label.clone()).or_insert(0) += 1;
+        }
+    }
+    let mut tags: Vec<(String, usize)> = counts.into_iter().collect();
+    tags.sort_by(|a, b| b.1.cmp(&a.1));
+    tags.into_iter().take(5).map(|(label, _)| label).collect()
+}
+
+/// Returns true if overlap between historical and current topics is < 50%.
+/// Used for topic drift detection.
+pub fn is_topic_drifted(historical: &[String], current: &[String]) -> bool {
+    if historical.is_empty() || current.is_empty() {
+        return false; // No data to compare
+    }
+    let overlap = current.iter().filter(|t| historical.contains(t)).count();
+    let max_possible = historical.len().max(current.len());
+    (overlap as f32 / max_possible as f32) < 0.5
+}
+
+// ---------------------------------------------------------------------------
 // ClusterStore — thread-safe wrapper with in-memory caching
 // ---------------------------------------------------------------------------
 

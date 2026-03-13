@@ -277,6 +277,24 @@ impl AgentCoordinator {
         Ok(())
     }
 
+    /// List agents that have stale or orphaned sessions (candidates for reconnection).
+    /// Returns agents sorted by last_seen descending.
+    pub fn list_reconnectable(&self) -> Result<Vec<AgentRecord>> {
+        let all_agents = self.registry.list_active()?;
+        let mut reconnectable = Vec::new();
+        for agent in all_agents {
+            let sessions = self.sessions.list_by_agent(&agent.agent_id)?;
+            let has_stale_or_orphaned = sessions.iter().any(|s|
+                matches!(s.state, SessionState::Stale | SessionState::Orphaned)
+            );
+            if has_stale_or_orphaned {
+                reconnectable.push(agent);
+            }
+        }
+        reconnectable.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+        Ok(reconnectable)
+    }
+
     /// Search with visibility and RBAC filtering.
     pub async fn search(
         &self,
@@ -548,6 +566,32 @@ mod tests {
 
         let updated = coord.sessions.get(&session.session_id).unwrap().unwrap();
         assert_eq!(updated.state, SessionState::Closed);
+    }
+
+    #[tokio::test]
+    async fn test_list_reconnectable_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = setup_coordinator(dir.path()).await;
+
+        // Register agent and create session
+        let identity = AgentIdentity::Registered {
+            agent_id: "test::agent".into(),
+            api_key: None,
+        };
+        coord.register_agent(&identity, "Agent", AgentPermission::ReadOnly).unwrap();
+        let session = coord.create_session("test::agent", true).unwrap();
+
+        // Initially no reconnectable agents (session is Active)
+        let reconnectable = coord.list_reconnectable().unwrap();
+        assert_eq!(reconnectable.len(), 0);
+
+        // Make session stale
+        coord.sessions.transition(&session.session_id, SessionState::Stale).unwrap();
+
+        // Now the agent is reconnectable
+        let reconnectable = coord.list_reconnectable().unwrap();
+        assert_eq!(reconnectable.len(), 1);
+        assert_eq!(reconnectable[0].agent_id, "test::agent");
     }
 
     #[tokio::test]
