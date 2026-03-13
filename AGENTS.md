@@ -151,3 +151,6 @@ PostgresStore (`crates/corvia-kernel/src/postgres_store.rs`) is behind the `post
 - `ops.rs` — Shared kernel operations (system status, config get/set, GC, rebuild)
 - `grpc_engine.rs` — gRPC client for corvia-inference server
 - `crates/corvia-telemetry/src/lib.rs` — Telemetry init, span name constants, exporters
+- `crates/corvia-server/src/dashboard/mod.rs` — Dashboard routes and handlers
+- `crates/corvia-server/src/dashboard/clustering.rs` — K-means ClusterStore, shared embedding vocabulary
+- `crates/corvia-server/src/dashboard/activity.rs` — Activity feed with semantic grouping

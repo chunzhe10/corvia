@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.7] - 2026-03-13
+
+### Added
+
+- **Dashboard UX Overhaul**: Complete overhaul of the standalone dashboard (18 tasks)
+- **K-means clustering**: `ClusterStore` with k-means++ initialization on 768-dim embeddings,
+  silhouette scoring for optimal K (3..12), shared across graph/activity/agent views
+- **Multi-tiered LOD graph**: 4-level rendering (L0 super-clusters → L1 sub-clusters →
+  L2 file groups → L3 entries) with zoom-driven level switching and viewport culling
+- **Activity feed**: `GET /api/dashboard/activity` with semantic grouping (same agent +
+  topic/5-min window), content deltas, topic tags from ClusterStore
+- **Agent enrichment**: `description` and `activity_summary` fields on AgentRecord,
+  topic drift detection, `GET /api/dashboard/agents/reconnectable`,
+  `POST /api/dashboard/agents/{id}/connect`, `POST /api/dashboard/agents/{id}/refresh-summary`
+- **Collapsible sidebar**: 3-state sidebar (collapsed/narrow/wide) with context-aware content
+  types (config, health, cluster, entry, agent, finding, history)
+- **Cross-tab navigation**: `navigateToHistory(entryId)` deeplinks from any view to History tab
+- **Agent identity CLI**: `corvia agent connect` interactive command for agent session management
+- **Human-readable cluster labels**: `build_with_labels()` resolves entry IDs to source_file
+  names or content previews throughout the dashboard
+
+### Changed
+
+- History tab rewritten from UUID-lookup to activity feed consumer with topic filter pills,
+  agent dropdown, and semantic group expansion
+- Graph view upgraded from flat force-directed to multi-tiered LOD with breadcrumb navigation
+- Agent cards enhanced with description subtitle, topic tag pills, and drift indicator
+
 ## [0.3.6] - 2026-03-10
 
 ### Added
@@ -129,6 +157,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **M1 Core kernel**: LiteStore + SurrealStore, Ollama embedding pipeline,
   REST API, MCP server, CLI
 
+[0.3.7]: https://github.com/corvia/corvia/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/corvia/corvia/compare/v0.3.4...v0.3.6
 [0.3.4]: https://github.com/corvia/corvia/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/corvia/corvia/compare/v0.3.1...v0.3.3
