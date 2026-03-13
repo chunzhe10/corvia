@@ -48,7 +48,8 @@ impl GpuCapabilities {
             .unwrap_or(false);
 
         let openvino_available = std::path::Path::new("/dev/dri").exists()
-            && (std::path::Path::new("/usr/lib/x86_64-linux-gnu/libopenvino.so").exists()
+            && (std::path::Path::new("/usr/lib/libopenvino.so").exists()
+                || std::path::Path::new("/usr/lib/x86_64-linux-gnu/libopenvino.so").exists()
                 || std::env::var("INTEL_OPENVINO_DIR").is_ok());
 
         tracing::info!(cuda = cuda_available, openvino = openvino_available, "GPU capabilities probed");
