@@ -25,6 +25,13 @@ pub enum CheckType {
     SemanticGap,
     /// Two entries with high embedding similarity but different source versions.
     Contradiction,
+    // Docs workflow checks
+    /// Doc file in wrong directory for its content_role.
+    MisplacedDoc,
+    /// Two entries with conflicting claims at overlapping valid time ranges from different origins.
+    TemporalContradiction,
+    /// Topic cluster has only memory-role entries, no formal design doc.
+    CoverageGap,
 }
 
 impl CheckType {
@@ -38,6 +45,9 @@ impl CheckType {
             CheckType::DependencyCycle => "dependency_cycle",
             CheckType::SemanticGap => "semantic_gap",
             CheckType::Contradiction => "contradiction",
+            CheckType::MisplacedDoc => "misplaced_doc",
+            CheckType::TemporalContradiction => "temporal_contradiction",
+            CheckType::CoverageGap => "coverage_gap",
         }
     }
 }
@@ -54,8 +64,11 @@ impl std::str::FromStr for CheckType {
             "cycle" | "dependency_cycle" => Ok(CheckType::DependencyCycle),
             "gap" | "semantic_gap" => Ok(CheckType::SemanticGap),
             "contradiction" => Ok(CheckType::Contradiction),
+            "misplaced" | "misplaced_doc" => Ok(CheckType::MisplacedDoc),
+            "temporal" | "temporal_contradiction" => Ok(CheckType::TemporalContradiction),
+            "coverage" | "coverage_gap" => Ok(CheckType::CoverageGap),
             _ => Err(format!(
-                "Unknown check type: {s}. Valid: stale, broken, orphan, dangling, cycle, gap, contradiction"
+                "Unknown check type: {s}. Valid: stale, broken, orphan, dangling, cycle, gap, contradiction, misplaced, temporal, coverage"
             )),
         }
     }
@@ -163,6 +176,8 @@ impl<'a> Reasoner<'a> {
             CheckType::DependencyCycle => self.check_cycles(entries, scope_id).await,
             // LLM checks require an InferenceEngine — use run_llm_checks() instead.
             CheckType::SemanticGap | CheckType::Contradiction => Ok(Vec::new()),
+            // Docs workflow checks — require docs_rules config, wired in Task 3.5.
+            CheckType::MisplacedDoc | CheckType::TemporalContradiction | CheckType::CoverageGap => Ok(Vec::new()),
         }
     }
 
@@ -1096,5 +1111,22 @@ mod tests {
     fn test_check_type_as_str_llm_variants() {
         assert_eq!(CheckType::SemanticGap.as_str(), "semantic_gap");
         assert_eq!(CheckType::Contradiction.as_str(), "contradiction");
+    }
+
+    #[test]
+    fn test_new_check_types_parse() {
+        assert_eq!("misplaced_doc".parse::<CheckType>().unwrap(), CheckType::MisplacedDoc);
+        assert_eq!("misplaced".parse::<CheckType>().unwrap(), CheckType::MisplacedDoc);
+        assert_eq!("temporal_contradiction".parse::<CheckType>().unwrap(), CheckType::TemporalContradiction);
+        assert_eq!("temporal".parse::<CheckType>().unwrap(), CheckType::TemporalContradiction);
+        assert_eq!("coverage_gap".parse::<CheckType>().unwrap(), CheckType::CoverageGap);
+        assert_eq!("coverage".parse::<CheckType>().unwrap(), CheckType::CoverageGap);
+    }
+
+    #[test]
+    fn test_new_check_types_as_str() {
+        assert_eq!(CheckType::MisplacedDoc.as_str(), "misplaced_doc");
+        assert_eq!(CheckType::TemporalContradiction.as_str(), "temporal_contradiction");
+        assert_eq!(CheckType::CoverageGap.as_str(), "coverage_gap");
     }
 }
