@@ -341,20 +341,35 @@ async fn graph_scope_handler(
     }
 
     // Build nodes with content previews
-    let entry_map: std::collections::HashMap<uuid::Uuid, &corvia_kernel::KnowledgeEntry> =
+    let entry_map: std::collections::HashMap<uuid::Uuid, &corvia_common::types::KnowledgeEntry> =
         entries.iter().map(|e| (e.id, e)).collect();
+
+    // Truncate a string at a char boundary, appending "…" if shortened.
+    fn truncate_str(s: &str, max: usize) -> String {
+        if s.len() <= max { return s.to_string(); }
+        let end = s.floor_char_boundary(max);
+        format!("{}…", &s[..end])
+    }
 
     let nodes: Vec<serde_json::Value> = node_ids
         .iter()
         .map(|id| {
-            let label = entry_map
-                .get(id)
-                .map(|e| {
-                    let c = &e.content;
-                    if c.len() > 80 { format!("{}…", &c[..80]) } else { c.clone() }
-                })
-                .unwrap_or_else(|| id.to_string());
-            serde_json::json!({ "id": id.to_string(), "label": label })
+            let entry = entry_map.get(id);
+            // Prefer source_file for the label, fall back to content preview
+            let label = entry
+                .and_then(|e| e.metadata.source_file.as_deref().map(|s| s.to_string()))
+                .or_else(|| entry.map(|e| truncate_str(&e.content, 80)))
+                .unwrap_or_else(|| truncate_str(&id.to_string(), 8));
+            let preview = entry
+                .map(|e| truncate_str(&e.content, 200))
+                .unwrap_or_default();
+            serde_json::json!({
+                "id": id.to_string(),
+                "label": label,
+                "preview": preview,
+                "source_file": entry.and_then(|e| e.metadata.source_file.as_deref()),
+                "language": entry.and_then(|e| e.metadata.language.as_deref()),
+            })
         })
         .collect();
 
