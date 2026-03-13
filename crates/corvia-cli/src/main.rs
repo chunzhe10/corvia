@@ -66,6 +66,12 @@ enum Commands {
     Ingest {
         /// Path to repository (optional in workspace mode)
         path: Option<String>,
+        /// Incremental mode: only re-index changed files
+        #[arg(long)]
+        incremental: bool,
+        /// Specific files to re-index (requires --incremental)
+        #[arg(long, num_args = 1.., requires = "incremental")]
+        files: Vec<String>,
     },
 
     /// Search ingested knowledge
@@ -342,7 +348,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Init { store } => cmd_init(&store).await?,
         Commands::Serve => cmd_serve().await?,
-        Commands::Ingest { path } => cmd_ingest(path.as_deref()).await?,
+        Commands::Ingest { path, incremental, files } => cmd_ingest(path.as_deref(), incremental, &files).await?,
         Commands::Search { query, limit } => cmd_search(&query, limit).await?,
         Commands::Status { metrics } => cmd_status(metrics).await?,
         Commands::Test { check_only, keep, ci } => cmd_test(check_only, keep, ci).await?,
@@ -587,7 +593,55 @@ async fn shutdown_signal() {
     }
 }
 
-async fn cmd_ingest(path: Option<&str>) -> Result<()> {
+async fn cmd_ingest(path: Option<&str>, incremental: bool, files: &[String]) -> Result<()> {
+    // Incremental mode: re-index specific files through the chunking pipeline
+    if incremental && !files.is_empty() {
+        let config = load_config()?;
+        ensure_inference_ready(&config).await?;
+        let (store, _graph) = connect_store_with_graph(&config).await?;
+        let engine = connect_engine(&config);
+        let pipeline = corvia_kernel::create_chunking_pipeline(&config);
+        let scope_id = &config.project.scope_id;
+
+        println!("Incremental re-indexing {} file(s)...", files.len());
+        for file_path in files {
+            let path = std::path::Path::new(file_path);
+            if !path.exists() {
+                println!("  Skipped (not found): {}", file_path);
+                continue;
+            }
+            println!("  Re-indexing: {}", file_path);
+
+            let content = std::fs::read_to_string(file_path)?;
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let meta = corvia_kernel::chunking_strategy::SourceMetadata {
+                file_path: file_path.to_string(),
+                extension: ext.to_string(),
+                language: None,
+                scope_id: scope_id.clone(),
+                source_version: "incremental".into(),
+            };
+            let (chunks, _relations) = pipeline.process(&content, &meta)?;
+            println!("    Chunked into {} pieces", chunks.len());
+
+            for chunk in &chunks {
+                let embedding = engine.embed(&chunk.content).await?;
+                let mut new_entry = corvia_common::types::KnowledgeEntry::new(
+                    chunk.content.clone(), scope_id.clone(), "incremental".into(),
+                );
+                new_entry.metadata.source_file = Some(file_path.to_string());
+                new_entry.metadata.chunk_type = Some(chunk.chunk_type.clone());
+                new_entry.metadata.start_line = Some(chunk.start_line);
+                new_entry.metadata.end_line = Some(chunk.end_line);
+                new_entry.embedding = Some(embedding);
+                store.insert(&new_entry).await?;
+            }
+            println!("    Created {} entries", chunks.len());
+        }
+        println!("Incremental re-index complete.");
+        return Ok(());
+    }
+
     if let Some(path) = path {
         // D69 pipeline flow: source files → ChunkingPipeline → embed → store
         let config = load_config()?;
