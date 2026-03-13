@@ -23,6 +23,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/dashboard/logs", get(logs_handler))
         .route("/api/dashboard/config", get(config_handler))
         .route("/api/dashboard/graph", get(graph_handler))
+        .route("/api/dashboard/graph/scope", get(graph_scope_handler))
         .route("/api/dashboard/agents", get(agents_handler))
         .route("/api/dashboard/agents/{agent_id}/sessions", get(agent_sessions_handler))
         .route("/api/dashboard/merge/queue", get(merge_queue_handler))
@@ -30,6 +31,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/dashboard/health", get(health_handler))
         .route("/api/dashboard/rag/context", post(rag_context_handler))
         .route("/api/dashboard/rag/ask", post(rag_ask_handler))
+        .route("/api/dashboard/entries/{entry_id}", get(entry_detail_handler))
+        .route("/api/dashboard/entries/{entry_id}/history", get(entry_history_handler))
         .with_state(state)
 }
 
@@ -294,6 +297,73 @@ async fn graph_handler(
     Ok(Json(serde_json::json!({ "edges": edge_dtos })))
 }
 
+/// GET /api/dashboard/graph/scope
+/// Returns all nodes and edges for the default scope's knowledge graph.
+async fn graph_scope_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let scope_id = state
+        .default_scope_id
+        .as_deref()
+        .unwrap_or("corvia");
+
+    // Load all entries from knowledge files
+    let entries = corvia_kernel::knowledge_files::read_scope(&state.data_dir, scope_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load entries: {e}")))?;
+
+    // Collect edges for every entry, deduplicating by from:relation:to
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut all_edges = Vec::new();
+    let mut node_ids = std::collections::HashSet::<uuid::Uuid>::new();
+
+    for entry in &entries {
+        let edges = state
+            .graph
+            .edges(&entry.id, corvia_common::types::EdgeDirection::Both)
+            .await
+            .unwrap_or_default();
+
+        for e in edges {
+            let key = format!("{}:{}:{}", e.from, e.relation, e.to);
+            if seen.insert(key) {
+                node_ids.insert(e.from);
+                node_ids.insert(e.to);
+                all_edges.push(serde_json::json!({
+                    "from": e.from.to_string(),
+                    "relation": e.relation,
+                    "to": e.to.to_string(),
+                    "weight": e.metadata.as_ref()
+                        .and_then(|m| m.get("weight"))
+                        .and_then(|w| w.as_f64()),
+                }));
+            }
+        }
+    }
+
+    // Build nodes with content previews
+    let entry_map: std::collections::HashMap<uuid::Uuid, &corvia_kernel::KnowledgeEntry> =
+        entries.iter().map(|e| (e.id, e)).collect();
+
+    let nodes: Vec<serde_json::Value> = node_ids
+        .iter()
+        .map(|id| {
+            let label = entry_map
+                .get(id)
+                .map(|e| {
+                    let c = &e.content;
+                    if c.len() > 80 { format!("{}…", &c[..80]) } else { c.clone() }
+                })
+                .unwrap_or_else(|| id.to_string());
+            serde_json::json!({ "id": id.to_string(), "label": label })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "nodes": nodes,
+        "edges": all_edges,
+    })))
+}
+
 // ---------------------------------------------------------------------------
 // Agent endpoints
 // ---------------------------------------------------------------------------
@@ -502,5 +572,83 @@ async fn rag_ask_handler(
         "answer": response.answer,
         "sources": sources,
         "trace": response.trace,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Entry / History endpoints
+// ---------------------------------------------------------------------------
+
+/// GET /api/dashboard/entries/{entry_id}
+/// Returns a single entry by ID.
+async fn entry_detail_handler(
+    State(state): State<Arc<AppState>>,
+    Path(entry_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let uuid = entry_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid entry_id: {e}")))?;
+
+    let entry = state
+        .store
+        .get(&uuid)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get entry: {e}")))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Entry {entry_id} not found")))?;
+
+    Ok(Json(serde_json::json!({
+        "id": entry.id.to_string(),
+        "content": entry.content,
+        "scope_id": entry.scope_id,
+        "recorded_at": entry.recorded_at.to_rfc3339(),
+        "valid_from": entry.valid_from.to_rfc3339(),
+        "valid_to": entry.valid_to.map(|t| t.to_rfc3339()),
+        "superseded_by": entry.superseded_by.map(|id| id.to_string()),
+        "metadata": {
+            "source_file": entry.metadata.source_file,
+            "language": entry.metadata.language,
+        },
+    })))
+}
+
+/// GET /api/dashboard/entries/{entry_id}/history
+/// Returns the supersession chain for an entry.
+async fn entry_history_handler(
+    State(state): State<Arc<AppState>>,
+    Path(entry_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let uuid = entry_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid entry_id: {e}")))?;
+
+    let chain = state
+        .temporal
+        .history(&uuid)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get history: {e}")))?;
+
+    let chain_json: Vec<serde_json::Value> = chain
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "id": e.id.to_string(),
+                "content": e.content,
+                "recorded_at": e.recorded_at.to_rfc3339(),
+                "valid_from": e.valid_from.to_rfc3339(),
+                "valid_to": e.valid_to.map(|t| t.to_rfc3339()),
+                "superseded_by": e.superseded_by.map(|id| id.to_string()),
+                "is_current": e.superseded_by.is_none(),
+                "metadata": {
+                    "source_file": e.metadata.source_file,
+                    "language": e.metadata.language,
+                },
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "entry_id": entry_id,
+        "chain": chain_json,
+        "count": chain_json.len(),
     })))
 }
