@@ -105,6 +105,7 @@ pub fn generate_workspace_config(
     config.workspace = Some(WorkspaceConfig {
         repos_dir: "repos".into(),
         repos,
+        docs: None,
     });
     Ok(config)
 }

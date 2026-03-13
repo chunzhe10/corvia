@@ -33,12 +33,34 @@ pub struct RepoConfig {
     pub namespace: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct DocsConfig {
+    #[serde(default)]
+    pub memory_dir: Option<String>,
+    #[serde(default)]
+    pub workspace_docs: Option<String>,
+    #[serde(default)]
+    pub allowed_workspace_subdirs: Vec<String>,
+    #[serde(default)]
+    pub rules: Option<DocsRulesConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct DocsRulesConfig {
+    #[serde(default)]
+    pub blocked_paths: Vec<String>,
+    #[serde(default)]
+    pub repo_docs_pattern: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkspaceConfig {
     #[serde(default = "default_repos_dir")]
     pub repos_dir: String,
     #[serde(default)]
     pub repos: Vec<RepoConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docs: Option<DocsConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -660,6 +682,7 @@ port = 8020
                     namespace: "main".into(),
                 },
             ],
+            docs: None,
         });
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let loaded: CorviaConfig = toml::from_str(&toml_str).unwrap();
@@ -677,6 +700,7 @@ port = 8020
         ws_config.workspace = Some(WorkspaceConfig {
             repos_dir: "repos".into(),
             repos: vec![],
+            docs: None,
         });
         assert!(ws_config.is_workspace());
     }
@@ -1079,5 +1103,66 @@ port = 8020
         let loaded: CorviaConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(loaded.inference.kv_quant, "q4");
         assert!(!loaded.inference.flash_attention);
+    }
+
+    #[test]
+    fn test_docs_config_from_toml() {
+        let toml_str = r#"
+[project]
+name = "test"
+scope_id = "test"
+
+[workspace]
+repos_dir = "repos"
+
+[workspace.docs]
+memory_dir = ".memory"
+workspace_docs = "docs"
+allowed_workspace_subdirs = ["decisions", "learnings"]
+
+[workspace.docs.rules]
+blocked_paths = ["docs/superpowers/*"]
+repo_docs_pattern = "docs/"
+
+[storage]
+store_type = "lite"
+data_dir = ".corvia"
+
+[embedding]
+provider = "ollama"
+model = "nomic-embed-text"
+url = "http://127.0.0.1:11434"
+dimensions = 768
+
+[server]
+host = "127.0.0.1"
+port = 8020
+"#;
+        let config: CorviaConfig = toml::from_str(toml_str).unwrap();
+        let ws = config.workspace.as_ref().unwrap();
+        let docs = ws.docs.as_ref().unwrap();
+        assert_eq!(docs.memory_dir, Some(".memory".into()));
+        assert_eq!(docs.workspace_docs, Some("docs".into()));
+        assert_eq!(docs.allowed_workspace_subdirs, vec!["decisions", "learnings"]);
+        let rules = docs.rules.as_ref().unwrap();
+        assert_eq!(rules.blocked_paths, vec!["docs/superpowers/*"]);
+        assert_eq!(rules.repo_docs_pattern, Some("docs/".into()));
+    }
+
+    #[test]
+    fn test_docs_config_optional() {
+        // Existing workspace configs without [workspace.docs] still parse
+        let config = CorviaConfig::default();
+        assert!(config.workspace.is_none());
+
+        let mut ws_config = CorviaConfig::default();
+        ws_config.workspace = Some(WorkspaceConfig {
+            repos_dir: "repos".into(),
+            repos: vec![],
+            docs: None,
+        });
+        let toml_str = toml::to_string_pretty(&ws_config).unwrap();
+        let loaded: CorviaConfig = toml::from_str(&toml_str).unwrap();
+        assert!(loaded.workspace.unwrap().docs.is_none());
     }
 }
