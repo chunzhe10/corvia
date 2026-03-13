@@ -41,6 +41,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/dashboard/entries/{entry_id}", get(entry_detail_handler))
         .route("/api/dashboard/entries/{entry_id}/history", get(entry_history_handler))
         .route("/api/dashboard/entries/{entry_id}/neighbors", get(entry_neighbors_handler))
+        .route("/api/dashboard/activity", get(activity::activity_feed_handler))
         .with_state(state)
 }
 
