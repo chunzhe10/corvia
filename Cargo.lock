@@ -1193,6 +1193,7 @@ dependencies = [
  "corvia-common",
  "corvia-kernel",
  "corvia-telemetry",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "tempfile",
