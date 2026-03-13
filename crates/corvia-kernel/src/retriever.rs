@@ -447,7 +447,7 @@ impl Retriever for GraphExpandRetriever {
 
 /// Post-filter search results by metadata fields (Option A from docs workflow spec).
 /// Applied after vector search, before returning to caller.
-pub(crate) fn post_filter_metadata(
+pub fn post_filter_metadata(
     results: Vec<SearchResult>,
     content_role: Option<&str>,
     source_origin: Option<&str>,

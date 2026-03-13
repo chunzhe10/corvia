@@ -85,9 +85,9 @@ async fn test_full_agent_lifecycle_e2e() {
     let session_id = session.session_id.clone();
 
     // 3. Write 3 knowledge entries
-    let e1 = coord.write_entry(&session_id, "Authentication uses JWT tokens", "project-a", "v1").await.unwrap();
-    let e2 = coord.write_entry(&session_id, "Database uses PostgreSQL 16", "project-a", "v1").await.unwrap();
-    let e3 = coord.write_entry(&session_id, "API follows REST conventions", "project-a", "v1").await.unwrap();
+    let e1 = coord.write_entry(&session_id, "Authentication uses JWT tokens", "project-a", "v1", None, None).await.unwrap();
+    let e2 = coord.write_entry(&session_id, "Database uses PostgreSQL 16", "project-a", "v1", None, None).await.unwrap();
+    let e3 = coord.write_entry(&session_id, "API follows REST conventions", "project-a", "v1", None, None).await.unwrap();
 
     assert_eq!(e1.entry_status, EntryStatus::Pending);
     assert_eq!(e2.entry_status, EntryStatus::Pending);
@@ -145,10 +145,10 @@ async fn test_two_agents_concurrent_writes() {
     let sess_b = &session_b.session_id;
 
     // Both write entries to same scope
-    coord.write_entry(sess_a, "Agent A: auth module docs", "shared", "v1").await.unwrap();
-    coord.write_entry(sess_a, "Agent A: config system docs", "shared", "v1").await.unwrap();
-    coord.write_entry(sess_b, "Agent B: testing guide", "shared", "v1").await.unwrap();
-    coord.write_entry(sess_b, "Agent B: deployment docs", "shared", "v1").await.unwrap();
+    coord.write_entry(sess_a, "Agent A: auth module docs", "shared", "v1", None, None).await.unwrap();
+    coord.write_entry(sess_a, "Agent A: config system docs", "shared", "v1", None, None).await.unwrap();
+    coord.write_entry(sess_b, "Agent B: testing guide", "shared", "v1", None, None).await.unwrap();
+    coord.write_entry(sess_b, "Agent B: deployment docs", "shared", "v1", None, None).await.unwrap();
 
     // Both commit
     coord.commit_session(sess_a).await.unwrap();
@@ -181,8 +181,8 @@ async fn test_crash_recovery_resume() {
     let session = coord.create_session("test::crasher", true).unwrap();
     let session_id = session.session_id.clone();
 
-    coord.write_entry(&session_id, "Important data before crash", "recovery", "v1").await.unwrap();
-    coord.write_entry(&session_id, "More data before crash", "recovery", "v1").await.unwrap();
+    coord.write_entry(&session_id, "Important data before crash", "recovery", "v1", None, None).await.unwrap();
+    coord.write_entry(&session_id, "More data before crash", "recovery", "v1", None, None).await.unwrap();
 
     // Simulate crash: mark session Stale then Orphaned
     coord.sessions.transition(&session_id, SessionState::Stale).unwrap();
@@ -201,7 +201,7 @@ async fn test_crash_recovery_resume() {
     assert!(matches!(session.state, SessionState::Active));
 
     // Can continue writing
-    coord.write_entry(&session_id, "New data after recovery", "recovery", "v1").await.unwrap();
+    coord.write_entry(&session_id, "New data after recovery", "recovery", "v1", None, None).await.unwrap();
 
     // Commit and merge
     coord.commit_session(&session_id).await.unwrap();
@@ -223,7 +223,7 @@ async fn test_crash_recovery_rollback() {
     let session = coord.create_session("test::roller", true).unwrap();
     let session_id = session.session_id.clone();
 
-    coord.write_entry(&session_id, "Data to be rolled back", "rollback", "v1").await.unwrap();
+    coord.write_entry(&session_id, "Data to be rolled back", "rollback", "v1", None, None).await.unwrap();
 
     // Mark as orphaned
     coord.sessions.transition(&session_id, SessionState::Stale).unwrap();

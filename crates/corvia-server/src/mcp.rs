@@ -121,7 +121,9 @@ fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "query": { "type": "string", "description": "The search query" },
                     "scope_id": { "type": "string", "description": "Scope to search within (defaults to workspace scope if omitted)" },
-                    "limit": { "type": "integer", "description": "Maximum results (default 10)" }
+                    "limit": { "type": "integer", "description": "Maximum results (default 10)" },
+                    "content_role": { "type": "string", "description": "Filter by content role: design, decision, plan, code, memory, finding, instruction, learning" },
+                    "source_origin": { "type": "string", "description": "Filter by source origin: repo:<name>, workspace, memory" }
                 },
                 "required": ["query"]
             }
@@ -135,7 +137,9 @@ fn tool_definitions() -> Vec<Value> {
                     "content": { "type": "string", "description": "The knowledge content to store" },
                     "scope_id": { "type": "string", "description": "Target scope (defaults to workspace scope if omitted)" },
                     "source_version": { "type": "string", "description": "Source version reference" },
-                    "agent_id": { "type": "string", "description": "Agent identity for attribution (e.g. 'claude-code')" }
+                    "agent_id": { "type": "string", "description": "Agent identity for attribution (e.g. 'claude-code')" },
+                    "content_role": { "type": "string", "description": "Content role: design, decision, plan, code, memory, finding, instruction, learning" },
+                    "source_origin": { "type": "string", "description": "Source origin: repo:<name>, workspace, memory" }
                 },
                 "required": ["content"]
             }
@@ -616,12 +620,16 @@ async fn tool_corvia_search(
         .ok_or((INVALID_PARAMS, "Missing 'query' parameter".into()))?;
     let scope_id = resolve_scope_id(args, state)?;
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let content_role = args.get("content_role").and_then(|v| v.as_str()).map(String::from);
+    let source_origin = args.get("source_origin").and_then(|v| v.as_str()).map(String::from);
 
     // Route through RAG pipeline if available (fixes ContextBuilder bypass)
     if let Some(rag) = &state.rag {
         let opts = corvia_kernel::rag_types::RetrievalOpts {
             limit,
             expand_graph: false, // search endpoint: pure vector (context/ask use graph)
+            content_role: content_role.clone(),
+            source_origin: source_origin.clone(),
             ..Default::default()
         };
         let response = rag.context(query, scope_id, Some(opts)).await
@@ -633,6 +641,8 @@ async fn tool_corvia_search(
                 "score": r.score,
                 "source_file": r.entry.metadata.source_file,
                 "language": r.entry.metadata.language,
+                "content_role": r.entry.metadata.content_role,
+                "source_origin": r.entry.metadata.source_origin,
             })
         }).collect();
 
@@ -651,8 +661,20 @@ async fn tool_corvia_search(
     let embedding = state.engine.embed(query).await
         .map_err(|e| (INTERNAL_ERROR, format!("Embedding failed: {e}")))?;
 
-    let results = state.store.search(&embedding, scope_id, limit).await
+    let search_limit = if content_role.is_some() || source_origin.is_some() {
+        limit * 3
+    } else {
+        limit
+    };
+    let results = state.store.search(&embedding, scope_id, search_limit).await
         .map_err(|e| (INTERNAL_ERROR, format!("Search failed: {e}")))?;
+
+    let results = corvia_kernel::retriever::post_filter_metadata(
+        results,
+        content_role.as_deref(),
+        source_origin.as_deref(),
+    );
+    let results: Vec<_> = results.into_iter().take(limit).collect();
 
     let items: Vec<Value> = results.iter().map(|r| {
         json!({
@@ -660,6 +682,8 @@ async fn tool_corvia_search(
             "score": r.score,
             "source_file": r.entry.metadata.source_file,
             "language": r.entry.metadata.language,
+            "content_role": r.entry.metadata.content_role,
+            "source_origin": r.entry.metadata.source_origin,
         })
     }).collect();
 
@@ -687,6 +711,9 @@ async fn tool_corvia_write(
         .ok_or((INVALID_PARAMS, "Missing 'content' parameter".into()))?;
     let scope_id = resolve_scope_id(args, state)?;
     let source_version = args.get("source_version").and_then(|v| v.as_str()).unwrap_or("mcp");
+    let content_role = args.get("content_role").and_then(|v| v.as_str()).map(String::from);
+    let source_origin = args.get("source_origin").and_then(|v| v.as_str()).map(String::from)
+        .or(Some("workspace".into())); // default per spec
 
     let coord = &state.coordinator;
 
@@ -720,7 +747,7 @@ async fn tool_corvia_write(
         .map(|s| s.session_id.as_str())
         .ok_or((INTERNAL_ERROR, "No active session".into()))?;
 
-    let entry = coord.write_entry(session_id, content, scope_id, source_version).await
+    let entry = coord.write_entry(session_id, content, scope_id, source_version, content_role, source_origin).await
         .map_err(|e| (INTERNAL_ERROR, format!("Write failed: {e}")))?;
 
     Ok(json!({

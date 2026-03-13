@@ -176,6 +176,8 @@ impl AgentCoordinator {
         content: &str,
         scope_id: &str,
         source_version: &str,
+        content_role: Option<String>,
+        source_origin: Option<String>,
     ) -> Result<KnowledgeEntry> {
         let session = self.sessions.get(session_id)?
             .ok_or_else(|| CorviaError::NotFound(format!("Session {session_id} not found")))?;
@@ -201,6 +203,8 @@ impl AgentCoordinator {
             &session.agent_id,
             session_id,
             staging_dir.as_deref(),
+            content_role,
+            source_origin,
         ).await?;
 
         self.sessions.increment_written(session_id)?;
@@ -422,8 +426,8 @@ mod tests {
         assert!(session.staging_dir.is_some());
 
         // 3. Write 2 entries
-        let e1 = coord.write_entry(&session.session_id, "knowledge one", "test", "v1").await.unwrap();
-        let e2 = coord.write_entry(&session.session_id, "knowledge two", "test", "v1").await.unwrap();
+        let e1 = coord.write_entry(&session.session_id, "knowledge one", "test", "v1", None, None).await.unwrap();
+        let e2 = coord.write_entry(&session.session_id, "knowledge two", "test", "v1", None, None).await.unwrap();
         assert_eq!(e1.entry_status, EntryStatus::Pending);
         assert_eq!(e2.entry_status, EntryStatus::Pending);
 
@@ -564,11 +568,11 @@ mod tests {
         let session = coord.create_session("test::writer", true).unwrap();
 
         // Writing to scope-a should succeed
-        let result = coord.write_entry(&session.session_id, "ok", "scope-a", "v1").await;
+        let result = coord.write_entry(&session.session_id, "ok", "scope-a", "v1", None, None).await;
         assert!(result.is_ok());
 
         // Writing to scope-b should be rejected
-        let result = coord.write_entry(&session.session_id, "denied", "scope-b", "v1").await;
+        let result = coord.write_entry(&session.session_id, "denied", "scope-b", "v1", None, None).await;
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("write permission"), "Expected RBAC error, got: {err_msg}");
@@ -587,7 +591,7 @@ mod tests {
         let session = coord.create_session("test::reader", false).unwrap();
 
         // ReadOnly agents cannot write to any scope
-        let result = coord.write_entry(&session.session_id, "denied", "scope-a", "v1").await;
+        let result = coord.write_entry(&session.session_id, "denied", "scope-a", "v1", None, None).await;
         assert!(result.is_err());
     }
 }

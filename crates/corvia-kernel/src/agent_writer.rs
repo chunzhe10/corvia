@@ -39,14 +39,20 @@ impl AgentWriter {
         agent_id: &str,
         session_id: &str,
         staging_dir: Option<&Path>,
+        content_role: Option<String>,
+        source_origin: Option<String>,
     ) -> Result<KnowledgeEntry> {
         // 1. Create entry with agent attribution
-        let entry = KnowledgeEntry::new(
+        let mut entry = KnowledgeEntry::new(
             content.to_string(),
             scope_id.to_string(),
             source_version.to_string(),
         )
         .with_agent(agent_id.to_string(), session_id.to_string());
+
+        // 1b. Set docs-workflow metadata if provided
+        entry.metadata.content_role = content_role;
+        entry.metadata.source_origin = source_origin;
 
         // 2. Embed content
         let embedding = self.engine.embed(content).await?;
@@ -104,6 +110,8 @@ mod tests {
             "test::agent",
             "test::agent/sess-abc",
             Some(&staging_dir),
+            None,
+            None,
         ).await.unwrap();
 
         assert_eq!(entry.agent_id, Some("test::agent".into()));
@@ -133,6 +141,8 @@ mod tests {
             "v1",
             "crewai::advisor",
             "crewai::advisor/sess-xyz",
+            None,
+            None,
             None,
         ).await.unwrap();
 

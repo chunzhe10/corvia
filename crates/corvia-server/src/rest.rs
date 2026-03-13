@@ -54,6 +54,8 @@ pub struct SearchRequest {
     pub query: String,
     pub scope_id: String,
     pub limit: Option<usize>,
+    pub content_role: Option<String>,
+    pub source_origin: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -71,6 +73,8 @@ pub struct SearchResultDto {
     pub chunk_type: Option<String>,
     pub start_line: Option<u32>,
     pub end_line: Option<u32>,
+    pub content_role: Option<String>,
+    pub source_origin: Option<String>,
 }
 
 impl From<SearchResult> for SearchResultDto {
@@ -83,6 +87,8 @@ impl From<SearchResult> for SearchResultDto {
             chunk_type: r.entry.metadata.chunk_type,
             start_line: r.entry.metadata.start_line,
             end_line: r.entry.metadata.end_line,
+            content_role: r.entry.metadata.content_role,
+            source_origin: r.entry.metadata.source_origin,
         }
     }
 }
@@ -331,12 +337,16 @@ async fn search_memories(
     Json(req): Json<SearchRequest>,
 ) -> std::result::Result<Json<SearchResponse>, (StatusCode, String)> {
     let limit = req.limit.unwrap_or(10);
+    let content_role = req.content_role.clone();
+    let source_origin = req.source_origin.clone();
 
     // Route through RAG pipeline if available (fixes ContextBuilder bypass bug)
     if let Some(rag) = &state.rag {
         let opts = corvia_kernel::rag_types::RetrievalOpts {
             limit,
             expand_graph: false, // search endpoint: pure vector (context/ask use graph)
+            content_role,
+            source_origin,
             ..Default::default()
         };
         let response = rag.context(&req.query, &req.scope_id, Some(opts)).await
@@ -351,8 +361,20 @@ async fn search_memories(
     let query_embedding = state.engine.embed(&req.query).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Embedding failed: {e}")))?;
 
-    let results = state.store.search(&query_embedding, &req.scope_id, limit).await
+    let search_limit = if content_role.is_some() || source_origin.is_some() {
+        limit * 3
+    } else {
+        limit
+    };
+    let results = state.store.search(&query_embedding, &req.scope_id, search_limit).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Search failed: {e}")))?;
+
+    let mut results = corvia_kernel::retriever::post_filter_metadata(
+        results,
+        content_role.as_deref(),
+        source_origin.as_deref(),
+    );
+    results.truncate(limit);
 
     let count = results.len();
     let results: Vec<SearchResultDto> = results.into_iter().map(Into::into).collect();
@@ -478,6 +500,8 @@ async fn session_write(
         &req.content,
         &req.scope_id,
         req.source_version.as_deref().unwrap_or("manual"),
+        None,
+        None,
     ).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Write failed: {e}")))?;
 
