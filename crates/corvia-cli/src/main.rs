@@ -219,6 +219,8 @@ enum AgentCommands {
         /// Agent ID (e.g., "myproject::indexer")
         agent_id: String,
     },
+    /// Interactive agent selection for session identity
+    Connect,
 }
 
 #[derive(Subcommand)]
@@ -1262,8 +1264,114 @@ async fn cmd_agent(command: AgentCommands) -> Result<()> {
                 }
             }
         }
+        AgentCommands::Connect => {
+            use corvia_common::agent_types::SessionState;
+            use std::io::Write;
+
+            let session_mgr = corvia_kernel::session_manager::SessionManager::from_db(db)?;
+            let all_agents = registry.list_active()?;
+
+            // Find agents with stale/orphaned sessions
+            let mut reconnectable = Vec::new();
+            for agent in &all_agents {
+                let sessions = session_mgr.list_by_agent(&agent.agent_id)?;
+                let has_stale_or_orphaned = sessions.iter().any(|s|
+                    matches!(s.state, SessionState::Stale | SessionState::Orphaned)
+                );
+                if has_stale_or_orphaned {
+                    reconnectable.push(agent);
+                }
+            }
+
+            if reconnectable.is_empty() {
+                println!("No reconnectable agents found.");
+            } else {
+                println!("Reconnectable agents:");
+                for (i, agent) in reconnectable.iter().enumerate() {
+                    println!("  [{}] {} ({})", i + 1, agent.display_name, agent.agent_id);
+                    if let Some(ref desc) = agent.description {
+                        println!("      Purpose: {desc}");
+                    }
+                    if let Some(ref summary) = agent.activity_summary {
+                        let tags = summary.topic_tags.join(", ");
+                        println!("      Activity: {} entries across [{}]", summary.entry_count, tags);
+                        if summary.drifted && !summary.last_topics.is_empty() {
+                            let last = summary.last_topics.join(", ");
+                            println!("      Last session drifted to: [{last}]");
+                        }
+                        let ago = humanize_duration(chrono::Utc::now() - summary.last_active);
+                        println!("      Last active: {ago}");
+                    }
+                }
+            }
+
+            println!("  [N] Register new agent");
+            print!("Pick one: ");
+            std::io::stdout().flush()?;
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let input = input.trim();
+
+            if input.eq_ignore_ascii_case("n") {
+                print!("Agent ID (e.g., myproject::refactor): ");
+                std::io::stdout().flush()?;
+                let mut name = String::new();
+                std::io::stdin().read_line(&mut name)?;
+                let name = name.trim();
+
+                print!("Display name: ");
+                std::io::stdout().flush()?;
+                let mut display = String::new();
+                std::io::stdin().read_line(&mut display)?;
+                let display = display.trim();
+
+                print!("Purpose (optional): ");
+                std::io::stdout().flush()?;
+                let mut desc = String::new();
+                std::io::stdin().read_line(&mut desc)?;
+                let desc = desc.trim();
+
+                let scope_id = config.project.scope_id.clone();
+                let record = registry.register(
+                    name,
+                    display,
+                    corvia_common::agent_types::IdentityType::Registered,
+                    corvia_common::agent_types::AgentPermission::ReadWrite {
+                        scopes: vec![scope_id],
+                    },
+                )?;
+                if !desc.is_empty() {
+                    registry.set_description(&record.agent_id, desc)?;
+                }
+                println!("Connected as {}.", record.agent_id);
+                println!("  export CORVIA_AGENT_ID=\"{}\"", record.agent_id);
+            } else {
+                let idx: usize = input.parse()
+                    .map_err(|_| anyhow::anyhow!("Invalid selection: '{input}'"))?;
+                let agent = reconnectable.get(idx - 1)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid index: {idx}"))?;
+                // Touch the agent to update last_seen
+                let _ = registry.touch(&agent.agent_id);
+                println!("Connected as {}.", agent.agent_id);
+                println!("  export CORVIA_AGENT_ID=\"{}\"", agent.agent_id);
+            }
+        }
     }
     Ok(())
+}
+
+/// Format a chrono Duration as a human-readable string (e.g., "3m ago", "2h ago").
+fn humanize_duration(dur: chrono::Duration) -> String {
+    let secs = dur.num_seconds();
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
 }
 
 async fn cmd_workspace(command: WorkspaceCommands) -> Result<()> {
