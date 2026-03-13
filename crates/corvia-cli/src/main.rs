@@ -26,6 +26,7 @@
 //! [ARCHITECTURE.md](https://github.com/corvia/corvia/blob/master/ARCHITECTURE.md)
 //! for the full project overview.
 
+mod hooks;
 mod server_client;
 mod upgrade;
 mod workspace;
@@ -305,6 +306,8 @@ enum WorkspaceCommands {
         #[command(subcommand)]
         command: DocsCommands,
     },
+    /// Generate enforcement hooks from corvia.toml config
+    InitHooks,
 }
 
 #[derive(Subcommand)]
@@ -1343,6 +1346,12 @@ async fn cmd_workspace(command: WorkspaceCommands) -> Result<()> {
                 DocsCommands::Check { check, fix, yes } =>
                     cmd_docs_check(check.as_deref(), fix, yes).await?,
             }
+            Ok(())
+        }
+        WorkspaceCommands::InitHooks => {
+            let root = std::env::current_dir()?;
+            let config = load_config()?;
+            hooks::generate_hooks(&root, &config)?;
             Ok(())
         }
     }
