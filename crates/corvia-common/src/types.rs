@@ -33,6 +33,10 @@ pub struct EntryMetadata {
     pub chunk_type: Option<String>,
     pub start_line: Option<u32>,
     pub end_line: Option<u32>,
+    #[serde(default)]
+    pub content_role: Option<String>,
+    #[serde(default)]
+    pub source_origin: Option<String>,
 }
 
 impl KnowledgeEntry {
@@ -163,5 +167,32 @@ mod tests {
         let deserialized: KnowledgeEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(entry.id, deserialized.id);
         assert_eq!(entry.content, deserialized.content);
+    }
+
+    #[test]
+    fn test_entry_metadata_new_fields_default() {
+        // Existing JSON without new fields should deserialize with None defaults
+        let json = r#"{"source_file":"lib.rs","language":"rust","chunk_type":"function","start_line":1,"end_line":10}"#;
+        let meta: EntryMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.source_file, Some("lib.rs".into()));
+        assert!(meta.content_role.is_none());
+        assert!(meta.source_origin.is_none());
+    }
+
+    #[test]
+    fn test_entry_metadata_new_fields_roundtrip() {
+        let meta = EntryMetadata {
+            source_file: Some("design.md".into()),
+            language: Some("markdown".into()),
+            chunk_type: Some("section".into()),
+            start_line: Some(1),
+            end_line: Some(50),
+            content_role: Some("design".into()),
+            source_origin: Some("repo:corvia".into()),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let roundtrip: EntryMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.content_role, Some("design".into()));
+        assert_eq!(roundtrip.source_origin, Some("repo:corvia".into()));
     }
 }
