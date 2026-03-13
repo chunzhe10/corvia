@@ -20,6 +20,10 @@ pub struct RetrievalOpts {
     pub permissions: Option<AgentPermission>,
     /// Oversample factor for vector search (more seeds = more graph expansion).
     pub oversample_factor: usize,
+    /// Filter results by content_role (post-filter, Option A from spec).
+    pub content_role: Option<String>,
+    /// Filter results by source_origin (post-filter, Option A from spec).
+    pub source_origin: Option<String>,
 }
 
 impl Default for RetrievalOpts {
@@ -32,7 +36,21 @@ impl Default for RetrievalOpts {
             agent_id: None,
             permissions: None,
             oversample_factor: 2,
+            content_role: None,
+            source_origin: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_retrieval_opts_filter_defaults() {
+        let opts = RetrievalOpts::default();
+        assert!(opts.content_role.is_none());
+        assert!(opts.source_origin.is_none());
     }
 }
 

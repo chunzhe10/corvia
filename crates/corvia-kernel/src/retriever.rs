@@ -111,16 +111,32 @@ impl Retriever for VectorRetriever {
         let embedding = self.engine.embed(query).await?;
 
         // Oversample (min 10) to allow for post-filter elimination.
-        let fetch_limit = (opts.limit * opts.oversample_factor).max(10);
+        // When metadata filters are active, over-fetch by 3x to compensate for post-filter.
+        let search_limit = if opts.content_role.is_some() || opts.source_origin.is_some() {
+            opts.limit * 3
+        } else {
+            opts.limit
+        };
+        let fetch_limit = (search_limit * opts.oversample_factor).max(10);
         let raw_results = self.store.search(&embedding, scope_id, fetch_limit).await?;
         let vector_results = raw_results.len();
 
-        // Visibility post-filter.
-        let filtered: Vec<SearchResult> = raw_results
+        // Visibility post-filter (no take yet — metadata filter runs after).
+        let vis_filtered: Vec<SearchResult> = raw_results
             .into_iter()
             .filter(|sr| visibility_filter(&sr.entry, &opts.visibility, opts.agent_id.as_deref()))
-            .take(opts.limit)
             .collect();
+
+        // Metadata post-filter.
+        let meta_filtered = post_filter_metadata(
+            vis_filtered,
+            opts.content_role.as_deref(),
+            opts.source_origin.as_deref(),
+        );
+
+        // Truncate to requested limit.
+        let mut filtered = meta_filtered;
+        filtered.truncate(opts.limit);
 
         let post_filter_count = filtered.len();
 
@@ -238,7 +254,13 @@ impl Retriever for GraphExpandRetriever {
         let embedding = self.engine.embed(query).await?;
 
         // Oversample (min 10) to allow for post-filter elimination.
-        let fetch_limit = (opts.limit * opts.oversample_factor).max(10);
+        // When metadata filters are active, over-fetch by 3x to compensate for post-filter.
+        let search_limit = if opts.content_role.is_some() || opts.source_origin.is_some() {
+            opts.limit * 3
+        } else {
+            opts.limit
+        };
+        let fetch_limit = (search_limit * opts.oversample_factor).max(10);
         let raw_results = self
             .store
             .search(&embedding, scope_id, fetch_limit)
@@ -377,13 +399,23 @@ impl Retriever for GraphExpandRetriever {
         // Sort by blended score descending.
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Visibility post-filter and limit.
-        let filtered: Vec<SearchResult> = scored
+        // Visibility post-filter (no take yet — metadata filter runs after).
+        let vis_filtered: Vec<SearchResult> = scored
             .into_iter()
             .map(|(_, sr)| sr)
             .filter(|sr| visibility_filter(&sr.entry, &opts.visibility, opts.agent_id.as_deref()))
-            .take(opts.limit)
             .collect();
+
+        // Metadata post-filter.
+        let meta_filtered = post_filter_metadata(
+            vis_filtered,
+            opts.content_role.as_deref(),
+            opts.source_origin.as_deref(),
+        );
+
+        // Truncate to requested limit.
+        let mut filtered = meta_filtered;
+        filtered.truncate(opts.limit);
 
         let post_filter_count = filtered.len();
 
@@ -410,6 +442,76 @@ impl Retriever for GraphExpandRetriever {
             },
             query_embedding: Some(embedding),
         })
+    }
+}
+
+/// Post-filter search results by metadata fields (Option A from docs workflow spec).
+/// Applied after vector search, before returning to caller.
+pub fn post_filter_metadata(
+    results: Vec<SearchResult>,
+    content_role: Option<&str>,
+    source_origin: Option<&str>,
+) -> Vec<SearchResult> {
+    if content_role.is_none() && source_origin.is_none() {
+        return results;
+    }
+    results.into_iter().filter(|r| {
+        if let Some(role) = content_role {
+            if r.entry.metadata.content_role.as_deref() != Some(role) {
+                return false;
+            }
+        }
+        if let Some(origin) = source_origin {
+            if r.entry.metadata.source_origin.as_deref() != Some(origin) {
+                return false;
+            }
+        }
+        true
+    }).collect()
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use corvia_common::types::{KnowledgeEntry, SearchResult};
+
+    fn make_result(content_role: Option<&str>, source_origin: Option<&str>, score: f32) -> SearchResult {
+        let mut entry = KnowledgeEntry::new("test".into(), "scope".into(), "v1".into());
+        entry.metadata.content_role = content_role.map(String::from);
+        entry.metadata.source_origin = source_origin.map(String::from);
+        SearchResult { entry, score }
+    }
+
+    #[test]
+    fn test_post_filter_by_content_role() {
+        let results = vec![
+            make_result(Some("design"), Some("repo:corvia"), 0.9),
+            make_result(Some("code"), Some("repo:corvia"), 0.8),
+            make_result(Some("design"), Some("workspace"), 0.7),
+        ];
+        let filtered = super::post_filter_metadata(results, Some("design"), None);
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|r| r.entry.metadata.content_role.as_deref() == Some("design")));
+    }
+
+    #[test]
+    fn test_post_filter_by_source_origin() {
+        let results = vec![
+            make_result(Some("design"), Some("repo:corvia"), 0.9),
+            make_result(Some("code"), Some("repo:corvia"), 0.8),
+            make_result(Some("design"), Some("workspace"), 0.7),
+        ];
+        let filtered = super::post_filter_metadata(results, None, Some("repo:corvia"));
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn test_post_filter_no_filters_returns_all() {
+        let results = vec![
+            make_result(Some("design"), Some("repo:corvia"), 0.9),
+            make_result(None, None, 0.8),
+        ];
+        let filtered = super::post_filter_metadata(results, None, None);
+        assert_eq!(filtered.len(), 2);
     }
 }
 
