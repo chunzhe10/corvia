@@ -135,12 +135,19 @@ impl Finding {
 pub struct Reasoner<'a> {
     store: &'a dyn QueryableStore,
     graph: &'a dyn GraphStore,
+    docs_rules: Option<corvia_common::config::DocsRulesConfig>,
 }
 
 impl<'a> Reasoner<'a> {
     /// Create a new Reasoner with access to the queryable store and graph store.
     pub fn new(store: &'a dyn QueryableStore, graph: &'a dyn GraphStore) -> Self {
-        Self { store, graph }
+        Self { store, graph, docs_rules: None }
+    }
+
+    /// Configure docs rules for MisplacedDoc checks.
+    pub fn with_docs_rules(mut self, rules: corvia_common::config::DocsRulesConfig) -> Self {
+        self.docs_rules = Some(rules);
+        self
     }
 
     /// Run all algorithmic checks on the provided entries. Returns all findings.
@@ -176,8 +183,18 @@ impl<'a> Reasoner<'a> {
             CheckType::DependencyCycle => self.check_cycles(entries, scope_id).await,
             // LLM checks require an InferenceEngine — use run_llm_checks() instead.
             CheckType::SemanticGap | CheckType::Contradiction => Ok(Vec::new()),
-            // Docs workflow checks — require docs_rules config, wired in Task 3.5.
-            CheckType::MisplacedDoc | CheckType::TemporalContradiction | CheckType::CoverageGap => Ok(Vec::new()),
+            // Docs workflow checks
+            CheckType::MisplacedDoc => {
+                if let Some(ref rules) = self.docs_rules {
+                    Ok(check_misplaced_doc(entries, rules))
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            CheckType::CoverageGap => Ok(check_coverage_gap(entries)),
+            CheckType::TemporalContradiction => {
+                Ok(check_temporal_contradiction(entries, 0.85))
+            }
         }
     }
 
