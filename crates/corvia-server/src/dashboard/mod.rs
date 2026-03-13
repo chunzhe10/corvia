@@ -13,6 +13,7 @@ use axum::{Json, Router};
 use corvia_common::dashboard::{
     DashboardConfig, DashboardStatusResponse, LogEntry, LogsResponse, ModuleStats, TracesResponse,
 };
+use serde::Serialize;
 use crate::rest::AppState;
 
 /// Dashboard REST API router — mounts at /api/dashboard/*
@@ -33,6 +34,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/dashboard/rag/ask", post(rag_ask_handler))
         .route("/api/dashboard/entries/{entry_id}", get(entry_detail_handler))
         .route("/api/dashboard/entries/{entry_id}/history", get(entry_history_handler))
+        .route("/api/dashboard/entries/{entry_id}/neighbors", get(entry_neighbors_handler))
         .with_state(state)
 }
 
@@ -389,6 +391,8 @@ async fn graph_scope_handler(
                 "source_file": entry.and_then(|e| e.metadata.source_file.as_deref()),
                 "language": entry.and_then(|e| e.metadata.language.as_deref()),
                 "group": group,
+                "content_role": entry.and_then(|e| e.metadata.content_role.as_deref()),
+                "source_origin": entry.and_then(|e| e.metadata.source_origin.as_deref()),
             })
         })
         .collect();
@@ -611,8 +615,92 @@ async fn rag_ask_handler(
 }
 
 // ---------------------------------------------------------------------------
-// Entry / History endpoints
+// Entry / History / Neighbors endpoints
 // ---------------------------------------------------------------------------
+
+/// DTO for a neighbor entry in the graph.
+#[derive(Serialize)]
+pub struct NeighborDto {
+    pub id: String,
+    pub content: String,
+    pub relation: String,
+    pub direction: String,
+    pub score: Option<f32>,
+    pub source_file: Option<String>,
+    pub content_role: Option<String>,
+    pub source_origin: Option<String>,
+}
+
+/// Query params for /api/dashboard/entries/{entry_id}/neighbors
+#[derive(Debug, serde::Deserialize)]
+pub struct NeighborParams {
+    pub depth: Option<usize>,
+}
+
+/// GET /api/dashboard/entries/{entry_id}/neighbors
+/// Returns neighbor entries via graph traversal.
+async fn entry_neighbors_handler(
+    State(state): State<Arc<AppState>>,
+    Path(entry_id): Path<String>,
+    Query(params): Query<NeighborParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let uuid = entry_id
+        .parse::<uuid::Uuid>()
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid entry_id: {e}")))?;
+    let depth = params.depth.unwrap_or(1).min(3);
+
+    // Use traverse for multi-hop BFS
+    let traversed = state
+        .graph
+        .traverse(&uuid, None, corvia_common::types::EdgeDirection::Both, depth)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Get direct edges for relation info
+    let edges = state
+        .graph
+        .edges(&uuid, corvia_common::types::EdgeDirection::Both)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Build map from neighbor_id -> (relation, direction)
+    let mut edge_info: std::collections::HashMap<uuid::Uuid, (String, String)> =
+        std::collections::HashMap::new();
+    for edge in &edges {
+        if edge.from == uuid {
+            edge_info.insert(edge.to, (edge.relation.clone(), "outgoing".into()));
+        } else {
+            edge_info.insert(edge.from, (edge.relation.clone(), "incoming".into()));
+        }
+    }
+
+    let mut neighbors = Vec::new();
+    for entry in &traversed {
+        if entry.id == uuid {
+            continue;
+        }
+        let (relation, direction) = edge_info
+            .get(&entry.id)
+            .cloned()
+            .unwrap_or(("transitive".into(), "outgoing".into()));
+        neighbors.push(NeighborDto {
+            id: entry.id.to_string(),
+            content: entry.content.chars().take(200).collect(),
+            relation,
+            direction,
+            score: None,
+            source_file: entry.metadata.source_file.clone(),
+            content_role: entry.metadata.content_role.clone(),
+            source_origin: entry.metadata.source_origin.clone(),
+        });
+    }
+
+    let count = neighbors.len();
+    Ok(Json(serde_json::json!({
+        "neighbors": neighbors,
+        "count": count,
+    })))
+}
 
 /// GET /api/dashboard/entries/{entry_id}
 /// Returns a single entry by ID.
@@ -642,6 +730,8 @@ async fn entry_detail_handler(
         "metadata": {
             "source_file": entry.metadata.source_file,
             "language": entry.metadata.language,
+            "content_role": entry.metadata.content_role,
+            "source_origin": entry.metadata.source_origin,
         },
     })))
 }
@@ -676,6 +766,8 @@ async fn entry_history_handler(
                 "metadata": {
                     "source_file": e.metadata.source_file,
                     "language": e.metadata.language,
+                    "content_role": e.metadata.content_role,
+                    "source_origin": e.metadata.source_origin,
                 },
             })
         })
