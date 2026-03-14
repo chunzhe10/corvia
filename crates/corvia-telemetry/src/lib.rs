@@ -113,10 +113,17 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<TelemetryGuard
                     .boxed()
             };
 
+            let context_layer = if otel_layer.is_some() {
+                Some(otel_context_layer::OtelContextLayer)
+            } else {
+                None
+            };
+
             tracing_subscriber::registry()
                 .with(env_filter)
-                .with(local_layer)
                 .with(otel_layer)
+                .with(context_layer)
+                .with(local_layer)
                 .init();
         }
         _ => {
@@ -127,10 +134,17 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<TelemetryGuard
                 fmt::layer().boxed()
             };
 
+            let context_layer = if otel_layer.is_some() {
+                Some(otel_context_layer::OtelContextLayer)
+            } else {
+                None
+            };
+
             tracing_subscriber::registry()
                 .with(env_filter)
-                .with(local_layer)
                 .with(otel_layer)
+                .with(context_layer)
+                .with(local_layer)
                 .init();
         }
     }
