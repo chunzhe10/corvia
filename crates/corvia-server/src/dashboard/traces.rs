@@ -257,9 +257,15 @@ pub fn collect_traces_from_lines(lines: &[&str]) -> TracesData {
         let errors = span_errors.get(name).copied().unwrap_or(0);
 
         let mut sorted = timings.clone();
-        let p50_ms = compute_percentile(&mut sorted, 50.0);
-        let p95_ms = compute_percentile(&mut sorted, 95.0);
-        let p99_ms = compute_percentile(&mut sorted, 99.0);
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let pct = |p: f64| -> f64 {
+            if sorted.is_empty() { return 0.0; }
+            let idx = ((p / 100.0) * (sorted.len() - 1) as f64).round() as usize;
+            sorted[idx.min(sorted.len() - 1)]
+        };
+        let p50_ms = pct(50.0);
+        let p95_ms = pct(95.0);
+        let p99_ms = pct(99.0);
 
         spans.insert(
             name.clone(),
