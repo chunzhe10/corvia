@@ -248,9 +248,46 @@ fn json_to_toml(json: &serde_json::Value) -> Result<toml::Value> {
 // GC
 // ---------------------------------------------------------------------------
 
-/// Run garbage collection sweep.
+/// Run garbage collection sweep with timing.
 pub async fn gc_run(coordinator: &AgentCoordinator) -> Result<GcReport> {
-    coordinator.gc().await
+    let start = std::time::Instant::now();
+    let mut report = coordinator.gc().await?;
+    report.duration_ms = start.elapsed().as_millis() as u64;
+    if report.started_at.is_empty() {
+        report.started_at = chrono::Utc::now().to_rfc3339();
+    }
+    Ok(report)
+}
+
+/// In-memory ring buffer of recent GC reports.
+pub struct GcHistory {
+    reports: std::sync::Mutex<std::collections::VecDeque<GcReport>>,
+    max_size: usize,
+}
+
+impl GcHistory {
+    pub fn new(max_size: usize) -> Self {
+        Self {
+            reports: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(max_size)),
+            max_size,
+        }
+    }
+
+    pub fn push(&self, report: GcReport) {
+        let mut reports = self.reports.lock().unwrap();
+        if reports.len() >= self.max_size {
+            reports.pop_front();
+        }
+        reports.push_back(report);
+    }
+
+    pub fn last(&self) -> Option<GcReport> {
+        self.reports.lock().unwrap().back().cloned()
+    }
+
+    pub fn all(&self) -> Vec<GcReport> {
+        self.reports.lock().unwrap().iter().cloned().collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -468,5 +505,38 @@ mod tests {
         let id = uuid::Uuid::now_v7();
         let count = merge_retry(&coord, &[id]).unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_gc_run_populates_timing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, coord) = setup_coordinator(dir.path()).await;
+
+        let report = gc_run(&coord).await.unwrap();
+        assert!(!report.started_at.is_empty(), "gc_run should populate started_at");
+        // duration_ms may be 0 for sub-millisecond GC on empty coordinator,
+        // but it must not be absurdly large
+        assert!(report.duration_ms < 10_000, "gc_run duration should be reasonable");
+    }
+
+    #[test]
+    fn test_gc_history_ring_buffer() {
+        let history = GcHistory::new(3);
+        assert!(history.last().is_none());
+        assert!(history.all().is_empty());
+
+        for i in 0..5 {
+            history.push(GcReport {
+                orphans_rolled_back: i,
+                duration_ms: i as u64 * 10,
+                ..Default::default()
+            });
+        }
+
+        let all = history.all();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].orphans_rolled_back, 2);
+        assert_eq!(all[2].orphans_rolled_back, 4);
+        assert_eq!(history.last().unwrap().orphans_rolled_back, 4);
     }
 }
