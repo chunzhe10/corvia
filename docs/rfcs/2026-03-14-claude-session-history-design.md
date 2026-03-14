@@ -443,6 +443,9 @@ Add `workstream` optional parameter to `corvia_search` tool schema.
 
 **Tests**
 Mirror existing `test_post_filter_by_content_role` pattern with workstream cases.
+The four existing `post_filter_metadata` test call sites in `retriever.rs`
+(lines ~491, ~503, ~514, ~526) must also be updated to pass `None` as the new
+third `workstream` argument so they continue to compile.
 
 ### No Breaking Changes
 
