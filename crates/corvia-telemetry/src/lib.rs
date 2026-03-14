@@ -1,3 +1,4 @@
+pub mod otel_context_layer;
 pub mod propagation;
 
 use corvia_common::config::TelemetryConfig;
