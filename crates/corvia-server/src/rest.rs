@@ -9,6 +9,7 @@ use chrono::{DateTime, Duration, Utc};
 use corvia_common::agent_types::*;
 use corvia_common::types::{EdgeDirection, GraphEdge, KnowledgeEntry, SearchResult};
 use corvia_kernel::agent_coordinator::AgentCoordinator;
+use corvia_kernel::ops::GcHistory;
 use corvia_kernel::traits::{GraphStore, InferenceEngine, QueryableStore, TemporalStore};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +34,8 @@ pub struct AppState {
     pub config_path: std::path::PathBuf,
     /// Semantic cluster hierarchy for LOD graph rendering.
     pub cluster_store: Arc<crate::dashboard::clustering::ClusterStore>,
+    /// In-memory ring buffer of recent GC reports.
+    pub gc_history: Arc<GcHistory>,
 }
 
 // --- Existing memory types ---

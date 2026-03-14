@@ -558,6 +558,7 @@ async fn cmd_serve() -> Result<()> {
         config: Arc::new(std::sync::RwLock::new(config.clone())),
         config_path,
         cluster_store: cluster_store.clone(),
+        gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
     });
     // Background cluster recompute every 60s
     {
