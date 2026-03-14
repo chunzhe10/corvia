@@ -5,6 +5,96 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-03-14
+
+### Added
+
+- **Dashboard completion**: OTEL span drill-down (`WaterfallView`), GC history panel with
+  sparkline (`GcPanel`), live sessions bar, percentile latency breakdown, trace tree view
+- **4 new dashboard endpoints**: `GET /api/dashboard/gc/history`, `GET /api/dashboard/sessions/live`,
+  `GET /api/dashboard/traces/recent`, `GET /api/dashboard/metrics/percentiles`
+- **`GcHistory` ring buffer**: Kernel tracks recent GC runs with duration and full `GcReport`
+  fields (stale, cleaned, scanned counts)
+- **OtelContextLayer**: Bridges W3C trace context from OTLP into the `tracing` fmt layer so
+  trace IDs appear in structured logs
+- **Config-driven chat model registry**: `corvia-inference` supports Qwen3 8B and other
+  models declared in `[inference]` config section
+- **Human-readable cluster labels**: Graph and activity endpoints resolve entry IDs to source
+  file names or content previews throughout the dashboard
+
+### Changed
+
+- `GcReport` expanded with `duration_ms`, `stale_found`, `sessions_cleaned` fields
+- Telemetry layer composition reordered — OTLP context injection happens before fmt layer
+
+## [0.4.2] - 2026-03-13
+
+### Added
+
+- **Docs reasoner checks**: `MisplacedDoc`, `TemporalContradiction`, `CoverageGap` —
+  three new automated checks in the reasoning pipeline for documentation health
+- **`corvia workspace docs check`**: CLI subcommand to run docs-specific health checks
+- **`DocsConfig`**: New `[docs]` section in `corvia.toml` for rules-based doc placement
+- **`content_role` / `source_origin` filters**: Added to `EntryMetadata`, `RetrievalOpts`,
+  REST and MCP search, and all dashboard JSON endpoints
+- **Graph clustering by source path**: Graph endpoint groups nodes by source file for
+  cleaner cluster visualization
+- **Dashboard detail + history endpoints**: `GET /api/dashboard/entries/:id` and
+  `GET /api/dashboard/entries/:id/history`
+- **`--incremental` / `--files` flags**: `corvia ingest` supports incremental re-ingestion
+  and targeted file lists
+- **`corvia workspace init-hooks`**: Generates hook scripts from `corvia.toml` config
+
+### Fixed
+
+- Source file labels and UTF-8 safe truncation in graph endpoint
+- OpenVINO library probed at `/usr/lib` in addition to multiarch path
+
+## [0.4.1] - 2026-03-12
+
+### Added
+
+- **GPU/CPU device control**: `corvia-inference` supports CUDA and OpenVINO EP selection
+  at runtime without server restart; per-model device/backend via `--model` flag
+- **KV cache quantization + flash attention**: `kv_quant` and `flash_attention` fields
+  plumbed through proto, inference service, model manager, provisioner, and CLI
+- **Hot-reloadable inference config**: `[inference]` section in `corvia.toml` is now
+  part of hot-reload config sections
+- **Dashboard REST API**: Full set of standalone dashboard endpoints
+  (`/api/dashboard/scope`, `/api/dashboard/graph`, `/api/dashboard/agents`, etc.)
+- **Dashboard module stats**: Pre-aggregated server-side for faster rendering
+
+### Fixed
+
+- Dashboard: poisoned lock on startup, DoS vector in graph endpoint, CSP header hardening
+- Missing `rag_context_handler` and remaining Tier 1 MCP endpoint handlers wired in
+
+## [0.4.0] - 2026-03-11
+
+### Added
+
+- **`corvia-telemetry` crate**: Structured tracing with configurable exporters (stdout,
+  file, OTLP gRPC), `TelemetryGuard` for flush-on-exit, D45 span name constants
+- **W3C trace context propagation**: End-to-end trace context across REST, MCP, gRPC
+  inference, and `tower-http` `TraceLayer` on all routers
+- **OTLP gRPC export**: Send spans to any OpenTelemetry collector; configurable via
+  `[telemetry]` section in `corvia.toml` (`service_name`, `otlp_endpoint`, `exporter`)
+- **MCP control plane** (10 new tools, 3 safety tiers):
+  - Tier 1 read-only: `corvia_system_status`, `corvia_config_get`, `corvia_adapters_list`, `corvia_agents_list`
+  - Tier 2 low-risk: `corvia_config_set`, `corvia_gc_run`, `corvia_rebuild_index`
+  - Tier 3 medium-risk: `corvia_agent_suspend`, `corvia_merge_retry`, `corvia_merge_queue`
+- **`ops.rs` shared operations module**: 12 kernel operations callable from both CLI and
+  MCP without code duplication
+- **Kernel instrumentation**: `#[tracing::instrument]` spans on `agent_coordinator`,
+  `merge_worker`, `lite_store`, `rag_pipeline` using D45 span contracts
+- **`corvia status --metrics`**: Extended telemetry output with agent counts, adapter
+  discovery, and coordination status
+- **Config hot-reload**: `AppState` wraps `CorviaConfig` in `Arc<RwLock<>>` for runtime
+  config updates via MCP
+- **MiniLM embedding models**: all-MiniLM-L6-v2 (384d) available alongside nomic-embed-text-v1.5 (768d)
+- **Workspace clean**: `corvia workspace clean` removes stale session staging data
+- **Optional merge/ask**: Merge and ask modes are now optional, not mandatory on every write
+
 ## [0.3.7] - 2026-03-13
 
 ### Added
@@ -157,6 +247,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **M1 Core kernel**: LiteStore + SurrealStore, Ollama embedding pipeline,
   REST API, MCP server, CLI
 
+[0.4.3]: https://github.com/corvia/corvia/compare/v0.4.2...v0.4.3
+[0.4.2]: https://github.com/corvia/corvia/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/corvia/corvia/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/corvia/corvia/compare/v0.3.7...v0.4.0
 [0.3.7]: https://github.com/corvia/corvia/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/corvia/corvia/compare/v0.3.4...v0.3.6
 [0.3.4]: https://github.com/corvia/corvia/compare/v0.3.3...v0.3.4
