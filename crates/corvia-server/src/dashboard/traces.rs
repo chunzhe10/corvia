@@ -243,6 +243,7 @@ pub fn collect_traces_from_lines(lines: &[&str]) -> TracesData {
                 avg_ms,
                 last_ms,
                 errors,
+                ..Default::default()
             },
         );
     }

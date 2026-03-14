@@ -32,6 +32,12 @@ pub struct SpanStats {
     pub avg_ms: f64,
     pub last_ms: f64,
     pub errors: u64,
+    #[serde(default)]
+    pub p50_ms: f64,
+    #[serde(default)]
+    pub p95_ms: f64,
+    #[serde(default)]
+    pub p99_ms: f64,
 }
 
 /// A structured trace event (mirrors Python TraceEvent)
@@ -108,6 +114,90 @@ pub struct TracesResponse {
     pub modules: HashMap<String, ModuleStats>,
 }
 
+/// GC report DTO (mirrors corvia-kernel GcReport for API responses)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GcReportDto {
+    pub orphans_rolled_back: usize,
+    pub duration_ms: u64,
+    pub stale_transitioned: usize,
+    pub closed_sessions_cleaned: usize,
+    pub agents_suspended: usize,
+    pub entries_deduplicated: usize,
+    pub started_at: String,
+}
+
+/// GET /api/dashboard/gc response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcStatusResponse {
+    pub last_run: Option<GcReportDto>,
+    pub history: Vec<GcReportDto>,
+    pub scheduled: bool,
+}
+
+/// Live session entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveSession {
+    pub session_id: String,
+    pub agent_id: String,
+    pub agent_name: String,
+    pub state: String,
+    pub started_at: String,
+    pub duration_secs: u64,
+    pub entries_written: u64,
+    pub entries_merged: u64,
+    pub pending_entries: u64,
+    pub git_branch: Option<String>,
+    pub has_staging_dir: bool,
+}
+
+/// Live sessions summary
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveSessionsSummary {
+    pub total_active: usize,
+    pub total_stale: usize,
+    pub total_entries_pending: u64,
+}
+
+/// GET /api/dashboard/sessions/live response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveSessionsResponse {
+    pub sessions: Vec<LiveSession>,
+    pub summary: LiveSessionsSummary,
+}
+
+/// A node in a span trace tree.
+/// `module` is derived via span_to_module() for waterfall UI color-coding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpanNode {
+    pub span_id: String,
+    pub parent_span_id: String,
+    pub trace_id: String,
+    pub span_name: String,
+    pub elapsed_ms: f64,
+    pub start_offset_ms: f64,
+    pub depth: usize,
+    pub module: String,
+    pub fields: serde_json::Value,
+    pub children: Vec<SpanNode>,
+}
+
+/// A complete trace tree
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceTree {
+    pub trace_id: String,
+    pub root_span: String,
+    pub total_ms: f64,
+    pub span_count: usize,
+    pub started_at: String,
+    pub spans: Vec<SpanNode>,
+}
+
+/// GET /api/dashboard/traces/recent response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentTracesResponse {
+    pub traces: Vec<TraceTree>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +223,26 @@ mod tests {
         let stats = SpanStats::default();
         assert_eq!(stats.count, 0);
         assert_eq!(stats.avg_ms, 0.0);
+    }
+
+    #[test]
+    fn span_stats_default_includes_percentiles() {
+        let stats = SpanStats::default();
+        assert_eq!(stats.p50_ms, 0.0);
+        assert_eq!(stats.p95_ms, 0.0);
+        assert_eq!(stats.p99_ms, 0.0);
+    }
+
+    #[test]
+    fn gc_status_response_serializes() {
+        let resp = GcStatusResponse {
+            last_run: None,
+            history: vec![],
+            scheduled: false,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"scheduled\":false"));
+        assert!(json.contains("\"last_run\":null"));
     }
 
     #[test]
