@@ -314,9 +314,17 @@ pub struct SourceMetadata {
 }
 ```
 
-The `ChunkingPipeline` must be updated to propagate these fields to the resulting
-`KnowledgeEntry` when present:
-- `metadata.workstream` → `entry.workstream`
+`ChunkingPipeline` never constructs `KnowledgeEntry` objects — it produces
+`ProcessedChunk`s. The `SourceMetadata` → `KnowledgeEntry` conversion happens
+at the CLI ingest layer. The two sites that must be updated are:
+
+- `crates/corvia-cli/src/workspace.rs` — adapter-driven ingest path (the path
+  this new adapter uses; currently sets `entry.workstream` from repo config but
+  does not propagate `content_role` or `source_origin` from `SourceMetadata`)
+- `crates/corvia-cli/src/main.rs` — single-repo ingest path
+
+Both sites must be updated to propagate the three new optional fields:
+- `metadata.workstream` → `entry.workstream` (if `Some`)
 - `metadata.content_role` → `entry.metadata.content_role`
 - `metadata.source_origin` → `entry.metadata.source_origin`
 
@@ -423,7 +431,9 @@ Add `workstream: Option<String>` to `RetrievalOpts` and `Default` impl.
    call sites:
    - `VectorRetriever::retrieve` (line ~131 in retriever.rs)
    - `GraphExpandRetriever::retrieve` (line ~410 in retriever.rs)
-   - Any direct call in `mcp.rs` if it calls `post_filter_metadata` independently
+   - `mcp.rs` RAG-absent fallback path (line ~672): the direct `post_filter_metadata`
+     call reached only when `state.rag` is `None`; must be updated even though
+     it is not the primary code path
 
 **`crates/corvia-server/src/rest.rs`**
 Add `workstream: Option<String>` to `SearchRequest`, wire to `RetrievalOpts`.
@@ -569,7 +579,7 @@ command is follow-on work (see Section 11).
 | Scoped GC CLI command | `corvia gc --scope <id>` does not exist; deletion today is via REST API + `corvia rebuild` |
 | Per-scope HNSW indices | Permanent fix for HNSW pollution; separate kernel design |
 | Workstream filter in `corvia_ask` / `corvia_context` MCP tools | Extend beyond `corvia_search` in a follow-on |
-| `ChunkingPipeline` propagation of new `SourceMetadata` fields | Requires identifying the exact insertion point in `chunking_pipeline.rs` where `KnowledgeEntry` is constructed from a `RawChunk` + `SourceMetadata` |
+| `SourceMetadata` field propagation insertion points | Propagation happens in CLI ingest layer, not `ChunkingPipeline`: `crates/corvia-cli/src/workspace.rs` (adapter-driven path) and `crates/corvia-cli/src/main.rs` (single-repo path) |
 
 ---
 
