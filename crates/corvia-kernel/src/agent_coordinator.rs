@@ -24,10 +24,16 @@ pub struct ConnectResponse {
     pub active_sessions: Vec<SessionRecord>,
 }
 
-/// Report from garbage collection sweep.
-#[derive(Debug, Clone, Default)]
+/// Report returned after a GC sweep.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct GcReport {
     pub orphans_rolled_back: usize,
+    pub duration_ms: u64,
+    pub stale_transitioned: usize,
+    pub closed_sessions_cleaned: usize,
+    pub agents_suspended: usize,
+    pub entries_deduplicated: usize,
+    pub started_at: String,
 }
 
 /// The top-level orchestrator that ties all agent coordination components together.
@@ -311,7 +317,10 @@ impl AgentCoordinator {
     /// Run garbage collection: Active past timeout → Stale, Stale past grace → Orphaned → rollback.
     #[tracing::instrument(name = "corvia.gc.run", skip(self))]
     pub async fn gc(&self) -> Result<GcReport> {
-        let mut report = GcReport::default();
+        let mut report = GcReport {
+            started_at: chrono::Utc::now().to_rfc3339(),
+            ..Default::default()
+        };
 
         // Step 1: Find Active sessions past heartbeat timeout → mark Stale
         let stale_timeout = std::time::Duration::from_secs(self.config.stale_timeout_secs);
@@ -319,6 +328,8 @@ impl AgentCoordinator {
         for session in &stale {
             if let Err(e) = self.sessions.transition(&session.session_id, SessionState::Stale) {
                 warn!(session_id = %session.session_id, error = %e, "gc_stale_transition_failed");
+            } else {
+                report.stale_transitioned += 1;
             }
         }
 
@@ -620,6 +631,24 @@ mod tests {
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("write permission"), "Expected RBAC error, got: {err_msg}");
+    }
+
+    #[test]
+    fn test_gc_report_has_enhanced_fields() {
+        let report = GcReport {
+            orphans_rolled_back: 1,
+            duration_ms: 150,
+            stale_transitioned: 2,
+            closed_sessions_cleaned: 3,
+            agents_suspended: 0,
+            entries_deduplicated: 0,
+            started_at: "2026-03-14T00:00:00Z".to_string(),
+        };
+        assert_eq!(report.orphans_rolled_back, 1);
+        assert_eq!(report.duration_ms, 150);
+        assert_eq!(report.stale_transitioned, 2);
+        assert_eq!(report.closed_sessions_cleaned, 3);
+        assert_eq!(report.started_at, "2026-03-14T00:00:00Z");
     }
 
     #[tokio::test]
