@@ -16,8 +16,21 @@ use axum::{Json, Router};
 use corvia_common::dashboard::{
     DashboardConfig, DashboardStatusResponse, LogEntry, LogsResponse, ModuleStats, TracesResponse,
 };
+use corvia_kernel::agent_coordinator::GcReport;
 use serde::{Deserialize, Serialize};
 use crate::rest::AppState;
+
+fn gc_report_to_dto(r: GcReport) -> corvia_common::dashboard::GcReportDto {
+    corvia_common::dashboard::GcReportDto {
+        orphans_rolled_back: r.orphans_rolled_back,
+        duration_ms: r.duration_ms,
+        stale_transitioned: r.stale_transitioned,
+        closed_sessions_cleaned: r.closed_sessions_cleaned,
+        agents_suspended: r.agents_suspended,
+        entries_deduplicated: r.entries_deduplicated,
+        started_at: r.started_at,
+    }
+}
 
 /// Dashboard REST API router — mounts at /api/dashboard/*
 pub fn router(state: Arc<AppState>) -> Router {
@@ -42,6 +55,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/dashboard/entries/{entry_id}/history", get(entry_history_handler))
         .route("/api/dashboard/entries/{entry_id}/neighbors", get(entry_neighbors_handler))
         .route("/api/dashboard/activity", get(activity::activity_feed_handler))
+        .route("/api/dashboard/gc", get(gc_status_handler))
+        .route("/api/dashboard/gc/run", post(gc_run_handler))
+        .route("/api/dashboard/sessions/live", get(live_sessions_handler))
+        .route("/api/dashboard/traces/recent", get(recent_traces_handler))
         .with_state(state)
 }
 
@@ -210,7 +227,7 @@ async fn logs_handler(
 
                 let (timestamp, level, module, message) = match parsed {
                     traces::ParsedTrace::Span {
-                        timestamp, level, span_name, elapsed_ms,
+                        timestamp, level, span_name, elapsed_ms, ..
                     } => {
                         let module = traces::span_to_module(&span_name);
                         let msg = format!("{span_name} ({elapsed_ms:.1}ms)");
@@ -915,6 +932,154 @@ async fn refresh_summary_handler(
     } else {
         Ok(Json(serde_json::json!({ "status": "skipped", "reason": "cluster store not yet computed" })))
     }
+}
+
+// ---------------------------------------------------------------------------
+// GC endpoints
+// ---------------------------------------------------------------------------
+
+/// GET /api/dashboard/gc
+/// Returns GC history, last run report, and schedule status.
+async fn gc_status_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<corvia_common::dashboard::GcStatusResponse> {
+    let last_run = state.gc_history.last().map(gc_report_to_dto);
+    let history: Vec<corvia_common::dashboard::GcReportDto> = state
+        .gc_history
+        .all()
+        .into_iter()
+        .map(gc_report_to_dto)
+        .collect();
+
+    Json(corvia_common::dashboard::GcStatusResponse {
+        last_run,
+        history,
+        scheduled: false,
+    })
+}
+
+/// POST /api/dashboard/gc/run
+/// Trigger a manual GC sweep and return the report.
+async fn gc_run_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<corvia_common::dashboard::GcReportDto>, (StatusCode, String)> {
+    let report = corvia_kernel::ops::gc_run(&state.coordinator)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("GC failed: {e}")))?;
+
+    state.gc_history.push(report.clone());
+
+    Ok(Json(gc_report_to_dto(report)))
+}
+
+// ---------------------------------------------------------------------------
+// Live sessions endpoint
+// ---------------------------------------------------------------------------
+
+/// GET /api/dashboard/sessions/live
+/// Returns currently open sessions with staging state and summary metrics.
+async fn live_sessions_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<corvia_common::dashboard::LiveSessionsResponse>, (StatusCode, String)> {
+    let open_sessions = state
+        .coordinator
+        .sessions
+        .list_open()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to list sessions: {e}")))?;
+
+    let agents = corvia_kernel::ops::agents_list(&state.coordinator).unwrap_or_default();
+    let agent_names: std::collections::HashMap<String, String> = agents
+        .into_iter()
+        .map(|a| (a.agent_id.clone(), a.display_name))
+        .collect();
+
+    let now = chrono::Utc::now();
+    let mut total_active = 0usize;
+    let mut total_stale = 0usize;
+    let mut total_entries_pending = 0u64;
+
+    let sessions: Vec<corvia_common::dashboard::LiveSession> = open_sessions
+        .iter()
+        .map(|s| {
+            let state_str = format!("{:?}", s.state);
+            let pending = s.entries_written.saturating_sub(s.entries_merged);
+            let duration = (now - s.created_at).num_seconds().max(0) as u64;
+            let has_staging = s
+                .staging_dir
+                .as_ref()
+                .map(|d| std::path::Path::new(d).exists())
+                .unwrap_or(false);
+
+            match s.state {
+                corvia_common::agent_types::SessionState::Active => total_active += 1,
+                corvia_common::agent_types::SessionState::Stale => total_stale += 1,
+                _ => {}
+            }
+            total_entries_pending += pending;
+
+            corvia_common::dashboard::LiveSession {
+                session_id: s.session_id.clone(),
+                agent_id: s.agent_id.clone(),
+                agent_name: agent_names
+                    .get(&s.agent_id)
+                    .cloned()
+                    .unwrap_or_else(|| s.agent_id.clone()),
+                state: state_str,
+                started_at: s.created_at.to_rfc3339(),
+                duration_secs: duration,
+                entries_written: s.entries_written,
+                entries_merged: s.entries_merged,
+                pending_entries: pending,
+                git_branch: s.git_branch.clone(),
+                has_staging_dir: has_staging,
+            }
+        })
+        .collect();
+
+    Ok(Json(corvia_common::dashboard::LiveSessionsResponse {
+        sessions,
+        summary: corvia_common::dashboard::LiveSessionsSummary {
+            total_active,
+            total_stale,
+            total_entries_pending,
+        },
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Recent traces endpoint
+// ---------------------------------------------------------------------------
+
+/// Query params for /api/dashboard/traces/recent
+#[derive(Debug, Deserialize)]
+pub struct RecentTracesQuery {
+    pub limit: Option<usize>,
+}
+
+/// GET /api/dashboard/traces/recent
+/// Returns recent OTEL traces as parent-child trees.
+async fn recent_traces_handler(
+    State(_state): State<Arc<AppState>>,
+    Query(params): Query<RecentTracesQuery>,
+) -> Json<corvia_common::dashboard::RecentTracesResponse> {
+    let limit = params.limit.unwrap_or(20).min(100);
+    let log_dir = traces::log_dir();
+
+    let mut all_lines = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&log_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "log") {
+                let lines = traces::tail_lines(&path, 2000);
+                all_lines.extend(lines);
+            }
+        }
+    }
+
+    let line_refs: Vec<&str> = all_lines.iter().map(|s| s.as_str()).collect();
+    let trees = traces::collect_trace_trees(&line_refs, limit);
+
+    Json(corvia_common::dashboard::RecentTracesResponse { traces: trees })
 }
 
 // ---------------------------------------------------------------------------

@@ -66,6 +66,9 @@ pub enum ParsedTrace {
         timestamp: String,
         span_name: String,
         elapsed_ms: f64,
+        trace_id: Option<String>,
+        span_id: Option<String>,
+        parent_span_id: Option<String>,
     },
     Event {
         level: String,
@@ -95,11 +98,17 @@ pub fn parse_trace_line(line: &str) -> Option<ParsedTrace> {
         .and_then(|n| n.as_str())
     {
         if let Some(elapsed_ms) = v.get("elapsed_ms").and_then(|e| e.as_f64()) {
+            let trace_id = v.get("otel.trace_id").and_then(|t| t.as_str()).map(String::from);
+            let span_id = v.get("otel.span_id").and_then(|t| t.as_str()).map(String::from);
+            let parent_span_id = v.get("otel.parent_span_id").and_then(|t| t.as_str()).map(String::from);
             return Some(ParsedTrace::Span {
                 level,
                 timestamp,
                 span_name: span_name.to_string(),
                 elapsed_ms,
+                trace_id,
+                span_id,
+                parent_span_id,
             });
         }
     }
@@ -164,6 +173,17 @@ fn timestamp_to_epoch(ts: &str) -> Option<i64> {
         })
 }
 
+/// Compute the p-th percentile from a mutable slice of durations.
+/// Sorts the slice in place. Returns 0.0 for empty slices.
+pub fn compute_percentile(durations: &mut [f64], percentile: f64) -> f64 {
+    if durations.is_empty() {
+        return 0.0;
+    }
+    durations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((percentile / 100.0) * (durations.len() - 1) as f64).round() as usize;
+    durations[idx.min(durations.len() - 1)]
+}
+
 /// Aggregate trace data from parsed log lines.
 /// Computes span statistics (all-time + 1-hour window) and collects recent events.
 pub fn collect_traces_from_lines(lines: &[&str]) -> TracesData {
@@ -187,6 +207,7 @@ pub fn collect_traces_from_lines(lines: &[&str]) -> TracesData {
                 timestamp,
                 span_name,
                 elapsed_ms,
+                ..
             } => {
                 span_all
                     .entry(span_name.clone())
@@ -235,6 +256,11 @@ pub fn collect_traces_from_lines(lines: &[&str]) -> TracesData {
         let count_1h = span_1h.get(name).map(|v| v.len() as u64).unwrap_or(0);
         let errors = span_errors.get(name).copied().unwrap_or(0);
 
+        let mut sorted = timings.clone();
+        let p50_ms = compute_percentile(&mut sorted, 50.0);
+        let p95_ms = compute_percentile(&mut sorted, 95.0);
+        let p99_ms = compute_percentile(&mut sorted, 99.0);
+
         spans.insert(
             name.clone(),
             SpanStats {
@@ -243,7 +269,9 @@ pub fn collect_traces_from_lines(lines: &[&str]) -> TracesData {
                 avg_ms,
                 last_ms,
                 errors,
-                ..Default::default()
+                p50_ms,
+                p95_ms,
+                p99_ms,
             },
         );
     }
@@ -258,6 +286,170 @@ pub fn collect_traces_from_lines(lines: &[&str]) -> TracesData {
     TracesData {
         spans,
         recent_events,
+    }
+}
+
+/// Build trace trees from log lines that have OTEL trace context.
+/// Groups spans by trace_id, sorts by timestamp, builds parent-child trees.
+/// Returns the most recent `limit` traces.
+pub fn collect_trace_trees(lines: &[&str], limit: usize) -> Vec<corvia_common::dashboard::TraceTree> {
+    use corvia_common::dashboard::{SpanNode, TraceTree};
+
+    struct RawSpan {
+        trace_id: String,
+        span_id: String,
+        parent_span_id: String,
+        span_name: String,
+        elapsed_ms: f64,
+        timestamp: String,
+    }
+
+    let mut spans_by_trace: HashMap<String, Vec<RawSpan>> = HashMap::new();
+
+    for line in lines {
+        if let Some(ParsedTrace::Span {
+            timestamp,
+            span_name,
+            elapsed_ms,
+            trace_id: Some(tid),
+            span_id: Some(sid),
+            parent_span_id,
+            ..
+        }) = parse_trace_line(line)
+        {
+            spans_by_trace
+                .entry(tid.clone())
+                .or_default()
+                .push(RawSpan {
+                    trace_id: tid,
+                    span_id: sid,
+                    parent_span_id: parent_span_id.unwrap_or_default(),
+                    span_name,
+                    elapsed_ms,
+                    timestamp,
+                });
+        }
+    }
+
+    let mut trees: Vec<TraceTree> = Vec::new();
+
+    for (trace_id, mut trace_spans) in spans_by_trace {
+        trace_spans.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+        let root_ts = trace_spans
+            .first()
+            .map(|s| s.timestamp.clone())
+            .unwrap_or_default();
+
+        let root_name = trace_spans
+            .iter()
+            .find(|s| s.parent_span_id.is_empty())
+            .map(|s| s.span_name.clone())
+            .unwrap_or_else(|| {
+                trace_spans
+                    .first()
+                    .map(|s| s.span_name.clone())
+                    .unwrap_or_default()
+            });
+
+        let total_ms = trace_spans
+            .iter()
+            .find(|s| s.parent_span_id.is_empty())
+            .map(|s| s.elapsed_ms)
+            .unwrap_or_else(|| {
+                trace_spans
+                    .iter()
+                    .map(|s| s.elapsed_ms)
+                    .fold(0.0f64, f64::max)
+            });
+
+        let span_count = trace_spans.len();
+
+        // Build parent-child tree
+        let mut node_map: HashMap<String, SpanNode> = trace_spans
+            .iter()
+            .map(|s| {
+                let offset_ms = compute_offset_ms(&root_ts, &s.timestamp);
+                (
+                    s.span_id.clone(),
+                    SpanNode {
+                        span_id: s.span_id.clone(),
+                        parent_span_id: s.parent_span_id.clone(),
+                        trace_id: s.trace_id.clone(),
+                        span_name: s.span_name.clone(),
+                        elapsed_ms: s.elapsed_ms,
+                        start_offset_ms: offset_ms,
+                        depth: 0,
+                        module: span_to_module(&s.span_name).to_string(),
+                        fields: serde_json::Value::Null,
+                        children: vec![],
+                    },
+                )
+            })
+            .collect();
+
+        let mut children_map: HashMap<String, Vec<String>> = HashMap::new();
+        let mut root_ids: Vec<String> = Vec::new();
+
+        for s in &trace_spans {
+            if s.parent_span_id.is_empty() || !node_map.contains_key(&s.parent_span_id) {
+                root_ids.push(s.span_id.clone());
+            } else {
+                children_map
+                    .entry(s.parent_span_id.clone())
+                    .or_default()
+                    .push(s.span_id.clone());
+            }
+        }
+
+        fn build_tree(
+            id: &str,
+            depth: usize,
+            node_map: &mut HashMap<String, SpanNode>,
+            children_map: &HashMap<String, Vec<String>>,
+        ) -> Option<SpanNode> {
+            let mut node = node_map.remove(id)?;
+            node.depth = depth;
+            if let Some(child_ids) = children_map.get(id) {
+                for cid in child_ids {
+                    if let Some(child) = build_tree(cid, depth + 1, node_map, children_map) {
+                        node.children.push(child);
+                    }
+                }
+            }
+            Some(node)
+        }
+
+        let tree_roots: Vec<SpanNode> = root_ids
+            .iter()
+            .filter_map(|id| build_tree(id, 0, &mut node_map, &children_map))
+            .collect();
+
+        trees.push(TraceTree {
+            trace_id,
+            root_span: root_name,
+            total_ms,
+            span_count,
+            started_at: root_ts,
+            spans: tree_roots,
+        });
+    }
+
+    trees.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    trees.truncate(limit);
+    trees
+}
+
+/// Compute millisecond offset between two RFC 3339 timestamps.
+fn compute_offset_ms(base: &str, ts: &str) -> f64 {
+    let base_dt = chrono::DateTime::parse_from_rfc3339(base).ok();
+    let ts_dt = chrono::DateTime::parse_from_rfc3339(ts).ok();
+    match (base_dt, ts_dt) {
+        (Some(b), Some(t)) => {
+            let diff = t.signed_duration_since(b);
+            diff.num_milliseconds() as f64
+        }
+        _ => 0.0,
     }
 }
 
@@ -485,5 +677,109 @@ mod tests {
     fn tail_lines_missing_file_returns_empty() {
         let lines = tail_lines(Path::new("/nonexistent/file.log"), 10);
         assert!(lines.is_empty());
+    }
+
+    // --- OTEL trace context ---
+
+    #[test]
+    fn parse_span_with_otel_context() {
+        let line = r#"{"timestamp":"2026-03-14T10:00:00Z","level":"INFO","span":{"name":"corvia.entry.write"},"fields":{},"elapsed_ms":12.5,"otel.trace_id":"abcdef1234567890abcdef1234567890","otel.span_id":"1234567890abcdef","otel.parent_span_id":"fedcba0987654321"}"#;
+        let result = parse_trace_line(line).unwrap();
+        match result {
+            ParsedTrace::Span {
+                trace_id,
+                span_id,
+                parent_span_id,
+                ..
+            } => {
+                assert_eq!(
+                    trace_id.as_deref(),
+                    Some("abcdef1234567890abcdef1234567890")
+                );
+                assert_eq!(span_id.as_deref(), Some("1234567890abcdef"));
+                assert_eq!(parent_span_id.as_deref(), Some("fedcba0987654321"));
+            }
+            _ => panic!("expected Span variant"),
+        }
+    }
+
+    #[test]
+    fn parse_span_without_otel_context() {
+        let line = r#"{"timestamp":"2026-03-14T10:00:00Z","level":"INFO","span":{"name":"corvia.entry.write"},"fields":{},"elapsed_ms":12.5}"#;
+        let result = parse_trace_line(line).unwrap();
+        match result {
+            ParsedTrace::Span {
+                trace_id,
+                span_id,
+                parent_span_id,
+                ..
+            } => {
+                assert!(trace_id.is_none());
+                assert!(span_id.is_none());
+                assert!(parent_span_id.is_none());
+            }
+            _ => panic!("expected Span variant"),
+        }
+    }
+
+    // --- Percentile computation ---
+
+    #[test]
+    fn percentile_computation() {
+        let mut durations: Vec<f64> = (1..=100).map(|i| i as f64).collect();
+        let p50 = compute_percentile(&mut durations, 50.0);
+        let p95 = compute_percentile(&mut durations, 95.0);
+        let p99 = compute_percentile(&mut durations, 99.0);
+        assert!((p50 - 50.0).abs() < 1.5);
+        assert!((p95 - 95.0).abs() < 1.5);
+        assert!((p99 - 99.0).abs() < 1.5);
+    }
+
+    #[test]
+    fn percentile_empty_returns_zero() {
+        let mut empty: Vec<f64> = vec![];
+        assert_eq!(compute_percentile(&mut empty, 50.0), 0.0);
+    }
+
+    #[test]
+    fn percentile_single_value() {
+        let mut single = vec![42.0];
+        assert_eq!(compute_percentile(&mut single, 50.0), 42.0);
+        assert_eq!(compute_percentile(&mut single, 99.0), 42.0);
+    }
+
+    // --- Trace tree builder ---
+
+    #[test]
+    fn collect_trace_trees_builds_hierarchy() {
+        let lines = vec![
+            r#"{"timestamp":"2026-03-14T10:00:00.000Z","level":"INFO","span":{"name":"corvia.entry.write"},"fields":{},"elapsed_ms":50.0,"otel.trace_id":"aaaa","otel.span_id":"1111","otel.parent_span_id":""}"#,
+            r#"{"timestamp":"2026-03-14T10:00:00.010Z","level":"INFO","span":{"name":"corvia.entry.embed"},"fields":{},"elapsed_ms":30.0,"otel.trace_id":"aaaa","otel.span_id":"2222","otel.parent_span_id":"1111"}"#,
+            r#"{"timestamp":"2026-03-14T10:00:00.020Z","level":"INFO","span":{"name":"corvia.store.insert"},"fields":{},"elapsed_ms":10.0,"otel.trace_id":"aaaa","otel.span_id":"3333","otel.parent_span_id":"1111"}"#,
+        ];
+        let trees = collect_trace_trees(&lines, 10);
+        assert_eq!(trees.len(), 1);
+        assert_eq!(trees[0].trace_id, "aaaa");
+        assert_eq!(trees[0].root_span, "corvia.entry.write");
+        assert_eq!(trees[0].span_count, 3);
+        assert!(trees[0].total_ms >= 50.0);
+
+        // Verify parent-child tree structure
+        assert_eq!(trees[0].spans.len(), 1, "should have 1 root span");
+        let root = &trees[0].spans[0];
+        assert_eq!(root.span_name, "corvia.entry.write");
+        assert_eq!(root.depth, 0);
+        assert_eq!(root.children.len(), 2, "root should have 2 children");
+        assert_eq!(root.children[0].depth, 1);
+        assert_eq!(root.children[1].depth, 1);
+    }
+
+    #[test]
+    fn collect_trace_trees_skips_lines_without_trace_id() {
+        let lines = vec![
+            r#"{"timestamp":"2026-03-14T10:00:00Z","level":"INFO","span":{"name":"corvia.entry.write"},"fields":{},"elapsed_ms":10.0}"#,
+        ];
+        let trees = collect_trace_trees(&lines, 10);
+        assert!(trees.is_empty());
     }
 }
