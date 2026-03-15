@@ -1,7 +1,8 @@
 use crate::backend::{BackendKind, ResolvedBackend};
 use corvia_proto::embedding_service_server::EmbeddingService;
 use corvia_proto::*;
-use ort::execution_providers::{CUDAExecutionProvider, OpenVINOExecutionProvider, ExecutionProviderDispatch};
+use ort::ep::ExecutionProvider;
+use ort::execution_providers::{self, CUDAExecutionProvider, OpenVINOExecutionProvider, ExecutionProviderDispatch};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -16,6 +17,24 @@ fn build_execution_providers(backend: &ResolvedBackend) -> Vec<ExecutionProvider
                 .build(),
         ],
         BackendKind::Cpu => vec![], // ort defaults to CPU EP
+    }
+}
+
+/// Check if the requested EP is actually available in the ORT runtime.
+/// Returns true if available, false if ORT will silently fall back to CPU.
+fn verify_ep_available(backend: &BackendKind) -> bool {
+    match backend {
+        BackendKind::Cuda => {
+            execution_providers::CUDAExecutionProvider::default()
+                .is_available()
+                .unwrap_or(false)
+        }
+        BackendKind::OpenVino => {
+            execution_providers::OpenVINOExecutionProvider::default()
+                .is_available()
+                .unwrap_or(false)
+        }
+        BackendKind::Cpu => true,
     }
 }
 
@@ -69,10 +88,32 @@ impl EmbeddingServiceImpl {
     }
 
     /// Load an embedding model by name. Downloads from HuggingFace if not cached.
-    pub async fn load_model(&self, name: &str, backend: ResolvedBackend) -> Result<(), Status> {
+    pub async fn load_model(&self, name: &str, mut backend: ResolvedBackend) -> Result<(), Status> {
         let model_enum = Self::resolve_model(name)?;
         let name_owned = name.to_string();
         tracing::info!(model = %name_owned, device = %backend.device, backend_kind = %backend.backend, "Loading embedding model...");
+
+        // Verify the requested EP is actually available in the ORT runtime.
+        // ORT silently falls back to CPU if the EP provider library is missing
+        // (e.g., libonnxruntime_providers_openvino.so). Detect this upfront.
+        if !verify_ep_available(&backend.backend) {
+            tracing::warn!(
+                model = %name_owned,
+                requested_backend = %backend.backend,
+                "ONNX Runtime does NOT have the {} EP provider library. \
+                 Embedding will fall back to CPU. To fix: install the matching \
+                 libonnxruntime_providers_{}.so alongside the binary.",
+                backend.backend,
+                match backend.backend {
+                    BackendKind::Cuda => "cuda",
+                    BackendKind::OpenVino => "openvino",
+                    BackendKind::Cpu => "cpu",
+                }
+            );
+            backend.backend = BackendKind::Cpu;
+            backend.device = crate::backend::Device::Cpu;
+            backend.fallback_used = true;
+        }
 
         let eps = build_execution_providers(&backend);
         let model_enum_for_spawn = model_enum.clone();
@@ -254,5 +295,29 @@ mod tests {
         };
         let eps = build_execution_providers(&backend);
         assert_eq!(eps.len(), 1, "OpenVINO backend should produce exactly one EP");
+    }
+
+    #[test]
+    fn test_verify_ep_available_cpu_always_true() {
+        assert!(verify_ep_available(&BackendKind::Cpu));
+    }
+
+    #[test]
+    fn test_verify_ep_available_cuda() {
+        // CUDA EP availability depends on whether ORT was built with CUDA support.
+        // In CI (no GPU), this should be true (ORT has the cu12 provider library).
+        let available = verify_ep_available(&BackendKind::Cuda);
+        // Don't assert true/false — just verify it doesn't panic.
+        let _ = available;
+    }
+
+    #[test]
+    fn test_verify_ep_available_openvino() {
+        // OpenVINO EP is NOT available in the default ort prebuilt (cu12 feature set).
+        // The ort-sys dist.txt has no openvino variant, so this should be false.
+        assert!(
+            !verify_ep_available(&BackendKind::OpenVino),
+            "OpenVINO EP should not be available (no libonnxruntime_providers_openvino.so)"
+        );
     }
 }

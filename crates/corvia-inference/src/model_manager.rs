@@ -156,6 +156,18 @@ impl ModelManager for ModelManagerService {
 
         match result {
             Ok(()) => {
+                // For embedding models, query the actual backend from the service
+                // (EP verification may have changed it due to missing provider library).
+                let (actual_device, actual_backend) = if model_type == ModelType::Embedding {
+                    if let Some(real_backend) = self.embed_svc.get_backend(&req.name) {
+                        (real_backend.device.to_string(), real_backend.backend.to_string())
+                    } else {
+                        (actual_device, actual_backend)
+                    }
+                } else {
+                    (actual_device, actual_backend)
+                };
+
                 let mut models = self.models.write().await;
                 models.insert(
                     req.name.clone(),
@@ -298,6 +310,17 @@ impl ModelManager for ModelManagerService {
 
             match load_result {
                 Ok(()) => {
+                    // Query actual backend (EP verification may have changed it)
+                    let (actual_device, actual_backend) = if model_type == ModelType::Embedding {
+                        if let Some(real_backend) = self.embed_svc.get_backend(&entry.name) {
+                            (real_backend.device.to_string(), real_backend.backend.to_string())
+                        } else {
+                            (actual_device, actual_backend)
+                        }
+                    } else {
+                        (actual_device, actual_backend)
+                    };
+
                     let mut models = self.models.write().await;
                     models.insert(
                         entry.name.clone(),
