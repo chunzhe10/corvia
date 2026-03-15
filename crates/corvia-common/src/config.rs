@@ -168,9 +168,15 @@ pub struct InferenceConfig {
     /// Device preference: "auto" (default), "gpu", or "cpu".
     #[serde(default = "default_device")]
     pub device: String,
-    /// Backend override: "cuda", "openvino", or "" (auto-select).
+    /// Backend override for chat models: "cuda", "openvino", or "" (auto-select).
+    /// For embedding-specific override, use `embedding_backend`.
     #[serde(default)]
     pub backend: String,
+    /// Backend override specifically for embedding models: "openvino", "cuda", or "" (use `backend`).
+    /// Allows ONNX embedding on Intel iGPU (OpenVINO) while chat runs on NVIDIA (CUDA).
+    /// Falls back to `backend` when empty.
+    #[serde(default)]
+    pub embedding_backend: String,
     /// KV cache quantization: "q8" (default), "q4", "none".
     #[serde(default = "default_kv_quant")]
     pub kv_quant: String,
@@ -187,6 +193,7 @@ impl Default for InferenceConfig {
         Self {
             device: default_device(),
             backend: String::new(),
+            embedding_backend: String::new(),
             kv_quant: default_kv_quant(),
             flash_attention: default_flash_attention(),
             chat_models: default_chat_models(),

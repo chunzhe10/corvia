@@ -94,6 +94,7 @@ impl InferenceProvisioner {
         chat_model: Option<&ChatModelCoords>,
         device: &str,
         backend: &str,
+        embedding_backend: &str,
         kv_quant: &str,
         flash_attention: bool,
     ) -> Result<()> {
@@ -101,13 +102,16 @@ impl InferenceProvisioner {
             .await
             .map_err(|e| CorviaError::Infra(format!("gRPC connect failed: {e}")))?;
 
+        // Use embedding_backend when set, otherwise fall back to the global backend.
+        let effective_embed_backend = if embedding_backend.is_empty() { backend } else { embedding_backend };
+
         // Load embedding model
         let resp = client
             .load_model(tonic::Request::new(LoadModelRequest {
                 name: embed_model.to_string(),
                 model_type: "embedding".to_string(),
                 device: device.to_string(),
-                backend: backend.to_string(),
+                backend: effective_embed_backend.to_string(),
                 kv_quant: kv_quant.to_string(),
                 flash_attention,
                 hf_repo: String::new(),
@@ -217,6 +221,7 @@ impl InferenceProvisioner {
         chat_model: Option<&ChatModelCoords>,
         device: &str,
         backend: &str,
+        embedding_backend: &str,
         kv_quant: &str,
         flash_attention: bool,
     ) -> Result<()> {
@@ -230,7 +235,7 @@ impl InferenceProvisioner {
             self.start()?;
             self.wait_ready(15).await?;
         }
-        self.load_models(embed_model, chat_model, device, backend, kv_quant, flash_attention).await?;
+        self.load_models(embed_model, chat_model, device, backend, embedding_backend, kv_quant, flash_attention).await?;
         Ok(())
     }
 }

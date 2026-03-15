@@ -457,6 +457,7 @@ async fn cmd_init(store: &str) -> Result<()> {
                         chat_coords.as_ref(),
                         &config.inference.device,
                         &config.inference.backend,
+                        &config.inference.embedding_backend,
                         &config.inference.kv_quant,
                         config.inference.flash_attention,
                     ).await?;
@@ -2068,6 +2069,7 @@ async fn ensure_inference_ready(config: &CorviaConfig) -> Result<()> {
                 chat_coords.as_ref(),
                 &config.inference.device,
                 &config.inference.backend,
+                &config.inference.embedding_backend,
                 &config.inference.kv_quant,
                 config.inference.flash_attention,
             ).await?;
