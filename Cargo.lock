@@ -1124,6 +1124,7 @@ dependencies = [
  "encoding_rs",
  "fastembed",
  "hf-hub",
+ "libc",
  "llama-cpp-2",
  "llama-cpp-sys-2",
  "opentelemetry",

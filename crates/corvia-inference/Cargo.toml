@@ -30,6 +30,7 @@ llama-cpp-2 = "0.1"
 llama-cpp-sys-2 = "0.1"
 hf-hub = "0.4"
 encoding_rs = "0.8.35"
+libc = "0.2"
 
 [features]
 default = []

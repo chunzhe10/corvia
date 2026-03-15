@@ -20,21 +20,44 @@ fn build_execution_providers(backend: &ResolvedBackend) -> Vec<ExecutionProvider
     }
 }
 
-/// Check if the requested EP is actually available in the ORT runtime.
-/// Returns true if available, false if ORT will silently fall back to CPU.
+/// Check if the requested EP's provider shared library can be loaded at runtime.
+///
+/// ORT's `GetAvailableProviders()` only reports *compiled-in* providers — it does
+/// NOT detect dynamically-loadable providers like OpenVINO EP (which are loaded
+/// via dlopen at session creation time). So we check for the provider .so directly.
 fn verify_ep_available(backend: &BackendKind) -> bool {
     match backend {
         BackendKind::Cuda => {
-            execution_providers::CUDAExecutionProvider::default()
+            // CUDA EP: check compiled-in first (cu12 prebuilt includes it),
+            // then fall back to checking the provider .so.
+            if execution_providers::CUDAExecutionProvider::default()
                 .is_available()
                 .unwrap_or(false)
+            {
+                return true;
+            }
+            can_dlopen("libonnxruntime_providers_cuda.so")
         }
         BackendKind::OpenVino => {
-            execution_providers::OpenVINOExecutionProvider::default()
-                .is_available()
-                .unwrap_or(false)
+            // OpenVINO EP is NEVER in GetAvailableProviders() for the cu12 prebuilt.
+            // It's loaded at runtime via dlopen — check the .so directly.
+            can_dlopen("libonnxruntime_providers_openvino.so")
         }
         BackendKind::Cpu => true,
+    }
+}
+
+/// Check if a shared library can be loaded via dlopen (same mechanism ORT uses).
+fn can_dlopen(lib_name: &str) -> bool {
+    use std::ffi::CString;
+    let name = CString::new(lib_name).unwrap();
+    // RTLD_LAZY: resolve symbols on first use (matches ORT behavior)
+    let handle = unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_LAZY) };
+    if handle.is_null() {
+        false
+    } else {
+        unsafe { libc::dlclose(handle) };
+        true
     }
 }
 
@@ -304,20 +327,27 @@ mod tests {
 
     #[test]
     fn test_verify_ep_available_cuda() {
-        // CUDA EP availability depends on whether ORT was built with CUDA support.
-        // In CI (no GPU), this should be true (ORT has the cu12 provider library).
-        let available = verify_ep_available(&BackendKind::Cuda);
+        // CUDA EP: the cu12 prebuilt includes the provider .so.
         // Don't assert true/false — just verify it doesn't panic.
-        let _ = available;
+        let _ = verify_ep_available(&BackendKind::Cuda);
     }
 
     #[test]
     fn test_verify_ep_available_openvino() {
-        // OpenVINO EP is NOT available in the default ort prebuilt (cu12 feature set).
-        // The ort-sys dist.txt has no openvino variant, so this should be false.
-        assert!(
-            !verify_ep_available(&BackendKind::OpenVino),
-            "OpenVINO EP should not be available (no libonnxruntime_providers_openvino.so)"
-        );
+        // OpenVINO EP availability depends on whether
+        // libonnxruntime_providers_openvino.so is installed on the system.
+        // Don't assert true/false — just verify it doesn't panic.
+        let _ = verify_ep_available(&BackendKind::OpenVino);
+    }
+
+    #[test]
+    fn test_can_dlopen_nonexistent() {
+        assert!(!can_dlopen("libdoes_not_exist_12345.so"));
+    }
+
+    #[test]
+    fn test_can_dlopen_libc() {
+        // libc.so.6 is always present on Linux
+        assert!(can_dlopen("libc.so.6"));
     }
 }
