@@ -2,6 +2,7 @@
 
 pub mod activity;
 pub mod clustering;
+pub mod gpu;
 pub mod health;
 pub mod traces;
 
@@ -59,6 +60,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/dashboard/gc/run", post(gc_run_handler))
         .route("/api/dashboard/sessions/live", get(live_sessions_handler))
         .route("/api/dashboard/traces/recent", get(recent_traces_handler))
+        .route("/api/dashboard/gpu", get(gpu_status_handler))
         .with_state(state)
 }
 
@@ -1080,6 +1082,20 @@ async fn recent_traces_handler(
     let trees = traces::collect_trace_trees(&line_refs, limit);
 
     Json(corvia_common::dashboard::RecentTracesResponse { traces: trees })
+}
+
+// ---------------------------------------------------------------------------
+// GPU status endpoint
+// ---------------------------------------------------------------------------
+
+/// GET /api/dashboard/gpu
+/// Returns detected GPU hardware and inference backend configuration.
+async fn gpu_status_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<corvia_common::dashboard::GpuStatusResponse> {
+    let cfg = state.config.read().unwrap_or_else(|e| e.into_inner());
+    let status = gpu::collect_gpu_status(&cfg);
+    Json(status)
 }
 
 // ---------------------------------------------------------------------------

@@ -40,8 +40,11 @@ fn verify_ep_available(backend: &BackendKind) -> bool {
         }
         BackendKind::OpenVino => {
             // OpenVINO EP is NEVER in GetAvailableProviders() for the cu12 prebuilt.
-            // It's loaded at runtime via dlopen — check the .so directly.
-            can_dlopen("libonnxruntime_providers_openvino.so")
+            // It's loaded at runtime via dlopen — check the .so exists on the library path.
+            // We use file-existence check instead of dlopen because the provider's init
+            // code references Provider_GetHost (from providers_shared.so), which isn't
+            // available until ORT loads it during session creation.
+            can_find_library("libonnxruntime_providers_openvino.so")
         }
         BackendKind::Cpu => true,
     }
@@ -59,6 +62,33 @@ fn can_dlopen(lib_name: &str) -> bool {
         unsafe { libc::dlclose(handle) };
         true
     }
+}
+
+/// Check if a shared library exists on the standard library search paths.
+/// Safer than dlopen for libraries with init code that depends on other libraries
+/// (e.g., providers_openvino.so requires Provider_GetHost from providers_shared.so).
+fn can_find_library(lib_name: &str) -> bool {
+    // Check common library paths
+    let search_paths = [
+        "/usr/lib",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/local/lib",
+        "/usr/local/bin",
+    ];
+    for dir in &search_paths {
+        if std::path::Path::new(dir).join(lib_name).exists() {
+            return true;
+        }
+    }
+    // Also check LD_LIBRARY_PATH
+    if let Ok(paths) = std::env::var("LD_LIBRARY_PATH") {
+        for dir in paths.split(':') {
+            if std::path::Path::new(dir).join(lib_name).exists() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// A loaded embedding model with its enum variant for metadata lookups.
@@ -162,7 +192,96 @@ impl EmbeddingServiceImpl {
                     backend,
                 },
             );
-        tracing::info!(model = %name_owned, "Embedding model loaded");
+        tracing::info!(model = %name_owned, "Embedding model loaded — running canary test...");
+
+        // Run canary embedding to verify the execution provider actually works.
+        // This catches silent CPU fallback, broken EP libraries, and other runtime
+        // issues that only surface when inference is attempted.
+        let canary_models = self.models.clone();
+        let canary_name = name_owned.clone();
+        let canary_result = tokio::task::spawn_blocking(move || {
+            let canary_start = std::time::Instant::now();
+            let mut guard = canary_models
+                .lock()
+                .map_err(|e| format!("Lock poisoned: {e}"))?;
+            let loaded = guard
+                .get_mut(&canary_name)
+                .ok_or_else(|| format!("Model '{canary_name}' disappeared after insert"))?;
+
+            let expected_dims = fastembed::TextEmbedding::get_model_info(&loaded.variant)
+                .map(|info| info.dim)
+                .unwrap_or(0);
+
+            let result = loaded
+                .engine
+                .embed(vec!["corvia canary test"], None)
+                .map_err(|e| format!("Canary embed failed: {e}"))?;
+
+            let embedding = result
+                .into_iter()
+                .next()
+                .ok_or_else(|| "Canary returned empty result".to_string())?;
+
+            let latency = canary_start.elapsed();
+            Ok::<_, String>((embedding, expected_dims, latency))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Canary spawn failed: {e}")));
+
+        match canary_result {
+            Ok(Ok((embedding, expected_dims, latency))) => {
+                // Verify the embedding is non-zero (valid)
+                let is_nonzero = embedding.iter().any(|&v| v != 0.0);
+                let actual_dims = embedding.len();
+
+                if !is_nonzero {
+                    tracing::warn!(
+                        model = %name_owned,
+                        "Canary embedding is all zeros — EP may not be working correctly"
+                    );
+                }
+
+                if expected_dims > 0 && actual_dims != expected_dims {
+                    tracing::warn!(
+                        model = %name_owned,
+                        expected_dims,
+                        actual_dims,
+                        "Canary embedding dimensions mismatch"
+                    );
+                }
+
+                if latency.as_secs() > 5 {
+                    tracing::warn!(
+                        model = %name_owned,
+                        latency_ms = latency.as_millis() as u64,
+                        "Canary embedding latency >5s — possible CPU fallback or cold start"
+                    );
+                }
+
+                tracing::info!(
+                    model = %name_owned,
+                    latency_ms = latency.as_millis() as u64,
+                    dimensions = actual_dims,
+                    nonzero = is_nonzero,
+                    "Canary embedding verified"
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    model = %name_owned,
+                    error = %e,
+                    "Canary embedding failed — model loaded but inference may not work"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    model = %name_owned,
+                    error = %e,
+                    "Canary embedding task failed — model loaded but inference may not work"
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -349,5 +468,16 @@ mod tests {
     fn test_can_dlopen_libc() {
         // libc.so.6 is always present on Linux
         assert!(can_dlopen("libc.so.6"));
+    }
+
+    #[test]
+    fn test_can_find_library_existing() {
+        // libc is always in /usr/lib/x86_64-linux-gnu/
+        assert!(can_find_library("libc.so.6"));
+    }
+
+    #[test]
+    fn test_can_find_library_nonexistent() {
+        assert!(!can_find_library("libdoes_not_exist_12345.so"));
     }
 }

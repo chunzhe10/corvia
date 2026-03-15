@@ -198,6 +198,47 @@ pub struct RecentTracesResponse {
     pub traces: Vec<TraceTree>,
 }
 
+/// A single detected GPU.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuInfo {
+    pub index: u32,
+    pub name: String,
+    pub vendor: String,
+    /// GPU core utilization percentage (NVIDIA only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub utilization_pct: Option<u32>,
+    /// GPU memory currently used in MB (NVIDIA only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_used_mb: Option<u64>,
+    /// GPU total memory in MB (NVIDIA only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_total_mb: Option<u64>,
+    /// GPU temperature in Celsius (NVIDIA only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature_c: Option<u32>,
+    /// Current GPU frequency in MHz (Intel only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_mhz: Option<u64>,
+    /// Maximum GPU frequency in MHz (Intel only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_max_mhz: Option<u64>,
+}
+
+/// Inference backend information for a single model type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceBackendInfo {
+    pub model: String,
+    pub device: String,
+    pub backend: String,
+}
+
+/// GET /api/dashboard/gpu response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuStatusResponse {
+    pub gpus: Vec<GpuInfo>,
+    pub inference_backend: HashMap<String, InferenceBackendInfo>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +304,64 @@ mod tests {
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("traces"));
+    }
+
+    #[test]
+    fn gpu_status_response_serializes() {
+        let resp = GpuStatusResponse {
+            gpus: vec![
+                GpuInfo {
+                    index: 0,
+                    name: "NVIDIA GeForce RTX 4090".to_string(),
+                    vendor: "nvidia".to_string(),
+                    utilization_pct: Some(45),
+                    memory_used_mb: Some(2048),
+                    memory_total_mb: Some(24576),
+                    temperature_c: Some(65),
+                    frequency_mhz: None,
+                    frequency_max_mhz: None,
+                },
+                GpuInfo {
+                    index: 1,
+                    name: "Intel UHD 770".to_string(),
+                    vendor: "intel".to_string(),
+                    utilization_pct: None,
+                    memory_used_mb: None,
+                    memory_total_mb: None,
+                    temperature_c: None,
+                    frequency_mhz: Some(1200),
+                    frequency_max_mhz: Some(1550),
+                },
+            ],
+            inference_backend: HashMap::from([
+                ("embedding".to_string(), InferenceBackendInfo {
+                    model: "nomic-embed-text-v1.5".to_string(),
+                    device: "cpu".to_string(),
+                    backend: "cpu".to_string(),
+                }),
+            ]),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"vendor\":\"nvidia\""));
+        assert!(json.contains("\"vendor\":\"intel\""));
+        assert!(json.contains("\"utilization_pct\":45"));
+        assert!(json.contains("\"frequency_mhz\":1200"));
+        // Intel GPU should not have NVIDIA-only fields
+        assert!(!json.contains("\"utilization_pct\":null"));
+
+        let roundtrip: GpuStatusResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.gpus.len(), 2);
+        assert_eq!(roundtrip.gpus[0].vendor, "nvidia");
+        assert_eq!(roundtrip.gpus[1].vendor, "intel");
+    }
+
+    #[test]
+    fn gpu_status_empty_gpus() {
+        let resp = GpuStatusResponse {
+            gpus: vec![],
+            inference_backend: HashMap::new(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"gpus\":[]"));
     }
 }
