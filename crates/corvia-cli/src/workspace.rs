@@ -314,11 +314,107 @@ pub fn remove_repo_from_config(config: &mut CorviaConfig, name: &str) -> Result<
     Ok(())
 }
 
+/// Infer `content_role` from a source file path.
+///
+/// Rules (from docs-workflow design spec, Section 2 Population Rules):
+/// - AGENTS.md / CLAUDE.md → "instruction"
+/// - .memory/ files → "memory"
+/// - Markdown in rfcs/ → "design"
+/// - Markdown in plans/ → "plan"
+/// - Markdown in decisions/ → "decision"
+/// - Markdown in learnings/ → "learning"
+/// - Markdown in docs/ (fallback) → "design"
+/// - Code extensions (.rs, .py, .ts, etc.) → "code"
+/// - Config/other → None (unclassified)
+pub fn infer_content_role(source_file: &str) -> Option<String> {
+    let lower = source_file.to_lowercase();
+    let file_name = std::path::Path::new(source_file)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    // Special files: instruction role
+    if file_name == "AGENTS.md" || file_name == "CLAUDE.md" || file_name == "README.md" {
+        return Some("instruction".into());
+    }
+
+    // Memory directory
+    if lower.contains("/.memory/") || lower.starts_with(".memory/") || lower == ".memory" {
+        return Some("memory".into());
+    }
+
+    // Directory-based inference for markdown/docs
+    if lower.ends_with(".md") || lower.ends_with(".mdx") {
+        // Check specific subdirs first (more specific wins)
+        if lower.contains("/rfcs/") || lower.starts_with("rfcs/") {
+            return Some("design".into());
+        }
+        if lower.contains("/plans/") || lower.starts_with("plans/") {
+            return Some("plan".into());
+        }
+        if lower.contains("/decisions/") || lower.starts_with("decisions/") {
+            return Some("decision".into());
+        }
+        if lower.contains("/learnings/") || lower.starts_with("learnings/") {
+            return Some("learning".into());
+        }
+        // Fallback: any markdown in a docs/ tree
+        if lower.contains("/docs/") || lower.starts_with("docs/") {
+            return Some("design".into());
+        }
+        return None;
+    }
+
+    // Code file extensions
+    const CODE_EXTS: &[&str] = &[
+        "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "rb", "php",
+        "c", "cpp", "h", "hpp", "cs", "swift", "kt", "scala", "ex", "exs",
+        "sh", "bash", "zsh", "toml", "yaml", "yml", "json",
+    ];
+    let ext = std::path::Path::new(source_file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    if CODE_EXTS.contains(&ext) {
+        return Some("code".into());
+    }
+
+    None
+}
+
+/// Infer `source_origin` based on where the file came from.
+///
+/// - Repo ingestion (repo_name is Some): "repo:<name>"
+/// - .memory/ files: "memory"
+/// - Workspace docs (repo_name is None): "workspace"
+pub fn infer_source_origin(repo_name: Option<&str>, source_file: &str) -> Option<String> {
+    let lower = source_file.to_lowercase();
+    if lower.contains("/.memory/") || lower.starts_with(".memory/") {
+        return Some("memory".into());
+    }
+    if let Some(name) = repo_name {
+        return Some(format!("repo:{name}"));
+    }
+    Some("workspace".into())
+}
+
+/// Simple glob matching for blocked paths (supports trailing `*` only).
+fn blocked_path_match(pattern: &str, path: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        path.starts_with(prefix)
+    } else {
+        path == pattern
+    }
+}
+
 /// Ingest all (or one) workspace repos with namespace isolation.
 ///
 /// For each repo in the workspace, discovers an adapter at runtime, spawns
 /// it as a process, streams source files via JSONL, runs them through the
 /// chunking pipeline, embeds, and stores entries with namespace isolation.
+///
+/// Also ingests workspace-level docs (docs/decisions/, docs/learnings/, etc.)
+/// when running a full workspace ingest (no repo filter).
 ///
 /// The `fresh` parameter is accepted but not yet used (future: delete existing
 /// entries before re-ingest).
@@ -446,7 +542,11 @@ pub async fn ingest_workspace(
                     chunk_type: Some(pc.chunk_type.clone()),
                     start_line: Some(pc.start_line),
                     end_line: Some(pc.end_line),
-                    ..Default::default()
+                    content_role: infer_content_role(&pc.metadata.source_file),
+                    source_origin: infer_source_origin(
+                        Some(&repo_config.name),
+                        &pc.metadata.source_file,
+                    ),
                 };
                 entry
             })
@@ -486,6 +586,171 @@ pub async fn ingest_workspace(
             "  {} chunks stored for namespace '{}'",
             stored, repo_config.namespace
         );
+    }
+
+    // --- Ingest workspace docs (only on full ingest, not single-repo) ---
+    if repo_filter.is_none() {
+        if let Some(docs_config) = ws.docs.as_ref() {
+            if let Some(workspace_docs_dir) = &docs_config.workspace_docs {
+                let docs_path = root.join(workspace_docs_dir);
+                if docs_path.exists() && docs_path.is_dir() {
+                    let docs_path_str = docs_path
+                        .to_str()
+                        .ok_or_else(|| anyhow::anyhow!("Invalid workspace docs path"))?;
+
+                    let blocked = docs_config
+                        .rules
+                        .as_ref()
+                        .map(|r| r.blocked_paths.clone())
+                        .unwrap_or_default();
+
+                    let adapter_info = adapter_discovery::resolve_adapter(
+                        docs_path_str,
+                        &discovered,
+                        None,
+                        default_name,
+                    );
+
+                    if let Some(adapter_info) = adapter_info {
+                        println!(
+                            "\nIngesting workspace docs ({})...",
+                            workspace_docs_dir
+                        );
+
+                        let mut process = ProcessAdapter::new(
+                            adapter_info.binary_path.clone(),
+                            adapter_info.metadata.clone(),
+                        );
+                        process.spawn().map_err(|e| anyhow::anyhow!(e))?;
+
+                        let source_files = process
+                            .ingest(docs_path_str, &config.project.scope_id)
+                            .map_err(|e| anyhow::anyhow!(e))?;
+
+                        // Filter: only allowed subdirs, exclude blocked paths
+                        let allowed = &docs_config.allowed_workspace_subdirs;
+                        let source_files: Vec<_> = source_files
+                            .into_iter()
+                            .filter(|sf| {
+                                let path = &sf.metadata.file_path;
+                                // Must be in an allowed subdir (or no restriction)
+                                let in_allowed = allowed.is_empty()
+                                    || allowed.iter().any(|sub| {
+                                        path.starts_with(&format!("{sub}/"))
+                                            || path.starts_with(sub.as_str())
+                                    });
+                                // Must not match blocked paths
+                                let is_blocked = blocked
+                                    .iter()
+                                    .any(|bp| blocked_path_match(bp, path));
+                                in_allowed && !is_blocked
+                            })
+                            .collect();
+
+                        if source_files.is_empty() {
+                            println!("  No docs files to ingest.");
+                        } else {
+                            let pipeline =
+                                corvia_kernel::create_chunking_pipeline(&config);
+                            let (processed, pipeline_relations, report) =
+                                pipeline.process_batch(&source_files)?;
+
+                            println!(
+                                "  {} files → {} chunks ({} merged, {} split)",
+                                report.files_processed,
+                                report.total_chunks,
+                                report.chunks_merged,
+                                report.chunks_split
+                            );
+
+                            let entries: Vec<corvia_common::types::KnowledgeEntry> =
+                                processed
+                                    .iter()
+                                    .map(|pc| {
+                                        let mut entry =
+                                            corvia_common::types::KnowledgeEntry::new(
+                                                pc.content.clone(),
+                                                config.project.scope_id.clone(),
+                                                pc.metadata.source_file.clone(),
+                                            );
+                                        entry.workstream = "docs".to_string();
+                                        entry.metadata =
+                                            corvia_common::types::EntryMetadata {
+                                                source_file: Some(
+                                                    pc.metadata.source_file.clone(),
+                                                ),
+                                                language: pc.metadata.language.clone(),
+                                                chunk_type: Some(
+                                                    pc.chunk_type.clone(),
+                                                ),
+                                                start_line: Some(pc.start_line),
+                                                end_line: Some(pc.end_line),
+                                                content_role: infer_content_role(
+                                                    &pc.metadata.source_file,
+                                                ),
+                                                source_origin: infer_source_origin(
+                                                    None,
+                                                    &pc.metadata.source_file,
+                                                ),
+                                            };
+                                        entry
+                                    })
+                                    .collect();
+
+                            let total = entries.len();
+                            let mut stored_ids: Vec<uuid::Uuid> =
+                                Vec::with_capacity(total);
+                            let mut stored = 0;
+                            for batch in
+                                entries.chunks(corvia_kernel::introspect::EMBED_BATCH_SIZE)
+                            {
+                                let texts: Vec<String> =
+                                    batch.iter().map(|e| e.content.clone()).collect();
+                                let embeddings = engine.embed_batch(&texts).await?;
+                                for (entry, embedding) in batch.iter().zip(embeddings) {
+                                    let mut entry = entry.clone();
+                                    entry.embedding = Some(embedding);
+                                    store.insert(&entry).await?;
+                                    stored_ids.push(entry.id);
+                                    stored += 1;
+                                }
+                                println!(
+                                    "  embedded and stored {}/{}",
+                                    stored, total
+                                );
+                            }
+
+                            if !pipeline_relations.is_empty() {
+                                let relations_stored = crate::wire_pipeline_relations(
+                                    &pipeline_relations,
+                                    &processed,
+                                    &stored_ids,
+                                    &*graph,
+                                )
+                                .await;
+                                if relations_stored > 0 {
+                                    println!(
+                                        "  {relations_stored} graph relations stored"
+                                    );
+                                }
+                            }
+
+                            println!(
+                                "  {} chunks stored for workspace docs",
+                                stored
+                            );
+                        }
+
+                        process.shutdown().map_err(|e| anyhow::anyhow!(e))?;
+                    } else {
+                        println!(
+                            "\n  Skipping workspace docs — no suitable adapter found \
+                             (install corvia-adapter-basic)"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     println!("\nWorkspace ingest complete.");
@@ -864,5 +1129,98 @@ mod tests {
             None,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_infer_content_role_code() {
+        assert_eq!(infer_content_role("src/main.rs"), Some("code".into()));
+        assert_eq!(infer_content_role("lib/utils.py"), Some("code".into()));
+        assert_eq!(infer_content_role("src/app.tsx"), Some("code".into()));
+        assert_eq!(infer_content_role("build.sh"), Some("code".into()));
+    }
+
+    #[test]
+    fn test_infer_content_role_instruction() {
+        assert_eq!(infer_content_role("AGENTS.md"), Some("instruction".into()));
+        assert_eq!(infer_content_role("CLAUDE.md"), Some("instruction".into()));
+        assert_eq!(infer_content_role("README.md"), Some("instruction".into()));
+        assert_eq!(
+            infer_content_role("crates/foo/README.md"),
+            Some("instruction".into())
+        );
+    }
+
+    #[test]
+    fn test_infer_content_role_markdown_dirs() {
+        assert_eq!(
+            infer_content_role("docs/rfcs/design-spec.md"),
+            Some("design".into())
+        );
+        assert_eq!(
+            infer_content_role("docs/plans/impl-plan.md"),
+            Some("plan".into())
+        );
+        assert_eq!(
+            infer_content_role("docs/decisions/d01.md"),
+            Some("decision".into())
+        );
+        assert_eq!(
+            infer_content_role("docs/learnings/rag-modes.md"),
+            Some("learning".into())
+        );
+        assert_eq!(
+            infer_content_role("docs/some-other.md"),
+            Some("design".into())
+        );
+    }
+
+    #[test]
+    fn test_infer_content_role_memory() {
+        assert_eq!(
+            infer_content_role(".memory/user_role.md"),
+            Some("memory".into())
+        );
+    }
+
+    #[test]
+    fn test_infer_content_role_unclassified() {
+        assert_eq!(infer_content_role("notes.txt"), None);
+    }
+
+    #[test]
+    fn test_infer_source_origin_repo() {
+        assert_eq!(
+            infer_source_origin(Some("corvia"), "src/main.rs"),
+            Some("repo:corvia".into())
+        );
+    }
+
+    #[test]
+    fn test_infer_source_origin_workspace() {
+        assert_eq!(
+            infer_source_origin(None, "decisions/d01.md"),
+            Some("workspace".into())
+        );
+    }
+
+    #[test]
+    fn test_infer_source_origin_memory() {
+        assert_eq!(
+            infer_source_origin(Some("corvia"), ".memory/foo.md"),
+            Some("memory".into())
+        );
+        assert_eq!(
+            infer_source_origin(None, ".memory/foo.md"),
+            Some("memory".into())
+        );
+    }
+
+    #[test]
+    fn test_blocked_path_match() {
+        assert!(blocked_path_match("docs/superpowers/*", "docs/superpowers/brainstorm.md"));
+        assert!(blocked_path_match("docs/superpowers/*", "docs/superpowers/plans/foo.md"));
+        assert!(!blocked_path_match("docs/superpowers/*", "docs/decisions/d01.md"));
+        assert!(blocked_path_match("exact.md", "exact.md"));
+        assert!(!blocked_path_match("exact.md", "other.md"));
     }
 }

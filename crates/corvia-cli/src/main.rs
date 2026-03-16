@@ -723,7 +723,8 @@ async fn cmd_ingest(path: Option<&str>, incremental: bool, files: &[String]) -> 
                     chunk_type: Some(pc.chunk_type.clone()),
                     start_line: Some(pc.start_line),
                     end_line: Some(pc.end_line),
-                    ..Default::default()
+                    content_role: workspace::infer_content_role(&pc.metadata.source_file),
+                    source_origin: workspace::infer_source_origin(None, &pc.metadata.source_file),
                 };
                 entry
             })

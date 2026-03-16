@@ -219,7 +219,7 @@ fn ingest_to_writer<W: Write>(source_path: &str, scope_id: &str, out: &mut W) {
     let exts = text_extensions();
     let mut total = 0;
 
-    walk_dir(path, &skip, &exts, scope_id, &mut total, out);
+    walk_dir(path, path, &skip, &exts, scope_id, &mut total, out);
 
     let done = DoneMsg { done: true, total_files: total };
     writeln!(out, "{}", serde_json::to_string(&done).unwrap()).ok();
@@ -228,6 +228,7 @@ fn ingest_to_writer<W: Write>(source_path: &str, scope_id: &str, out: &mut W) {
 
 fn walk_dir<W: Write>(
     dir: &Path,
+    root: &Path,
     skip: &HashSet<&str>,
     exts: &HashSet<&str>,
     scope_id: &str,
@@ -251,7 +252,7 @@ fn walk_dir<W: Write>(
             if skip.contains(name_str.as_ref()) || name_str.starts_with('.') {
                 continue;
             }
-            walk_dir(&path, skip, exts, scope_id, total, out);
+            walk_dir(&path, root, skip, exts, scope_id, total, out);
             continue;
         }
 
@@ -286,9 +287,9 @@ fn walk_dir<W: Write>(
             .to_string_lossy()
             .to_string();
 
-        // Use path relative to the source root, not the parent
+        // Use path relative to the source root, not the current directory
         let rel_from_source = path
-            .strip_prefix(dir)
+            .strip_prefix(root)
             .unwrap_or(&path)
             .to_string_lossy()
             .to_string();
