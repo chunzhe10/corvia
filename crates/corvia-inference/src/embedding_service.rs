@@ -51,6 +51,24 @@ fn verify_ep_available(backend: &BackendKind) -> bool {
     }
 }
 
+/// Build the fallback chain for backend attempts.
+/// CUDA → OpenVINO → CPU, starting from the resolved backend.
+/// Skips backends whose provider libraries aren't available.
+fn build_fallback_chain(backend: &ResolvedBackend) -> Vec<BackendKind> {
+    let mut chain = vec![backend.backend];
+    let fallbacks: &[BackendKind] = match backend.backend {
+        BackendKind::Cuda => &[BackendKind::OpenVino, BackendKind::Cpu],
+        BackendKind::OpenVino => &[BackendKind::Cpu],
+        BackendKind::Cpu => &[],
+    };
+    for &fb in fallbacks {
+        if fb == BackendKind::Cpu || verify_ep_available(&fb) {
+            chain.push(fb);
+        }
+    }
+    chain
+}
+
 /// Check if a shared library can be loaded via dlopen (same mechanism ORT uses).
 fn can_dlopen(lib_name: &str) -> bool {
     use std::ffi::CString;
@@ -142,6 +160,10 @@ impl EmbeddingServiceImpl {
     }
 
     /// Load an embedding model by name. Downloads from HuggingFace if not cached.
+    ///
+    /// If the requested GPU backend fails at runtime (e.g., CUDA EP registers but
+    /// cudaSetDevice fails), automatically falls back through the backend chain:
+    /// CUDA → OpenVINO → CPU.
     pub async fn load_model(&self, name: &str, mut backend: ResolvedBackend) -> Result<(), Status> {
         let model_enum = Self::resolve_model(name)?;
         let name_owned = name.to_string();
@@ -169,18 +191,69 @@ impl EmbeddingServiceImpl {
             backend.fallback_used = true;
         }
 
-        let eps = build_execution_providers(&backend);
-        let model_enum_for_spawn = model_enum.clone();
-        let engine = tokio::task::spawn_blocking(move || {
-            fastembed::TextEmbedding::try_new(
-                fastembed::InitOptions::new(model_enum_for_spawn)
-                    .with_show_download_progress(true)
-                    .with_execution_providers(eps),
-            )
-        })
-        .await
-        .map_err(|e| Status::internal(format!("Spawn failed: {e}")))?
-        .map_err(|e| Status::internal(format!("Model load failed: {e}")))?;
+        // Build the fallback chain: requested backend → alternatives → CPU.
+        let fallback_chain = build_fallback_chain(&backend);
+
+        let mut engine = None;
+        for attempt_backend in fallback_chain {
+            let is_fallback = attempt_backend != backend.backend;
+            if is_fallback {
+                tracing::warn!(
+                    model = %name_owned,
+                    fallback_backend = %attempt_backend,
+                    "Retrying with fallback backend"
+                );
+            }
+
+            let eps = build_execution_providers(&ResolvedBackend {
+                device: if attempt_backend == BackendKind::Cpu {
+                    crate::backend::Device::Cpu
+                } else {
+                    crate::backend::Device::Gpu
+                },
+                backend: attempt_backend,
+                fallback_used: is_fallback,
+            });
+            let model_enum_for_spawn = model_enum.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                fastembed::TextEmbedding::try_new(
+                    fastembed::InitOptions::new(model_enum_for_spawn)
+                        .with_show_download_progress(true)
+                        .with_execution_providers(eps),
+                )
+            })
+            .await
+            .map_err(|e| Status::internal(format!("Spawn failed: {e}")))?;
+
+            match result {
+                Ok(e) => {
+                    if is_fallback {
+                        backend.backend = attempt_backend;
+                        backend.device = if attempt_backend == BackendKind::Cpu {
+                            crate::backend::Device::Cpu
+                        } else {
+                            crate::backend::Device::Gpu
+                        };
+                        backend.fallback_used = true;
+                    }
+                    engine = Some(e);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        model = %name_owned,
+                        backend = %attempt_backend,
+                        error = %e,
+                        "ONNX session creation failed for backend"
+                    );
+                    // Continue to next fallback
+                }
+            }
+        }
+
+        let engine = engine.ok_or_else(|| {
+            Status::internal("Model load failed: all backends (including CPU) failed")
+        })?;
 
         self.models
             .lock()
