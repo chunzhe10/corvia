@@ -126,9 +126,9 @@ CTA:     "What does your team re-explain to AI agents every single session?"
 
 ## 5-Star Checklist
 
-- [x] **Explorer voice:** "I expected X, found Y" — discovery journal
-- [x] **Standalone insight:** "Vector vs graph is about question type, not quality" — valuable without Corvia
-- [x] **Concrete artifact:** Side-by-side terminal screenshots
-- [x] **Generous credit:** Mem0 paper, Zep temporal graph
-- [x] **Open question:** "What does your team re-explain every session?"
-- [x] **Curiosity hook:** Tease Post 3 (reasoning engine on OSS codebase)
+- **Explorer voice:** "I expected X, found Y" — discovery journal
+- **Standalone insight:** "Vector vs graph is about question type, not quality" — valuable without Corvia
+- **Concrete artifact:** Side-by-side terminal screenshots
+- **Generous credit:** Mem0 paper, Zep temporal graph
+- **Open question:** "What does your team re-explain every session?"
+- **Curiosity hook:** Tease Post 3 (reasoning engine on OSS codebase)

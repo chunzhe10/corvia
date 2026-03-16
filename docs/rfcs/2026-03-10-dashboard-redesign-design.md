@@ -13,7 +13,7 @@ Redesign the Corvia VS Code extension dashboard from the current card-based layo
 
 ## Design Direction
 
-Warm charcoal dark mode (not navy) with gold as the dominant accent. Figma-inspired: large border radius, elevated cards with soft shadows, generous spacing, bold metric numbers, vivid multi-color accents. The mockup is at `.superpowers/brainstorm/layout-v5.html`.
+Warm charcoal dark mode (not navy) with gold as the dominant accent. Figma-inspired: large border radius, elevated cards with soft shadows, generous spacing, bold metric numbers, vivid multi-color accents. The mockup (layout-v5.html) informed the shipped implementation.
 
 ---
 
@@ -212,5 +212,5 @@ Below 700px width:
 
 ---
 
-*Mockup reference: `.superpowers/brainstorm/layout-v5.html`*
+*Mockup: layout-v5.html (superseded by shipped implementation)*
 *Created: 2026-03-10*

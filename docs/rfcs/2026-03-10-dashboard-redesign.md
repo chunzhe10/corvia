@@ -9,7 +9,7 @@
 **Tech Stack:** VS Code Webview API, vanilla HTML/CSS/JS (embedded in extension.js template literal), Inter font from Google Fonts.
 
 **Spec:** `2026-03-10-dashboard-redesign-design.md`
-**Mockup:** `.superpowers/brainstorm/layout-v5.html`
+**Mockup:** (layout-v5.html, superseded by shipped implementation)
 
 ---
 
@@ -91,7 +91,7 @@ git commit -m "feat(extension): track previous poll data for metric trends"
 **Files:**
 - Modify: `.devcontainer/extensions/corvia-services/extension.js` — the `<style>` block inside `getDashboardHtml()`
 
-Replace everything between `<style>` and `</style>` (current lines 114-390) with the new design token system and all component styles. The CSS is adapted directly from the approved mockup (`.superpowers/brainstorm/layout-v5.html`) with these adjustments for the webview context:
+Replace everything between `<style>` and `</style>` (current lines 114-390) with the new design token system and all component styles. The CSS is adapted directly from the approved mockup with these adjustments for the webview context:
 
 1. Inter font loaded via `@import` inside `<style>` (VS Code webviews support external CSS imports)
 2. All VS Code theme variable fallbacks removed — we own the full palette now

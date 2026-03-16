@@ -46,7 +46,7 @@
 **Files:**
 - Modify: `crates/corvia-kernel/src/agent_coordinator.rs:28-31`
 
-- [ ] **Step 1: Write the failing test**
+- **Step 1: Write the failing test**
 
 In the existing `#[cfg(test)] mod tests` at the bottom of `agent_coordinator.rs`, add:
 
@@ -70,12 +70,12 @@ fn test_gc_report_has_enhanced_fields() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- **Step 2: Run test to verify it fails**
 
 Run: `cd /workspaces/corvia-workspace/repos/corvia && cargo test -p corvia-kernel test_gc_report_has_enhanced_fields 2>&1 | tail -20`
 Expected: FAIL — `GcReport` has no field named `duration_ms`, etc.
 
-- [ ] **Step 3: Expand GcReport struct**
+- **Step 3: Expand GcReport struct**
 
 In `crates/corvia-kernel/src/agent_coordinator.rs`, replace the existing `GcReport` (lines 27-31).
 Note: the existing struct only has `#[derive(Debug, Clone, Default)]` — we add `serde::Serialize, serde::Deserialize`
@@ -96,7 +96,7 @@ pub struct GcReport {
 }
 ```
 
-- [ ] **Step 4: Update gc() method to populate new fields**
+- **Step 4: Update gc() method to populate new fields**
 
 In the same file, update the `gc()` method. The method currently starts with `let mut report = GcReport::default();`. Change it to capture stale count, and set `started_at`:
 
@@ -122,18 +122,18 @@ pub async fn gc(&self) -> Result<GcReport> {
 
 After the orphan rollback loop, add the `Ok(report)` return as before. The `duration_ms` and `closed_sessions_cleaned` will be populated by the `ops::gc_run` wrapper (Task 2).
 
-- [ ] **Step 5: Fix any compile errors from callers**
+- **Step 5: Fix any compile errors from callers**
 
 Run: `cd /workspaces/corvia-workspace/repos/corvia && cargo build --workspace 2>&1 | head -30`
 
 Check that `GcReport::default()` still works (it does, since all new fields are `u64`/`usize`/`String` with Default). Fix any issues.
 
-- [ ] **Step 6: Run test to verify it passes**
+- **Step 6: Run test to verify it passes**
 
 Run: `cd /workspaces/corvia-workspace/repos/corvia && cargo test -p corvia-kernel test_gc_report_has_enhanced_fields -- --nocapture 2>&1 | tail -10`
 Expected: PASS
 
-- [ ] **Step 7: Commit**
+- **Step 7: Commit**
 
 ```bash
 cd /workspaces/corvia-workspace/repos/corvia
@@ -146,7 +146,7 @@ git commit -m "feat(kernel): expand GcReport with duration, stale, cleanup field
 **Files:**
 - Modify: `crates/corvia-kernel/src/ops.rs:248-254`
 
-- [ ] **Step 1: Write the failing test**
+- **Step 1: Write the failing test**
 
 In `ops.rs` `mod tests`, add:
 
@@ -165,12 +165,12 @@ async fn test_gc_run_populates_timing() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- **Step 2: Run test to verify it fails**
 
 Run: `cd /workspaces/corvia-workspace/repos/corvia && cargo test -p corvia-kernel test_gc_run_populates_timing -- --nocapture 2>&1 | tail -10`
 Expected: FAIL — `duration_ms` is 0 because the current `gc_run` just delegates to `coordinator.gc()` without timing
 
-- [ ] **Step 3: Add timing wrapper in gc_run()**
+- **Step 3: Add timing wrapper in gc_run()**
 
 Replace the `gc_run` function in `ops.rs`:
 
@@ -189,12 +189,12 @@ pub async fn gc_run(coordinator: &AgentCoordinator) -> Result<GcReport> {
 
 Add `chrono` import if not already present. Check the existing imports — `ops.rs` doesn't currently import chrono. Add: `use chrono::Utc;` (chrono is already a workspace dependency).
 
-- [ ] **Step 4: Run test to verify it passes**
+- **Step 4: Run test to verify it passes**
 
 Run: `cd /workspaces/corvia-workspace/repos/corvia && cargo test -p corvia-kernel test_gc_run_populates_timing -- --nocapture 2>&1 | tail -10`
 Expected: PASS
 
-- [ ] **Step 5: Add GcHistory type**
+- **Step 5: Add GcHistory type**
 
 Add to `ops.rs` after the gc_run function:
 
@@ -234,7 +234,7 @@ impl GcHistory {
 }
 ```
 
-- [ ] **Step 6: Write test for GcHistory**
+- **Step 6: Write test for GcHistory**
 
 ```rust
 #[test]
@@ -262,12 +262,12 @@ fn test_gc_history_ring_buffer() {
 }
 ```
 
-- [ ] **Step 7: Run tests**
+- **Step 7: Run tests**
 
 Run: `cd /workspaces/corvia-workspace/repos/corvia && cargo test -p corvia-kernel test_gc_history_ring_buffer test_gc_run_populates_timing -- --nocapture 2>&1 | tail -15`
 Expected: both PASS
 
-- [ ] **Step 8: Commit**
+- **Step 8: Commit**
 
 ```bash
 cd /workspaces/corvia-workspace/repos/corvia
@@ -280,7 +280,7 @@ git commit -m "feat(kernel): add GcHistory ring buffer and timing wrapper for gc
 **Files:**
 - Modify: `crates/corvia-server/src/rest.rs:19-36`
 
-- [ ] **Step 1: Add gc_history field to AppState**
+- **Step 1: Add gc_history field to AppState**
 
 In `rest.rs`, add the import and field:
 
@@ -296,7 +296,7 @@ Add to the `AppState` struct after `cluster_store`:
     pub gc_history: Arc<GcHistory>,
 ```
 
-- [ ] **Step 2: Update AppState construction sites**
+- **Step 2: Update AppState construction sites**
 
 `AppState` is constructed in two places in `crates/corvia-server/src/mcp.rs`:
 
@@ -316,12 +316,12 @@ cd /workspaces/corvia-workspace/repos/corvia && grep -rn "AppState {" crates/cor
 ```
 Update any additional sites found.
 
-- [ ] **Step 3: Build to verify compilation**
+- **Step 3: Build to verify compilation**
 
 Run: `cd /workspaces/corvia-workspace/repos/corvia && cargo build -p corvia-server 2>&1 | tail -20`
 Expected: compiles successfully
 
-- [ ] **Step 4: Commit**
+- **Step 4: Commit**
 
 ```bash
 cd /workspaces/corvia-workspace/repos/corvia
@@ -334,7 +334,7 @@ git commit -m "feat(server): add GcHistory to AppState"
 **Files:**
 - Modify: `crates/corvia-common/src/dashboard.rs`
 
-- [ ] **Step 1: Add p50/p95/p99 to SpanStats**
+- **Step 1: Add p50/p95/p99 to SpanStats**
 
 Add three fields to the existing `SpanStats` struct:
 
@@ -375,7 +375,7 @@ SpanStats {
 
 This is a temporary fix — Task 8 will replace it with actual percentile values.
 
-- [ ] **Step 2: Add GC response types**
+- **Step 2: Add GC response types**
 
 Add after `TracesResponse`:
 
@@ -467,7 +467,7 @@ pub struct RecentTracesResponse {
 }
 ```
 
-- [ ] **Step 3: Add a test for new SpanStats fields**
+- **Step 3: Add a test for new SpanStats fields**
 
 ```rust
 #[test]
@@ -491,12 +491,12 @@ fn gc_status_response_serializes() {
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- **Step 4: Run tests**
 
 Run: `cd /workspaces/corvia-workspace/repos/corvia && cargo test -p corvia-common 2>&1 | tail -15`
 Expected: all PASS
 
-- [ ] **Step 5: Commit**
+- **Step 5: Commit**
 
 ```bash
 cd /workspaces/corvia-workspace/repos/corvia
@@ -513,7 +513,7 @@ git commit -m "feat(common): add GC, live session, trace tree, and percentile re
 **Files:**
 - Create: `crates/corvia-telemetry/src/otel_context_layer.rs`
 
-- [ ] **Step 1: Create the OtelContextLayer module**
+- **Step 1: Create the OtelContextLayer module**
 
 ```rust
 //! Custom tracing Layer that bridges OpenTelemetry span context into
@@ -586,7 +586,7 @@ where
 }
 ```
 
-- [ ] **Step 2: Add module declaration in lib.rs**
+- **Step 2: Add module declaration in lib.rs**
 
 In `crates/corvia-telemetry/src/lib.rs`, add after `pub mod propagation;`:
 
@@ -594,11 +594,11 @@ In `crates/corvia-telemetry/src/lib.rs`, add after `pub mod propagation;`:
 pub mod otel_context_layer;
 ```
 
-- [ ] **Step 3: Build to verify compilation**
+- **Step 3: Build to verify compilation**
 
 Run: `cd /workspaces/corvia-workspace/repos/corvia && cargo build -p corvia-telemetry 2>&1 | tail -20`
 
-- [ ] **Step 4: Add unit tests**
+- **Step 4: Add unit tests**
 
 Add to the bottom of `otel_context_layer.rs`:
 
@@ -631,12 +631,12 @@ Note: Full integration tests (verifying trace_id appears in JSON output) require
 OTEL collector or mock subscriber, which is beyond unit test scope. The above tests verify
 the data structures. Integration testing happens in Task 19.
 
-- [ ] **Step 5: Run tests**
+- **Step 5: Run tests**
 
 Run: `cd /workspaces/corvia-workspace/repos/corvia && cargo test -p corvia-telemetry 2>&1 | tail -15`
 Expected: all PASS
 
-- [ ] **Step 6: Commit**
+- **Step 6: Commit**
 
 ```bash
 cd /workspaces/corvia-workspace/repos/corvia
@@ -649,7 +649,7 @@ git commit -m "feat(telemetry): add OtelContextLayer bridging OTEL trace context
 **Files:**
 - Modify: `crates/corvia-telemetry/src/lib.rs:95-135`
 
-- [ ] **Step 1: Refactor layer composition order**
+- **Step 1: Refactor layer composition order**
 
 The current code has `registry.with(env_filter).with(local_layer).with(otel_layer)`. We need to change the order so OTEL is composed before the context layer and fmt layer:
 
@@ -708,17 +708,17 @@ match config.exporter.as_str() {
 }
 ```
 
-- [ ] **Step 2: Build and verify**
+- **Step 2: Build and verify**
 
 Run: `cd /workspaces/corvia-workspace/repos/corvia && cargo build -p corvia-telemetry 2>&1 | tail -20`
 Expected: compiles. The `Option<OtelContextLayer>` impl works because `Option<L: Layer<S>>` implements `Layer<S>`.
 
-- [ ] **Step 3: Run existing telemetry tests**
+- **Step 3: Run existing telemetry tests**
 
 Run: `cd /workspaces/corvia-workspace/repos/corvia && cargo test -p corvia-telemetry 2>&1 | tail -15`
 Expected: all existing tests pass
 
-- [ ] **Step 4: Commit**
+- **Step 4: Commit**
 
 ```bash
 cd /workspaces/corvia-workspace/repos/corvia
@@ -735,7 +735,7 @@ git commit -m "refactor(telemetry): reorder layer composition for OTEL context i
 **Files:**
 - Modify: `crates/corvia-server/src/dashboard/traces.rs:63-76`
 
-- [ ] **Step 1: Write the failing test**
+- **Step 1: Write the failing test**
 
 Add to `traces.rs` tests:
 
@@ -769,12 +769,12 @@ fn parse_span_without_otel_context() {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- **Step 2: Run tests to verify they fail**
 
 Run: `cd /workspaces/corvia-workspace/repos/corvia && cargo test -p corvia-server parse_span_with_otel_context parse_span_without_otel_context 2>&1 | tail -20`
 Expected: FAIL — `ParsedTrace::Span` has no field `trace_id`
 
-- [ ] **Step 3: Add Optional fields to ParsedTrace::Span**
+- **Step 3: Add Optional fields to ParsedTrace::Span**
 
 Update the `ParsedTrace` enum:
 
@@ -798,7 +798,7 @@ pub enum ParsedTrace {
 }
 ```
 
-- [ ] **Step 4: Update parse_trace_line() to extract OTEL fields**
+- **Step 4: Update parse_trace_line() to extract OTEL fields**
 
 In the `parse_trace_line` function, update the Span return:
 
@@ -819,7 +819,7 @@ if let Some(elapsed_ms) = v.get("elapsed_ms").and_then(|e| e.as_f64()) {
 }
 ```
 
-- [ ] **Step 5: Fix all match arms that destructure ParsedTrace::Span**
+- **Step 5: Fix all match arms that destructure ParsedTrace::Span**
 
 In `collect_traces_from_lines()` (same file, line ~184), update the match:
 
@@ -841,12 +841,12 @@ traces::ParsedTrace::Span {
 } => {
 ```
 
-- [ ] **Step 6: Run all tests**
+- **Step 6: Run all tests**
 
 Run: `cd /workspaces/corvia-workspace/repos/corvia && cargo test -p corvia-server 2>&1 | tail -20`
 Expected: all PASS
 
-- [ ] **Step 7: Commit**
+- **Step 7: Commit**
 
 ```bash
 cd /workspaces/corvia-workspace/repos/corvia
@@ -859,7 +859,7 @@ git commit -m "feat(dashboard): add OTEL trace context fields to ParsedTrace"
 **Files:**
 - Modify: `crates/corvia-server/src/dashboard/traces.rs:167-261`
 
-- [ ] **Step 1: Write the failing test**
+- **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -874,12 +874,12 @@ fn percentile_computation() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- **Step 2: Run test to verify it fails**
 
 Run: `cd /workspaces/corvia-workspace/repos/corvia && cargo test -p corvia-server percentile_computation 2>&1 | tail -10`
 Expected: FAIL — `compute_percentile` not found
 
-- [ ] **Step 3: Add compute_percentile function**
+- **Step 3: Add compute_percentile function**
 
 Add before `collect_traces_from_lines`:
 
@@ -896,7 +896,7 @@ pub fn compute_percentile(durations: &mut [f64], percentile: f64) -> f64 {
 }
 ```
 
-- [ ] **Step 4: Update collect_traces_from_lines to compute percentiles**
+- **Step 4: Update collect_traces_from_lines to compute percentiles**
 
 In the `collect_traces_from_lines` function, update the SpanStats construction to include percentiles. After the `for (name, timings) in &span_all` loop header, clone the timings for percentile computation:
 
@@ -929,12 +929,12 @@ for (name, timings) in &span_all {
 }
 ```
 
-- [ ] **Step 5: Run tests**
+- **Step 5: Run tests**
 
 Run: `cd /workspaces/corvia-workspace/repos/corvia && cargo test -p corvia-server 2>&1 | tail -15`
 Expected: all PASS
 
-- [ ] **Step 6: Commit**
+- **Step 6: Commit**
 
 ```bash
 cd /workspaces/corvia-workspace/repos/corvia
@@ -947,7 +947,7 @@ git commit -m "feat(dashboard): add percentile computation (p50/p95/p99) for spa
 **Files:**
 - Modify: `crates/corvia-server/src/dashboard/traces.rs`
 
-- [ ] **Step 1: Write the failing test**
+- **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -984,12 +984,12 @@ fn collect_trace_trees_skips_lines_without_trace_id() {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- **Step 2: Run tests to verify they fail**
 
 Run: `cd /workspaces/corvia-workspace/repos/corvia && cargo test -p corvia-server collect_trace_trees 2>&1 | tail -10`
 Expected: FAIL — `collect_trace_trees` not found
 
-- [ ] **Step 3: Implement collect_trace_trees**
+- **Step 3: Implement collect_trace_trees**
 
 Add the function and its necessary import for `TraceTree` and `SpanNode` from `corvia_common::dashboard`:
 
@@ -1141,12 +1141,12 @@ fn compute_offset_ms(base: &str, ts: &str) -> f64 {
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- **Step 4: Run tests**
 
 Run: `cd /workspaces/corvia-workspace/repos/corvia && cargo test -p corvia-server collect_trace_trees 2>&1 | tail -15`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- **Step 5: Commit**
 
 ```bash
 cd /workspaces/corvia-workspace/repos/corvia
@@ -1159,7 +1159,7 @@ git commit -m "feat(dashboard): add trace tree builder for OTEL span drill-down"
 **Files:**
 - Modify: `crates/corvia-server/src/dashboard/mod.rs`
 
-- [ ] **Step 0: Add conversion helper to eliminate GcReport→GcReportDto duplication**
+- **Step 0: Add conversion helper to eliminate GcReport→GcReportDto duplication**
 
 At the top of `mod.rs` (after imports), add a plain conversion function. We use a function
 instead of `From` because Rust's orphan rule forbids `impl From<ForeignType> for OtherForeignType`
@@ -1181,7 +1181,7 @@ fn gc_report_to_dto(r: GcReport) -> corvia_common::dashboard::GcReportDto {
 }
 ```
 
-- [ ] **Step 1: Add routes to the router**
+- **Step 1: Add routes to the router**
 
 In the `router()` function, add before `.with_state(state)`:
 
@@ -1192,7 +1192,7 @@ In the `router()` function, add before `.with_state(state)`:
 .route("/api/dashboard/traces/recent", get(recent_traces_handler))
 ```
 
-- [ ] **Step 2: Add the GC status handler**
+- **Step 2: Add the GC status handler**
 
 ```rust
 /// GET /api/dashboard/gc
@@ -1213,7 +1213,7 @@ async fn gc_status_handler(
 }
 ```
 
-- [ ] **Step 3: Add the GC run handler**
+- **Step 3: Add the GC run handler**
 
 ```rust
 /// POST /api/dashboard/gc/run
@@ -1229,7 +1229,7 @@ async fn gc_run_handler(
 }
 ```
 
-- [ ] **Step 4: Add the live sessions handler**
+- **Step 4: Add the live sessions handler**
 
 ```rust
 /// GET /api/dashboard/sessions/live
@@ -1292,7 +1292,7 @@ async fn live_sessions_handler(
 }
 ```
 
-- [ ] **Step 5: Add the recent traces handler**
+- **Step 5: Add the recent traces handler**
 
 ```rust
 /// Query params for /api/dashboard/traces/recent
@@ -1327,17 +1327,17 @@ async fn recent_traces_handler(
 }
 ```
 
-- [ ] **Step 6: Build to verify**
+- **Step 6: Build to verify**
 
 Run: `cd /workspaces/corvia-workspace/repos/corvia && cargo build -p corvia-server 2>&1 | tail -20`
 Expected: compiles. Fix any import issues (add `use chrono;` if needed, fix `SessionState` path, etc.).
 
-- [ ] **Step 7: Run all dashboard tests**
+- **Step 7: Run all dashboard tests**
 
 Run: `cd /workspaces/corvia-workspace/repos/corvia && cargo test -p corvia-server 2>&1 | tail -20`
 Expected: all PASS
 
-- [ ] **Step 8: Commit**
+- **Step 8: Commit**
 
 ```bash
 cd /workspaces/corvia-workspace/repos/corvia
@@ -1354,7 +1354,7 @@ git commit -m "feat(dashboard): add GC, live sessions, and recent traces endpoin
 **Files:**
 - Modify: `tools/corvia-dashboard/src/types.ts`
 
-- [ ] **Step 1: Add p50/p95/p99 to SpanStats interface**
+- **Step 1: Add p50/p95/p99 to SpanStats interface**
 
 Update `SpanStats`:
 
@@ -1371,7 +1371,7 @@ export interface SpanStats {
 }
 ```
 
-- [ ] **Step 2: Add GC types**
+- **Step 2: Add GC types**
 
 Add after `ActivityFeedResponse`:
 
@@ -1450,7 +1450,7 @@ export interface RecentTracesResponse {
 }
 ```
 
-- [ ] **Step 3: Commit**
+- **Step 3: Commit**
 
 Note: `tools/corvia-dashboard/` lives in the workspace root repo, not `repos/corvia/`.
 
@@ -1465,7 +1465,7 @@ git commit -m "feat(dashboard-ui): add GC, live session, and trace tree TypeScri
 **Files:**
 - Modify: `tools/corvia-dashboard/src/api.ts`
 
-- [ ] **Step 1: Add imports**
+- **Step 1: Add imports**
 
 Update the import block at the top to include new types:
 
@@ -1479,7 +1479,7 @@ import type {
 } from "./types";
 ```
 
-- [ ] **Step 2: Add 4 new API functions**
+- **Step 2: Add 4 new API functions**
 
 Add at the bottom of the file:
 
@@ -1508,7 +1508,7 @@ export function fetchRecentTraces(limit?: number): Promise<RecentTracesResponse>
 }
 ```
 
-- [ ] **Step 3: Commit**
+- **Step 3: Commit**
 
 ```bash
 cd /workspaces/corvia-workspace
@@ -1525,7 +1525,7 @@ git commit -m "feat(dashboard-ui): add GC, live sessions, and recent traces API 
 **Files:**
 - Create: `tools/corvia-dashboard/src/components/LiveSessionsBar.tsx`
 
-- [ ] **Step 1: Create the component**
+- **Step 1: Create the component**
 
 ```tsx
 import { useCallback } from "preact/hooks";
@@ -1589,7 +1589,7 @@ export function LiveSessionsBar({ onSessionClick }: { onSessionClick?: (agentId:
 }
 ```
 
-- [ ] **Step 2: Commit**
+- **Step 2: Commit**
 
 ```bash
 cd /workspaces/corvia-workspace
@@ -1602,7 +1602,7 @@ git commit -m "feat(dashboard-ui): add LiveSessionsBar component"
 **Files:**
 - Create: `tools/corvia-dashboard/src/components/GcPanel.tsx`
 
-- [ ] **Step 1: Create the component**
+- **Step 1: Create the component**
 
 ```tsx
 import { useState, useCallback } from "preact/hooks";
@@ -1734,7 +1734,7 @@ export function GcPanel() {
 }
 ```
 
-- [ ] **Step 2: Commit**
+- **Step 2: Commit**
 
 ```bash
 cd /workspaces/corvia-workspace
@@ -1747,7 +1747,7 @@ git commit -m "feat(dashboard-ui): add GcPanel component with sparkline and trig
 **Files:**
 - Create: `tools/corvia-dashboard/src/components/WaterfallView.tsx`
 
-- [ ] **Step 1: Create the component**
+- **Step 1: Create the component**
 
 ```tsx
 import { useState, useCallback } from "preact/hooks";
@@ -1877,7 +1877,7 @@ export function WaterfallView() {
 }
 ```
 
-- [ ] **Step 2: Commit**
+- **Step 2: Commit**
 
 ```bash
 cd /workspaces/corvia-workspace
@@ -1891,7 +1891,7 @@ git commit -m "feat(dashboard-ui): add WaterfallView component for OTEL span dri
 - Modify: `tools/corvia-dashboard/src/components/TracesView.tsx`
 - Modify: `tools/corvia-dashboard/src/components/AgentsView.tsx`
 
-- [ ] **Step 1: Integrate GcPanel into TracesView**
+- **Step 1: Integrate GcPanel into TracesView**
 
 In `TracesView.tsx`, add import:
 
@@ -1930,7 +1930,7 @@ Inside the `traces-workspace` div, after the `trace-detail` div closes (line 409
 </div>
 ```
 
-- [ ] **Step 2: Update span rows with percentiles**
+- **Step 2: Update span rows with percentiles**
 
 In `DetailPanel`, add a percentile line inside each span row. Find the existing block (around line 303) that renders `{fields && <div class="span-fields">{fields}</div>}` and add after it:
 
@@ -1944,7 +1944,7 @@ In `DetailPanel`, add a percentile line inside each span row. Find the existing 
 
 This adds a new `<div>` inside the existing `<div>` wrapper, after the fields line. Do NOT replace the surrounding code — only insert this block.
 
-- [ ] **Step 3: Integrate LiveSessionsBar into AgentsView**
+- **Step 3: Integrate LiveSessionsBar into AgentsView**
 
 In `AgentsView.tsx`, add import:
 
@@ -1963,12 +1963,12 @@ return (
       {/* ... existing ... */}
 ```
 
-- [ ] **Step 4: Build the dashboard to verify**
+- **Step 4: Build the dashboard to verify**
 
 Run: `cd /workspaces/corvia-workspace/tools/corvia-dashboard && npm run build 2>&1 | tail -20`
 Expected: builds successfully (or note TypeScript errors and fix them)
 
-- [ ] **Step 5: Commit**
+- **Step 5: Commit**
 
 ```bash
 cd /workspaces/corvia-workspace
@@ -1982,12 +1982,12 @@ git commit -m "feat(dashboard-ui): integrate GcPanel, WaterfallView, LiveSession
 
 ### Task 17: Run all backend tests
 
-- [ ] **Step 1: Run full Rust test suite**
+- **Step 1: Run full Rust test suite**
 
 Run: `cd /workspaces/corvia-workspace/repos/corvia && cargo test --workspace 2>&1 | tail -30`
 Expected: all tests pass. Fix any compilation errors or test failures.
 
-- [ ] **Step 2: Run the dashboard build**
+- **Step 2: Run the dashboard build**
 
 Run: `cd /workspaces/corvia-workspace/tools/corvia-dashboard && npm run build 2>&1 | tail -20`
 Expected: clean build
@@ -1998,7 +1998,7 @@ Expected: clean build
 - Modify: `repos/corvia/AGENTS.md`
 - Modify: `repos/corvia/CHANGELOG.md`
 
-- [ ] **Step 1: Update AGENTS.md key files**
+- **Step 1: Update AGENTS.md key files**
 
 Add to the Key Files section in `repos/corvia/AGENTS.md`:
 
@@ -2006,11 +2006,11 @@ Add to the Key Files section in `repos/corvia/AGENTS.md`:
 - `crates/corvia-telemetry/src/otel_context_layer.rs` — Custom OTEL→fmt bridge layer
 ```
 
-- [ ] **Step 2: Add CHANGELOG entry**
+- **Step 2: Add CHANGELOG entry**
 
 Add a new section at the top of `CHANGELOG.md` for the new features.
 
-- [ ] **Step 3: Commit**
+- **Step 3: Commit**
 
 ```bash
 cd /workspaces/corvia-workspace/repos/corvia
@@ -2020,7 +2020,7 @@ git commit -m "docs: update AGENTS.md and CHANGELOG for dashboard completion fea
 
 ### Task 19: Final integration test
 
-- [ ] **Step 1: Start the server and verify endpoints**
+- **Step 1: Start the server and verify endpoints**
 
 ```bash
 cd /workspaces/corvia-workspace && corvia serve &
@@ -2032,7 +2032,7 @@ curl -s http://localhost:8020/api/dashboard/traces/recent | python3 -m json.tool
 
 Expected: all 3 endpoints return valid JSON with the expected structure.
 
-- [ ] **Step 2: Trigger GC and verify**
+- **Step 2: Trigger GC and verify**
 
 ```bash
 curl -s -X POST http://localhost:8020/api/dashboard/gc/run | python3 -m json.tool
@@ -2040,7 +2040,7 @@ curl -s -X POST http://localhost:8020/api/dashboard/gc/run | python3 -m json.too
 
 Expected: returns a GcReportDto with `duration_ms`, `started_at`, etc.
 
-- [ ] **Step 3: Verify GC history updates**
+- **Step 3: Verify GC history updates**
 
 ```bash
 curl -s http://localhost:8020/api/dashboard/gc | python3 -m json.tool
