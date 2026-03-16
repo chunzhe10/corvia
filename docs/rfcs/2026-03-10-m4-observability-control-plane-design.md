@@ -3,7 +3,7 @@
 **Date:** 2026-03-10
 **Status:** Shipped (v0.4.0)
 **Depends on:** M3 (complete)
-**Supersedes:** `docs/rfcs/scratch/2026-03-04-m4-revised-plan.md` (git commit `55f0a3b`)
+**Supersedes:** `docs/rfcs/2026-03-04-m4-revised-plan.md` (git commit `55f0a3b`)
 
 ---
 
@@ -348,6 +348,6 @@ Critical path: D80 + D82 (parallel) → D84 + D83 + D87/D89 (parallel) → D85 �
 ---
 
 *Created: 2026-03-10*
-*Supersedes: docs/rfcs/scratch/2026-03-04-m4-revised-plan.md (git commit 55f0a3b)*
-*References: docs/rfcs/scratch/2026-03-04-m4-control-plane-research.md (git commit 55f0a3b)*
+*Supersedes: docs/rfcs/2026-03-04-m4-revised-plan.md (git commit 55f0a3b)*
+*References: docs/rfcs/2026-03-04-m4-control-plane-research.md (git commit 55f0a3b)*
 *OSS research: Databend, InfluxDB IOx, Linkerd2-proxy, Vector, TiKV patterns*
