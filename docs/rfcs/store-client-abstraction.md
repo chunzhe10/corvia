@@ -1,6 +1,6 @@
 # StoreClient Trait Abstraction — Future Work
 
-> **Status:** Design decision, not yet scheduled. Beyond M4 scope.
+> **Status:** Proposed (deferred beyond M4)
 > **Date:** 2026-03-08
 
 ## Problem

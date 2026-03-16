@@ -154,3 +154,6 @@ PostgresStore (`crates/corvia-kernel/src/postgres_store.rs`) is behind the `post
 - `crates/corvia-server/src/dashboard/mod.rs` — Dashboard routes and handlers
 - `crates/corvia-server/src/dashboard/clustering.rs` — K-means ClusterStore, shared embedding vocabulary
 - `crates/corvia-server/src/dashboard/activity.rs` — Activity feed with semantic grouping
+- `crates/corvia-inference/src/backend.rs` — GPU backend resolution (CUDA/OpenVINO/CPU)
+- `crates/corvia-cli/src/hooks.rs` — Doc-placement hook generation from DocsConfig
+- `crates/corvia-common/src/config.rs` — DocsConfig, InferenceConfig, content_role/source_origin filters

@@ -1,6 +1,6 @@
 # Adapter Plugin System — Design Document
 
-**Status:** Approved
+**Status:** Shipped (v0.3.0)
 **Date:** 2026-03-03
 **Author:** Lim Chun Zhe + Claude (brainstorming session)
 **Decisions:** D72-D79 (see `docs/local/plans/2026-03-03-adapter-plugin-architecture.md`)

@@ -1,6 +1,6 @@
 # Benchmark Script Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **Status:** Shipped (v0.3.0)
 
 **Goal:** Create `scripts/benchmark.sh` — a self-contained bash script that runs vector-only vs graph-expanded retrieval on Corvia's own codebase and saves raw JSON results.
 

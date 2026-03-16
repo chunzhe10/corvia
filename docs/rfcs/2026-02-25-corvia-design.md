@@ -1,6 +1,6 @@
 # Corvia — Design Document
 
-**Status:** Approved
+**Status:** Shipped (v0.1.0)
 **Date:** 2026-02-25
 **Author:** Lim Chun Zhe + Claude (brainstorming session)
 **Brainstorm log:** `docs/rfcs/2026-02-25-corvia-brainstorm.md`

@@ -1,6 +1,6 @@
 # corvia Brand Guideline — Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **Status:** Shipped (v0.2.0)
 
 **Goal:** Build a polished brand guideline page (HTML + PDF) and update all repos with gold dark-mode logo and refined README copy.
 

@@ -1,6 +1,6 @@
 # gRPC Inference Server Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **Status:** Shipped (v0.3.0)
 
 **Goal:** Build a custom gRPC inference server (`corvia-inference`) that serves embeddings (ONNX Runtime) and chat (candle), replacing Ollama as the LiteStore default.
 

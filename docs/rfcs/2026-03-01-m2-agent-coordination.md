@@ -1,6 +1,6 @@
 # M2: Agent Coordination Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **Status:** Shipped (v0.2.0)
 
 **Goal:** Enable multiple AI agents to concurrently write knowledge through isolated staging, merge into a shared knowledge base, and survive crashes — all exposed via REST and MCP.
 

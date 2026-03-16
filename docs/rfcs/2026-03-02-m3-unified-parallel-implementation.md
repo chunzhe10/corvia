@@ -1,6 +1,6 @@
 # M3.1 + M3.2 + M3.3 Unified Parallel Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **Status:** Shipped (v0.3.0)
 
 **Goal:** Coordinate parallel implementation of three milestones — gRPC Inference Server (M3.1), RAG Pipeline (M3.2), and Embedding & Chunking (M3.3) — with explicit handoff points where one milestone unblocks another.
 

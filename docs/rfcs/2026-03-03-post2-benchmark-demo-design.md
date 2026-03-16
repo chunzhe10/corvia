@@ -1,5 +1,7 @@
 # Post 2 Benchmark Demo Design
 
+> **Status:** Shipped (v0.3.0)
+
 **Date:** 2026-03-03
 **Purpose:** Generate side-by-side terminal output for LinkedIn Post 2: "I ran the same search two ways. The difference surprised me."
 

@@ -1,6 +1,6 @@
 # M1: "Point it at your repo, search your code" — Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **Status:** Shipped (v0.1.0)
 
 **Goal:** Build a working CLI tool that provisions SurrealDB, ingests a Git repo via tree-sitter AST chunking, embeds chunks via Ollama, and returns semantic search results over code.
 

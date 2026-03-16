@@ -1,6 +1,6 @@
 # Dashboard Completion Implementation Plan
 
-> **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Status:** Shipped (v0.4.3)
 
 **Goal:** Complete the remaining 3 dashboard features (#7 Live Session State, #9 OTEL Span Drill-Down, #10 GC Operations Dashboard) with proper OTEL trace context, live session monitoring, and GC operations visibility.
 

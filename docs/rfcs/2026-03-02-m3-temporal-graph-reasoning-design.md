@@ -1,5 +1,7 @@
 # M3 Design: Temporal + Graph + Reasoning
 
+> **Status:** Shipped (v0.3.0)
+
 *"Knowledge that remembers — and reasons"*
 
 **Milestone:** M3 (single milestone, D56)

@@ -1,5 +1,7 @@
 # Dashboard Completion — Features 7, 9, 10
 
+> **Status:** Shipped (v0.4.3)
+
 > Design spec for the three remaining dashboard roadmap features:
 > Live Session State (#7), OTEL Span Drill-Down (#9), GC Operations Dashboard (#10).
 

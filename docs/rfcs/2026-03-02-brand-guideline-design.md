@@ -1,7 +1,7 @@
 # corvia Brand Guideline — Design
 
 **Date:** 2026-03-02
-**Status:** Design
+**Status:** Shipped (v0.2.0)
 **Format:** Single-page HTML + PDF export
 **Location:** `docs/brand/corvia-brand-guide.html` + `docs/brand/corvia-brand-guide.pdf`
 

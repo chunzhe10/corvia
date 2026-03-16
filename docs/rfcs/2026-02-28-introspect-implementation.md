@@ -1,6 +1,6 @@
 # Introspect Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **Status:** Shipped (v0.1.0)
 
 **Goal:** Corvia validates itself by ingesting and querying its own source code — serving as both recursive developer testing (`corvia test`) and interactive new-user demo (`corvia demo`).
 

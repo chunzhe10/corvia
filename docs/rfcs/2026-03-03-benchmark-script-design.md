@@ -1,5 +1,7 @@
 # Benchmark Script Design: Vector vs Graph-Expanded Retrieval
 
+> **Status:** Shipped (v0.3.0)
+
 **Date:** 2026-03-03
 **Purpose:** Bash script to run the Post 2 benchmark — comparing vector-only vs graph-expanded retrieval on Corvia's own codebase using LiteStore + corvia-inference.
 **Output:** Raw JSON files for later PDF carousel generation.

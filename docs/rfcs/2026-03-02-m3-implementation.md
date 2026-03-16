@@ -1,6 +1,6 @@
 # M3: Temporal + Graph + Reasoning — Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **Status:** Shipped (v0.3.0)
 
 **Goal:** Add bi-temporal queries, graph traversal, and algorithmic reasoning to Corvia's kernel — making knowledge time-aware, relationship-aware, and self-analyzing.
 

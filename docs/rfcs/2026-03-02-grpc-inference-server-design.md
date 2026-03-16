@@ -1,7 +1,7 @@
 # D60: gRPC Inference Server Design
 
 **Date:** 2026-03-02
-**Status:** Approved
+**Status:** Shipped (v0.3.0)
 **Depends on:** D35 (Two-tier storage), D40 (Ollama default), D53 (Python SDK)
 
 ## Summary

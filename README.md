@@ -13,12 +13,14 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License: AGPL-3.0"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/built%20with-Rust-dea584.svg" alt="Built with Rust"></a>
-  <a href="Cargo.toml"><img src="https://img.shields.io/badge/version-0.3.6-green.svg" alt="Version 0.3.6"></a>
+  <a href="Cargo.toml"><img src="https://img.shields.io/badge/version-0.4.3-green.svg" alt="Version 0.4.3"></a>
 </p>
 
-> **Pre-release (v0.3.6).** Core kernel, three-tier storage, multi-agent coordination, temporal
+> **Pre-release (v0.4.3).** Core kernel, three-tier storage, multi-agent coordination, temporal
 > queries, knowledge graph, automated reasoning, RAG pipeline, chunking pipeline, adapter
-> plugin system, observability, control plane, and CLI metrics are implemented and tested (433+ tests). API surface may change before 1.0.
+> plugin system, observability, control plane, CLI metrics, standalone dashboard (10 features),
+> GPU-accelerated inference (OpenVINO/CUDA), and docs workflow are implemented and tested
+> (433+ tests). API surface may change before 1.0.
 
 ---
 
@@ -42,7 +44,7 @@ Organizational memory:  why the auth system was redesigned, which decisions led 
 
 ## How it works
 
-1. **Ingest** — tree-sitter parses code into semantic chunks, Ollama generates embeddings locally
+1. **Ingest** — tree-sitter parses code into semantic chunks, corvia-inference generates embeddings locally (ONNX Runtime; Ollama also supported)
 2. **Store** — knowledge files land in `.corvia/knowledge/` as Git-trackable JSON (the database is a cache, these files are truth)
 3. **Connect** — a knowledge graph links related entries with directed, labeled edges
 4. **Query** — semantic search, temporal queries ("what did we know last week?"), graph traversal
@@ -53,7 +55,7 @@ Organizational memory:  why the auth system was redesigned, which decisions led 
 
 | Feature | What it does |
 |---------|-------------|
-| **Semantic search** | Vector similarity over ingested knowledge. Local embeddings via Ollama — no API keys |
+| **Semantic search** | Vector similarity over ingested knowledge. Local embeddings via corvia-inference (ONNX) or Ollama — no API keys |
 | **Knowledge graph** | Directed edges between entries. BFS traversal, shortest path, cycle detection |
 | **Temporal queries** | Bi-temporal model. Point-in-time snapshots, supersession chains, time-range evolution |
 | **Automated reasoning** | 5 deterministic checks + 2 opt-in LLM checks. Same input, same findings, every time |
@@ -63,13 +65,21 @@ Organizational memory:  why the auth system was redesigned, which decisions led 
 | **Observability** | Structured tracing across all kernel subsystems. Configurable exporters (stdout, file, OTLP). CLI metrics via `corvia status --metrics` |
 | **MCP control plane** | 18 MCP tools across 3 safety tiers (read-only, low-risk, medium-risk). Config hot-reload, GC, index rebuild |
 | **Three integration paths** | Rust crate, REST API (`:8020`), or MCP server for Claude and other agent frameworks |
+| **Dashboard** | Standalone web dashboard (`:8021`) with knowledge browser, semantic clustering, activity feed, agent status, and system health |
+| **GPU inference** | OpenVINO for Intel iGPU, CUDA for NVIDIA GPU. Runtime backend switching via config. CPU fallback with automatic detection |
+| **Docs workflow** | Doc placement enforcement (hooks), docs health checks (Aggregator), multi-repo ownership tracking |
 
 ## Quick start
 
 ### Prerequisites
 
 - **Rust 1.88+** (2024 edition)
-- **Ollama** with `nomic-embed-text`:
+- **corvia-inference** (default, recommended):
+  ```bash
+  cargo build -p corvia-inference --release
+  corvia-inference &  # starts gRPC server on :8030
+  ```
+- **Ollama** (alternative):
   ```bash
   # https://ollama.com/download
   ollama pull nomic-embed-text
@@ -196,7 +206,7 @@ Storage:             LiteStore ─── hnsw_rs · petgraph · Redb · Git
 
 ### Design principles
 
-- **Local-first** — zero cost, no API keys. Ollama provides local embeddings
+- **Local-first** — zero cost, no API keys. corvia-inference (ONNX) or Ollama provides local embeddings
 - **Provider-agnostic** — any LLM, any embedding model. All inference goes through traits
 - **Domain-agnostic kernel** — adapters bring domain knowledge. The kernel doesn't assume code
 - **Trait-bounded** — `QueryableStore`, `InferenceEngine`, `TemporalStore`, `GraphStore`, `IngestionAdapter` are all swappable
@@ -213,6 +223,8 @@ For detailed internals, see [ARCHITECTURE.md](ARCHITECTURE.md).
 - [x] **M3.3** — Chunking strategies (AST, Markdown, Config, PDF)
 - [x] **M3.4** — Graph edge improvements + cross-file relation discovery
 - [x] **M4** — Observability + control plane (structured tracing, 18 MCP tools, CLI metrics)
+- [x] **M4.2** — Standalone dashboard (semantic clustering, activity feed, agent identity, knowledge browser)
+- [x] **M4.3** — GPU-accelerated inference (OpenVINO/CUDA), docs workflow enforcement
 - [ ] **M5** — VS Code extension + Python SDK
 - [ ] **M6** — Eval framework (precision@k, MRR, NDCG)
 - [ ] **M7** — 1.0 + PyPI publish

@@ -1,6 +1,6 @@
 # Adapter Plugin System — Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **Status:** Shipped (v0.3.0)
 
 **Goal:** Replace compile-time adapter dependencies with runtime process-based plugins discovered via JSONL over stdin/stdout, enabling adapter ecosystem extensibility.
 
