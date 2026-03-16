@@ -37,6 +37,7 @@ fn verify_ep_available(backend: &BackendKind) -> bool {
                 return true;
             }
             can_dlopen("libonnxruntime_providers_cuda.so")
+                || can_find_library("libonnxruntime_providers_cuda.so")
         }
         BackendKind::OpenVino => {
             // OpenVINO EP is NEVER in GetAvailableProviders() for the cu12 prebuilt.

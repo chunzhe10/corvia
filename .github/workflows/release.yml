@@ -57,6 +57,14 @@ jobs:
           cp target/release/corvia-adapter-git corvia-adapter-git-linux-amd64
           chmod +x corvia-cli-linux-amd64 corvia-inference-linux-amd64 corvia-adapter-basic-linux-amd64 corvia-adapter-git-linux-amd64
 
+          # ORT execution provider shared libraries (cp -L resolves symlinks from ort cache)
+          for lib in libonnxruntime_providers_shared libonnxruntime_providers_cuda libonnxruntime_providers_openvino; do
+            src="target/release/${lib}.so"
+            if [ -e "$src" ]; then
+              cp -L "$src" "${lib}-linux-amd64.so"
+            fi
+          done
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
@@ -65,4 +73,7 @@ jobs:
             corvia-inference-linux-amd64
             corvia-adapter-basic-linux-amd64
             corvia-adapter-git-linux-amd64
+            libonnxruntime_providers_shared-linux-amd64.so
+            libonnxruntime_providers_cuda-linux-amd64.so
+            libonnxruntime_providers_openvino-linux-amd64.so
           generate_release_notes: true
