@@ -214,7 +214,9 @@ impl ModelManager for ModelManagerService {
         req: Request<ReloadModelsRequest>,
     ) -> Result<Response<ReloadModelsResponse>, Status> {
         let req = req.into_inner();
-        tracing::info!(device = %req.device, backend = %req.backend, reprobe = req.reprobe_gpu, "reload_models requested");
+        tracing::info!(device = %req.device, backend = %req.backend,
+            embedding_backend = %req.embedding_backend, reprobe = req.reprobe_gpu,
+            "reload_models requested");
 
         // Optionally re-probe GPU capabilities
         if req.reprobe_gpu {
@@ -263,9 +265,16 @@ impl ModelManager for ModelManagerService {
                 }
             };
 
+            // Use embedding_backend override for embedding models when set.
+            let effective_backend = if model_type == ModelType::Embedding && !req.embedding_backend.is_empty() {
+                &req.embedding_backend
+            } else {
+                &req.backend
+            };
+
             let resolved = {
                 let gpu = self.gpu.read().map_err(|e| Status::internal(format!("GPU lock poisoned: {e}")))?;
-                match backend::resolve_backend(&req.device, &req.backend, model_type, &gpu) {
+                match backend::resolve_backend(&req.device, effective_backend, model_type, &gpu) {
                     Ok(r) => r,
                     Err(e) => {
                         results.push(ModelReloadResult {

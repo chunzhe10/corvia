@@ -1972,6 +1972,7 @@ async fn cmd_inference_reload(
     provisioner.reload_models(
         &config.inference.device,
         &config.inference.backend,
+        &config.inference.embedding_backend,
         &config.inference.kv_quant,
         config.inference.flash_attention,
         model,

@@ -52,6 +52,7 @@ message ReloadModelsRequest {
   string name = 4;               // optional: reload only this model (empty = all)
   string kv_quant = 5;           // "q8", "q4", "none", ""
   bool flash_attention = 6;      // enable flash attention
+  string embedding_backend = 7;  // optional: override backend for embedding models only
 }
 message ReloadModelsResponse {
   bool success = 1;

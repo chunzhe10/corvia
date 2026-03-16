@@ -175,7 +175,7 @@ pub struct InferenceConfig {
     /// Backend override specifically for embedding models: "openvino", "cuda", or "" (use `backend`).
     /// Allows ONNX embedding on Intel iGPU (OpenVINO) while chat runs on NVIDIA (CUDA).
     /// Falls back to `backend` when empty.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub embedding_backend: String,
     /// KV cache quantization: "q8" (default), "q4", "none".
     #[serde(default = "default_kv_quant")]
