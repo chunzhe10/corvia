@@ -270,7 +270,7 @@ pub struct FindingDto {
 // --- Session ingest types ---
 
 /// Response from `POST /v1/ingest/sessions`.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct SessionIngestResponse {
     pub sessions_ingested: usize,
     pub entries_stored: usize,
@@ -284,7 +284,7 @@ pub struct ClassifySessionsRequest {
 }
 
 /// Response from `POST /v1/classify/sessions`.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct ClassifySessionsResponse {
     pub processed: usize,
     pub promoted: usize,
@@ -1073,3 +1073,680 @@ fn parse_duration(s: &str) -> std::result::Result<Duration, String> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::State;
+    use corvia_kernel::agent_coordinator::AgentCoordinator;
+    use corvia_kernel::lite_store::LiteStore;
+    use corvia_kernel::traits::{
+        GenerationEngine, GenerationResult, GraphStore, InferenceEngine, QueryableStore,
+        TemporalStore,
+    };
+
+    struct MockEngine;
+    #[async_trait::async_trait]
+    impl InferenceEngine for MockEngine {
+        async fn embed(&self, _text: &str) -> corvia_common::errors::Result<Vec<f32>> {
+            Ok(vec![1.0, 0.0, 0.0])
+        }
+        async fn embed_batch(
+            &self,
+            texts: &[String],
+        ) -> corvia_common::errors::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect())
+        }
+        fn dimensions(&self) -> usize {
+            3
+        }
+    }
+
+    /// Mock generation engine with configurable response text.
+    struct MockGenerationEngine {
+        response: String,
+    }
+    impl MockGenerationEngine {
+        fn new(response: &str) -> Self {
+            Self {
+                response: response.to_string(),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl GenerationEngine for MockGenerationEngine {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn generate(
+            &self,
+            _system_prompt: &str,
+            _user_message: &str,
+        ) -> corvia_common::errors::Result<GenerationResult> {
+            Ok(GenerationResult {
+                text: self.response.clone(),
+                model: "mock".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+            })
+        }
+        fn context_window(&self) -> usize {
+            4096
+        }
+    }
+
+    async fn test_state(dir: &std::path::Path) -> Arc<AppState> {
+        let store = Arc::new(LiteStore::open(dir, 3).unwrap());
+        store.init_schema().await.unwrap();
+        let engine = Arc::new(MockEngine) as Arc<dyn InferenceEngine>;
+        let gen_engine =
+            Arc::new(MockGenerationEngine::new("merged")) as Arc<dyn GenerationEngine>;
+        let coordinator = Arc::new(
+            AgentCoordinator::new(
+                store.clone() as Arc<dyn QueryableStore>,
+                engine.clone(),
+                dir,
+                corvia_common::config::AgentLifecycleConfig::default(),
+                corvia_common::config::MergeConfig {
+                    similarity_threshold: 2.0,
+                    ..Default::default()
+                },
+                gen_engine,
+            )
+            .unwrap(),
+        );
+        Arc::new(AppState {
+            store: store.clone() as Arc<dyn QueryableStore>,
+            engine,
+            coordinator,
+            graph: store.clone() as Arc<dyn GraphStore>,
+            temporal: store as Arc<dyn TemporalStore>,
+            data_dir: dir.to_path_buf(),
+            rag: None,
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            default_scope_id: None,
+            config: Arc::new(std::sync::RwLock::new(
+                corvia_common::config::CorviaConfig::default(),
+            )),
+            config_path: dir.join("corvia.toml"),
+            cluster_store: Arc::new(crate::dashboard::clustering::ClusterStore::new()),
+            gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
+            session_ingest_lock: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    /// Build a test AppState with a RagPipeline that has a mock generator.
+    async fn test_state_with_generator(
+        dir: &std::path::Path,
+        response: &str,
+    ) -> Arc<AppState> {
+        let store = Arc::new(LiteStore::open(dir, 3).unwrap());
+        store.init_schema().await.unwrap();
+        let engine = Arc::new(MockEngine) as Arc<dyn InferenceEngine>;
+        let gen_engine =
+            Arc::new(MockGenerationEngine::new("merged")) as Arc<dyn GenerationEngine>;
+        let coordinator = Arc::new(
+            AgentCoordinator::new(
+                store.clone() as Arc<dyn QueryableStore>,
+                engine.clone(),
+                dir,
+                corvia_common::config::AgentLifecycleConfig::default(),
+                corvia_common::config::MergeConfig {
+                    similarity_threshold: 2.0,
+                    ..Default::default()
+                },
+                gen_engine,
+            )
+            .unwrap(),
+        );
+
+        // Build a minimal RagPipeline with a mock generator for classify tests
+        let mock_gen =
+            Arc::new(MockGenerationEngine::new(response)) as Arc<dyn GenerationEngine>;
+        let mock_retriever = Arc::new(MockRetriever) as Arc<dyn corvia_kernel::retriever::Retriever>;
+        let mock_augmenter = Arc::new(MockAugmenter) as Arc<dyn corvia_kernel::augmenter::Augmenter>;
+        let rag = corvia_kernel::rag_pipeline::RagPipeline::new(
+            mock_retriever,
+            mock_augmenter,
+            Some(mock_gen),
+            corvia_kernel::rag_types::RagConfig::default(),
+        );
+
+        Arc::new(AppState {
+            store: store.clone() as Arc<dyn QueryableStore>,
+            engine,
+            coordinator,
+            graph: store.clone() as Arc<dyn GraphStore>,
+            temporal: store as Arc<dyn TemporalStore>,
+            data_dir: dir.to_path_buf(),
+            rag: Some(Arc::new(rag)),
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            default_scope_id: None,
+            config: Arc::new(std::sync::RwLock::new(
+                corvia_common::config::CorviaConfig::default(),
+            )),
+            config_path: dir.join("corvia.toml"),
+            cluster_store: Arc::new(crate::dashboard::clustering::ClusterStore::new()),
+            gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
+            session_ingest_lock: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    struct MockRetriever;
+    #[async_trait::async_trait]
+    impl corvia_kernel::retriever::Retriever for MockRetriever {
+        fn name(&self) -> &str { "mock" }
+        async fn retrieve(
+            &self,
+            _query: &str,
+            _scope_id: &str,
+            _opts: &corvia_kernel::rag_types::RetrievalOpts,
+        ) -> corvia_common::errors::Result<corvia_kernel::rag_types::RetrievalResult> {
+            Ok(corvia_kernel::rag_types::RetrievalResult {
+                results: vec![],
+                metrics: corvia_kernel::rag_types::RetrievalMetrics {
+                    latency_ms: 0,
+                    embed_latency_ms: 0,
+                    search_latency_ms: 0,
+                    hnsw_latency_ms: 0,
+                    graph_latency_ms: 0,
+                    filter_latency_ms: 0,
+                    vector_results: 0,
+                    graph_expanded: 0,
+                    graph_reinforced: 0,
+                    post_filter_count: 0,
+                    retriever_name: "mock".into(),
+                },
+                query_embedding: None,
+            })
+        }
+    }
+
+    struct MockAugmenter;
+    impl corvia_kernel::augmenter::Augmenter for MockAugmenter {
+        fn name(&self) -> &str { "mock" }
+        fn augment(
+            &self,
+            _query: &str,
+            _results: &[corvia_common::types::SearchResult],
+            _budget: &corvia_kernel::rag_types::TokenBudget,
+        ) -> corvia_common::errors::Result<corvia_kernel::rag_types::AugmentedContext> {
+            Ok(corvia_kernel::rag_types::AugmentedContext {
+                system_prompt: String::new(),
+                context: String::new(),
+                sources: vec![],
+                metrics: corvia_kernel::rag_types::AugmentationMetrics {
+                    latency_ms: 0,
+                    token_estimate: 0,
+                    token_budget: 0,
+                    sources_included: 0,
+                    sources_truncated: 0,
+                    augmenter_name: "mock".into(),
+                    skills_used: vec![],
+                },
+            })
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Pure function tests: infer_content_role_from_llm
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_infer_llm_decision() {
+        assert_eq!(
+            infer_content_role_from_llm("YES. This is a decision about the API."),
+            Some("decision".into())
+        );
+    }
+
+    #[test]
+    fn test_infer_llm_design() {
+        assert_eq!(
+            infer_content_role_from_llm("YES. This discusses the design of the system."),
+            Some("design".into())
+        );
+    }
+
+    #[test]
+    fn test_infer_llm_finding() {
+        assert_eq!(
+            infer_content_role_from_llm("YES. This is a research finding."),
+            Some("finding".into())
+        );
+    }
+
+    #[test]
+    fn test_infer_llm_learning() {
+        assert_eq!(
+            infer_content_role_from_llm("YES. This captures a learning about Rust."),
+            Some("learning".into())
+        );
+    }
+
+    #[test]
+    fn test_infer_llm_no_match() {
+        assert_eq!(
+            infer_content_role_from_llm("YES. This is important."),
+            None
+        );
+    }
+
+    #[test]
+    fn test_infer_llm_case_insensitive() {
+        assert_eq!(
+            infer_content_role_from_llm("YES. Content type: DECISION"),
+            Some("decision".into())
+        );
+    }
+
+    #[test]
+    fn test_infer_llm_priority_order() {
+        // "decision" checked before "design", so it wins when both present
+        assert_eq!(
+            infer_content_role_from_llm("A decision about the design."),
+            Some("decision".into())
+        );
+    }
+
+    #[test]
+    fn test_infer_llm_no_response() {
+        assert_eq!(infer_content_role_from_llm("NO."), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pure function tests: infer_product_content_role
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_product_role_decision_keyword() {
+        assert_eq!(
+            infer_product_content_role("We decided to use Rust for the kernel"),
+            "decision"
+        );
+    }
+
+    #[test]
+    fn test_product_role_chose() {
+        assert_eq!(
+            infer_product_content_role("We chose LiteStore as the default"),
+            "decision"
+        );
+    }
+
+    #[test]
+    fn test_product_role_design() {
+        assert_eq!(
+            infer_product_content_role("The architecture of the RAG pipeline"),
+            "design"
+        );
+    }
+
+    #[test]
+    fn test_product_role_rfc() {
+        assert_eq!(
+            infer_product_content_role("RFC: Add PostgreSQL support"),
+            "design"
+        );
+    }
+
+    #[test]
+    fn test_product_role_research() {
+        assert_eq!(
+            infer_product_content_role("Research on vector databases"),
+            "finding"
+        );
+    }
+
+    #[test]
+    fn test_product_role_discovered() {
+        assert_eq!(
+            infer_product_content_role("We discovered that HNSW performs better"),
+            "finding"
+        );
+    }
+
+    #[test]
+    fn test_product_role_learned() {
+        assert_eq!(
+            infer_product_content_role("We learned batch embedding is 10x faster"),
+            "learning"
+        );
+    }
+
+    #[test]
+    fn test_product_role_lesson() {
+        assert_eq!(
+            infer_product_content_role("A lesson from the production incident"),
+            "learning"
+        );
+    }
+
+    #[test]
+    fn test_product_role_pattern() {
+        assert_eq!(
+            infer_product_content_role("A useful pattern for error handling"),
+            "learning"
+        );
+    }
+
+    #[test]
+    fn test_product_role_default() {
+        assert_eq!(
+            infer_product_content_role("Some random text without keywords"),
+            "finding"
+        );
+    }
+
+    #[test]
+    fn test_product_role_only_checks_prefix() {
+        // Keywords beyond 300 chars should not be detected
+        let mut content = "x".repeat(301);
+        content.push_str("decision");
+        assert_eq!(infer_product_content_role(&content), "finding");
+    }
+
+    #[test]
+    fn test_product_role_keyword_in_prefix() {
+        // Keyword at char 299 should be detected
+        let mut content = "x".repeat(290);
+        content.push_str("decision");
+        assert_eq!(infer_product_content_role(&content), "decision");
+    }
+
+    // -----------------------------------------------------------------------
+    // Endpoint tests: ingest_sessions
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ingest_sessions_no_sessions_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+
+        // Point HOME to temp dir (no .claude/sessions exists)
+        let orig_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+
+        let result = ingest_sessions(State(state)).await;
+
+        if let Some(h) = orig_home {
+            unsafe { std::env::set_var("HOME", h) };
+        }
+
+        let Json(resp) = result.unwrap();
+        assert_eq!(resp.sessions_ingested, 0);
+        assert_eq!(resp.entries_stored, 0);
+    }
+
+    #[tokio::test]
+    async fn test_ingest_sessions_no_user_history_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+
+        // Create sessions dir so the "no dir" check passes
+        let sessions = dir.path().join(".claude").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        let orig_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+
+        let result = ingest_sessions(State(state)).await;
+
+        if let Some(h) = orig_home {
+            unsafe { std::env::set_var("HOME", h) };
+        }
+
+        // Config has no user-history scope → 400
+        assert!(result.is_err());
+        let (status, msg) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("user-history"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Endpoint tests: classify_sessions
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_classify_sessions_empty_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+
+        // No .classify-queue file → empty queue
+        let orig_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+
+        let result = classify_sessions(
+            State(state),
+            Json(ClassifySessionsRequest::default()),
+        )
+        .await;
+
+        if let Some(h) = orig_home {
+            unsafe { std::env::set_var("HOME", h) };
+        }
+
+        let Json(resp) = result.unwrap();
+        assert_eq!(resp.processed, 0);
+        assert_eq!(resp.promoted, 0);
+        assert_eq!(resp.rejected, 0);
+        assert_eq!(resp.failed, 0);
+        assert_eq!(resp.remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn test_classify_sessions_no_generator() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await; // rag: None
+
+        // Create a non-empty queue so the handler proceeds past the empty check
+        let sessions = dir.path().join(".claude").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join(".classify-queue"), "ses-abc:turn-1\n").unwrap();
+
+        let orig_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+
+        let result = classify_sessions(
+            State(state),
+            Json(ClassifySessionsRequest::default()),
+        )
+        .await;
+
+        if let Some(h) = orig_home {
+            unsafe { std::env::set_var("HOME", h) };
+        }
+
+        assert!(result.is_err());
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_classify_sessions_entry_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_generator(dir.path(), "YES. This is a decision.").await;
+
+        // Create queue referencing an entry that doesn't exist in knowledge files
+        let sessions = dir.path().join(".claude").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join(".classify-queue"),
+            "ses-nonexistent:turn-1\n",
+        )
+        .unwrap();
+
+        let orig_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+
+        let result = classify_sessions(
+            State(state),
+            Json(ClassifySessionsRequest::default()),
+        )
+        .await;
+
+        if let Some(h) = orig_home {
+            unsafe { std::env::set_var("HOME", h) };
+        }
+
+        let Json(resp) = result.unwrap();
+        assert_eq!(resp.processed, 1);
+        assert_eq!(resp.promoted, 0);
+        assert_eq!(resp.rejected, 1); // not found → rejected
+        assert_eq!(resp.failed, 0);
+        assert_eq!(resp.remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn test_classify_sessions_yes_promotes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            test_state_with_generator(dir.path(), "YES. This is a decision about storage.").await;
+
+        // Write a user-history entry to knowledge files
+        let entry = KnowledgeEntry::new(
+            "We decided to use LiteStore as the default backend".into(),
+            "user-history".into(),
+            "ses-abc:turn-1".into(),
+        );
+        corvia_kernel::knowledge_files::write_entry(&state.data_dir, &entry).unwrap();
+
+        // Create queue referencing that entry
+        let sessions = dir.path().join(".claude").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join(".classify-queue"), "ses-abc:turn-1\n").unwrap();
+
+        let orig_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+
+        let result = classify_sessions(
+            State(state),
+            Json(ClassifySessionsRequest::default()),
+        )
+        .await;
+
+        if let Some(h) = orig_home {
+            unsafe { std::env::set_var("HOME", h) };
+        }
+
+        let Json(resp) = result.unwrap();
+        assert_eq!(resp.processed, 1);
+        assert_eq!(resp.promoted, 1);
+        assert_eq!(resp.rejected, 0);
+        assert_eq!(resp.remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn test_classify_sessions_no_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            test_state_with_generator(dir.path(), "NO. This is just a greeting.").await;
+
+        let entry = KnowledgeEntry::new(
+            "Hello, how are you?".into(),
+            "user-history".into(),
+            "ses-abc:turn-1".into(),
+        );
+        corvia_kernel::knowledge_files::write_entry(&state.data_dir, &entry).unwrap();
+
+        let sessions = dir.path().join(".claude").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join(".classify-queue"), "ses-abc:turn-1\n").unwrap();
+
+        let orig_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+
+        let result = classify_sessions(
+            State(state),
+            Json(ClassifySessionsRequest::default()),
+        )
+        .await;
+
+        if let Some(h) = orig_home {
+            unsafe { std::env::set_var("HOME", h) };
+        }
+
+        let Json(resp) = result.unwrap();
+        assert_eq!(resp.processed, 1);
+        assert_eq!(resp.promoted, 0);
+        assert_eq!(resp.rejected, 1);
+        assert_eq!(resp.remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn test_classify_sessions_batch_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            test_state_with_generator(dir.path(), "NO. Not relevant.").await;
+
+        // Write 3 entries, but set batch_size to 2
+        for i in 1..=3 {
+            let entry = KnowledgeEntry::new(
+                format!("Turn {i} content"),
+                "user-history".into(),
+                format!("ses-abc:turn-{i}"),
+            );
+            corvia_kernel::knowledge_files::write_entry(&state.data_dir, &entry).unwrap();
+        }
+
+        let sessions = dir.path().join(".claude").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join(".classify-queue"),
+            "ses-abc:turn-1\nses-abc:turn-2\nses-abc:turn-3\n",
+        )
+        .unwrap();
+
+        let orig_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+
+        let result = classify_sessions(
+            State(state),
+            Json(ClassifySessionsRequest {
+                batch_size: Some(2),
+            }),
+        )
+        .await;
+
+        if let Some(h) = orig_home {
+            unsafe { std::env::set_var("HOME", h) };
+        }
+
+        let Json(resp) = result.unwrap();
+        assert_eq!(resp.processed, 2);
+        assert_eq!(resp.remaining, 1); // 1 left in queue
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper tests: parse_duration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_duration_days() {
+        assert_eq!(parse_duration("7d").unwrap(), Duration::try_days(7).unwrap());
+    }
+
+    #[test]
+    fn test_parse_duration_hours() {
+        assert_eq!(parse_duration("24h").unwrap(), Duration::try_hours(24).unwrap());
+    }
+
+    #[test]
+    fn test_parse_duration_minutes() {
+        assert_eq!(parse_duration("30m").unwrap(), Duration::try_minutes(30).unwrap());
+    }
+
+    #[test]
+    fn test_parse_duration_seconds() {
+        assert_eq!(parse_duration("60s").unwrap(), Duration::try_seconds(60).unwrap());
+    }
+
+    #[test]
+    fn test_parse_duration_invalid_unit() {
+        assert!(parse_duration("10x").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_empty() {
+        assert!(parse_duration("").is_err());
+    }
+}

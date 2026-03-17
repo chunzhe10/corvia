@@ -811,49 +811,46 @@ pub async fn ingest_workspace(
                     if source_files.is_empty() {
                         println!("  No new sessions to ingest.");
                     } else {
-                        let pipeline = corvia_kernel::create_chunking_pipeline(&config);
-                        let (processed, _pipeline_relations, report) =
-                            pipeline.process_batch(&source_files)?;
+                        // Build entries directly from adapter output — each SourceFile
+                        // is one session turn, already chunked by the adapter. Skipping
+                        // the ChunkingPipeline preserves the per-turn source_version
+                        // (e.g. "ses-abc:turn-1") which the pipeline would collapse to
+                        // just the file_path (session ID).
+                        let session_count = {
+                            let mut seen = std::collections::HashSet::new();
+                            source_files.iter().for_each(|sf| { seen.insert(&sf.metadata.file_path); });
+                            seen.len()
+                        };
 
                         println!(
-                            "  {} sessions → {} chunks ({} merged, {} split)",
-                            report.files_processed,
-                            report.total_chunks,
-                            report.chunks_merged,
-                            report.chunks_split
+                            "  {} sessions → {} turn entries",
+                            session_count,
+                            source_files.len()
                         );
 
-                        // Build lookup for adapter-provided SourceMetadata overrides
-                        let session_meta_lookup: std::collections::HashMap<&str, &corvia_kernel::chunking_strategy::SourceMetadata> =
-                            source_files.iter().map(|sf| (sf.metadata.file_path.as_str(), &sf.metadata)).collect();
-
                         let entries: Vec<corvia_common::types::KnowledgeEntry> =
-                            processed
+                            source_files
                                 .iter()
-                                .map(|pc| {
-                                    let src_meta = session_meta_lookup.get(pc.metadata.source_file.as_str());
+                                .map(|sf| {
                                     let mut entry =
                                         corvia_common::types::KnowledgeEntry::new(
-                                            pc.content.clone(),
+                                            sf.content.clone(),
                                             "user-history".to_string(),
-                                            pc.metadata.source_file.clone(),
+                                            sf.metadata.source_version.clone(),
                                         );
-                                    entry.workstream = src_meta
-                                        .and_then(|m| m.workstream.clone())
+                                    entry.workstream = sf.metadata.workstream.clone()
                                         .unwrap_or_default();
                                     entry.metadata =
                                         corvia_common::types::EntryMetadata {
                                             source_file: Some(
-                                                pc.metadata.source_file.clone(),
+                                                sf.metadata.file_path.clone(),
                                             ),
-                                            language: pc.metadata.language.clone(),
-                                            chunk_type: Some(pc.chunk_type.clone()),
-                                            start_line: Some(pc.start_line),
-                                            end_line: Some(pc.end_line),
-                                            content_role: src_meta
-                                                .and_then(|m| m.content_role.clone()),
-                                            source_origin: src_meta
-                                                .and_then(|m| m.source_origin.clone()),
+                                            language: sf.metadata.language.clone(),
+                                            chunk_type: Some("session-turn".into()),
+                                            start_line: None,
+                                            end_line: None,
+                                            content_role: sf.metadata.content_role.clone(),
+                                            source_origin: sf.metadata.source_origin.clone(),
                                         };
                                     entry
                                 })
