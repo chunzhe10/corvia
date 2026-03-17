@@ -262,9 +262,10 @@ mod tests {
     #[test]
     fn test_git_branch_lifecycle() {
         let dir = tempfile::tempdir().unwrap();
-        // Initialize a git repo in the temp dir
+        // Initialize a git repo with a valid initial commit
         std::process::Command::new("git").args(["init"]).current_dir(dir.path()).output().unwrap();
-        std::process::Command::new("git").args(["commit", "--allow-empty", "-m", "init"])
+        std::process::Command::new("git")
+            .args(["-c", "user.name=test", "-c", "user.email=test@test.com", "commit", "--allow-empty", "-m", "init"])
             .current_dir(dir.path()).output().unwrap();
 
         let staging = test_staging_in(dir.path());

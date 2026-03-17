@@ -79,6 +79,12 @@ FILE_PATH=$(echo "$INPUT" | jq -r '.file_path // empty')
 [ -z "$FILE_PATH" ] && exit 0
 case "$FILE_PATH" in *.md|*.mdx|*.rst) ;; *) exit 0 ;; esac
 case "$FILE_PATH" in
+  # Common root-level files — always allowed
+  README.md|CLAUDE.md|AGENTS.md|CHANGELOG.md|CONTRIBUTING.md|LICENSE.md)
+    exit 0 ;;
+  # Agent skills and config — always allowed
+  .agents/*)
+    exit 0 ;;
 {blocked_cases}
   {allow_list})
     exit 0 ;;
