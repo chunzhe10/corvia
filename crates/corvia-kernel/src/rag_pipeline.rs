@@ -49,6 +49,11 @@ impl RagPipeline {
         }
     }
 
+    /// Access the generation engine (if configured).
+    pub fn generator(&self) -> Option<&Arc<dyn GenerationEngine>> {
+        self.generator.as_ref()
+    }
+
     /// Get the name of the active retriever (for config verification / tests).
     pub fn retriever_name(&self) -> &str {
         self.retriever.name()

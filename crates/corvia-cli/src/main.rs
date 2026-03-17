@@ -534,6 +534,7 @@ async fn cmd_serve() -> Result<()> {
         config_path,
         cluster_store: cluster_store.clone(),
         gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
+        session_ingest_lock: tokio::sync::Mutex::new(()),
     });
     // Background cluster recompute every 60s
     {

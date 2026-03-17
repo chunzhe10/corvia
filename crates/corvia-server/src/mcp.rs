@@ -1406,6 +1406,7 @@ mod tests {
             config_path: dir.join("corvia.toml"),
             cluster_store: Arc::new(crate::dashboard::clustering::ClusterStore::new()),
             gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
+            session_ingest_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -1709,6 +1710,7 @@ mod tests {
             config_path: dir.path().join("corvia.toml"),
             cluster_store: Arc::new(crate::dashboard::clustering::ClusterStore::new()),
             gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
+            session_ingest_lock: tokio::sync::Mutex::new(()),
         });
 
         let args = json!({ "query": "rag-routed", "scope_id": "rag-scope", "limit": 5 });

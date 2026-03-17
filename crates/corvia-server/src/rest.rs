@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 pub struct AppState {
     pub store: Arc<dyn QueryableStore>,
@@ -36,6 +36,8 @@ pub struct AppState {
     pub cluster_store: Arc<crate::dashboard::clustering::ClusterStore>,
     /// In-memory ring buffer of recent GC reports.
     pub gc_history: Arc<GcHistory>,
+    /// Serializes session ingest + classify to prevent concurrent state file races.
+    pub session_ingest_lock: tokio::sync::Mutex<()>,
 }
 
 // --- Existing memory types ---
@@ -265,6 +267,33 @@ pub struct FindingDto {
     pub target_ids: Vec<String>,
 }
 
+// --- Session ingest types ---
+
+/// Response from `POST /v1/ingest/sessions`.
+#[derive(Serialize)]
+pub struct SessionIngestResponse {
+    pub sessions_ingested: usize,
+    pub entries_stored: usize,
+}
+
+/// Request body for `POST /v1/classify/sessions`.
+#[derive(Deserialize, Default)]
+pub struct ClassifySessionsRequest {
+    /// Max entries to classify per batch (default 10).
+    pub batch_size: Option<usize>,
+}
+
+/// Response from `POST /v1/classify/sessions`.
+#[derive(Serialize)]
+pub struct ClassifySessionsResponse {
+    pub processed: usize,
+    pub promoted: usize,
+    pub rejected: usize,
+    /// Entries that failed classification (transient errors). Left in queue for retry.
+    pub failed: usize,
+    pub remaining: usize,
+}
+
 // --- Router ---
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -290,6 +319,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         // RAG endpoints
         .route("/v1/context", post(rag_context))
         .route("/v1/ask", post(rag_ask))
+        // Session history endpoints
+        .route("/v1/ingest/sessions", post(ingest_sessions))
+        .route("/v1/classify/sessions", post(classify_sessions))
         .route("/health", get(health))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -675,6 +707,348 @@ async fn reason(
         "findings": items,
         "count": items.len(),
     })))
+}
+
+// --- Session ingest handlers ---
+
+/// Sessions directory path (always ~/.claude/sessions, no user override to prevent path traversal).
+fn sessions_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    std::path::PathBuf::from(home).join(".claude").join("sessions")
+}
+
+/// Ingest Claude Code session history into the `user-history` scope.
+///
+/// Discovers and runs the `corvia-adapter-claude-sessions` adapter via IPC,
+/// then embeds and stores the resulting entries. Serialized via `session_ingest_lock`
+/// to prevent concurrent adapter runs from racing on `.ingested` state.
+async fn ingest_sessions(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<SessionIngestResponse>, (StatusCode, String)> {
+    // Serialize: only one ingest/classify at a time to protect state files
+    let _guard = state.session_ingest_lock.lock().await;
+
+    let sessions_path = sessions_dir();
+    if !sessions_path.is_dir() {
+        return Ok(Json(SessionIngestResponse {
+            sessions_ingested: 0,
+            entries_stored: 0,
+        }));
+    }
+
+    // Read config for adapter search dirs
+    let config = state.config.read()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Config lock poisoned: {e}")))?
+        .clone();
+
+    // Check user-history scope exists
+    let has_scope = config.scope.as_ref()
+        .map_or(false, |scopes| scopes.iter().any(|s| s.id == "user-history"));
+    if !has_scope {
+        return Err((StatusCode::BAD_REQUEST, "No 'user-history' scope in config".into()));
+    }
+
+    // Discover and run the adapter (blocking I/O — must be in spawn_blocking)
+    let extra_dirs: Vec<String> = config.adapters
+        .as_ref()
+        .map(|a| a.search_dirs.clone())
+        .unwrap_or_default();
+    let sessions_dir_str = sessions_path.to_string_lossy().to_string();
+
+    let source_files = tokio::task::spawn_blocking(move || -> Result<Vec<corvia_kernel::chunking_strategy::SourceFile>, String> {
+        let discovered = corvia_kernel::adapter_discovery::discover_adapters(&extra_dirs);
+        let adapter_info = discovered.iter()
+            .find(|a| a.metadata.domain == "claude-sessions")
+            .ok_or_else(|| "claude-sessions adapter not found on PATH".to_string())?;
+
+        let mut process = corvia_kernel::process_adapter::ProcessAdapter::new(
+            adapter_info.binary_path.clone(),
+            adapter_info.metadata.clone(),
+        );
+        process.spawn()?;
+        // ProcessAdapter::Drop calls shutdown() if we bail early, but explicit
+        // shutdown provides better error reporting.
+        let files = match process.ingest(&sessions_dir_str, "user-history") {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = process.shutdown();
+                return Err(e);
+            }
+        };
+        process.shutdown()?;
+        Ok(files)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task join error: {e}")))?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Adapter error: {e}")))?;
+
+    if source_files.is_empty() {
+        return Ok(Json(SessionIngestResponse {
+            sessions_ingested: 0,
+            entries_stored: 0,
+        }));
+    }
+
+    // Count unique sessions (distinct file_path values = session IDs)
+    let session_count = {
+        let mut seen = std::collections::HashSet::new();
+        for sf in &source_files {
+            seen.insert(&sf.metadata.file_path);
+        }
+        seen.len()
+    };
+
+    info!(
+        "Session ingest: {} sessions → {} turn entries",
+        session_count, source_files.len()
+    );
+
+    // Build entries directly from adapter output. Each SourceFile is one turn,
+    // already chunked by the adapter. Skipping the ChunkingPipeline preserves
+    // the per-turn source_version (e.g. "ses-abc:turn-1") which the pipeline
+    // would collapse to just the file_path.
+    let entries: Vec<KnowledgeEntry> = source_files.iter().map(|sf| {
+        let mut entry = KnowledgeEntry::new(
+            sf.content.clone(),
+            "user-history".to_string(),
+            sf.metadata.source_version.clone(),
+        );
+        entry.workstream = sf.metadata.workstream.clone().unwrap_or_default();
+        entry.metadata = corvia_common::types::EntryMetadata {
+            source_file: Some(sf.metadata.file_path.clone()),
+            language: sf.metadata.language.clone(),
+            chunk_type: Some("session-turn".into()),
+            start_line: None,
+            end_line: None,
+            content_role: sf.metadata.content_role.clone(),
+            source_origin: sf.metadata.source_origin.clone(),
+        };
+        entry
+    }).collect();
+
+    // Embed and store in batches
+    let total = entries.len();
+    let mut stored = 0;
+    for batch in entries.chunks(corvia_kernel::introspect::EMBED_BATCH_SIZE) {
+        let texts: Vec<String> = batch.iter().map(|e| e.content.clone()).collect();
+        let embeddings = state.engine.embed_batch(&texts).await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Embedding failed: {e}")))?;
+        for (entry, embedding) in batch.iter().zip(embeddings) {
+            let mut entry = entry.clone();
+            entry.embedding = Some(embedding);
+            state.store.insert(&entry).await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Storage failed: {e}")))?;
+            stored += 1;
+        }
+    }
+
+    info!("Session ingest complete: {stored}/{total} entries stored");
+
+    Ok(Json(SessionIngestResponse {
+        sessions_ingested: session_count,
+        entries_stored: stored,
+    }))
+}
+
+/// Classify queued session entries and promote product-relevant ones to the `corvia` scope.
+///
+/// Reads `.classify-queue`, sends each entry to the GenerationEngine for classification,
+/// and writes promoted entries to the `corvia` scope. Transient LLM failures leave entries
+/// in the queue for retry. Serialized via `session_ingest_lock`.
+async fn classify_sessions(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ClassifySessionsRequest>,
+) -> std::result::Result<Json<ClassifySessionsResponse>, (StatusCode, String)> {
+    // Serialize: only one ingest/classify at a time
+    let _guard = state.session_ingest_lock.lock().await;
+
+    let batch_size = req.batch_size.unwrap_or(10);
+    let queue_path = sessions_dir().join(".classify-queue");
+
+    // Read queue (blocking I/O, but classify-queue is tiny — a few KB at most)
+    let queue_content = tokio::fs::read_to_string(&queue_path).await.unwrap_or_default();
+    let all_entries: Vec<String> = queue_content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(String::from)
+        .collect();
+
+    if all_entries.is_empty() {
+        return Ok(Json(ClassifySessionsResponse {
+            processed: 0,
+            promoted: 0,
+            rejected: 0,
+            failed: 0,
+            remaining: 0,
+        }));
+    }
+
+    // Get generation engine
+    let generator = state.rag.as_ref()
+        .and_then(|rag| rag.generator().cloned())
+        .ok_or_else(|| (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "GenerationEngine not configured — cannot classify sessions".into(),
+        ))?;
+
+    let to_process: Vec<String> = all_entries.iter().take(batch_size).cloned().collect();
+    let mut remaining_entries: Vec<String> = all_entries.iter().skip(batch_size).cloned().collect();
+
+    // Load user-history entries for source_version lookup (blocking I/O in spawn_blocking)
+    let data_dir = state.data_dir.clone();
+    let uh_entries = tokio::task::spawn_blocking(move || {
+        corvia_kernel::knowledge_files::read_scope(&data_dir, "user-history")
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task join error: {e}")))?
+    .map_err(|e| {
+        warn!("Failed to read user-history knowledge files: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("Knowledge file read failed: {e}"))
+    })?;
+
+    let sv_lookup: std::collections::HashMap<&str, &KnowledgeEntry> = uh_entries.iter()
+        .map(|e| (e.source_version.as_str(), e))
+        .collect();
+
+    let mut promoted = 0;
+    let mut rejected = 0;
+    let mut failed = 0;
+
+    for entry_ref in &to_process {
+        // Look up entry by source_version (e.g. "ses-abc:turn-1")
+        let entry = match sv_lookup.get(entry_ref.as_str()) {
+            Some(e) => (*e).clone(),
+            None => {
+                warn!("Entry not found for {entry_ref}, removing from queue");
+                rejected += 1;
+                continue;
+            }
+        };
+
+        // Ask the LLM to classify
+        let system_prompt = "You are a knowledge classification assistant. \
+            Answer YES or NO followed by one sentence of rationale. \
+            If YES, also state the content type: decision, design, finding, or learning.";
+        let user_message = format!(
+            "Does the following conversation turn contain a product decision, \
+            architectural discussion, or research finding relevant to building \
+            the corvia software product?\n\n---\n{}\n---",
+            entry.content
+        );
+
+        let result = match generator.generate(system_prompt, &user_message).await {
+            Ok(r) => r,
+            Err(e) => {
+                // Transient failure: leave in queue for retry
+                warn!("Classification LLM call failed for {entry_ref}: {e}");
+                remaining_entries.push(entry_ref.clone());
+                failed += 1;
+                continue;
+            }
+        };
+
+        let answer = result.text.trim().to_uppercase();
+        if answer.starts_with("YES") {
+            // Infer content_role from the LLM response first, fall back to keyword heuristic
+            let content_role = infer_content_role_from_llm(&result.text)
+                .unwrap_or_else(|| infer_product_content_role(&entry.content));
+
+            // Write a copy to the corvia scope
+            let mut promoted_entry = KnowledgeEntry::new(
+                entry.content.clone(),
+                "corvia".to_string(),
+                entry.source_version.clone(),
+            );
+            promoted_entry.workstream = entry.workstream.clone();
+            promoted_entry.metadata = corvia_common::types::EntryMetadata {
+                source_file: entry.metadata.source_file.clone(),
+                language: None,
+                chunk_type: Some("session-promoted".into()),
+                start_line: None,
+                end_line: None,
+                content_role: Some(content_role),
+                source_origin: Some("claude:promoted".into()),
+            };
+
+            match state.engine.embed(&promoted_entry.content).await {
+                Ok(emb) => {
+                    promoted_entry.embedding = Some(emb);
+                    match state.store.insert(&promoted_entry).await {
+                        Ok(_) => {
+                            info!("Promoted {entry_ref} to corvia scope as {}", promoted_entry.metadata.content_role.as_deref().unwrap_or("?"));
+                            promoted += 1;
+                        }
+                        Err(e) => {
+                            warn!("Failed to store promoted entry {entry_ref}: {e}");
+                            remaining_entries.push(entry_ref.clone());
+                            failed += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to embed promoted entry {entry_ref}: {e}");
+                    remaining_entries.push(entry_ref.clone());
+                    failed += 1;
+                }
+            }
+        } else {
+            rejected += 1;
+        }
+    }
+
+    // Atomically rewrite the queue (write temp + rename, POSIX atomic on same filesystem)
+    let remaining = remaining_entries.len();
+    let tmp_path = queue_path.with_extension("tmp");
+    let new_content = if remaining_entries.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", remaining_entries.join("\n"))
+    };
+    if let Err(e) = tokio::fs::write(&tmp_path, &new_content).await {
+        warn!("Failed to write classify queue temp file: {e}");
+    } else if let Err(e) = tokio::fs::rename(&tmp_path, &queue_path).await {
+        warn!("Failed to rename classify queue temp file: {e}");
+    }
+
+    Ok(Json(ClassifySessionsResponse {
+        processed: to_process.len(),
+        promoted,
+        rejected,
+        failed,
+        remaining,
+    }))
+}
+
+/// Try to extract content_role from the LLM classification response.
+/// The prompt asks the LLM to state "decision", "design", "finding", or "learning".
+fn infer_content_role_from_llm(response: &str) -> Option<String> {
+    let lower = response.to_lowercase();
+    for role in &["decision", "design", "finding", "learning"] {
+        if lower.contains(role) {
+            return Some((*role).to_string());
+        }
+    }
+    None
+}
+
+/// Fallback: infer content_role from turn content via keyword heuristic.
+/// Only used when the LLM response doesn't mention a specific role.
+fn infer_product_content_role(content: &str) -> String {
+    // Only check the first 300 chars (prompt area) to reduce false positives
+    // from tool output that happens to mention these words.
+    let prefix: String = content.chars().take(300).collect();
+    let lower = prefix.to_lowercase();
+    if lower.contains("decision") || lower.contains("decided") || lower.contains("chose") {
+        "decision".into()
+    } else if lower.contains("design") || lower.contains("architecture") || lower.contains("rfc") {
+        "design".into()
+    } else if lower.contains("research") || lower.contains("finding") || lower.contains("discovered") {
+        "finding".into()
+    } else if lower.contains("learned") || lower.contains("lesson") || lower.contains("pattern") {
+        "learning".into()
+    } else {
+        "finding".into()
+    }
 }
 
 // --- Helpers ---
