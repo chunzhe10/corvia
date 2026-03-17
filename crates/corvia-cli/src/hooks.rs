@@ -77,6 +77,8 @@ set -euo pipefail
 INPUT=$(cat)
 FILE_PATH=$(echo "$INPUT" | jq -r '.file_path // empty')
 [ -z "$FILE_PATH" ] && exit 0
+# Strip workspace prefix to get relative path (Claude Code sends absolute paths)
+FILE_PATH="${{FILE_PATH#$PWD/}}"
 case "$FILE_PATH" in *.md|*.mdx|*.rst) ;; *) exit 0 ;; esac
 case "$FILE_PATH" in
   # Common root-level files — always allowed

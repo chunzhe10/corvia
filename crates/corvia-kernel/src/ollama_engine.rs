@@ -41,14 +41,32 @@ impl OllamaEngine {
         }
     }
 
-    /// Check if Ollama is reachable at the configured URL.
-    /// Ollama returns "Ollama is running" at GET /.
+    /// Check if Ollama is reachable and has at least one model available.
+    /// Returns false if Ollama is down or no models are pulled.
     pub async fn check_health(url: &str) -> bool {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()
             .unwrap_or_default();
-        client.get(url).send().await.is_ok()
+        // Check if Ollama is reachable
+        if client.get(url).send().await.is_err() {
+            return false;
+        }
+        // Check if any models are available via /api/tags
+        let tags_url = format!("{}/api/tags", url.trim_end_matches('/'));
+        match client.get(&tags_url).send().await {
+            Ok(resp) => {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    json.get("models")
+                        .and_then(|m| m.as_array())
+                        .map(|arr| !arr.is_empty())
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        }
     }
 }
 
