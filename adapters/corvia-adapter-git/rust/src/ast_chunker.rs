@@ -81,6 +81,9 @@ mod tests {
             language: None,
             scope_id: "test:scope".into(),
             source_version: "v1".into(),
+            workstream: None,
+            content_role: None,
+            source_origin: None,
         }
     }
 

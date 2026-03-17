@@ -97,6 +97,8 @@ pub struct CorviaConfig {
     pub adapters: Option<AdaptersConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sources: Option<Vec<SourceConfig>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<Vec<ScopeConfig>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -425,6 +427,16 @@ pub struct SourceConfig {
     pub adapter_config: Option<toml::Value>,
 }
 
+/// Per-scope configuration (e.g. `[[scope]]` in corvia.toml).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopeConfig {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_days: Option<u32>,
+}
+
 impl Default for CorviaConfig {
     fn default() -> Self {
         Self {
@@ -457,6 +469,7 @@ impl Default for CorviaConfig {
             inference: InferenceConfig::default(),
             adapters: None,
             sources: None,
+            scope: None,
         }
     }
 }

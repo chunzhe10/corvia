@@ -24,6 +24,8 @@ pub struct RetrievalOpts {
     pub content_role: Option<String>,
     /// Filter results by source_origin (post-filter, Option A from spec).
     pub source_origin: Option<String>,
+    /// Filter results by workstream (e.g. git branch name).
+    pub workstream: Option<String>,
 }
 
 impl Default for RetrievalOpts {
@@ -38,6 +40,7 @@ impl Default for RetrievalOpts {
             oversample_factor: 2,
             content_role: None,
             source_origin: None,
+            workstream: None,
         }
     }
 }
@@ -51,6 +54,7 @@ mod tests {
         let opts = RetrievalOpts::default();
         assert!(opts.content_role.is_none());
         assert!(opts.source_origin.is_none());
+        assert!(opts.workstream.is_none());
     }
 }
 
@@ -97,6 +101,21 @@ pub struct RetrievalResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrievalMetrics {
     pub latency_ms: u64,
+    /// Time spent on embedding inference (gRPC → ONNX Runtime).
+    #[serde(default)]
+    pub embed_latency_ms: u64,
+    /// Time spent on HNSW vector search + graph expansion + post-filtering.
+    #[serde(default)]
+    pub search_latency_ms: u64,
+    /// Time spent on HNSW vector search only (subset of search_latency_ms).
+    #[serde(default)]
+    pub hnsw_latency_ms: u64,
+    /// Time spent on graph expansion only (subset of search_latency_ms).
+    #[serde(default)]
+    pub graph_latency_ms: u64,
+    /// Time spent on sort + filter (subset of search_latency_ms).
+    #[serde(default)]
+    pub filter_latency_ms: u64,
     pub vector_results: usize,
     pub graph_expanded: usize,
     #[serde(default)]

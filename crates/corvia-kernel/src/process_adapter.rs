@@ -272,6 +272,9 @@ for line in sys.stdin:
             language: Some("rust".into()),
             scope_id: "test".into(),
             source_version: "v1".into(),
+            workstream: None,
+            content_role: None,
+            source_origin: None,
         };
         let (chunks, relations) = adapter.chunk("fn main() {}", &meta).unwrap();
         assert_eq!(chunks.len(), 1);
@@ -299,6 +302,9 @@ for line in sys.stdin:
             language: None,
             scope_id: "test".into(),
             source_version: "v1".into(),
+            workstream: None,
+            content_role: None,
+            source_origin: None,
         };
         let (chunks, _) = adapter.chunk("test content", &meta).unwrap();
         assert_eq!(chunks.len(), 1);

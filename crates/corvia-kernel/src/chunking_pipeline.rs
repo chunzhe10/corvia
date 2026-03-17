@@ -756,6 +756,9 @@ mod tests {
             language: None,
             scope_id: "test:scope".into(),
             source_version: "v1".into(),
+            workstream: None,
+            content_role: None,
+            source_origin: None,
         }
     }
 
@@ -1067,6 +1070,9 @@ mod tests {
                     language: Some("markdown".into()),
                     scope_id: "test".into(),
                     source_version: "v1".into(),
+                    workstream: None,
+                    content_role: None,
+                    source_origin: None,
                 },
             },
             SourceFile {
@@ -1077,6 +1083,9 @@ mod tests {
                     language: Some("toml".into()),
                     scope_id: "test".into(),
                     source_version: "v1".into(),
+                    workstream: None,
+                    content_role: None,
+                    source_origin: None,
                 },
             },
             SourceFile {
@@ -1087,6 +1096,9 @@ mod tests {
                     language: None,
                     scope_id: "test".into(),
                     source_version: "v1".into(),
+                    workstream: None,
+                    content_role: None,
+                    source_origin: None,
                 },
             },
         ];

@@ -10,6 +10,7 @@ members = [
     "crates/corvia-telemetry",
     "adapters/corvia-adapter-basic/rust",
     "adapters/corvia-adapter-git/rust",
+    "adapters/corvia-adapter-claude-sessions/rust",
 ]
 
 [workspace.package]

@@ -43,6 +43,11 @@ fn check_rbac_scope(
                     results: Vec::new(),
                     metrics: RetrievalMetrics {
                         latency_ms: start.elapsed().as_millis() as u64,
+                        embed_latency_ms: 0,
+                        search_latency_ms: 0,
+                        hnsw_latency_ms: 0,
+                        graph_latency_ms: 0,
+                        filter_latency_ms: 0,
                         vector_results: 0,
                         graph_expanded: 0,
                         graph_reinforced: 0,
@@ -107,12 +112,17 @@ impl Retriever for VectorRetriever {
             return Ok(denied);
         }
 
-        // Embed the query.
+        // Embed the query (timed separately for per-stage metrics).
+        let embed_start = Instant::now();
         let embedding = self.engine.embed(query).await?;
+        let embed_latency_ms = embed_start.elapsed().as_millis() as u64;
+
+        // Vector search + post-filtering (timed separately).
+        let search_start = Instant::now();
 
         // Oversample (min 10) to allow for post-filter elimination.
         // When metadata filters are active, over-fetch by 3x to compensate for post-filter.
-        let search_limit = if opts.content_role.is_some() || opts.source_origin.is_some() {
+        let search_limit = if opts.content_role.is_some() || opts.source_origin.is_some() || opts.workstream.is_some() {
             opts.limit * 3
         } else {
             opts.limit
@@ -132,12 +142,14 @@ impl Retriever for VectorRetriever {
             vis_filtered,
             opts.content_role.as_deref(),
             opts.source_origin.as_deref(),
+            opts.workstream.as_deref(),
         );
 
         // Truncate to requested limit.
         let mut filtered = meta_filtered;
         filtered.truncate(opts.limit);
 
+        let search_latency_ms = search_start.elapsed().as_millis() as u64;
         let post_filter_count = filtered.len();
 
         info!(
@@ -145,6 +157,8 @@ impl Retriever for VectorRetriever {
             scope_id,
             vector_results,
             post_filter_count,
+            embed_latency_ms,
+            search_latency_ms,
             latency_ms = start.elapsed().as_millis() as u64,
             "retrieval complete"
         );
@@ -153,6 +167,11 @@ impl Retriever for VectorRetriever {
             results: filtered,
             metrics: RetrievalMetrics {
                 latency_ms: start.elapsed().as_millis() as u64,
+                embed_latency_ms,
+                search_latency_ms,
+                hnsw_latency_ms: search_latency_ms, // VectorRetriever: all search time is HNSW
+                graph_latency_ms: 0,
+                filter_latency_ms: 0,
                 vector_results,
                 graph_expanded: 0,
                 graph_reinforced: 0,
@@ -250,21 +269,28 @@ impl Retriever for GraphExpandRetriever {
             return Ok(denied);
         }
 
-        // Embed the query.
+        // Embed the query (timed separately for per-stage metrics).
+        let embed_start = Instant::now();
         let embedding = self.engine.embed(query).await?;
+        let embed_latency_ms = embed_start.elapsed().as_millis() as u64;
+
+        // Search + graph expansion + filtering (timed separately).
+        let search_start = Instant::now();
 
         // Oversample (min 10) to allow for post-filter elimination.
         // When metadata filters are active, over-fetch by 3x to compensate for post-filter.
-        let search_limit = if opts.content_role.is_some() || opts.source_origin.is_some() {
+        let search_limit = if opts.content_role.is_some() || opts.source_origin.is_some() || opts.workstream.is_some() {
             opts.limit * 3
         } else {
             opts.limit
         };
         let fetch_limit = (search_limit * opts.oversample_factor).max(10);
+        let hnsw_start = Instant::now();
         let raw_results = self
             .store
             .search(&embedding, scope_id, fetch_limit)
             .await?;
+        let hnsw_latency_ms = hnsw_start.elapsed().as_millis() as u64;
         let vector_results = raw_results.len();
 
         // Track seen IDs and scored (score, SearchResult) pairs.
@@ -278,7 +304,8 @@ impl Retriever for GraphExpandRetriever {
             scored.push((blended, sr.clone()));
         }
 
-        // Graph expansion.
+        // Graph expansion (timed separately).
+        let graph_start = Instant::now();
         let mut graph_expanded: usize = 0;
         let mut graph_reinforced: usize = 0;
         // Track reinforcement count per result for diminishing returns.
@@ -396,6 +423,11 @@ impl Retriever for GraphExpandRetriever {
             }
         }
 
+        let graph_latency_ms = graph_start.elapsed().as_millis() as u64;
+
+        // Sort + filter (timed separately).
+        let filter_start = Instant::now();
+
         // Sort by blended score descending.
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -411,12 +443,15 @@ impl Retriever for GraphExpandRetriever {
             vis_filtered,
             opts.content_role.as_deref(),
             opts.source_origin.as_deref(),
+            opts.workstream.as_deref(),
         );
 
         // Truncate to requested limit.
         let mut filtered = meta_filtered;
         filtered.truncate(opts.limit);
 
+        let filter_latency_ms = filter_start.elapsed().as_millis() as u64;
+        let search_latency_ms = search_start.elapsed().as_millis() as u64;
         let post_filter_count = filtered.len();
 
         info!(
@@ -426,6 +461,11 @@ impl Retriever for GraphExpandRetriever {
             graph_expanded,
             graph_reinforced,
             post_filter_count,
+            embed_latency_ms,
+            hnsw_latency_ms,
+            graph_latency_ms,
+            filter_latency_ms,
+            search_latency_ms,
             latency_ms = start.elapsed().as_millis() as u64,
             "retrieval complete"
         );
@@ -434,6 +474,11 @@ impl Retriever for GraphExpandRetriever {
             results: filtered,
             metrics: RetrievalMetrics {
                 latency_ms: start.elapsed().as_millis() as u64,
+                embed_latency_ms,
+                search_latency_ms,
+                hnsw_latency_ms,
+                graph_latency_ms,
+                filter_latency_ms,
                 vector_results,
                 graph_expanded,
                 graph_reinforced,
@@ -451,8 +496,9 @@ pub fn post_filter_metadata(
     results: Vec<SearchResult>,
     content_role: Option<&str>,
     source_origin: Option<&str>,
+    workstream: Option<&str>,
 ) -> Vec<SearchResult> {
-    if content_role.is_none() && source_origin.is_none() {
+    if content_role.is_none() && source_origin.is_none() && workstream.is_none() {
         return results;
     }
     results.into_iter().filter(|r| {
@@ -463,6 +509,11 @@ pub fn post_filter_metadata(
         }
         if let Some(origin) = source_origin {
             if r.entry.metadata.source_origin.as_deref() != Some(origin) {
+                return false;
+            }
+        }
+        if let Some(ws) = workstream {
+            if r.entry.workstream.as_str() != ws {
                 return false;
             }
         }
@@ -481,6 +532,14 @@ mod filter_tests {
         SearchResult { entry, score }
     }
 
+    fn make_result_with_workstream(content_role: Option<&str>, source_origin: Option<&str>, workstream: &str, score: f32) -> SearchResult {
+        let mut entry = KnowledgeEntry::new("test".into(), "scope".into(), "v1".into());
+        entry.metadata.content_role = content_role.map(String::from);
+        entry.metadata.source_origin = source_origin.map(String::from);
+        entry.workstream = workstream.to_string();
+        SearchResult { entry, score }
+    }
+
     #[test]
     fn test_post_filter_by_content_role() {
         let results = vec![
@@ -488,7 +547,7 @@ mod filter_tests {
             make_result(Some("code"), Some("repo:corvia"), 0.8),
             make_result(Some("design"), Some("workspace"), 0.7),
         ];
-        let filtered = super::post_filter_metadata(results, Some("design"), None);
+        let filtered = super::post_filter_metadata(results, Some("design"), None, None);
         assert_eq!(filtered.len(), 2);
         assert!(filtered.iter().all(|r| r.entry.metadata.content_role.as_deref() == Some("design")));
     }
@@ -500,7 +559,7 @@ mod filter_tests {
             make_result(Some("code"), Some("repo:corvia"), 0.8),
             make_result(Some("design"), Some("workspace"), 0.7),
         ];
-        let filtered = super::post_filter_metadata(results, None, Some("repo:corvia"));
+        let filtered = super::post_filter_metadata(results, None, Some("repo:corvia"), None);
         assert_eq!(filtered.len(), 2);
     }
 
@@ -511,7 +570,7 @@ mod filter_tests {
             make_result(Some("code"), Some("repo:corvia"), 0.8),
             make_result(Some("design"), Some("workspace"), 0.7),
         ];
-        let filtered = super::post_filter_metadata(results, Some("design"), Some("repo:corvia"));
+        let filtered = super::post_filter_metadata(results, Some("design"), Some("repo:corvia"), None);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].entry.metadata.content_role.as_deref(), Some("design"));
         assert_eq!(filtered[0].entry.metadata.source_origin.as_deref(), Some("repo:corvia"));
@@ -523,8 +582,33 @@ mod filter_tests {
             make_result(Some("design"), Some("repo:corvia"), 0.9),
             make_result(None, None, 0.8),
         ];
-        let filtered = super::post_filter_metadata(results, None, None);
+        let filtered = super::post_filter_metadata(results, None, None, None);
         assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn test_post_filter_by_workstream() {
+        let results = vec![
+            make_result_with_workstream(Some("design"), None, "feat/auth", 0.9),
+            make_result_with_workstream(Some("code"), None, "feat/billing", 0.8),
+            make_result_with_workstream(Some("design"), None, "feat/auth", 0.7),
+        ];
+        let filtered = super::post_filter_metadata(results, None, None, Some("feat/auth"));
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|r| r.entry.workstream == "feat/auth"));
+    }
+
+    #[test]
+    fn test_post_filter_workstream_combined_with_role() {
+        let results = vec![
+            make_result_with_workstream(Some("design"), None, "feat/auth", 0.9),
+            make_result_with_workstream(Some("code"), None, "feat/auth", 0.8),
+            make_result_with_workstream(Some("design"), None, "feat/billing", 0.7),
+        ];
+        let filtered = super::post_filter_metadata(results, Some("design"), None, Some("feat/auth"));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].entry.workstream, "feat/auth");
+        assert_eq!(filtered[0].entry.metadata.content_role.as_deref(), Some("design"));
     }
 }
 

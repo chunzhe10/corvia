@@ -123,7 +123,8 @@ fn tool_definitions() -> Vec<Value> {
                     "scope_id": { "type": "string", "description": "Scope to search within (defaults to workspace scope if omitted)" },
                     "limit": { "type": "integer", "description": "Maximum results (default 10)" },
                     "content_role": { "type": "string", "description": "Filter by content role: design, decision, plan, code, memory, finding, instruction, learning" },
-                    "source_origin": { "type": "string", "description": "Filter by source origin: repo:<name>, workspace, memory" }
+                    "source_origin": { "type": "string", "description": "Filter by source origin: repo:<name>, workspace, memory" },
+                    "workstream": { "type": "string", "description": "Filter by workstream (e.g. git branch name)" }
                 },
                 "required": ["query"]
             }
@@ -622,6 +623,7 @@ async fn tool_corvia_search(
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
     let content_role = args.get("content_role").and_then(|v| v.as_str()).map(String::from);
     let source_origin = args.get("source_origin").and_then(|v| v.as_str()).map(String::from);
+    let workstream = args.get("workstream").and_then(|v| v.as_str()).map(String::from);
 
     // Route through RAG pipeline if available (fixes ContextBuilder bypass)
     if let Some(rag) = &state.rag {
@@ -630,6 +632,7 @@ async fn tool_corvia_search(
             expand_graph: false, // search endpoint: pure vector (context/ask use graph)
             content_role: content_role.clone(),
             source_origin: source_origin.clone(),
+            workstream: workstream.clone(),
             ..Default::default()
         };
         let response = rag.context(query, scope_id, Some(opts)).await
@@ -661,7 +664,7 @@ async fn tool_corvia_search(
     let embedding = state.engine.embed(query).await
         .map_err(|e| (INTERNAL_ERROR, format!("Embedding failed: {e}")))?;
 
-    let search_limit = if content_role.is_some() || source_origin.is_some() {
+    let search_limit = if content_role.is_some() || source_origin.is_some() || workstream.is_some() {
         limit * 3
     } else {
         limit
@@ -673,6 +676,7 @@ async fn tool_corvia_search(
         results,
         content_role.as_deref(),
         source_origin.as_deref(),
+        workstream.as_deref(),
     );
     let results: Vec<_> = results.into_iter().take(limit).collect();
 

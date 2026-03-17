@@ -526,27 +526,38 @@ pub async fn ingest_workspace(
             report.chunks_merged, report.chunks_split
         );
 
+        // Build lookup for adapter-provided SourceMetadata overrides
+        let src_meta_lookup: std::collections::HashMap<&str, &corvia_kernel::chunking_strategy::SourceMetadata> =
+            source_files.iter().map(|sf| (sf.metadata.file_path.as_str(), &sf.metadata)).collect();
+
         // Convert ProcessedChunks to KnowledgeEntries, embed, and store
         let entries: Vec<corvia_common::types::KnowledgeEntry> = processed
             .iter()
             .map(|pc| {
+                let src_meta = src_meta_lookup.get(pc.metadata.source_file.as_str());
                 let mut entry = corvia_common::types::KnowledgeEntry::new(
                     pc.content.clone(),
                     config.project.scope_id.clone(),
                     pc.metadata.source_file.clone(),
                 );
-                entry.workstream = repo_config.namespace.clone();
+                entry.workstream = src_meta
+                    .and_then(|m| m.workstream.clone())
+                    .unwrap_or_else(|| repo_config.namespace.clone());
                 entry.metadata = corvia_common::types::EntryMetadata {
                     source_file: Some(pc.metadata.source_file.clone()),
                     language: pc.metadata.language.clone(),
                     chunk_type: Some(pc.chunk_type.clone()),
                     start_line: Some(pc.start_line),
                     end_line: Some(pc.end_line),
-                    content_role: infer_content_role(&pc.metadata.source_file),
-                    source_origin: infer_source_origin(
-                        Some(&repo_config.name),
-                        &pc.metadata.source_file,
-                    ),
+                    content_role: src_meta
+                        .and_then(|m| m.content_role.clone())
+                        .or_else(|| infer_content_role(&pc.metadata.source_file)),
+                    source_origin: src_meta
+                        .and_then(|m| m.source_origin.clone())
+                        .or_else(|| infer_source_origin(
+                            Some(&repo_config.name),
+                            &pc.metadata.source_file,
+                        )),
                 };
                 entry
             })
@@ -663,17 +674,24 @@ pub async fn ingest_workspace(
                                 report.chunks_split
                             );
 
+                            // Build lookup for adapter-provided SourceMetadata overrides
+                            let docs_meta_lookup: std::collections::HashMap<&str, &corvia_kernel::chunking_strategy::SourceMetadata> =
+                                source_files.iter().map(|sf| (sf.metadata.file_path.as_str(), &sf.metadata)).collect();
+
                             let entries: Vec<corvia_common::types::KnowledgeEntry> =
                                 processed
                                     .iter()
                                     .map(|pc| {
+                                        let src_meta = docs_meta_lookup.get(pc.metadata.source_file.as_str());
                                         let mut entry =
                                             corvia_common::types::KnowledgeEntry::new(
                                                 pc.content.clone(),
                                                 config.project.scope_id.clone(),
                                                 pc.metadata.source_file.clone(),
                                             );
-                                        entry.workstream = "docs".to_string();
+                                        entry.workstream = src_meta
+                                            .and_then(|m| m.workstream.clone())
+                                            .unwrap_or_else(|| "docs".to_string());
                                         entry.metadata =
                                             corvia_common::types::EntryMetadata {
                                                 source_file: Some(
@@ -685,13 +703,17 @@ pub async fn ingest_workspace(
                                                 ),
                                                 start_line: Some(pc.start_line),
                                                 end_line: Some(pc.end_line),
-                                                content_role: infer_content_role(
-                                                    &pc.metadata.source_file,
-                                                ),
-                                                source_origin: infer_source_origin(
-                                                    None,
-                                                    &pc.metadata.source_file,
-                                                ),
+                                                content_role: src_meta
+                                                    .and_then(|m| m.content_role.clone())
+                                                    .or_else(|| infer_content_role(
+                                                        &pc.metadata.source_file,
+                                                    )),
+                                                source_origin: src_meta
+                                                    .and_then(|m| m.source_origin.clone())
+                                                    .or_else(|| infer_source_origin(
+                                                        None,
+                                                        &pc.metadata.source_file,
+                                                    )),
                                             };
                                         entry
                                     })

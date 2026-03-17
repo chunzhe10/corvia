@@ -61,6 +61,7 @@ pub struct SearchRequest {
     pub limit: Option<usize>,
     pub content_role: Option<String>,
     pub source_origin: Option<String>,
+    pub workstream: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -344,6 +345,7 @@ async fn search_memories(
     let limit = req.limit.unwrap_or(10);
     let content_role = req.content_role.clone();
     let source_origin = req.source_origin.clone();
+    let workstream = req.workstream.clone();
 
     // Route through RAG pipeline if available (fixes ContextBuilder bypass bug)
     if let Some(rag) = &state.rag {
@@ -352,6 +354,7 @@ async fn search_memories(
             expand_graph: false, // search endpoint: pure vector (context/ask use graph)
             content_role,
             source_origin,
+            workstream,
             ..Default::default()
         };
         let response = rag.context(&req.query, &req.scope_id, Some(opts)).await
@@ -366,7 +369,7 @@ async fn search_memories(
     let query_embedding = state.engine.embed(&req.query).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Embedding failed: {e}")))?;
 
-    let search_limit = if content_role.is_some() || source_origin.is_some() {
+    let search_limit = if content_role.is_some() || source_origin.is_some() || workstream.is_some() {
         limit * 3
     } else {
         limit
@@ -378,6 +381,7 @@ async fn search_memories(
         results,
         content_role.as_deref(),
         source_origin.as_deref(),
+        workstream.as_deref(),
     );
     results.truncate(limit);
 

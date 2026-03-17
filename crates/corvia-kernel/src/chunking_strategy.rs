@@ -26,6 +26,18 @@ pub struct SourceMetadata {
     pub language: Option<String>,
     pub scope_id: String,
     pub source_version: String,
+    /// Optional workstream (e.g. git branch). When set by an adapter,
+    /// propagated to `KnowledgeEntry.workstream` at ingest time.
+    #[serde(default)]
+    pub workstream: Option<String>,
+    /// Optional content role (e.g. "session-turn", "research").
+    /// Overrides path-based inference when set.
+    #[serde(default)]
+    pub content_role: Option<String>,
+    /// Optional source origin (e.g. "claude:main", "claude:subagent").
+    /// Overrides path-based inference when set.
+    #[serde(default)]
+    pub source_origin: Option<String>,
 }
 
 /// A raw chunk produced by a [`ChunkingStrategy`] before pipeline processing.
@@ -205,6 +217,9 @@ mod tests {
             language: Some("rust".into()),
             scope_id: "org:proj:ws:git:v1".into(),
             source_version: "abc123".into(),
+            workstream: None,
+            content_role: None,
+            source_origin: None,
         };
         assert_eq!(meta.file_path, "src/main.rs");
         assert_eq!(meta.extension, "rs");
@@ -301,6 +316,9 @@ mod tests {
             language: None,
             scope_id: "test:scope".into(),
             source_version: "v1".into(),
+            workstream: None,
+            content_role: None,
+            source_origin: None,
         }
     }
 
@@ -349,6 +367,9 @@ mod tests {
                 language: Some("rust".into()),
                 scope_id: "test".into(),
                 source_version: "abc123".into(),
+                workstream: None,
+                content_role: None,
+                source_origin: None,
             },
         };
         let json = serde_json::to_string(&sf).unwrap();

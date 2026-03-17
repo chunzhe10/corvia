@@ -394,6 +394,9 @@ mod tests {
             language: Some("markdown".into()),
             scope_id: "org:proj:ws:git:v1".into(),
             source_version: "abc123".into(),
+            workstream: None,
+            content_role: None,
+            source_origin: None,
         }
     }
 

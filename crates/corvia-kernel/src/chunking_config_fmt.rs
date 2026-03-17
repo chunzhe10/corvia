@@ -282,6 +282,9 @@ mod tests {
             language: Some("toml".into()),
             scope_id: "org:proj:ws:git:v1".into(),
             source_version: "abc123".into(),
+            workstream: None,
+            content_role: None,
+            source_origin: None,
         }
     }
 
@@ -292,6 +295,9 @@ mod tests {
             language: Some("json".into()),
             scope_id: "org:proj:ws:git:v1".into(),
             source_version: "abc123".into(),
+            workstream: None,
+            content_role: None,
+            source_origin: None,
         }
     }
 
@@ -302,6 +308,9 @@ mod tests {
             language: Some("yaml".into()),
             scope_id: "org:proj:ws:git:v1".into(),
             source_version: "abc123".into(),
+            workstream: None,
+            content_role: None,
+            source_origin: None,
         }
     }
 

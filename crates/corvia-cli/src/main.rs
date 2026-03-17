@@ -661,6 +661,9 @@ async fn cmd_ingest(path: Option<&str>, incremental: bool, files: &[String]) -> 
                 language: None,
                 scope_id: scope_id.clone(),
                 source_version: source_version.clone(),
+                workstream: None,
+                content_role: None,
+                source_origin: None,
             };
             let (chunks, pipeline_relations) = pipeline.process(&content, &meta)?;
             println!("    Chunked into {} pieces", chunks.len());
@@ -761,22 +764,33 @@ async fn cmd_ingest(path: Option<&str>, incremental: bool, files: &[String]) -> 
         );
 
         // Step 4: Convert ProcessedChunks to KnowledgeEntries, embed, and store
+        let src_meta_lookup: std::collections::HashMap<&str, &corvia_kernel::chunking_strategy::SourceMetadata> =
+            source_files.iter().map(|sf| (sf.metadata.file_path.as_str(), &sf.metadata)).collect();
+
         let entries: Vec<corvia_common::types::KnowledgeEntry> = processed
             .iter()
             .map(|pc| {
+                let src_meta = src_meta_lookup.get(pc.metadata.source_file.as_str());
                 let mut entry = corvia_common::types::KnowledgeEntry::new(
                     pc.content.clone(),
                     config.project.scope_id.clone(),
                     pc.metadata.source_file.clone(),
                 );
+                if let Some(ws) = src_meta.and_then(|m| m.workstream.clone()) {
+                    entry.workstream = ws;
+                }
                 entry.metadata = corvia_common::types::EntryMetadata {
                     source_file: Some(pc.metadata.source_file.clone()),
                     language: pc.metadata.language.clone(),
                     chunk_type: Some(pc.chunk_type.clone()),
                     start_line: Some(pc.start_line),
                     end_line: Some(pc.end_line),
-                    content_role: workspace::infer_content_role(&pc.metadata.source_file),
-                    source_origin: workspace::infer_source_origin(None, &pc.metadata.source_file),
+                    content_role: src_meta
+                        .and_then(|m| m.content_role.clone())
+                        .or_else(|| workspace::infer_content_role(&pc.metadata.source_file)),
+                    source_origin: src_meta
+                        .and_then(|m| m.source_origin.clone())
+                        .or_else(|| workspace::infer_source_origin(None, &pc.metadata.source_file)),
                 };
                 entry
             })

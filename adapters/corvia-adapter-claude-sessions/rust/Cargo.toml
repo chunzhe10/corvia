@@ -1,0 +1,23 @@
+[package]
+name = "corvia-adapter-claude-sessions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Claude Code session history ingestion adapter for Corvia"
+keywords = ["ai-agents", "ingestion", "adapter", "claude-code", "session-history"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "corvia-adapter-claude-sessions"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+flate2 = "1"
+
+[dev-dependencies]
+tempfile = "3"

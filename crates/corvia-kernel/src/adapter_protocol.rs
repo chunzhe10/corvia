@@ -136,6 +136,9 @@ mod tests {
                 language: Some("rust".into()),
                 scope_id: "test".into(),
                 source_version: "abc123".into(),
+                workstream: None,
+                content_role: None,
+                source_origin: None,
             },
         };
         let json = serde_json::to_string(&req).unwrap();

@@ -785,6 +785,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "corvia-adapter-claude-sessions"
+version = "0.4.3"
+dependencies = [
+ "flate2",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "corvia-adapter-git"
 version = "0.4.3"
 dependencies = [

@@ -122,6 +122,9 @@ impl IngestionAdapter for GitAdapter {
                     language: lang_for_ext(extension),
                     scope_id: scope_id.clone(),
                     source_version: source_version.clone(),
+                    workstream: None,
+                    content_role: None,
+                    source_origin: None,
                 },
             });
         }
