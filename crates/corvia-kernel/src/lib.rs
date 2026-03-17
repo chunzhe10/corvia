@@ -6,13 +6,11 @@
 //!
 //! # Storage Tiers
 //!
-//! Corvia offers three storage tiers behind the same [`QueryableStore`](traits::QueryableStore) trait:
+//! Corvia offers two storage tiers behind the same [`QueryableStore`](traits::QueryableStore) trait:
 //!
 //! - **[`LiteStore`](lite_store::LiteStore)** (default) — zero-Docker, uses hnsw_rs for
 //!   vector search, petgraph for graph traversal, and Redb for metadata. Knowledge is
 //!   persisted as Git-tracked JSON files in `.corvia/knowledge/`.
-//! - **[`SurrealStore`](knowledge_store::SurrealStore)** (opt-in) — SurrealDB-backed store
-//!   with native vector indexes, graph `RELATE`, and bi-temporal queries.
 //! - **`PostgresStore`** (opt-in, `--features postgres`) — PostgreSQL + pgvector store
 //!   with HNSW vector indexes, recursive CTE temporal queries, and relational graph edges.
 //!
@@ -57,7 +55,6 @@
 //! for the full layered design.
 
 pub mod traits;
-pub mod knowledge_store;
 pub mod embedding_pipeline;
 pub mod ollama_engine;
 pub mod ollama_provisioner;
@@ -125,18 +122,6 @@ pub fn create_engine(config: &CorviaConfig) -> Arc<dyn traits::InferenceEngine> 
     }
 }
 
-/// Internal: connect to SurrealDB with config defaults.
-async fn connect_surrealdb(config: &CorviaConfig) -> Result<knowledge_store::SurrealStore> {
-    knowledge_store::SurrealStore::connect(
-        config.storage.surrealdb_url.as_deref().unwrap_or("127.0.0.1:8000"),
-        config.storage.surrealdb_ns.as_deref().unwrap_or("corvia"),
-        config.storage.surrealdb_db.as_deref().unwrap_or("main"),
-        config.storage.surrealdb_user.as_deref().unwrap_or("root"),
-        config.storage.surrealdb_pass.as_deref().unwrap_or("root"),
-        config.embedding.dimensions,
-    ).await
-}
-
 /// Internal: connect to PostgreSQL with config defaults.
 #[cfg(feature = "postgres")]
 async fn connect_postgres(config: &CorviaConfig) -> Result<postgres_store::PostgresStore> {
@@ -151,7 +136,7 @@ async fn connect_postgres(config: &CorviaConfig) -> Result<postgres_store::Postg
 /// Create a store at a specific directory path (for workspace support).
 ///
 /// For LiteStore, opens the store at the given `data_dir` path instead of
-/// reading `config.storage.data_dir`. For SurrealDB, delegates to `create_store`.
+/// reading `config.storage.data_dir`. For PostgresStore, delegates to `create_store`.
 pub async fn create_store_at(
     config: &CorviaConfig,
     data_dir: &std::path::Path,
@@ -160,9 +145,6 @@ pub async fn create_store_at(
         StoreType::Lite => {
             let store = lite_store::LiteStore::open(data_dir, config.embedding.dimensions)?;
             Ok(Box::new(store))
-        }
-        StoreType::Surrealdb => {
-            create_store(config).await
         }
         #[cfg(feature = "postgres")]
         StoreType::Postgres => {
@@ -186,10 +168,6 @@ pub async fn create_store(config: &CorviaConfig) -> Result<Box<dyn traits::Query
                 std::path::Path::new(&config.storage.data_dir),
                 config.embedding.dimensions,
             )?;
-            Ok(Box::new(store))
-        }
-        StoreType::Surrealdb => {
-            let store = connect_surrealdb(config).await?;
             Ok(Box::new(store))
         }
         #[cfg(feature = "postgres")]
@@ -219,10 +197,6 @@ pub async fn create_store_with_graph(
             )?);
             Ok((store.clone() as Arc<dyn traits::QueryableStore>, store as Arc<dyn traits::GraphStore>))
         }
-        StoreType::Surrealdb => {
-            let store = Arc::new(connect_surrealdb(config).await?);
-            Ok((store.clone() as Arc<dyn traits::QueryableStore>, store as Arc<dyn traits::GraphStore>))
-        }
         #[cfg(feature = "postgres")]
         StoreType::Postgres => {
             let store = Arc::new(connect_postgres(config).await?);
@@ -248,14 +222,6 @@ pub async fn create_full_store(
                 std::path::Path::new(&config.storage.data_dir),
                 config.embedding.dimensions,
             )?);
-            Ok((
-                store.clone() as Arc<dyn traits::QueryableStore>,
-                store.clone() as Arc<dyn traits::GraphStore>,
-                store as Arc<dyn traits::TemporalStore>,
-            ))
-        }
-        StoreType::Surrealdb => {
-            let store = Arc::new(connect_surrealdb(config).await?);
             Ok((
                 store.clone() as Arc<dyn traits::QueryableStore>,
                 store.clone() as Arc<dyn traits::GraphStore>,
@@ -375,9 +341,6 @@ pub async fn create_store_at_with_graph(
             let store = Arc::new(lite_store::LiteStore::open(data_dir, config.embedding.dimensions)?);
             Ok((store.clone() as Arc<dyn traits::QueryableStore>, store as Arc<dyn traits::GraphStore>))
         }
-        StoreType::Surrealdb => {
-            create_store_with_graph(config).await
-        }
         StoreType::Postgres => {
             create_store_with_graph(config).await
         }
@@ -399,8 +362,10 @@ mod tests {
 
     #[test]
     fn test_create_engine_vllm() {
-        let config = CorviaConfig::full_default();
-        assert_eq!(config.embedding.provider, InferenceProvider::Vllm);
+        let mut config = CorviaConfig::default();
+        config.embedding.provider = InferenceProvider::Vllm;
+        config.embedding.url = "http://127.0.0.1:8001".into();
+        config.embedding.model = "nomic-ai/nomic-embed-text-v1.5".into();
         let engine = create_engine(&config);
         assert_eq!(engine.dimensions(), 768);
     }

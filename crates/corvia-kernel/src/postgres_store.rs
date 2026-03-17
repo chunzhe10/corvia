@@ -336,8 +336,7 @@ impl crate::traits::TemporalStore for PostgresStore {
         // First walk forward (find entries this one was superseded by),
         // then walk backward (find entries that were superseded to reach this one).
         //
-        // The SurrealStore walks backward only (find predecessors).
-        // We match that behavior: start from entry_id, then walk backward via superseded_by.
+        // Walk backward (find predecessors): start from entry_id, then walk backward via superseded_by.
         let mut chain = Vec::new();
 
         // Start with the given entry
@@ -471,7 +470,7 @@ impl crate::traits::GraphStore for PostgresStore {
         direction: EdgeDirection,
         max_depth: usize,
     ) -> Result<Vec<KnowledgeEntry>> {
-        // App-level BFS matching SurrealStore pattern
+        // App-level BFS traversal
         let mut visited = std::collections::HashSet::new();
         let mut queue = std::collections::VecDeque::new();
         let mut results = Vec::new();

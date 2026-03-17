@@ -7,7 +7,6 @@ use crate::errors::{CorviaError, Result};
 pub enum StoreType {
     #[default]
     Lite,
-    Surrealdb,
     Postgres,
 }
 
@@ -112,11 +111,6 @@ pub struct StorageConfig {
     pub store_type: StoreType,
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
-    pub surrealdb_url: Option<String>,
-    pub surrealdb_ns: Option<String>,
-    pub surrealdb_db: Option<String>,
-    pub surrealdb_user: Option<String>,
-    pub surrealdb_pass: Option<String>,
     pub postgres_url: Option<String>,
 }
 
@@ -441,11 +435,6 @@ impl Default for CorviaConfig {
             storage: StorageConfig {
                 store_type: StoreType::Lite,
                 data_dir: ".corvia".into(),
-                surrealdb_url: None,
-                surrealdb_ns: None,
-                surrealdb_db: None,
-                surrealdb_user: None,
-                surrealdb_pass: None,
                 postgres_url: None,
             },
             embedding: EmbeddingConfig {
@@ -478,40 +467,12 @@ impl CorviaConfig {
         self.workspace.is_some()
     }
 
-    /// Return a config preset for the full SurrealDB + vLLM stack.
-    pub fn full_default() -> Self {
-        Self {
-            storage: StorageConfig {
-                store_type: StoreType::Surrealdb,
-                data_dir: ".corvia".into(),
-                surrealdb_url: Some("127.0.0.1:8000".into()),
-                surrealdb_ns: Some("corvia".into()),
-                surrealdb_db: Some("main".into()),
-                surrealdb_user: Some("root".into()),
-                surrealdb_pass: Some("root".into()),
-                postgres_url: None,
-            },
-            embedding: EmbeddingConfig {
-                provider: InferenceProvider::Vllm,
-                model: "nomic-ai/nomic-embed-text-v1.5".into(),
-                url: "http://127.0.0.1:8001".into(),
-                dimensions: 768,
-            },
-            ..Self::default()
-        }
-    }
-
     /// Return a config preset for PostgreSQL + vLLM.
     pub fn postgres_default() -> Self {
         Self {
             storage: StorageConfig {
                 store_type: StoreType::Postgres,
                 data_dir: ".corvia".into(),
-                surrealdb_url: None,
-                surrealdb_ns: None,
-                surrealdb_db: None,
-                surrealdb_user: None,
-                surrealdb_pass: None,
                 postgres_url: Some("postgres://corvia:corvia@127.0.0.1:5432/corvia".into()),
             },
             embedding: EmbeddingConfig {
@@ -546,17 +507,11 @@ impl CorviaConfig {
     /// Apply environment variable overrides. Checks CORVIA_* vars
     /// and overrides the corresponding config fields if set.
     pub fn with_env_overrides(mut self) -> Self {
-        if let Ok(val) = std::env::var("CORVIA_SURREALDB_URL") {
-            self.storage.surrealdb_url = Some(val);
-        }
         if let Ok(val) = std::env::var("CORVIA_VLLM_URL") {
             self.embedding.url = val;
         }
         if let Ok(val) = std::env::var("CORVIA_OLLAMA_URL") {
             self.embedding.url = val;
-        }
-        if let Ok(val) = std::env::var("CORVIA_TEST_NAMESPACE") {
-            self.storage.surrealdb_ns = Some(val);
         }
         if let Ok(val) = std::env::var("CORVIA_POSTGRES_URL") {
             self.storage.postgres_url = Some(val);
@@ -564,7 +519,6 @@ impl CorviaConfig {
         if let Ok(val) = std::env::var("CORVIA_STORE_TYPE") {
             match val.as_str() {
                 "lite" => self.storage.store_type = StoreType::Lite,
-                "surrealdb" => self.storage.store_type = StoreType::Surrealdb,
                 "postgres" => self.storage.store_type = StoreType::Postgres,
                 _ => {}
             }
@@ -594,16 +548,6 @@ mod tests {
         assert_eq!(config.storage.data_dir, ".corvia");
         assert_eq!(config.embedding.url, "http://127.0.0.1:11434");
         assert_eq!(config.embedding.model, "nomic-embed-text");
-        assert!(config.storage.surrealdb_url.is_none());
-    }
-
-    #[test]
-    fn test_full_config_defaults() {
-        let config = CorviaConfig::full_default();
-        assert_eq!(config.storage.store_type, StoreType::Surrealdb);
-        assert_eq!(config.embedding.provider, InferenceProvider::Vllm);
-        assert_eq!(config.storage.surrealdb_url, Some("127.0.0.1:8000".into()));
-        assert_eq!(config.embedding.url, "http://127.0.0.1:8001");
     }
 
     #[test]
@@ -616,28 +560,11 @@ mod tests {
     }
 
     #[test]
-    fn test_full_config_roundtrip() {
-        let config = CorviaConfig::full_default();
-        config.save(std::path::Path::new("/tmp/corvia-test-full.toml")).unwrap();
-        let loaded = CorviaConfig::load(std::path::Path::new("/tmp/corvia-test-full.toml")).unwrap();
-        assert_eq!(loaded.storage.store_type, StoreType::Surrealdb);
-        assert_eq!(loaded.storage.surrealdb_url, Some("127.0.0.1:8000".into()));
-    }
-
-    #[test]
     fn test_store_type_serde() {
         let json = serde_json::to_string(&StoreType::Lite).unwrap();
         assert_eq!(json, "\"lite\"");
-        let parsed: StoreType = serde_json::from_str("\"surrealdb\"").unwrap();
-        assert_eq!(parsed, StoreType::Surrealdb);
-    }
-
-    #[test]
-    fn test_env_override_surrealdb_url() {
-        unsafe { std::env::set_var("CORVIA_SURREALDB_URL", "ws://ci-host:9000"); }
-        let config = CorviaConfig::default().with_env_overrides();
-        assert_eq!(config.storage.surrealdb_url, Some("ws://ci-host:9000".into()));
-        unsafe { std::env::remove_var("CORVIA_SURREALDB_URL"); }
+        let parsed: StoreType = serde_json::from_str("\"postgres\"").unwrap();
+        assert_eq!(parsed, StoreType::Postgres);
     }
 
     #[test]
@@ -651,14 +578,11 @@ mod tests {
     #[test]
     fn test_no_env_override_preserves_defaults() {
         unsafe {
-            std::env::remove_var("CORVIA_SURREALDB_URL");
             std::env::remove_var("CORVIA_VLLM_URL");
             std::env::remove_var("CORVIA_OLLAMA_URL");
-            std::env::remove_var("CORVIA_TEST_NAMESPACE");
             std::env::remove_var("CORVIA_STORE_TYPE");
         }
         let config = CorviaConfig::default().with_env_overrides();
-        assert!(config.storage.surrealdb_url.is_none());
         assert_eq!(config.embedding.url, "http://127.0.0.1:11434");
     }
 

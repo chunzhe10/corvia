@@ -8,10 +8,6 @@ use serde_json;
 use std::collections::HashMap;
 use tracing::info;
 
-const CONTAINER_NAME: &str = "corvia-surrealdb";
-const SURREALDB_IMAGE: &str = "surrealdb/surrealdb:v3";
-const SURREALDB_PORT: u16 = 8000;
-
 const VLLM_CONTAINER_NAME: &str = "corvia-vllm";
 const VLLM_IMAGE: &str = "vllm/vllm-openai:latest";
 const VLLM_PORT: u16 = 8001;
@@ -29,102 +25,6 @@ impl DockerProvisioner {
         let docker = Docker::connect_with_local_defaults()
             .map_err(|e| CorviaError::Docker(format!("Failed to connect to Docker: {e}")))?;
         Ok(Self { docker })
-    }
-
-    /// Check if SurrealDB container is already running.
-    pub async fn is_running(&self) -> Result<bool> {
-        let filters: HashMap<String, Vec<String>> = HashMap::from([
-            ("name".into(), vec![CONTAINER_NAME.into()]),
-        ]);
-        let options = ListContainersOptions {
-            filters,
-            ..Default::default()
-        };
-        let containers = self.docker.list_containers(Some(options)).await
-            .map_err(|e| CorviaError::Docker(format!("SurrealDB: Failed to list containers: {e}")))?;
-        Ok(!containers.is_empty())
-    }
-
-    /// Pull the SurrealDB image if not present.
-    pub async fn pull_image(&self) -> Result<()> {
-        info!("Pulling SurrealDB image: {SURREALDB_IMAGE}");
-        let options = CreateImageOptions {
-            from_image: SURREALDB_IMAGE,
-            ..Default::default()
-        };
-        self.docker.create_image(Some(options), None, None)
-            .try_collect::<Vec<_>>().await
-            .map_err(|e| CorviaError::Docker(format!("SurrealDB: Failed to pull image: {e}")))?;
-        info!("SurrealDB image pulled successfully");
-        Ok(())
-    }
-
-    /// Start SurrealDB container. Pulls image if needed.
-    pub async fn start(&self, user: &str, pass: &str) -> Result<()> {
-        if self.is_running().await? {
-            info!("SurrealDB container already running");
-            return Ok(());
-        }
-
-        // Pull image (idempotent)
-        self.pull_image().await?;
-
-        let port_str = format!("{SURREALDB_PORT}/tcp");
-        let host_config = HostConfig {
-            port_bindings: Some(HashMap::from([(
-                port_str.clone(),
-                Some(vec![PortBinding {
-                    host_ip: Some("0.0.0.0".into()),
-                    host_port: Some(SURREALDB_PORT.to_string()),
-                }]),
-            )])),
-            ..Default::default()
-        };
-
-        let config: Config<String> = Config {
-            image: Some(SURREALDB_IMAGE.to_string()),
-            cmd: Some(vec![
-                "start".into(),
-                "--log=info".into(),
-                format!("--user={user}"),
-                format!("--pass={pass}"),
-            ]),
-            exposed_ports: Some(HashMap::from([(port_str, HashMap::new())])),
-            host_config: Some(host_config),
-            ..Default::default()
-        };
-
-        let options = CreateContainerOptions {
-            name: CONTAINER_NAME.to_string(),
-            ..Default::default()
-        };
-
-        // Remove existing stopped container if present
-        let _ = self.docker.remove_container(CONTAINER_NAME, None::<bollard::container::RemoveContainerOptions>).await;
-
-        info!("Creating SurrealDB container: {CONTAINER_NAME}");
-        self.docker.create_container(Some(options), config).await
-            .map_err(|e| CorviaError::Docker(format!("SurrealDB: Failed to create container: {e}")))?;
-
-        self.docker.start_container(CONTAINER_NAME, None::<StartContainerOptions<String>>).await
-            .map_err(|e| CorviaError::Docker(format!("SurrealDB: Failed to start container: {e}")))?;
-
-        info!("SurrealDB started on port {SURREALDB_PORT}");
-
-        // Wait for SurrealDB to be ready
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-        Ok(())
-    }
-
-    /// Stop and remove the SurrealDB container.
-    pub async fn stop(&self) -> Result<()> {
-        info!("Stopping SurrealDB container");
-        self.docker.stop_container(CONTAINER_NAME, None::<bollard::container::StopContainerOptions>).await
-            .map_err(|e| CorviaError::Docker(format!("SurrealDB: Failed to stop container: {e}")))?;
-        self.docker.remove_container(CONTAINER_NAME, None::<bollard::container::RemoveContainerOptions>).await
-            .map_err(|e| CorviaError::Docker(format!("SurrealDB: Failed to remove container: {e}")))?;
-        Ok(())
     }
 
     /// Check if vLLM container is already running.

@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+
+- **SurrealDB storage backend**: Removed `SurrealStore`, the `surrealdb` dependency (893
+  transitive deps), and all related config fields, CLI commands, Docker provisioning, tests,
+  and documentation. Storage is now a clean two-tier model: LiteStore (default, zero deps) +
+  PostgresStore (opt-in, `--features postgres`). Migration path: `corvia migrate --to lite`
+  or `corvia migrate --to postgres` before upgrading.
+
 ## [0.4.3] - 2026-03-14
 
 ### Added

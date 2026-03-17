@@ -34,7 +34,6 @@ independent of any specific frontend, adapter, or integration surface.
 ├─────────────────────────────────────────────────────────────────────┤
 │  Storage                                                            │
 │  LiteStore ─── hnsw_rs · petgraph · Redb · Git (JSON files)       │
-│  FullStore ─── SurrealDB · Redb · Git (JSON files)                │
 │  PostgresStore ─── pgvector · PostgreSQL                           │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -51,7 +50,7 @@ independent of any specific frontend, adapter, or integration surface.
 | Crate | Path | Role |
 |-------|------|------|
 | `corvia-common` | `crates/corvia-common` | Shared types (`KnowledgeEntry`, `GraphEdge`, `EntryMetadata`), configuration (`CorviaConfig`), error types, namespace parsing, event types, agent identity types |
-| `corvia-kernel` | `crates/corvia-kernel` | All kernel subsystems: both storage implementations (LiteStore, SurrealStore), embedding engines, agent coordination, graph store, temporal queries, reasoning, merge worker, context builder |
+| `corvia-kernel` | `crates/corvia-kernel` | All kernel subsystems: both storage implementations (LiteStore, PostgresStore), embedding engines, agent coordination, graph store, temporal queries, reasoning, merge worker, context builder |
 | `corvia-server` | `crates/corvia-server` | Axum-based HTTP server exposing REST endpoints under `/v1/` and the MCP JSON-RPC 2.0 endpoint at `/mcp`. Thin orchestration layer that wires kernel types together and handles request/response translation |
 | `corvia` (CLI) | `crates/corvia-cli` | Binary crate. CLI commands (`init`, `ingest`, `search`, `serve`, `reason`, etc.) and workspace management. Orchestrates kernel + server |
 | `corvia-inference` | `crates/corvia-inference` | gRPC inference server with ONNX Runtime for local embeddings |
@@ -68,7 +67,7 @@ The kernel contains eleven subsystems, each in its own module within `corvia-ker
 
 | Subsystem | Module | Description |
 |-----------|--------|-------------|
-| **Knowledge Store** | `knowledge_store.rs`, `lite_store.rs`, `postgres_store.rs` | Read/write knowledge entries with vector search. Three implementations: `LiteStore` (hnsw_rs + Redb, embedded), `SurrealStore` (SurrealDB, HTTP), and `PostgresStore` (pgvector). All implement `QueryableStore` |
+| **Knowledge Store** | `lite_store.rs`, `postgres_store.rs` | Read/write knowledge entries with vector search. Two implementations: `LiteStore` (hnsw_rs + Redb, embedded) and `PostgresStore` (pgvector). Both implement `QueryableStore` |
 | **Agent Coordinator** | `agent_coordinator.rs`, `agent_registry.rs`, `session_manager.rs`, `staging.rs`, `agent_writer.rs` | Multi-agent lifecycle management. Agent registration with multi-layer identity (three tiers: Registered, MCP Client, Anonymous — chosen over single-tier to support both long-lived agents and one-shot queries without forcing registration). Session state machine (Created → Active → Committing → Merging → Closed), staging isolation, crash recovery (resume/commit/rollback), garbage collection |
 | **Embedding Pipeline** | `embedding_pipeline.rs`, `ollama_engine.rs`, `grpc_engine.rs`, `ollama_provisioner.rs` | Provider-agnostic embedding generation. `OllamaEngine` for Ollama (HTTP), `GrpcEngine` for the corvia-inference gRPC server. Both implement `InferenceEngine` |
 | **RAG Pipeline** | `rag_pipeline.rs`, `retriever.rs`, `augmenter.rs`, `rag_types.rs` | Retrieval-augmented generation: Retriever → Augmenter → GenerationEngine. Graph-expanded retrieval with configurable oversample and scoring |
@@ -100,12 +99,11 @@ Created ──► Active ──► Committing ──► Merging ──► Closed
 
 ## Storage Tiers
 
-corvia has three storage backends that implement the same kernel traits. The **three-tier storage**
-design exists because requiring Docker for a dev tool kills adoption — but SurrealDB's unified
-vector+graph+temporal queries are genuinely valuable at scale, and PostgreSQL is the standard
-in production environments. All three tiers implement the same traits: LiteStore is the full
-product with zero external dependencies, while SurrealStore and PostgresStore are opt-in
-upgrades for users who need specific capabilities.
+corvia has two storage backends that implement the same kernel traits. The **two-tier storage**
+design exists because requiring Docker for a dev tool kills adoption — but PostgreSQL is the
+standard in production environments. Both tiers implement the same traits: LiteStore is the full
+product with zero external dependencies, while PostgresStore is an opt-in upgrade for users
+who need production-grade PostgreSQL capabilities.
 
 ### LiteStore (default, zero Docker)
 
@@ -117,18 +115,9 @@ upgrades for users who need specific capabilities.
 | Persistence | Git-tracked JSON files | `.corvia/knowledge/{scope}/{uuid}.json` — source of truth. `corvia rebuild` reconstructs all indexes from these files |
 | Embeddings | Ollama (HTTP, local) | `nomic-embed-text` model (768 dimensions). Auto-provisioned on first use |
 
-### FullStore (SurrealDB + vLLM)
-
-| Component | Service | Purpose |
-|-----------|---------|---------|
-| Vector search + graph + temporal | SurrealDB | Unified queryable store. Vectors via native vector search, graphs via edge records in an `edges` table, temporal via SurrealQL time-range queries |
-| Coordination | `Redb` (embedded) | Same as LiteStore — agent sessions and merge queue are always local |
-| Persistence | Git-tracked JSON files | Same as LiteStore — Git is always the source of truth |
-| Embeddings | vLLM (HTTP, GPU) | GPU-accelerated embedding generation for higher throughput |
-
 **Both tiers share:** Git-trackable JSON knowledge files as the rebuildable source of truth, Redb for coordination, and the same kernel traits
 (`QueryableStore`, `TemporalStore`, `GraphStore`). Switching tiers is a configuration change
-(`corvia init --store lite|surrealdb|postgres`), not a code change.
+(`corvia init --store lite|postgres`), not a code change.
 
 ## Core Traits
 
@@ -154,7 +143,7 @@ pub trait QueryableStore: Send + Sync {
 
 The `as_any()` method enables downcasting for store-specific operations (e.g., `LiteStore::rebuild_from_files`).
 
-**Implementations:** `LiteStore`, `SurrealStore`, `PostgresStore`.
+**Implementations:** `LiteStore`, `PostgresStore`.
 
 ### `InferenceEngine`
 
@@ -202,15 +191,14 @@ pub trait TemporalStore: Send + Sync {
 }
 ```
 
-**Implementations:** `LiteStore` (Redb compound-key range scans, O(log n)),
-`SurrealStore` (SurrealQL time-range queries).
+**Implementations:** `LiteStore` (Redb compound-key range scans, O(log n)).
 
 ### `GraphStore`
 
-Directed knowledge graph interface. petgraph was chosen over requiring SurrealDB for graph
-queries so that LiteStore gets full traversal capabilities (BFS, shortest path, cycle detection)
-without any external service. Supports edge creation, edge queries by direction, BFS traversal
-with optional relation filtering, and shortest path computation.
+Directed knowledge graph interface. petgraph was chosen so that LiteStore gets full traversal
+capabilities (BFS, shortest path, cycle detection) without any external service. Supports edge
+creation, edge queries by direction, BFS traversal with optional relation filtering, and
+shortest path computation.
 
 ```rust
 pub trait GraphStore: Send + Sync {
@@ -222,8 +210,7 @@ pub trait GraphStore: Send + Sync {
 }
 ```
 
-**Implementations:** `LiteGraphStore` (petgraph DiGraph + Redb persistence),
-`SurrealStore` (SurrealDB edge table + graph queries).
+**Implementations:** `LiteGraphStore` (petgraph DiGraph + Redb persistence).
 
 ## API Surface
 
@@ -319,10 +306,10 @@ available at [`docs/rfcs/`](docs/rfcs/).
 | Decision | Alternative rejected | Why this choice wins |
 |----------|---------------------|---------------------|
 | **AGPL-3.0-only license** | MIT/Apache-2.0 | SaaS protection — prevents cloud providers from offering corvia-as-a-service without contributing back. Dual-license path preserves commercial option (Grafana/MinIO playbook) |
-| **SurrealDB behind `QueryableStore` trait** | Hardcode SurrealDB directly | Trait boundary enabled building LiteStore (zero-Docker) without touching kernel code. Storage became a compile-time choice, not a runtime dependency |
+| **Trait-bounded storage** | Hardcode storage directly | Trait boundary enabled building LiteStore (zero-Docker) and PostgresStore without touching kernel code. Storage became a compile-time choice, not a runtime dependency |
 | **LLM-assisted merge** | Last-write-wins / manual merge | Knowledge conflicts are semantic, not textual — an LLM can reason about which version of "how auth works" is more accurate. Last-write-wins silently loses knowledge |
-| **Three-tier storage (LiteStore + SurrealStore + PostgresStore)** | Single backend | Requiring Docker for a dev tool kills adoption. LiteStore is the full product at zero cost; SurrealStore and PostgresStore are opt-in upgrades |
-| **petgraph + Redb for graph** | SurrealDB graph queries only | LiteStore needed full traversal (BFS, shortest path, cycles) without any external service. petgraph handles computation in-memory, Redb handles persistence |
+| **Two-tier storage (LiteStore + PostgresStore)** | Single backend | Requiring Docker for a dev tool kills adoption. LiteStore is the full product at zero cost; PostgresStore is an opt-in upgrade for production environments |
+| **petgraph + Redb for graph** | External graph database | LiteStore needed full traversal (BFS, shortest path, cycles) without any external service. petgraph handles computation in-memory, Redb handles persistence |
 | **Redb compound-key range scans for temporal** | Dedicated time-series DB | Redb is already embedded for coordination. Compound keys `(scope, valid_from, entry_id)` give O(log n) temporal lookups without adding another dependency |
 | **Git-trackable JSON knowledge files** | Database-only storage | Storing knowledge as JSON files designed for Git gives auditability and diffability. `corvia rebuild` reconstructs all indexes from JSON files alone — the database is a cache, the files are truth |
 | **Staging hybrid (branches + shared HNSW)** | Full git branch isolation | Pure branch isolation prevents cross-agent search during staging. Shared HNSW lets agents see each other's work-in-progress while writes stay isolated until commit |

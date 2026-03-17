@@ -40,7 +40,6 @@ pub fn target_to_module(target: &str) -> &'static str {
         ("agent_coordinator", "agent"),
         ("merge_worker", "merge"),
         ("lite_store", "storage"),
-        ("knowledge_store", "storage"),
         ("postgres_store", "storage"),
         ("rag_pipeline", "rag"),
         ("graph_store", "storage"),
@@ -543,7 +542,6 @@ mod tests {
         assert_eq!(target_to_module("corvia_kernel::agent_coordinator"), "agent");
         assert_eq!(target_to_module("corvia_kernel::merge_worker"), "merge");
         assert_eq!(target_to_module("corvia_kernel::lite_store::write"), "storage");
-        assert_eq!(target_to_module("corvia_kernel::knowledge_store"), "storage");
         assert_eq!(target_to_module("corvia_kernel::rag_pipeline"), "rag");
         assert_eq!(target_to_module("corvia_kernel::graph_store"), "storage");
         assert_eq!(target_to_module("corvia_inference::embedding_service"), "inference");

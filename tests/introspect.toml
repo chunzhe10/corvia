@@ -15,7 +15,7 @@ min_score = 0.70
 
 [[query]]
 text = "how is knowledge stored in the database?"
-expect_file = "crates/corvia-kernel/src/knowledge_store.rs"
+expect_file = "crates/corvia-kernel/src/lite_store.rs"
 min_score = 0.70
 
 [[query]]

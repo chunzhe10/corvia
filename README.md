@@ -16,11 +16,11 @@
   <a href="Cargo.toml"><img src="https://img.shields.io/badge/version-0.4.3-green.svg" alt="Version 0.4.3"></a>
 </p>
 
-> **Pre-release (v0.4.3).** Core kernel, three-tier storage, multi-agent coordination, temporal
-> queries, knowledge graph, automated reasoning, RAG pipeline, chunking pipeline, adapter
-> plugin system, observability, control plane, CLI metrics, standalone dashboard (10 features),
-> GPU-accelerated inference (OpenVINO/CUDA), and docs workflow are implemented and tested
-> (433+ tests). API surface may change before 1.0.
+> **Pre-release (v0.4.3).** Core kernel, two-tier storage (LiteStore + PostgresStore),
+> multi-agent coordination, temporal queries, knowledge graph, automated reasoning, RAG
+> pipeline, chunking pipeline, adapter plugin system, observability, control plane, CLI
+> metrics, standalone dashboard (10 features), GPU-accelerated inference (OpenVINO/CUDA),
+> and docs workflow are implemented and tested (433+ tests). API surface may change before 1.0.
 
 ---
 
@@ -60,7 +60,7 @@ Organizational memory:  why the auth system was redesigned, which decisions led 
 | **Temporal queries** | Bi-temporal model. Point-in-time snapshots, supersession chains, time-range evolution |
 | **Automated reasoning** | 5 deterministic checks + 2 opt-in LLM checks. Same input, same findings, every time |
 | **Multi-agent coordination** | Session isolation, staging, crash recovery, LLM-assisted merge. No last-write-wins |
-| **Three-tier storage** | LiteStore (zero Docker, embedded) is the full product. SurrealDB and PostgreSQL are opt-in upgrades |
+| **Two-tier storage** | LiteStore (zero Docker, embedded) is the full product. PostgreSQL is an opt-in upgrade |
 | **Git as truth** | All knowledge stored as JSON in `.corvia/knowledge/`. `corvia rebuild` reconstructs everything from files alone |
 | **Observability** | Structured tracing across all kernel subsystems. Configurable exporters (stdout, file, OTLP). CLI metrics via `corvia status --metrics` |
 | **MCP control plane** | 18 MCP tools across 3 safety tiers (read-only, low-risk, medium-risk). Config hot-reload, GC, index rebuild |
@@ -186,7 +186,6 @@ Kernel:              Knowledge Store  ·  Agent Coordinator  ·  RAG Pipeline
 Telemetry:           corvia-telemetry (structured tracing, span contracts)
                             │
 Storage:             LiteStore ─── hnsw_rs · petgraph · Redb · Git
-                     FullStore ─── SurrealDB · Redb · Git
                      PostgresStore ─── pgvector · PostgreSQL
 ```
 

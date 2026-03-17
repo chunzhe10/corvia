@@ -56,7 +56,7 @@ impl IntrospectConfig {
                 },
                 CanonicalQuery {
                     text: "how is knowledge stored in the database?".into(),
-                    expect_file: "crates/corvia-kernel/src/knowledge_store.rs".into(),
+                    expect_file: "crates/corvia-kernel/src/lite_store.rs".into(),
                     min_score: None,
                 },
                 CanonicalQuery {
@@ -145,19 +145,6 @@ impl Introspect {
             IntrospectConfig::default_queries()
         };
         Self::new(config)
-    }
-
-    /// Phase 1: Check environment for FullStore (SurrealDB + vLLM).
-    pub async fn check_env(
-        &self,
-        docker: &crate::docker::DockerProvisioner,
-    ) -> Vec<(&'static str, bool)> {
-        let surrealdb = docker.is_running().await.unwrap_or(false);
-        let vllm = docker.is_vllm_running().await.unwrap_or(false);
-        vec![
-            ("SurrealDB", surrealdb),
-            ("vLLM", vllm),
-        ]
     }
 
     /// Phase 1: Check environment for LiteStore (Ollama).

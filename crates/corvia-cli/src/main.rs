@@ -8,7 +8,7 @@
 //!
 //! | Command | Purpose |
 //! |---------|---------|
-//! | `init` | Initialize a new Corvia store (`--store lite\|surrealdb\|postgres`) |
+//! | `init` | Initialize a new Corvia store (`--store lite\|postgres`) |
 //! | `ingest` | Ingest a Git repository (or all workspace repos) |
 //! | `search` | Semantic search across ingested knowledge |
 //! | `serve` | Start the REST API and MCP server |
@@ -19,7 +19,7 @@
 //! | `relate` | Create a directed edge between two entries |
 //! | `agent` | Multi-agent session management (start, list, commit, merge) |
 //! | `workspace` | Workspace lifecycle (init, add, list, status, ingest) |
-//! | `migrate` | Migrate data between storage backends (`--to lite\|surrealdb\|postgres`) |
+//! | `migrate` | Migrate data between storage backends (`--to lite\|postgres`) |
 //! | `demo` | Run the built-in demo workspace |
 //!
 //! See the [README](https://github.com/corvia/corvia) and
@@ -34,7 +34,6 @@ mod workspace;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use corvia_common::config::CorviaConfig;
-use corvia_kernel::docker::DockerProvisioner;
 use corvia_kernel::ollama_provisioner::OllamaProvisioner;
 use corvia_kernel::agent_coordinator::AgentCoordinator;
 use corvia_kernel::traits::{InferenceEngine, IngestionAdapter, QueryableStore, GraphStore, TemporalStore};
@@ -55,7 +54,7 @@ struct Cli {
 enum Commands {
     /// Initialize Corvia (LiteStore by default, --store to select backend)
     Init {
-        /// Storage backend: lite (default), surrealdb, postgres
+        /// Storage backend: lite (default), postgres
         #[arg(long, default_value = "lite")]
         store: String,
     },
@@ -187,18 +186,10 @@ enum Commands {
 
     /// Migrate data between storage backends
     Migrate {
-        /// Target storage backend: lite, surrealdb, postgres
+        /// Target storage backend: lite, postgres
         #[arg(long)]
         to: String,
         /// Show what would be migrated without making changes
-        #[arg(long)]
-        dry_run: bool,
-    },
-
-    /// Alias for 'migrate --to surrealdb' (deprecated, use migrate instead)
-    #[command(hide = true)]
-    Upgrade {
-        /// Dry run: show what would be migrated without making changes
         #[arg(long)]
         dry_run: bool,
     },
@@ -367,7 +358,6 @@ async fn main() -> Result<()> {
         Commands::Relate { from, relation, to } => cmd_relate(&from, &relation, &to).await?,
         Commands::Reason { scope, check, llm } => cmd_reason(scope.as_deref(), check.as_deref(), llm).await?,
         Commands::Migrate { to, dry_run } => upgrade::cmd_migrate(&to, dry_run).await?,
-        Commands::Upgrade { dry_run } => upgrade::cmd_migrate("surrealdb", dry_run).await?,
         Commands::Inference { command } => match command {
             InferenceCommands::Reload { device, backend, model, kv_quant, flash_attention, no_persist } =>
                 cmd_inference_reload(device.as_deref(), backend.as_deref(), model.as_deref(), kv_quant.as_deref(), flash_attention, no_persist).await?,
@@ -380,10 +370,6 @@ async fn main() -> Result<()> {
 
 async fn cmd_init(store: &str) -> Result<()> {
     let config = match store {
-        "surrealdb" => {
-            println!("Initializing Corvia (SurrealDB + vLLM)...");
-            CorviaConfig::full_default()
-        }
         "postgres" => {
             println!("Initializing Corvia (PostgreSQL + pgvector + vLLM)...");
             CorviaConfig::postgres_default()
@@ -393,7 +379,7 @@ async fn cmd_init(store: &str) -> Result<()> {
             CorviaConfig::default()
         }
         other => {
-            anyhow::bail!("Unknown store type '{other}'. Valid options: lite, surrealdb, postgres");
+            anyhow::bail!("Unknown store type '{other}'. Valid options: lite, postgres");
         }
     };
 
@@ -406,18 +392,6 @@ async fn cmd_init(store: &str) -> Result<()> {
     }
 
     match store {
-        "surrealdb" => {
-            // Provision Docker containers for SurrealDB
-            let docker = DockerProvisioner::new()?;
-            docker.start(
-                config.storage.surrealdb_user.as_deref().unwrap_or("root"),
-                config.storage.surrealdb_pass.as_deref().unwrap_or("root"),
-            ).await?;
-
-            let s = connect_store(&config).await?;
-            s.init_schema().await?;
-            println!("  SurrealDB running on port 8000.");
-        }
         "postgres" => {
             // PostgreSQL must be running (user manages via docker-compose or make postgres-up)
             println!("  Connecting to PostgreSQL...");
@@ -846,18 +820,6 @@ async fn cmd_status(metrics: bool) -> Result<()> {
             let count = store.count(&config.project.scope_id).await?;
             println!("Entries in scope '{}': {count}", config.project.scope_id);
         }
-        corvia_common::config::StoreType::Surrealdb => {
-            let docker = DockerProvisioner::new()?;
-            let running = docker.is_running().await?;
-            println!("Store: SurrealDB ({})",
-                if running { "running" } else { "stopped" });
-
-            if running {
-                let store = connect_store(&config).await?;
-                let count = store.count(&config.project.scope_id).await?;
-                println!("Entries in scope '{}': {count}", config.project.scope_id);
-            }
-        }
         corvia_common::config::StoreType::Postgres => {
             println!("Store: PostgresStore ({})",
                 config.storage.postgres_url.as_deref().unwrap_or("postgres://127.0.0.1:5432/corvia"));
@@ -901,7 +863,6 @@ async fn cmd_status(metrics: bool) -> Result<()> {
         // Store type
         let store_type = match config.storage.store_type {
             corvia_common::config::StoreType::Lite => "lite",
-            corvia_common::config::StoreType::Surrealdb => "surrealdb",
             corvia_common::config::StoreType::Postgres => "postgres",
         };
         println!("  Store type: {store_type}");
@@ -957,9 +918,6 @@ async fn cmd_rebuild() -> Result<()> {
             let count = corvia_kernel::ops::rebuild_index(&store)?;
             println!("Rebuilt {count} entries.");
         }
-        corvia_common::config::StoreType::Surrealdb => {
-            println!("Rebuild is only needed for LiteStore. SurrealDB manages its own indexes.");
-        }
         corvia_common::config::StoreType::Postgres => {
             println!("Rebuild is only needed for LiteStore. PostgreSQL manages its own indexes.");
         }
@@ -970,7 +928,6 @@ async fn cmd_rebuild() -> Result<()> {
 
 async fn cmd_test(check_only: bool, keep: bool, ci: bool) -> Result<()> {
     let config = CorviaConfig::default().with_env_overrides();
-    let is_lite = matches!(config.storage.store_type, corvia_common::config::StoreType::Lite);
 
     let introspect = Introspect::from_file_or_default(
         std::path::Path::new("tests/introspect.toml"),
@@ -978,58 +935,18 @@ async fn cmd_test(check_only: bool, keep: bool, ci: bool) -> Result<()> {
 
     // Phase 1: Check environment
     println!("  Checking environment...");
-    if is_lite {
-        println!("    LiteStore: no Docker required");
-        let provisioner = OllamaProvisioner::new(&config.embedding.url);
-        if provisioner.is_running().await {
-            println!("    Ollama: running");
-        } else {
-            println!("    Ollama: not running");
-            println!("  Auto-provisioning Ollama...");
-            if let Err(e) = provisioner.ensure_ready(&config.embedding.model).await {
-                eprintln!("  Failed to provision Ollama: {e}");
-                std::process::exit(2);
-            }
-            println!("    Ollama: provisioned");
-        }
+    println!("    LiteStore: no Docker required");
+    let provisioner = OllamaProvisioner::new(&config.embedding.url);
+    if provisioner.is_running().await {
+        println!("    Ollama: running");
     } else {
-        let docker = match DockerProvisioner::new() {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("  Infrastructure error: {e}");
-                std::process::exit(2);
-            }
-        };
-        let env_status = introspect.check_env(&docker).await;
-        let mut all_running = true;
-        for (service, running) in &env_status {
-            if *running {
-                println!("    {service}: running");
-            } else {
-                all_running = false;
-                println!("    {service}: not running");
-            }
+        println!("    Ollama: not running");
+        println!("  Auto-provisioning Ollama...");
+        if let Err(e) = provisioner.ensure_ready(&config.embedding.model).await {
+            eprintln!("  Failed to provision Ollama: {e}");
+            std::process::exit(2);
         }
-        if !all_running {
-            println!("  Auto-provisioning missing services...");
-            for (service, running) in &env_status {
-                if !running {
-                    let result = match *service {
-                        "SurrealDB" => docker.start(
-                            config.storage.surrealdb_user.as_deref().unwrap_or("root"),
-                            config.storage.surrealdb_pass.as_deref().unwrap_or("root"),
-                        ).await,
-                        "vLLM" => docker.start_vllm(&config.embedding.model).await,
-                        _ => Ok(()),
-                    };
-                    if let Err(e) = result {
-                        eprintln!("  Infrastructure error: failed to provision {service}: {e}");
-                        std::process::exit(2);
-                    }
-                    println!("    {service}: provisioned");
-                }
-            }
-        }
+        println!("    Ollama: provisioned");
     }
 
     if check_only {
@@ -1038,15 +955,10 @@ async fn cmd_test(check_only: bool, keep: bool, ci: bool) -> Result<()> {
     }
 
     // Phase 2: Create store for test
-    let test_config = if is_lite {
+    let test_config = {
         let mut tc = config.clone();
         let test_dir = std::env::temp_dir().join("corvia-introspect-test");
         tc.storage.data_dir = test_dir.to_string_lossy().to_string();
-        tc
-    } else {
-        let mut tc = config.clone();
-        tc.storage.surrealdb_ns = Some("corvia_introspect".into());
-        tc.storage.surrealdb_db = Some("test".into());
         tc
     };
 
@@ -1117,7 +1029,6 @@ async fn cmd_test(check_only: bool, keep: bool, ci: bool) -> Result<()> {
 
 async fn cmd_demo(keep: bool) -> Result<()> {
     let config = CorviaConfig::default().with_env_overrides();
-    let is_lite = matches!(config.storage.store_type, corvia_common::config::StoreType::Lite);
 
     let introspect = Introspect::from_file_or_default(
         std::path::Path::new("tests/introspect.toml"),
@@ -1125,47 +1036,21 @@ async fn cmd_demo(keep: bool) -> Result<()> {
 
     // Phase 1: Check + auto-provision
     println!("  Checking environment...");
-    if is_lite {
-        println!("    LiteStore: no Docker required");
-        let provisioner = OllamaProvisioner::new(&config.embedding.url);
-        if provisioner.is_running().await {
-            println!("    Ollama: running");
-        } else {
-            print!("    Ollama: provisioning...");
-            provisioner.ensure_ready(&config.embedding.model).await?;
-            println!(" done");
-        }
+    println!("    LiteStore: no Docker required");
+    let provisioner = OllamaProvisioner::new(&config.embedding.url);
+    if provisioner.is_running().await {
+        println!("    Ollama: running");
     } else {
-        let docker = DockerProvisioner::new()?;
-        let env_status = introspect.check_env(&docker).await;
-        for (service, running) in &env_status {
-            if !*running {
-                print!("    {service}: provisioning...");
-                match *service {
-                    "SurrealDB" => docker.start(
-                        config.storage.surrealdb_user.as_deref().unwrap_or("root"),
-                        config.storage.surrealdb_pass.as_deref().unwrap_or("root"),
-                    ).await?,
-                    "vLLM" => docker.start_vllm(&config.embedding.model).await?,
-                    _ => {}
-                }
-                println!(" done");
-            } else {
-                println!("    {service}: running");
-            }
-        }
+        print!("    Ollama: provisioning...");
+        provisioner.ensure_ready(&config.embedding.model).await?;
+        println!(" done");
     }
 
     // Phase 2: Create store
-    let demo_config = if is_lite {
+    let demo_config = {
         let mut tc = config.clone();
         let demo_dir = std::env::temp_dir().join("corvia-demo");
         tc.storage.data_dir = demo_dir.to_string_lossy().to_string();
-        tc
-    } else {
-        let mut tc = config.clone();
-        tc.storage.surrealdb_ns = Some("corvia_introspect".into());
-        tc.storage.surrealdb_db = Some("demo".into());
         tc
     };
 

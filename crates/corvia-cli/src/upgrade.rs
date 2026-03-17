@@ -15,9 +15,6 @@ async fn load_source(
 
     match config.storage.store_type {
         StoreType::Lite => {
-            // Open LiteStore once — reads entries from Redb and edges from GRAPH_EDGES
-            // in single passes, avoiding the double-read of JSON files and N per-entry
-            // edge queries.
             let lite = corvia_kernel::lite_store::LiteStore::open(
                 data_dir,
                 config.embedding.dimensions,
@@ -26,12 +23,6 @@ async fn load_source(
             let all_edges = lite.graph().fetch_all_edges()?;
 
             Ok((entries, all_edges))
-        }
-        StoreType::Surrealdb => {
-            let surreal = connect_surrealdb(config).await?;
-            let entries = surreal.fetch_all_entries().await?;
-            let edges = surreal.fetch_all_edges().await?;
-            Ok((entries, edges))
         }
         #[cfg(feature = "postgres")]
         StoreType::Postgres => {
@@ -47,21 +38,6 @@ async fn load_source(
             );
         }
     }
-}
-
-/// Connect to SurrealDB using config defaults.
-async fn connect_surrealdb(
-    config: &CorviaConfig,
-) -> Result<corvia_kernel::knowledge_store::SurrealStore> {
-    Ok(corvia_kernel::knowledge_store::SurrealStore::connect(
-        config.storage.surrealdb_url.as_deref().unwrap_or("127.0.0.1:8000"),
-        config.storage.surrealdb_ns.as_deref().unwrap_or("corvia"),
-        config.storage.surrealdb_db.as_deref().unwrap_or("main"),
-        config.storage.surrealdb_user.as_deref().unwrap_or("root"),
-        config.storage.surrealdb_pass.as_deref().unwrap_or("root"),
-        config.embedding.dimensions,
-    )
-    .await?)
 }
 
 /// Connect to PostgreSQL using config defaults.
@@ -81,10 +57,9 @@ async fn connect_postgres(
 fn parse_target(to: &str) -> Result<StoreType> {
     match to.to_lowercase().as_str() {
         "lite" => Ok(StoreType::Lite),
-        "surrealdb" | "surreal" => Ok(StoreType::Surrealdb),
         "postgres" | "postgresql" | "pg" => Ok(StoreType::Postgres),
         other => anyhow::bail!(
-            "Unknown store type '{other}'. Valid targets: lite, surrealdb, postgres"
+            "Unknown store type '{other}'. Valid targets: lite, postgres"
         ),
     }
 }
@@ -92,7 +67,6 @@ fn parse_target(to: &str) -> Result<StoreType> {
 fn store_type_name(st: &StoreType) -> &'static str {
     match st {
         StoreType::Lite => "lite",
-        StoreType::Surrealdb => "surrealdb",
         StoreType::Postgres => "postgres",
     }
 }
@@ -182,9 +156,6 @@ pub async fn cmd_migrate(to: &str, dry_run: bool) -> Result<()> {
         StoreType::Lite => {
             write_to_lite(&config, data_dir, &entries, &all_edges, &entries_by_scope, &scope_names).await?;
         }
-        StoreType::Surrealdb => {
-            write_to_surrealdb(&config, &entries, &all_edges, &entries_by_scope, &scope_names).await?;
-        }
         #[cfg(feature = "postgres")]
         StoreType::Postgres => {
             write_to_postgres(&config, &entries, &all_edges, &entries_by_scope, &scope_names).await?;
@@ -201,23 +172,6 @@ pub async fn cmd_migrate(to: &str, dry_run: bool) -> Result<()> {
     updated_config.storage.store_type = target.clone();
 
     match target {
-        StoreType::Surrealdb => {
-            if updated_config.storage.surrealdb_url.is_none() {
-                updated_config.storage.surrealdb_url = Some("127.0.0.1:8000".to_string());
-            }
-            if updated_config.storage.surrealdb_ns.is_none() {
-                updated_config.storage.surrealdb_ns = Some("corvia".to_string());
-            }
-            if updated_config.storage.surrealdb_db.is_none() {
-                updated_config.storage.surrealdb_db = Some("main".to_string());
-            }
-            if updated_config.storage.surrealdb_user.is_none() {
-                updated_config.storage.surrealdb_user = Some("root".to_string());
-            }
-            if updated_config.storage.surrealdb_pass.is_none() {
-                updated_config.storage.surrealdb_pass = Some("root".to_string());
-            }
-        }
         StoreType::Postgres => {
             if updated_config.storage.postgres_url.is_none() {
                 updated_config.storage.postgres_url =
@@ -312,33 +266,6 @@ async fn write_to_lite(
     ).await?;
 
     Ok(())
-}
-
-/// Write entries and edges to a SurrealDB destination.
-async fn write_to_surrealdb(
-    config: &CorviaConfig,
-    entries: &[KnowledgeEntry],
-    edges: &[GraphEdge],
-    entries_by_scope: &HashMap<String, Vec<&KnowledgeEntry>>,
-    scope_names: &[String],
-) -> Result<()> {
-    let surreal_url = config.storage.surrealdb_url.as_deref().unwrap_or("127.0.0.1:8000");
-
-    println!("\nConnecting to SurrealDB at {}...", surreal_url);
-    let store = connect_surrealdb(config).await?;
-    println!("Initializing SurrealDB schema...");
-    store.init_schema().await?;
-
-    let store = Arc::new(store);
-    bulk_insert_and_verify(
-        store.clone() as Arc<dyn QueryableStore>,
-        store as Arc<dyn GraphStore>,
-        entries,
-        edges,
-        entries_by_scope,
-        scope_names,
-    )
-    .await
 }
 
 /// Write entries and edges to a PostgreSQL destination.
@@ -518,8 +445,6 @@ mod tests {
     #[test]
     fn test_parse_target_valid() {
         assert_eq!(parse_target("lite").unwrap(), StoreType::Lite);
-        assert_eq!(parse_target("surrealdb").unwrap(), StoreType::Surrealdb);
-        assert_eq!(parse_target("surreal").unwrap(), StoreType::Surrealdb);
         assert_eq!(parse_target("postgres").unwrap(), StoreType::Postgres);
         assert_eq!(parse_target("postgresql").unwrap(), StoreType::Postgres);
         assert_eq!(parse_target("pg").unwrap(), StoreType::Postgres);
@@ -528,7 +453,6 @@ mod tests {
     #[test]
     fn test_parse_target_case_insensitive() {
         assert_eq!(parse_target("Lite").unwrap(), StoreType::Lite);
-        assert_eq!(parse_target("SURREALDB").unwrap(), StoreType::Surrealdb);
         assert_eq!(parse_target("Postgres").unwrap(), StoreType::Postgres);
         assert_eq!(parse_target("PG").unwrap(), StoreType::Postgres);
     }
@@ -538,12 +462,12 @@ mod tests {
         assert!(parse_target("mysql").is_err());
         assert!(parse_target("").is_err());
         assert!(parse_target("redis").is_err());
+        assert!(parse_target("surrealdb").is_err());
     }
 
     #[test]
     fn test_store_type_name() {
         assert_eq!(store_type_name(&StoreType::Lite), "lite");
-        assert_eq!(store_type_name(&StoreType::Surrealdb), "surrealdb");
         assert_eq!(store_type_name(&StoreType::Postgres), "postgres");
     }
 }

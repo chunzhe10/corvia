@@ -4,7 +4,7 @@ use corvia_common::types::{EdgeDirection, GraphEdge, KnowledgeEntry, SearchResul
 use std::any::Any;
 
 /// Queryable store for knowledge entries (D15).
-/// SurrealDB is the first implementation. Trait-bounded for future swap.
+/// LiteStore is the default implementation. Trait-bounded for backend swap.
 #[async_trait]
 pub trait QueryableStore: Send + Sync {
     /// Insert a knowledge entry (must have embedding set).
@@ -65,7 +65,7 @@ pub trait IngestionAdapter: Send + Sync {
 }
 
 /// Temporal query interface for bi-temporal knowledge (D38).
-/// Implemented by LiteStore (Redb range scans) and SurrealStore (SurrealQL).
+/// Implemented by LiteStore (Redb range scans) and PostgresStore (SQL).
 #[async_trait]
 pub trait TemporalStore: Send + Sync {
     /// Return entries valid at a point in time within a scope.
@@ -89,7 +89,7 @@ pub trait TemporalStore: Send + Sync {
 }
 
 /// Knowledge graph interface (D37).
-/// Implemented by LiteStore (petgraph + Redb) and SurrealStore (RELATE).
+/// Implemented by LiteStore (petgraph + Redb) and PostgresStore (relational edges).
 #[async_trait]
 pub trait GraphStore: Send + Sync {
     /// Create a directed edge between two entries.

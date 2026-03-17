@@ -1,6 +1,5 @@
 //! End-to-end integration tests for M1.
 //!
-//! SurrealDB tests require: Docker running, SurrealDB on port 8000, vLLM on port 8001.
 //! Ollama tests require: Ollama running on port 11434 with nomic-embed-text model.
 //! LiteStore-only tests (test_lite_store_*) run without any external services.
 //!
@@ -8,144 +7,10 @@
 
 use corvia_common::config::CorviaConfig;
 use corvia_common::types::KnowledgeEntry;
-use corvia_kernel::embedding_pipeline::VllmEngine;
-use corvia_kernel::knowledge_store::SurrealStore;
 use corvia_kernel::lite_store::LiteStore;
 use corvia_kernel::ollama_engine::OllamaEngine;
 use corvia_kernel::traits::{InferenceEngine, QueryableStore};
 use corvia_kernel::introspect::{Introspect, IntrospectConfig, IntrospectMeta, CanonicalQuery, IntrospectReport};
-
-/// Per-process unique ID to isolate concurrent test runs against the same SurrealDB.
-static TEST_RUN_ID: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    format!("{:x}", std::process::id())
-});
-
-#[tokio::test]
-async fn test_write_and_search() {
-    // Use test namespace to avoid polluting real data
-    let config = CorviaConfig::default();
-
-    let db_name = format!("e2e_{}", *TEST_RUN_ID);
-    let store = match SurrealStore::connect(
-        config.storage.surrealdb_url.as_deref().unwrap_or("127.0.0.1:8000"),
-        "corvia_test",
-        &db_name,
-        config.storage.surrealdb_user.as_deref().unwrap_or("root"),
-        config.storage.surrealdb_pass.as_deref().unwrap_or("root"),
-        config.embedding.dimensions,
-    ).await {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("SKIPPING test_write_and_search: SurrealDB not reachable");
-            return;
-        }
-    };
-
-    store.init_schema().await.expect("Failed to init schema");
-
-    let engine = VllmEngine::new(
-        &config.embedding.url,
-        &config.embedding.model,
-        config.embedding.dimensions,
-    );
-
-    // Embed and store a test entry
-    let content = "fn authenticate(token: &str) -> Result<User> { verify_jwt(token) }";
-    let embedding = engine.embed(content).await
-        .expect("Failed to embed — is vLLM running with nomic-embed-text-v1.5?");
-
-    assert_eq!(embedding.len(), config.embedding.dimensions);
-
-    let entry = KnowledgeEntry::new(
-        content.to_string(),
-        "test-repo".to_string(),
-        "abc123".to_string(),
-    ).with_embedding(embedding);
-
-    store.insert(&entry).await.expect("Failed to insert");
-
-    // Search for it
-    let query_embedding = engine.embed("how does authentication work?").await.unwrap();
-    let results = store.search(&query_embedding, "test-repo", 5).await.unwrap();
-
-    assert!(!results.is_empty(), "Expected at least one search result");
-    assert!(results[0].entry.content.contains("authenticate"));
-
-    println!("E2E test passed: wrote 1 entry, searched, found it.");
-    println!("Score: {:.3}", results[0].score);
-}
-
-#[tokio::test]
-async fn test_introspect_self_query() {
-    let config = CorviaConfig::default();
-
-    let db_name = format!("introspect_{}", *TEST_RUN_ID);
-    let store = match SurrealStore::connect(
-        config.storage.surrealdb_url.as_deref().unwrap_or("127.0.0.1:8000"),
-        "corvia_introspect_test",
-        &db_name,
-        config.storage.surrealdb_user.as_deref().unwrap_or("root"),
-        config.storage.surrealdb_pass.as_deref().unwrap_or("root"),
-        config.embedding.dimensions,
-    ).await {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("SKIPPING test_introspect_self_query: SurrealDB not reachable");
-            return;
-        }
-    };
-
-    store.init_schema().await.expect("Failed to init schema");
-
-    let engine = VllmEngine::new(
-        &config.embedding.url,
-        &config.embedding.model,
-        config.embedding.dimensions,
-    );
-
-    let adapter = corvia_adapter_git::GitAdapter::new();
-
-    let introspect_config = IntrospectConfig {
-        config: IntrospectMeta {
-            default_min_score: 0.50,
-            scope_id: "introspect-e2e".into(),
-        },
-        query: vec![
-            CanonicalQuery {
-                text: "what CLI commands are available?".into(),
-                expect_file: "crates/corvia-cli/src/main.rs".into(),
-                min_score: None,
-            },
-        ],
-    };
-
-    let introspect = Introspect::new(introspect_config);
-
-    let chunks = introspect.ingest_self(".", &adapter, &engine, &store).await
-        .expect("Failed to ingest self");
-    assert!(chunks > 0, "Expected at least one chunk ingested");
-
-    let results = introspect.query_self(&engine, &store).await
-        .expect("Failed to query self");
-
-    let report = IntrospectReport {
-        results,
-        chunks_ingested: chunks,
-    };
-
-    println!("Introspect E2E: {}/{} passed, avg score: {:.3}",
-        report.pass_count(), report.results.len(), report.avg_score());
-
-    for r in &report.results {
-        println!("  [{}] \"{}\" -> {} (score: {:.3})",
-            if r.passed() { "PASS" } else { "FAIL" },
-            r.query_text,
-            r.actual_file.as_deref().unwrap_or("none"),
-            r.score);
-    }
-
-    assert!(report.pass_count() > 0, "Expected at least one passing query");
-}
 
 #[tokio::test]
 async fn test_lite_store_write_and_search() {
