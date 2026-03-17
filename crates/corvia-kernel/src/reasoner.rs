@@ -151,17 +151,29 @@ impl<'a> Reasoner<'a> {
     }
 
     /// Run all algorithmic checks on the provided entries. Returns all findings.
+    ///
+    /// Includes the 5 core checks (stale, broken chain, orphan, dangling, cycle)
+    /// plus the 3 docs workflow checks (misplaced doc, coverage gap, temporal
+    /// contradiction). MisplacedDoc requires `with_docs_rules()` to be configured;
+    /// if absent, that check is silently skipped.
     pub async fn run_all(
         &self,
         entries: &[KnowledgeEntry],
         scope_id: &str,
     ) -> Result<Vec<Finding>> {
         let mut findings = Vec::new();
+        // Core checks
         findings.extend(self.check_stale_entries(entries, scope_id).await?);
         findings.extend(self.check_broken_chains(entries, scope_id).await?);
         findings.extend(self.check_orphaned_nodes(entries, scope_id).await?);
         findings.extend(self.check_dangling_imports(entries, scope_id).await?);
         findings.extend(self.check_cycles(entries, scope_id).await?);
+        // Docs workflow checks
+        if let Some(ref rules) = self.docs_rules {
+            findings.extend(check_misplaced_doc(entries, rules));
+        }
+        findings.extend(check_coverage_gap(entries, scope_id));
+        findings.extend(check_temporal_contradiction(entries, 0.85));
         Ok(findings)
     }
 
@@ -191,10 +203,11 @@ impl<'a> Reasoner<'a> {
                     Ok(Vec::new())
                 }
             }
-            CheckType::CoverageGap => Ok(check_coverage_gap(entries)),
+            CheckType::CoverageGap => Ok(check_coverage_gap(entries, scope_id)),
             CheckType::TemporalContradiction => {
                 Ok(check_temporal_contradiction(entries, 0.85))
             }
+
         }
     }
 
@@ -565,6 +578,11 @@ impl<'a> Reasoner<'a> {
 ///
 /// Compares each entry's `source_file` against the `blocked_paths` globs
 /// in the `DocsRulesConfig`. Any match is a misplaced doc.
+///
+/// **Scope:** This is a blocklist check only — it catches files in explicitly
+/// forbidden directories but does not validate that a file's `content_role` is
+/// consistent with its directory location. The `repo_docs_pattern` field in
+/// `DocsRulesConfig` is reserved for future positive-placement validation.
 pub fn check_misplaced_doc(
     entries: &[KnowledgeEntry],
     rules: &corvia_common::config::DocsRulesConfig,
@@ -603,13 +621,23 @@ pub fn check_misplaced_doc(
 /// Flags when entries exist with `content_role = "memory"` but none with
 /// `design`, `decision`, or `plan` roles — suggesting knowledge exists only
 /// as transient memory without formalization.
-pub fn check_coverage_gap(entries: &[KnowledgeEntry]) -> Vec<Finding> {
-    let memory_only: Vec<&KnowledgeEntry> = entries
+///
+/// **Design note:** The spec describes a cluster-based approach ("cluster by embedding,
+/// flag clusters with only memory role"). This simplified implementation does a
+/// scope-global check; embedding-based per-topic clustering can be added as a
+/// follow-up optimization.
+pub fn check_coverage_gap(entries: &[KnowledgeEntry], scope_id: &str) -> Vec<Finding> {
+    let scoped: Vec<&KnowledgeEntry> = entries
+        .iter()
+        .filter(|e| e.scope_id == scope_id)
+        .collect();
+
+    let memory_only: Vec<&&KnowledgeEntry> = scoped
         .iter()
         .filter(|e| e.metadata.content_role.as_deref() == Some("memory"))
         .collect();
 
-    let has_formal = entries.iter().any(|e| {
+    let has_formal = scoped.iter().any(|e| {
         matches!(
             e.metadata.content_role.as_deref(),
             Some("design" | "decision" | "plan")
@@ -617,10 +645,6 @@ pub fn check_coverage_gap(entries: &[KnowledgeEntry]) -> Vec<Finding> {
     });
 
     if !memory_only.is_empty() && !has_formal {
-        let scope_id = entries
-            .first()
-            .map(|e| e.scope_id.as_str())
-            .unwrap_or("unknown");
         vec![Finding::new(
             CheckType::CoverageGap,
             scope_id,
@@ -641,15 +665,41 @@ pub fn check_coverage_gap(entries: &[KnowledgeEntry]) -> Vec<Finding> {
 /// Uses cosine similarity on pre-computed embeddings. Entries with high similarity
 /// (>= threshold) from different `source_origin` values are flagged, since they
 /// likely describe the same topic but may contain conflicting information.
+///
+/// **Design note:** The spec calls for overlapping `valid_from`/`valid_to` window checks.
+/// This simplified implementation filters to `is_current()` entries instead — all current
+/// entries implicitly overlap temporally (they are all "now"). A future refinement could
+/// compare actual temporal windows for superseded entries.
+///
+/// Entries where both `source_origin` values are `None` are skipped (legacy/untagged
+/// entries cannot be meaningfully compared cross-origin).
+///
+/// Pairwise comparisons are capped at 1000 pairs to bound O(n²) cost, matching the
+/// existing `Contradiction` check's cap.
 pub fn check_temporal_contradiction(
     entries: &[KnowledgeEntry],
     threshold: f32,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
-    let current: Vec<&KnowledgeEntry> = entries.iter().filter(|e| e.is_current()).collect();
+    // Only compare entries that have a source_origin set and are current
+    let current: Vec<&KnowledgeEntry> = entries
+        .iter()
+        .filter(|e| e.is_current() && e.metadata.source_origin.is_some())
+        .collect();
+
+    let max_pairs = 1000;
+    let mut pair_count = 0;
 
     for i in 0..current.len() {
+        if pair_count >= max_pairs {
+            break;
+        }
         for j in (i + 1)..current.len() {
+            if pair_count >= max_pairs {
+                break;
+            }
+            pair_count += 1;
+
             let a = current[i];
             let b = current[j];
 
@@ -669,7 +719,7 @@ pub fn check_temporal_contradiction(
                     CheckType::TemporalContradiction,
                     &a.scope_id,
                     vec![a.id, b.id],
-                    sim,
+                    0.6, // heuristic confidence (consistent with Contradiction check)
                     format!(
                         "High similarity ({:.2}) between entries from '{}' and '{}' — possible contradiction",
                         sim,
@@ -1318,7 +1368,7 @@ mod tests {
             make_entry_with_role("memory", "topic A discussion"),
             make_entry_with_role("memory", "topic A notes"),
         ];
-        let findings = check_coverage_gap(&entries);
+        let findings = check_coverage_gap(&entries, "test");
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].check_type, CheckType::CoverageGap);
     }
@@ -1329,8 +1379,46 @@ mod tests {
             make_entry_with_role("memory", "topic A discussion"),
             make_entry_with_role("design", "topic A design spec"),
         ];
-        let findings = check_coverage_gap(&entries);
+        let findings = check_coverage_gap(&entries, "test");
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn test_coverage_gap_no_flag_when_decision_exists() {
+        let entries = vec![
+            make_entry_with_role("memory", "topic A discussion"),
+            make_entry_with_role("decision", "topic A decision"),
+        ];
+        let findings = check_coverage_gap(&entries, "test");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn test_coverage_gap_no_flag_when_plan_exists() {
+        let entries = vec![
+            make_entry_with_role("memory", "topic A discussion"),
+            make_entry_with_role("plan", "topic A impl plan"),
+        ];
+        let findings = check_coverage_gap(&entries, "test");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn test_temporal_contradiction_excludes_superseded() {
+        let fake_embedding = vec![0.1, 0.2, 0.3, 0.4];
+        let mut e1 = KnowledgeEntry::new("auth uses JWT".into(), "test".into(), "v1".into());
+        e1.metadata.source_origin = Some("repo:backend".into());
+        e1.embedding = Some(fake_embedding.clone());
+        // Supersede e1 so is_current() returns false
+        e1.valid_to = Some(chrono::Utc::now());
+        e1.superseded_by = Some(Uuid::now_v7());
+
+        let mut e2 = KnowledgeEntry::new("auth uses cookies".into(), "test".into(), "v2".into());
+        e2.metadata.source_origin = Some("repo:frontend".into());
+        e2.embedding = Some(fake_embedding);
+
+        let findings = check_temporal_contradiction(&[e1, e2], 0.85);
+        assert!(findings.is_empty()); // e1 is superseded, should be excluded
     }
 
     // ---- MisplacedDoc check ----
@@ -1372,5 +1460,54 @@ mod tests {
         assert_eq!(CheckType::MisplacedDoc.as_str(), "misplaced_doc");
         assert_eq!(CheckType::TemporalContradiction.as_str(), "temporal_contradiction");
         assert_eq!(CheckType::CoverageGap.as_str(), "coverage_gap");
+    }
+
+    // ---- End-to-end Reasoner dispatch tests ----
+
+    #[tokio::test]
+    async fn test_reasoner_misplaced_doc_via_run_check() {
+        let (_dir, store) = test_store().await;
+
+        let mut e = entry("design doc", "test");
+        e.metadata.content_role = Some("design".into());
+        e.metadata.source_file = Some("docs/superpowers/specs/design.md".into());
+        store.insert(&e).await.unwrap();
+
+        let reasoner = Reasoner::new(&store, &store)
+            .with_docs_rules(test_docs_rules());
+        let findings = reasoner.run_check(&[e], "test", CheckType::MisplacedDoc).await.unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].check_type, CheckType::MisplacedDoc);
+    }
+
+    #[tokio::test]
+    async fn test_reasoner_misplaced_doc_without_rules_returns_empty() {
+        let (_dir, store) = test_store().await;
+
+        let mut e = entry("design doc", "test");
+        e.metadata.source_file = Some("docs/superpowers/specs/design.md".into());
+        store.insert(&e).await.unwrap();
+
+        // No with_docs_rules() — should return empty
+        let reasoner = Reasoner::new(&store, &store);
+        let findings = reasoner.run_check(&[e], "test", CheckType::MisplacedDoc).await.unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reasoner_coverage_gap_via_run_check() {
+        let (_dir, store) = test_store().await;
+
+        let mut e1 = entry("topic A discussion", "test");
+        e1.metadata.content_role = Some("memory".into());
+        let mut e2 = entry("topic A notes", "test");
+        e2.metadata.content_role = Some("memory".into());
+        store.insert(&e1).await.unwrap();
+        store.insert(&e2).await.unwrap();
+
+        let reasoner = Reasoner::new(&store, &store);
+        let findings = reasoner.run_check(&[e1, e2], "test", CheckType::CoverageGap).await.unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].check_type, CheckType::CoverageGap);
     }
 }

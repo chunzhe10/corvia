@@ -1413,27 +1413,38 @@ async fn cmd_docs_check(
     println!("Running documentation health checks...");
 
     // Try routing through running server first
-    if let Some(client) = server_client::ServerClient::detect(&config).await {
-        println!("(via server at {})\n", client.url());
-        let mut total = 0;
-        for check_type in &checks {
-            let response = client.reason(scope_id, Some(check_type.as_str())).await?;
-            for (i, finding) in response.findings.iter().enumerate() {
-                println!("  [{}] {} (confidence: {:.0}%)", total + i + 1, finding.check_type, finding.confidence * 100.0);
-                println!("      {}", finding.rationale);
+    if !fix {
+        if let Some(client) = server_client::ServerClient::detect(&config).await {
+            println!("(via server at {})\n", client.url());
+            let mut total = 0;
+            for check_type in &checks {
+                let response = client.reason(scope_id, Some(check_type.as_str())).await?;
+                for (i, finding) in response.findings.iter().enumerate() {
+                    println!("  [{}] {} (confidence: {:.0}%)", total + i + 1, finding.check_type, finding.confidence * 100.0);
+                    println!("      {}", finding.rationale);
+                }
+                total += response.findings.len();
             }
-            total += response.findings.len();
+            if total == 0 {
+                println!("No issues found.");
+            }
+            return Ok(());
         }
-        if total == 0 {
-            println!("No issues found.");
-        }
-        return Ok(());
+    } else {
+        // --fix requires local execution (needs filesystem access for moves)
+        println!("(--fix mode: running locally)\n");
     }
 
-    // Fallback: run locally
+    // Run locally
     let (store, graph, _temporal) = connect_full_store(&config).await?;
     let data_dir = std::path::Path::new(&config.storage.data_dir);
     let entries = corvia_kernel::knowledge_files::read_scope(data_dir, scope_id)?;
+
+    if entries.is_empty() {
+        println!("No entries found in scope '{}'. Run 'corvia ingest' first.", scope_id);
+        return Ok(());
+    }
+    println!("Checking {} entries in scope '{}'...\n", entries.len(), scope_id);
 
     let reasoner = corvia_kernel::reasoner::Reasoner::new(&*store, &*graph)
         .with_docs_rules(docs_rules);
@@ -1470,10 +1481,11 @@ async fn cmd_docs_check(
             println!("Would move {} file(s). Re-run with --yes to execute.", misplaced.len());
             return Ok(());
         }
+        println!("Auto-fix is not yet implemented. Showing planned moves:\n");
         for finding in misplaced {
-            println!("  Moving: {}", finding.rationale);
-            // TODO: resolve target path and execute move
+            println!("  {}", finding.rationale);
         }
+        println!("\nManually move these files to the correct location.");
     }
 
     Ok(())
@@ -1749,14 +1761,19 @@ async fn cmd_reason(scope: Option<&str>, check: Option<&str>, llm: bool) -> Resu
     let data_dir = std::path::Path::new(&config.storage.data_dir);
     let entries = corvia_kernel::knowledge_files::read_scope(data_dir, scope_id)?;
 
-    let reasoner = corvia_kernel::reasoner::Reasoner::new(&*store, &*graph);
+    // Wire DocsRulesConfig so MisplacedDoc check works via `corvia reason`
+    let docs_rules = config.workspace.as_ref()
+        .and_then(|ws| ws.docs.as_ref()?.rules.clone())
+        .unwrap_or_default();
+    let reasoner = corvia_kernel::reasoner::Reasoner::new(&*store, &*graph)
+        .with_docs_rules(docs_rules);
 
     let mut findings = if let Some(check_str) = check {
         // Run a single check type
         let check_type = parse_check_type(check_str)?;
         reasoner.run_check(&entries, scope_id, check_type).await?
     } else {
-        // Run all algorithmic checks
+        // Run all algorithmic checks (includes docs workflow checks)
         reasoner.run_all(&entries, scope_id).await?
     };
 

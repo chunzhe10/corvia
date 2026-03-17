@@ -692,7 +692,8 @@ async fn merge_retry_handler(
 /// Query params for /api/dashboard/health
 #[derive(Debug, serde::Deserialize)]
 pub struct HealthQuery {
-    /// Optional single check to run (e.g. "stale", "broken", "orphan", "dangling", "cycle")
+    /// Optional single check to run (e.g. "stale", "broken", "orphan", "dangling", "cycle",
+    /// "misplaced", "temporal", "coverage")
     pub check: Option<String>,
 }
 
@@ -711,7 +712,16 @@ async fn health_handler(
     let entries = corvia_kernel::knowledge_files::read_scope(&state.data_dir, scope_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load entries: {e}")))?;
 
-    let reasoner = corvia_kernel::reasoner::Reasoner::new(&*state.store, &*state.graph);
+    // Extract DocsRulesConfig from live config for MisplacedDoc checks
+    let docs_rules = state
+        .config
+        .read()
+        .ok()
+        .and_then(|cfg| cfg.workspace.as_ref()?.docs.as_ref()?.rules.clone())
+        .unwrap_or_default();
+
+    let reasoner = corvia_kernel::reasoner::Reasoner::new(&*state.store, &*state.graph)
+        .with_docs_rules(docs_rules);
 
     let findings = if let Some(ref check_str) = params.check {
         let check_type = check_str.parse::<corvia_kernel::reasoner::CheckType>()
