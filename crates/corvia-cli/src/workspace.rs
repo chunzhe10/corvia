@@ -775,6 +775,116 @@ pub async fn ingest_workspace(
         }
     }
 
+    // --- Ingest Claude Code session history (only on full ingest) ---
+    if repo_filter.is_none() {
+        // Check for a user-history scope in [[scope]] config
+        let session_scope = config
+            .scope
+            .as_ref()
+            .and_then(|scopes| scopes.iter().find(|s| s.id == "user-history"));
+
+        if session_scope.is_some() {
+            let adapter_info = discovered.iter().find(|a| a.metadata.domain == "claude-sessions");
+            if let Some(adapter_info) = adapter_info {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+                let sessions_dir = PathBuf::from(home)
+                    .join(".claude")
+                    .join("sessions");
+
+                if sessions_dir.is_dir() {
+                    println!("\nIngesting Claude Code session history...");
+
+                    let sessions_path = sessions_dir
+                        .to_str()
+                        .unwrap_or("~/.claude/sessions");
+
+                    let mut process = ProcessAdapter::new(
+                        adapter_info.binary_path.clone(),
+                        adapter_info.metadata.clone(),
+                    );
+                    process.spawn().map_err(|e| anyhow::anyhow!(e))?;
+
+                    let source_files = process
+                        .ingest(sessions_path, "user-history")
+                        .map_err(|e| anyhow::anyhow!(e))?;
+
+                    if source_files.is_empty() {
+                        println!("  No new sessions to ingest.");
+                    } else {
+                        let pipeline = corvia_kernel::create_chunking_pipeline(&config);
+                        let (processed, _pipeline_relations, report) =
+                            pipeline.process_batch(&source_files)?;
+
+                        println!(
+                            "  {} sessions → {} chunks ({} merged, {} split)",
+                            report.files_processed,
+                            report.total_chunks,
+                            report.chunks_merged,
+                            report.chunks_split
+                        );
+
+                        // Build lookup for adapter-provided SourceMetadata overrides
+                        let session_meta_lookup: std::collections::HashMap<&str, &corvia_kernel::chunking_strategy::SourceMetadata> =
+                            source_files.iter().map(|sf| (sf.metadata.file_path.as_str(), &sf.metadata)).collect();
+
+                        let entries: Vec<corvia_common::types::KnowledgeEntry> =
+                            processed
+                                .iter()
+                                .map(|pc| {
+                                    let src_meta = session_meta_lookup.get(pc.metadata.source_file.as_str());
+                                    let mut entry =
+                                        corvia_common::types::KnowledgeEntry::new(
+                                            pc.content.clone(),
+                                            "user-history".to_string(),
+                                            pc.metadata.source_file.clone(),
+                                        );
+                                    entry.workstream = src_meta
+                                        .and_then(|m| m.workstream.clone())
+                                        .unwrap_or_default();
+                                    entry.metadata =
+                                        corvia_common::types::EntryMetadata {
+                                            source_file: Some(
+                                                pc.metadata.source_file.clone(),
+                                            ),
+                                            language: pc.metadata.language.clone(),
+                                            chunk_type: Some(pc.chunk_type.clone()),
+                                            start_line: Some(pc.start_line),
+                                            end_line: Some(pc.end_line),
+                                            content_role: src_meta
+                                                .and_then(|m| m.content_role.clone()),
+                                            source_origin: src_meta
+                                                .and_then(|m| m.source_origin.clone()),
+                                        };
+                                    entry
+                                })
+                                .collect();
+
+                        let total = entries.len();
+                        let mut stored = 0;
+                        for batch in
+                            entries.chunks(corvia_kernel::introspect::EMBED_BATCH_SIZE)
+                        {
+                            let texts: Vec<String> =
+                                batch.iter().map(|e| e.content.clone()).collect();
+                            let embeddings = engine.embed_batch(&texts).await?;
+                            for (entry, embedding) in batch.iter().zip(embeddings) {
+                                let mut entry = entry.clone();
+                                entry.embedding = Some(embedding);
+                                store.insert(&entry).await?;
+                                stored += 1;
+                            }
+                            println!("  embedded and stored {}/{}", stored, total);
+                        }
+
+                        println!("  {} session turns stored", stored);
+                    }
+
+                    process.shutdown().map_err(|e| anyhow::anyhow!(e))?;
+                }
+            }
+        }
+    }
+
     println!("\nWorkspace ingest complete.");
     Ok(())
 }
