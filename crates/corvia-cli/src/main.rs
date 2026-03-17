@@ -612,10 +612,28 @@ async fn cmd_ingest(path: Option<&str>, incremental: bool, files: &[String]) -> 
     if incremental && !files.is_empty() {
         let config = load_config()?;
         ensure_inference_ready(&config).await?;
-        let (store, _graph) = connect_store_with_graph(&config).await?;
+        let (store, graph, _temporal) = connect_full_store(&config).await?;
         let engine = connect_engine(&config);
-        let pipeline = corvia_kernel::create_chunking_pipeline(&config);
         let scope_id = &config.project.scope_id;
+
+        // Register adapter chunking strategies (tree-sitter AST for code files)
+        let mut pipeline = corvia_kernel::create_chunking_pipeline(&config);
+        let adapter = GitAdapter::new();
+        adapter.register_chunking(pipeline.registry_mut());
+
+        // Resolve git HEAD for source_version
+        let source_version = std::process::Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "incremental".into());
+
+        // Load existing entries for supersession lookup
+        let data_dir = std::path::Path::new(&config.storage.data_dir);
+        let existing_entries = corvia_kernel::knowledge_files::read_scope(data_dir, scope_id)
+            .unwrap_or_default();
 
         println!("Incremental re-indexing {} file(s)...", files.len());
         for file_path in files {
@@ -624,33 +642,93 @@ async fn cmd_ingest(path: Option<&str>, incremental: bool, files: &[String]) -> 
                 println!("  Skipped (not found): {}", file_path);
                 continue;
             }
+
+            // Skip binary files gracefully
+            let content = match std::fs::read_to_string(file_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("  Skipped (read error): {} — {}", file_path, e);
+                    continue;
+                }
+            };
+
             println!("  Re-indexing: {}", file_path);
 
-            let content = std::fs::read_to_string(file_path)?;
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let meta = corvia_kernel::chunking_strategy::SourceMetadata {
                 file_path: file_path.to_string(),
                 extension: ext.to_string(),
                 language: None,
                 scope_id: scope_id.clone(),
-                source_version: "incremental".into(),
+                source_version: source_version.clone(),
             };
-            let (chunks, _relations) = pipeline.process(&content, &meta)?;
+            let (chunks, pipeline_relations) = pipeline.process(&content, &meta)?;
             println!("    Chunked into {} pieces", chunks.len());
 
-            for chunk in &chunks {
-                let embedding = engine.embed(&chunk.content).await?;
-                let mut new_entry = corvia_common::types::KnowledgeEntry::new(
-                    chunk.content.clone(), scope_id.clone(), "incremental".into(),
-                );
-                new_entry.metadata.source_file = Some(file_path.to_string());
-                new_entry.metadata.chunk_type = Some(chunk.chunk_type.clone());
-                new_entry.metadata.start_line = Some(chunk.start_line);
-                new_entry.metadata.end_line = Some(chunk.end_line);
-                new_entry.embedding = Some(embedding);
-                store.insert(&new_entry).await?;
+            // Build entries with full metadata (matching full ingest quality)
+            let entries: Vec<corvia_common::types::KnowledgeEntry> = chunks
+                .iter()
+                .map(|chunk| {
+                    let mut entry = corvia_common::types::KnowledgeEntry::new(
+                        chunk.content.clone(),
+                        scope_id.clone(),
+                        source_version.clone(),
+                    );
+                    entry.metadata = corvia_common::types::EntryMetadata {
+                        source_file: Some(file_path.to_string()),
+                        language: chunk.metadata.language.clone(),
+                        chunk_type: Some(chunk.chunk_type.clone()),
+                        start_line: Some(chunk.start_line),
+                        end_line: Some(chunk.end_line),
+                        content_role: workspace::infer_content_role(file_path),
+                        source_origin: workspace::infer_source_origin(None, file_path),
+                    };
+                    entry
+                })
+                .collect();
+
+            // Batch embed
+            let texts: Vec<String> = entries.iter().map(|e| e.content.clone()).collect();
+            let embeddings = engine.embed_batch(&texts).await?;
+
+            // Insert new entries, collecting IDs for graph wiring
+            let mut stored_ids: Vec<uuid::Uuid> = Vec::with_capacity(entries.len());
+            for (entry, embedding) in entries.iter().zip(embeddings) {
+                let mut entry = entry.clone();
+                entry.embedding = Some(embedding);
+                store.insert(&entry).await?;
+                stored_ids.push(entry.id);
             }
-            println!("    Created {} entries", chunks.len());
+
+            // Supersede old entries for this file
+            let old_entries: Vec<&corvia_common::types::KnowledgeEntry> = existing_entries
+                .iter()
+                .filter(|e| {
+                    e.metadata.source_file.as_deref() == Some(file_path.as_str())
+                        && e.is_current()
+                })
+                .collect();
+            if !old_entries.is_empty() {
+                if let Some(lite) = store.as_any().downcast_ref::<corvia_kernel::lite_store::LiteStore>() {
+                    let first_new_id = stored_ids[0];
+                    for old in &old_entries {
+                        let _ = lite.supersede(&old.id, &first_new_id).await;
+                    }
+                    println!("    Superseded {} old entries", old_entries.len());
+                }
+            }
+
+            // Wire graph edges from pipeline relations
+            if !pipeline_relations.is_empty() {
+                let edges = wire_pipeline_relations(
+                    &pipeline_relations, &chunks, &stored_ids, &*graph,
+                ).await;
+                if edges > 0 {
+                    println!("    {edges} graph relations stored");
+                }
+            }
+
+            println!("    Created {} entries", stored_ids.len());
         }
         println!("Incremental re-index complete.");
         return Ok(());
