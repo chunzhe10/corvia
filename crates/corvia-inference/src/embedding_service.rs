@@ -154,7 +154,26 @@ impl EmbeddingServiceImpl {
             "all-MiniLM-L12-v2" | "sentence-transformers/all-MiniLM-L12-v2" => {
                 Ok(fastembed::EmbeddingModel::AllMiniLML12V2)
             }
-            other => Err(Status::not_found(format!("Unknown embedding model: {other}"))),
+            // Snowflake Arctic Embed — strong retrieval quality (MTEB ~55.6)
+            "snowflake-arctic-embed-l" | "Snowflake/snowflake-arctic-embed-l" => {
+                Ok(fastembed::EmbeddingModel::SnowflakeArcticEmbedL)
+            }
+            "snowflake-arctic-embed-m" | "Snowflake/snowflake-arctic-embed-m" => {
+                Ok(fastembed::EmbeddingModel::SnowflakeArcticEmbedM)
+            }
+            "snowflake-arctic-embed-s" | "Snowflake/snowflake-arctic-embed-s" => {
+                Ok(fastembed::EmbeddingModel::SnowflakeArcticEmbedS)
+            }
+            // GTE — strong overall quality (MTEB ~65)
+            "gte-large-en-v1.5" | "Alibaba-NLP/gte-large-en-v1.5" => {
+                Ok(fastembed::EmbeddingModel::GTELargeENV15)
+            }
+            "gte-base-en-v1.5" | "Alibaba-NLP/gte-base-en-v1.5" => {
+                Ok(fastembed::EmbeddingModel::GTEBaseENV15)
+            }
+            other => Err(Status::not_found(format!("Unknown embedding model: {other}. \
+                Supported: nomic-embed-text-v1.5, all-MiniLM-L6-v2, bge-small/base/large-en-v1.5, \
+                snowflake-arctic-embed-s/m/l, gte-base/large-en-v1.5"))),
         }
     }
 
