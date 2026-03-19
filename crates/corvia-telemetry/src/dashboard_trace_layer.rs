@@ -1,5 +1,6 @@
 //! A tracing Layer that writes span-close events as JSON lines to a file,
-//! enriched with OTEL trace context (trace_id, span_id, parent_span_id).
+//! enriched with OTEL trace context (trace_id, span_id, parent_span_id)
+//! and accurate elapsed timing.
 //!
 //! This layer exists because `tracing_subscriber::fmt::json()` doesn't include
 //! data from span extensions (where OtelFields lives). The dashboard traces
@@ -10,12 +11,15 @@ use crate::otel_context_layer::OtelFields;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::SystemTime;
-use tracing::span::Id;
+use std::time::{Instant, SystemTime};
+use tracing::span::{Attributes, Id};
 use tracing::Subscriber;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
+
+/// Stored in span extensions to track creation time.
+struct SpanCreatedAt(Instant);
 
 /// A tracing Layer that appends span-close JSON to a log file for dashboard consumption.
 pub struct DashboardTraceLayer {
@@ -51,6 +55,15 @@ impl<S> Layer<S> for DashboardTraceLayer
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
+    fn on_new_span(&self, _attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        if let Some(span) = ctx.span(id) {
+            // Only track corvia.* spans
+            if span.metadata().name().starts_with("corvia.") {
+                span.extensions_mut().insert(SpanCreatedAt(Instant::now()));
+            }
+        }
+    }
+
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
         let span = match ctx.span(&id) {
             Some(s) => s,
@@ -83,11 +96,10 @@ where
                 (None, None, None)
             };
 
-        // Calculate elapsed time from span's busy/idle time
-        // tracing-subscriber tracks this via extensions
+        // Compute elapsed time from span creation
         let elapsed_ms = extensions
-            .get::<tracing_subscriber::fmt::time::SystemTime>()
-            .map(|_| 0.0)
+            .get::<SpanCreatedAt>()
+            .map(|created| created.0.elapsed().as_secs_f64() * 1000.0)
             .unwrap_or(0.0);
 
         drop(extensions);
@@ -99,7 +111,6 @@ where
                 .unwrap_or_default();
             let secs = d.as_secs();
             let micros = d.subsec_micros();
-            // Simple UTC timestamp without pulling in chrono
             let (y, mo, dy, h, mi, s) = unix_to_utc(secs);
             format!("{y:04}-{mo:02}-{dy:02}T{h:02}:{mi:02}:{s:02}.{micros:06}Z")
         };
