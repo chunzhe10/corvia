@@ -61,7 +61,9 @@ impl MergeWorker {
             // Update entry status to Rejected in store
             if let Ok(Some(mut entry)) = self.store.get(&queue_entry.entry_id).await {
                 entry.entry_status = EntryStatus::Rejected;
-                let _ = self.store.insert(&entry).await;
+                if let Err(e) = self.store.insert(&entry).await {
+                    warn!(entry_id = %queue_entry.entry_id, error = %e, "failed to update rejected entry status in store");
+                }
             }
             self.queue.mark_complete(&queue_entry.entry_id)?;
             return Ok(());

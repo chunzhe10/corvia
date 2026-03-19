@@ -17,6 +17,16 @@ use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
+/// Map a CorviaError to the appropriate HTTP status code + message.
+fn map_corvia_err(prefix: &str, e: corvia_common::errors::CorviaError) -> (StatusCode, String) {
+    let status = match &e {
+        corvia_common::errors::CorviaError::NotFound(_) => StatusCode::NOT_FOUND,
+        corvia_common::errors::CorviaError::Validation(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, format!("{prefix}: {e}"))
+}
+
 pub struct AppState {
     pub store: Arc<dyn QueryableStore>,
     pub engine: Arc<dyn InferenceEngine>,
@@ -525,7 +535,7 @@ async fn heartbeat(
 ) -> std::result::Result<StatusCode, (StatusCode, String)> {
     let coord = coordinator(&state);
     coord.heartbeat(&session_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Heartbeat failed: {e}")))?;
+        .map_err(|e| map_corvia_err("Heartbeat failed", e))?;
     Ok(StatusCode::OK)
 }
 
@@ -558,7 +568,7 @@ async fn commit_session(
 ) -> std::result::Result<StatusCode, (StatusCode, String)> {
     let coord = coordinator(&state);
     coord.commit_session(&session_id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Commit failed: {e}")))?;
+        .map_err(|e| map_corvia_err("Commit failed", e))?;
     Ok(StatusCode::OK)
 }
 
@@ -568,7 +578,7 @@ async fn rollback_session(
 ) -> std::result::Result<StatusCode, (StatusCode, String)> {
     let coord = coordinator(&state);
     coord.rollback_session(&session_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Rollback failed: {e}")))?;
+        .map_err(|e| map_corvia_err("Rollback failed", e))?;
     Ok(StatusCode::OK)
 }
 

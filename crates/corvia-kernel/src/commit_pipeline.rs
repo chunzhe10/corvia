@@ -1,7 +1,7 @@
 use corvia_common::agent_types::{EntryStatus, SessionState};
 use corvia_common::errors::{CorviaError, Result};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::merge_queue::MergeQueue;
 use crate::session_manager::SessionManager;
@@ -67,7 +67,9 @@ impl CommitPipeline {
                         .collect();
                     let file_refs: Vec<&str> = file_paths.iter().map(|s| s.as_str()).collect();
                     let msg = format!("agent commit: {} ({} entries)", session_id, files.len());
-                    let _ = self.staging.commit_on_branch(branch, &msg, &file_refs);
+                    if let Err(e) = self.staging.commit_on_branch(branch, &msg, &file_refs) {
+                        warn!(session_id, branch, error = %e, "commit_step2: git commit failed");
+                    }
                     info!(session_id, branch, "commit_step2: git commit on branch");
                 }
             }
@@ -81,7 +83,9 @@ impl CommitPipeline {
                 if let Ok(Some(mut entry)) = self.store.get(entry_id).await {
                     if entry.entry_status == EntryStatus::Pending {
                         entry.entry_status = EntryStatus::Committed;
-                        let _ = self.store.insert(&entry).await;
+                        if let Err(e) = self.store.insert(&entry).await {
+                            warn!(entry_id = %entry_id, error = %e, "commit_step3: failed to update entry status");
+                        }
                     }
                 }
             }
