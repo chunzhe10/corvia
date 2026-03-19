@@ -22,6 +22,10 @@ use corvia_kernel::agent_coordinator::GcReport;
 use serde::{Deserialize, Serialize};
 use crate::rest::AppState;
 
+/// Timeout for RAG ask operations (seconds). Prevents LLM inference from
+/// blocking the server indefinitely.
+const RAG_ASK_TIMEOUT_SECS: u64 = 120;
+
 fn gc_report_to_dto(r: GcReport) -> corvia_common::dashboard::GcReportDto {
     corvia_common::dashboard::GcReportDto {
         orphans_rolled_back: r.orphans_rolled_back,
@@ -809,10 +813,10 @@ async fn rag_ask_handler(
     };
 
     let response = tokio::time::timeout(
-        std::time::Duration::from_secs(120),
+        std::time::Duration::from_secs(RAG_ASK_TIMEOUT_SECS),
         rag.ask(&req.query, &req.scope_id, Some(opts)),
     ).await
-        .map_err(|_| (StatusCode::GATEWAY_TIMEOUT, "RAG ask timed out after 120s".into()))?
+        .map_err(|_| (StatusCode::GATEWAY_TIMEOUT, format!("RAG ask timed out after {RAG_ASK_TIMEOUT_SECS}s")))?
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("RAG failed: {e}")))?;
 
     let sources: Vec<serde_json::Value> = response.context.sources.iter().map(|s| {

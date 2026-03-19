@@ -475,7 +475,7 @@ pub fn tail_lines(path: &Path, n: usize) -> Vec<String> {
         Err(_) => return Vec::new(),
     };
     let reader = BufReader::new(file);
-    let all_lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
+    let all_lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
     let start = all_lines.len().saturating_sub(n);
     all_lines[start..].to_vec()
 }

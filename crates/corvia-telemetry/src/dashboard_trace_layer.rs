@@ -22,7 +22,12 @@ use tracing_subscriber::Layer;
 struct SpanCreatedAt(Instant);
 
 /// A tracing Layer that appends span-close JSON to a log file for dashboard consumption.
+/// Maximum trace log file size before rotation (10 MB).
+const MAX_TRACE_LOG_SIZE: u64 = 10 * 1024 * 1024;
+
+/// A tracing Layer that appends span-close JSON to a log file for dashboard consumption.
 pub struct DashboardTraceLayer {
+    path: PathBuf,
     writer: Mutex<std::io::BufWriter<std::fs::File>>,
 }
 
@@ -36,10 +41,33 @@ impl DashboardTraceLayer {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)?;
+            .open(&path)?;
         Ok(Self {
+            path,
             writer: Mutex::new(std::io::BufWriter::new(file)),
         })
+    }
+
+    /// Rotate the trace log if it exceeds the size cap.
+    /// Renames the current file to `.old` and opens a fresh file.
+    fn maybe_rotate(&self) {
+        let size = std::fs::metadata(&self.path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if size <= MAX_TRACE_LOG_SIZE {
+            return;
+        }
+        let old_path = self.path.with_extension("log.old");
+        let _ = std::fs::rename(&self.path, &old_path);
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            if let Ok(mut writer) = self.writer.lock() {
+                *writer = std::io::BufWriter::new(file);
+            }
+        }
     }
 
     /// Default path: the same directory corvia-dev writes service logs to.
@@ -139,6 +167,9 @@ where
             let _ = writeln!(writer, "{}", json);
             let _ = writer.flush();
         }
+
+        // Rotate after writing if file exceeds size cap
+        self.maybe_rotate();
     }
 }
 

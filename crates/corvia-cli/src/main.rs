@@ -2499,7 +2499,9 @@ async fn cmd_bench_run(server: &str, limit: usize, ab: bool) -> Result<()> {
 
 /// Show the latest benchmark results.
 fn cmd_bench_report() -> Result<()> {
-    let results_dir = std::path::Path::new("benchmarks/rag-retrieval/results");
+    let workspace_root = std::env::var("CORVIA_WORKSPACE_ROOT")
+        .unwrap_or_else(|_| ".".to_string());
+    let results_dir = std::path::Path::new(&workspace_root).join("benchmarks/rag-retrieval/results");
     if !results_dir.exists() {
         eprintln!("No benchmark results found. Run 'corvia bench run' first.");
         return Ok(());

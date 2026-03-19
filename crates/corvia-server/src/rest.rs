@@ -19,6 +19,10 @@ use rust_embed::Embed;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
+/// Timeout for RAG ask operations (seconds). Prevents LLM inference from
+/// blocking the server indefinitely.
+const RAG_ASK_TIMEOUT_SECS: u64 = 120;
+
 /// Embedded dashboard static assets. Built from the workspace's dashboard dist/.
 /// The path is resolved at compile time via CORVIA_DASHBOARD_DIR env var,
 /// defaulting to a placeholder that produces an empty embed.
@@ -558,10 +562,10 @@ async fn rag_ask(
     // Timeout prevents LLM inference from blocking the server indefinitely.
     // The /v1/ask endpoint can OOM or hang if the model is large.
     let response = tokio::time::timeout(
-        std::time::Duration::from_secs(120),
+        std::time::Duration::from_secs(RAG_ASK_TIMEOUT_SECS),
         rag.ask(&req.query, &req.scope_id, Some(opts)),
     ).await
-        .map_err(|_| (StatusCode::GATEWAY_TIMEOUT, "RAG ask timed out after 120s".into()))?
+        .map_err(|_| (StatusCode::GATEWAY_TIMEOUT, format!("RAG ask timed out after {RAG_ASK_TIMEOUT_SECS}s")))?
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("RAG failed: {e}")))?;
 
     Ok(Json(RagResponseDto {

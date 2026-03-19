@@ -508,10 +508,17 @@ impl super::traits::QueryableStore for LiteStore {
             .ok_or_else(|| CorviaError::Storage("Entry must have embedding set".into()))?;
 
         if embedding.len() != self.dimensions {
+            warn!(
+                "Embedding dimension mismatch: got {}d, store expects {}d. \
+                 Run 'corvia rebuild' to re-index.",
+                embedding.len(),
+                self.dimensions
+            );
             return Err(CorviaError::Storage(format!(
-                "Embedding dimension mismatch: expected {}, got {}",
-                self.dimensions,
-                embedding.len()
+                "Embedding dimension mismatch: got {}d, store expects {}d. \
+                 Run 'corvia rebuild' to re-index.",
+                embedding.len(),
+                self.dimensions
             )));
         }
 
