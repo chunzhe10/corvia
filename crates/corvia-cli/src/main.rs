@@ -223,6 +223,15 @@ enum BenchCommands {
     },
     /// Show the latest benchmark results
     Report,
+    /// Run A/B comparison: vector-only vs graph-expanded retrieval
+    Compare {
+        /// Server URL
+        #[arg(long, default_value = "http://localhost:8020")]
+        server: String,
+        /// Number of results to retrieve per query
+        #[arg(long, default_value = "10")]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -390,6 +399,7 @@ async fn main() -> Result<()> {
         Commands::Bench { command } => match command {
             BenchCommands::Run { server, limit, ab } => cmd_bench_run(&server, limit, ab).await?,
             BenchCommands::Report => cmd_bench_report()?,
+            BenchCommands::Compare { server, limit } => cmd_bench_compare(&server, limit).await?,
         },
     }
 
@@ -2547,6 +2557,100 @@ fn cmd_bench_report() -> Result<()> {
                 vector["avg_mrr"].as_f64().unwrap_or(0.0),
                 vector["avg_latency"].as_f64().unwrap_or(0.0));
         }
+    }
+
+    Ok(())
+}
+
+/// Run A/B comparison: vector-only vs graph-expanded retrieval.
+async fn cmd_bench_compare(server: &str, limit: usize) -> Result<()> {
+    use std::process::Command;
+
+    println!("corvia bench compare — A/B Retrieval Comparison");
+    println!("Server: {server}");
+    println!("Top-K:  {limit}");
+    println!();
+
+    // Check server health
+    let health_url = format!("{server}/health");
+    let client = reqwest::Client::new();
+    match client.get(&health_url).timeout(std::time::Duration::from_secs(5)).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            println!("Server: OK");
+        }
+        _ => {
+            anyhow::bail!("Server at {server} is not responding. Start with 'corvia serve'.");
+        }
+    }
+
+    let workspace_root = std::env::var("CORVIA_WORKSPACE_ROOT")
+        .unwrap_or_else(|_| ".".to_string());
+
+    // Prefer ab-test.py; fall back to running eval.py twice
+    let ab_script = "benchmarks/rag-retrieval/ab-test.py";
+    let ab_path = std::path::Path::new(&workspace_root).join(ab_script);
+    let ab_alt = std::path::Path::new(ab_script);
+    let ab_actual = if ab_path.exists() {
+        Some(ab_path)
+    } else if ab_alt.exists() {
+        Some(ab_alt.to_path_buf())
+    } else {
+        None
+    };
+
+    if let Some(script) = ab_actual {
+        println!("Running: python3 {} --server {server} --limit {limit}", script.display());
+        println!("{}", "-".repeat(70));
+
+        let status = Command::new("python3")
+            .arg(script.to_string_lossy().as_ref())
+            .args(["--server", server, "--limit", &limit.to_string()])
+            .status()
+            .map_err(|e| anyhow::anyhow!("Failed to run ab-test: {e}"))?;
+
+        if !status.success() {
+            eprintln!("ab-test exited with non-zero status");
+        }
+    } else {
+        // Fallback: run eval.py twice with different expand_graph settings
+        let eval_script = "benchmarks/rag-retrieval/eval.py";
+        let eval_path = std::path::Path::new(&workspace_root).join(eval_script);
+        let eval_alt = std::path::Path::new(eval_script);
+        let eval_actual = if eval_path.exists() {
+            eval_path
+        } else if eval_alt.exists() {
+            eval_alt.to_path_buf()
+        } else {
+            anyhow::bail!(
+                "Neither ab-test.py nor eval.py found. Run from workspace root or set CORVIA_WORKSPACE_ROOT."
+            );
+        };
+
+        println!("ab-test.py not found, falling back to running eval.py twice");
+        println!("{}", "-".repeat(70));
+
+        println!("\n--- Run 1: graph_expand=true ---");
+        let status = Command::new("python3")
+            .arg(eval_actual.to_string_lossy().as_ref())
+            .args(["--server", server, "--limit", &limit.to_string()])
+            .status()
+            .map_err(|e| anyhow::anyhow!("Failed to run eval (graph_expand): {e}"))?;
+        if !status.success() {
+            eprintln!("eval.py (graph_expand) exited with non-zero status");
+        }
+
+        println!("\n--- Run 2: vector-only ---");
+        let status = Command::new("python3")
+            .arg(eval_actual.to_string_lossy().as_ref())
+            .args(["--server", server, "--limit", &limit.to_string()])
+            .status()
+            .map_err(|e| anyhow::anyhow!("Failed to run eval (vector-only): {e}"))?;
+        if !status.success() {
+            eprintln!("eval.py (vector-only) exited with non-zero status");
+        }
+
+        println!("\nNote: fallback mode runs eval.py twice but cannot toggle graph expansion.");
+        println!("Install ab-test.py for proper A/B comparison with graph vs vector modes.");
     }
 
     Ok(())
