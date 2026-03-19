@@ -64,11 +64,15 @@ pub async fn activity_feed_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ActivityFeedParams>,
 ) -> impl IntoResponse {
-    let scope_id = state.default_scope_id.as_deref().unwrap_or(DEFAULT_SCOPE_ID);
-    let data_dir = &state.data_dir;
+    let scope_id = state.default_scope_id.as_deref().unwrap_or(DEFAULT_SCOPE_ID).to_string();
+    let data_dir = state.data_dir.clone();
 
-    let mut entries =
-        corvia_kernel::knowledge_files::read_scope(data_dir, scope_id).unwrap_or_default();
+    // Read knowledge files on a blocking thread to avoid starving the async runtime.
+    let mut entries = tokio::task::spawn_blocking(move || {
+        corvia_kernel::knowledge_files::read_scope(&data_dir, &scope_id).unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
 
     // Sort by recorded_at descending (newest first)
     entries.sort_by_key(|e| std::cmp::Reverse(e.recorded_at));

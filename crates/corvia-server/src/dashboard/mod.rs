@@ -324,17 +324,25 @@ async fn graph_handler(
 
 /// GET /api/dashboard/graph/scope
 /// Returns all nodes and edges for the default scope's knowledge graph.
+/// Uses spawn_blocking for the file I/O to avoid blocking the async runtime.
 async fn graph_scope_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let scope_id = state
         .default_scope_id
         .as_deref()
-        .unwrap_or(DEFAULT_SCOPE_ID);
+        .unwrap_or(DEFAULT_SCOPE_ID)
+        .to_string();
 
-    // Load all entries from knowledge files
-    let entries = corvia_kernel::knowledge_files::read_scope(&state.data_dir, scope_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load entries: {e}")))?;
+    // Load entries on a blocking thread to avoid starving the async runtime.
+    // With ~8,774 JSON files, this I/O is too heavy for the async executor.
+    let data_dir = state.data_dir.clone();
+    let entries = tokio::task::spawn_blocking(move || {
+        corvia_kernel::knowledge_files::read_scope(&data_dir, &scope_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task join failed: {e}")))?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load entries: {e}")))?;
 
     // Collect edges for every entry, deduplicating by from:relation:to
     let mut seen = std::collections::HashSet::<String>::new();
