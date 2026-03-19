@@ -33,5 +33,9 @@ encoding_rs = "0.8.35"
 libc = "0.2"
 
 [features]
+# CUDA for llama.cpp chat models. Requires CUDA Toolkit (nvcc) at build time.
+# Enable with: cargo build -p corvia-inference --features cuda
+# The devcontainer has CUDA runtime (for ORT embedding) but not the build toolkit.
+# See: docs/decisions/gpu-inference.md for setup instructions.
 default = []
 cuda = ["llama-cpp-2/cuda"]
