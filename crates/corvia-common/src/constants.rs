@@ -11,3 +11,7 @@ pub const CLAUDE_SESSIONS_ADAPTER: &str = "claude-sessions";
 
 /// Fallback scope ID used when no explicit scope is configured.
 pub const DEFAULT_SCOPE_ID: &str = "corvia";
+
+/// Timeout for RAG ask operations (seconds). Prevents LLM inference from
+/// blocking the server indefinitely. Used by both REST and dashboard handlers.
+pub const RAG_ASK_TIMEOUT_SECS: u64 = 120;

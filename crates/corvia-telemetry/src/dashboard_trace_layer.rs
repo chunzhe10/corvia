@@ -166,10 +166,22 @@ where
         if let Ok(mut writer) = self.writer.lock() {
             let _ = writeln!(writer, "{}", json);
             let _ = writer.flush();
-        }
 
-        // Rotate after writing if file exceeds size cap
-        self.maybe_rotate();
+            // Rotate while holding the lock to avoid TOCTOU race
+            if let Ok(meta) = std::fs::metadata(&self.path) {
+                if meta.len() > MAX_TRACE_LOG_SIZE {
+                    let old_path = self.path.with_extension("log.old");
+                    let _ = std::fs::rename(&self.path, &old_path);
+                    if let Ok(file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&self.path)
+                    {
+                        *writer = std::io::BufWriter::new(file);
+                    }
+                }
+            }
+        }
     }
 }
 

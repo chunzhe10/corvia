@@ -7,7 +7,7 @@ use axum::{
 };
 use chrono::{DateTime, Duration, Utc};
 use corvia_common::agent_types::*;
-use corvia_common::constants::{CLAUDE_SESSIONS_ADAPTER, USER_HISTORY_SCOPE};
+use corvia_common::constants::{CLAUDE_SESSIONS_ADAPTER, RAG_ASK_TIMEOUT_SECS, USER_HISTORY_SCOPE};
 use corvia_common::types::{EdgeDirection, GraphEdge, KnowledgeEntry, SearchResult};
 use corvia_kernel::agent_coordinator::AgentCoordinator;
 use corvia_kernel::ops::GcHistory;
@@ -18,10 +18,6 @@ use std::sync::Arc;
 use rust_embed::Embed;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
-
-/// Timeout for RAG ask operations (seconds). Prevents LLM inference from
-/// blocking the server indefinitely.
-const RAG_ASK_TIMEOUT_SECS: u64 = 120;
 
 /// Embedded dashboard static assets. Built from the workspace's dashboard dist/.
 /// The path is resolved at compile time via CORVIA_DASHBOARD_DIR env var,

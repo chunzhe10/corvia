@@ -14,17 +14,13 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 
-use corvia_common::constants::DEFAULT_SCOPE_ID;
+use corvia_common::constants::{DEFAULT_SCOPE_ID, RAG_ASK_TIMEOUT_SECS};
 use corvia_common::dashboard::{
     DashboardConfig, DashboardStatusResponse, LogEntry, LogsResponse, ModuleStats, TracesResponse,
 };
 use corvia_kernel::agent_coordinator::GcReport;
 use serde::{Deserialize, Serialize};
 use crate::rest::AppState;
-
-/// Timeout for RAG ask operations (seconds). Prevents LLM inference from
-/// blocking the server indefinitely.
-const RAG_ASK_TIMEOUT_SECS: u64 = 120;
 
 fn gc_report_to_dto(r: GcReport) -> corvia_common::dashboard::GcReportDto {
     corvia_common::dashboard::GcReportDto {
