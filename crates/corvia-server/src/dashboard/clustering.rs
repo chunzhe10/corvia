@@ -351,7 +351,7 @@ impl ClusterHierarchy {
                 .map(|(id, e)| (id.clone(), e.clone()))
                 .collect();
 
-            let sub_k_max = (sc.entry_ids.len() / 2).min(8).max(2);
+            let sub_k_max = (sc.entry_ids.len() / 2).clamp(2, 8);
             let sub_k = find_best_k(&sc_embeddings, 2, sub_k_max, 200);
             let sub_assignments = kmeans(&sc_embeddings, sub_k, 100);
 
@@ -445,7 +445,7 @@ pub fn compute_topic_tags(hierarchy: &ClusterHierarchy, embeddings: &[Vec<f32>])
         }
     }
     let mut tags: Vec<(String, usize)> = counts.into_iter().collect();
-    tags.sort_by(|a, b| b.1.cmp(&a.1));
+    tags.sort_by_key(|a| std::cmp::Reverse(a.1));
     tags.into_iter().take(5).map(|(label, _)| label).collect()
 }
 

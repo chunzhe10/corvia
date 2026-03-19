@@ -21,6 +21,7 @@ use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use crate::chunking_strategy::{ChunkMetadata, ChunkRelation, ChunkResult, ChunkingStrategy, RawChunk, SourceMetadata};
 
 /// Heading-based Markdown section chunker.
+#[derive(Default)]
 pub struct MarkdownChunker;
 
 impl MarkdownChunker {

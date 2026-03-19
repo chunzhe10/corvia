@@ -71,7 +71,7 @@ pub async fn activity_feed_handler(
         corvia_kernel::knowledge_files::read_scope(data_dir, scope_id).unwrap_or_default();
 
     // Sort by recorded_at descending (newest first)
-    entries.sort_by(|a, b| b.recorded_at.cmp(&a.recorded_at));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.recorded_at));
 
     // Apply agent filter before building items
     if let Some(ref agent) = params.agent {
@@ -218,7 +218,7 @@ pub async fn activity_feed_handler(
 
 /// Groups adjacent activity items that share the same agent + topic within a
 /// 5-minute window. Items in a group share a `group_id` and `group_count`.
-pub fn group_activity_items(items: &mut Vec<ActivityItem>) {
+pub fn group_activity_items(items: &mut [ActivityItem]) {
     let mut i = 0;
     while i < items.len() {
         let mut group_size = 1usize;
@@ -249,9 +249,9 @@ pub fn group_activity_items(items: &mut Vec<ActivityItem>) {
 
         if group_size > 1 {
             let group_id = format!("group-{i}");
-            for k in i..j {
-                items[k].group_id = Some(group_id.clone());
-                items[k].group_count = Some(group_size);
+            for item in &mut items[i..j] {
+                item.group_id = Some(group_id.clone());
+                item.group_count = Some(group_size);
             }
         }
         i = j;

@@ -307,7 +307,7 @@ impl ChunkingPipeline {
     fn merge_step(
         &self,
         strategy: &Arc<dyn ChunkingStrategy>,
-        chunks: &mut Vec<RawChunk>,
+        chunks: &mut [RawChunk],
     ) -> (Vec<RawChunk>, Vec<bool>) {
         // Try strategy-specific merge first.
         if let Some(merged) = strategy.merge_small(chunks, self.config.max_tokens) {

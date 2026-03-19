@@ -133,9 +133,9 @@ pub fn inference_backend_from_config(
     let mut backends = HashMap::new();
 
     // Embedding backend
-    let emb_device = if !cfg.inference.embedding_backend.is_empty() {
-        "gpu"
-    } else if !cfg.inference.backend.is_empty() {
+    let emb_device = if !cfg.inference.embedding_backend.is_empty()
+        || !cfg.inference.backend.is_empty()
+    {
         "gpu"
     } else {
         "cpu"

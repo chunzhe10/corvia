@@ -296,7 +296,7 @@ impl AgentCoordinator {
                 reconnectable.push(agent);
             }
         }
-        reconnectable.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+        reconnectable.sort_by_key(|a| std::cmp::Reverse(a.last_seen));
         Ok(reconnectable)
     }
 

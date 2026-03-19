@@ -14,6 +14,7 @@ use corvia_common::errors::Result;
 use crate::chunking_strategy::{ChunkMetadata, ChunkResult, ChunkingStrategy, RawChunk, SourceMetadata};
 
 /// Configuration file chunker for TOML, YAML, and JSON.
+#[derive(Default)]
 pub struct ConfigChunker;
 
 impl ConfigChunker {

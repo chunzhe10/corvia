@@ -16,6 +16,7 @@ use crate::chunking_strategy::{ChunkMetadata, ChunkResult, ChunkingStrategy, Raw
 ///
 /// Expects pre-extracted text from a PDF. Splits on `\n\n` boundaries and
 /// produces one [`RawChunk`] per non-empty paragraph.
+#[derive(Default)]
 pub struct PdfChunker;
 
 impl PdfChunker {

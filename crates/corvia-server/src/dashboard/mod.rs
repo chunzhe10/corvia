@@ -393,9 +393,9 @@ async fn graph_scope_handler(
                 .and_then(|e| e.metadata.source_file.as_deref())
                 .map(|sf| {
                     let parts: Vec<&str> = sf.split('/').collect();
-                    if parts.first() == Some(&"crates") && parts.len() >= 2 {
-                        parts[1].to_string()
-                    } else if parts.first() == Some(&"adapters") && parts.len() >= 2 {
+                    if (parts.first() == Some(&"crates") || parts.first() == Some(&"adapters"))
+                        && parts.len() >= 2
+                    {
                         parts[1].to_string()
                     } else if parts.first() == Some(&"docs") {
                         "docs".to_string()

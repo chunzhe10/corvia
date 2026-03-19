@@ -281,6 +281,13 @@ impl Default for MergeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RagConfig {
+    /// Retriever strategy name. Built-in: "vector", "graph_expand".
+    /// Default: "graph_expand" (falls back to "vector" if no graph store).
+    #[serde(default = "default_retriever")]
+    pub retriever: String,
+    /// Augmenter strategy name. Built-in: "structured".
+    #[serde(default = "default_augmenter")]
+    pub augmenter: String,
     #[serde(default = "default_rag_limit")]
     pub default_limit: usize,
     #[serde(default = "default_graph_expand")]
@@ -316,6 +323,8 @@ pub struct RagConfig {
     pub reserve_for_skills: f32,
 }
 
+fn default_retriever() -> String { "graph_expand".into() }
+fn default_augmenter() -> String { "structured".into() }
 fn default_rag_limit() -> usize { 10 }
 fn default_graph_expand() -> bool { true }
 fn default_graph_depth() -> usize { 2 }
@@ -330,6 +339,8 @@ fn default_reserve_for_skills() -> f32 { 0.15 }
 impl Default for RagConfig {
     fn default() -> Self {
         Self {
+            retriever: default_retriever(),
+            augmenter: default_augmenter(),
             default_limit: default_rag_limit(),
             graph_expand: default_graph_expand(),
             graph_depth: default_graph_depth(),
