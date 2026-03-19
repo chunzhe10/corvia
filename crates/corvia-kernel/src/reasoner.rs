@@ -296,13 +296,13 @@ impl<'a> Reasoner<'a> {
 
         let mut findings = Vec::new();
         for entry in &scoped {
-            // Skip chunk types that are legitimately orphaned
-            let chunk_type = entry
-                .metadata
-                .chunk_type
-                .as_deref()
-                .unwrap_or("");
-            if chunk_type == "finding" || chunk_type == "file" {
+            // Skip chunk types that are structurally orphaned — no edge extraction
+            // exists for these types, so flagging them is noise, not signal.
+            let chunk_type = entry.metadata.chunk_type.as_deref().unwrap_or("");
+            let language = entry.metadata.language.as_deref().unwrap_or("");
+            if matches!(chunk_type, "finding" | "file" | "text" | "section")
+                || matches!(language, "" | "toml" | "yaml" | "json")
+            {
                 continue;
             }
 
@@ -852,7 +852,8 @@ mod tests {
     async fn test_check_orphaned_nodes() {
         let (_dir, store) = test_store().await;
 
-        let e = entry("lonely node", "scope");
+        let mut e = entry("lonely node", "scope");
+        e.metadata.language = Some("rs".into()); // Must have a language to not be skipped
         store.insert(&e).await.unwrap();
         // No graph edges created — this entry is an orphan
 
@@ -1009,9 +1010,13 @@ mod tests {
         stale.valid_to = Some(Utc::now());
         store.insert(&stale).await.unwrap();
 
-        // Create an orphaned entry (no edges)
-        let orphan = entry("orphan", "scope");
+        // Create an orphaned entry (no edges) — must have language to not be skipped
+        let mut orphan = entry("orphan", "scope");
+        orphan.metadata.language = Some("rs".into());
         store.insert(&orphan).await.unwrap();
+
+        // Also set language on stale entry so it's eligible for orphan check
+        stale.metadata.language = Some("rs".into());
 
         let reasoner = Reasoner::new(&store, &store);
         let findings = reasoner
