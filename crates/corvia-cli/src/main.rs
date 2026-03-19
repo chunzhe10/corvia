@@ -582,8 +582,14 @@ async fn cmd_serve() -> Result<()> {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                match corvia_kernel::knowledge_files::read_scope(&data_dir_bg, &scope_id_bg) {
-                    Ok(entries) => {
+                // Read files on blocking thread to avoid starving the async runtime.
+                let dir = data_dir_bg.clone();
+                let scope = scope_id_bg.clone();
+                let entries = tokio::task::spawn_blocking(move || {
+                    corvia_kernel::knowledge_files::read_scope(&dir, &scope)
+                }).await;
+                match entries {
+                    Ok(Ok(entries)) => {
                         let pairs: Vec<(String, Vec<f32>)> = entries
                             .iter()
                             .filter_map(|e| {
@@ -599,7 +605,8 @@ async fn cmd_serve() -> Result<()> {
                             );
                         }
                     }
-                    Err(e) => tracing::warn!("Cluster recompute failed: {e}"),
+                    Ok(Err(e)) => tracing::warn!("Cluster recompute failed: {e}"),
+                    Err(e) => tracing::warn!(error = %e, "cluster_recompute_task_failed"),
                 }
             }
         });
