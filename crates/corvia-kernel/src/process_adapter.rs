@@ -50,9 +50,9 @@ impl ProcessAdapter {
             .spawn()
             .map_err(|e| format!("Failed to spawn {}: {e}", self.binary_path.display()))?;
 
-        let stdin = child.stdin.as_ref().map(|_| ()).ok_or("no stdin")?;
-        let stdout = child.stdout.as_ref().map(|_| ()).ok_or("no stdout")?;
-        let _ = (stdin, stdout);
+        child.stdin.as_ref().map(|_| ()).ok_or("no stdin")?;
+        child.stdout.as_ref().map(|_| ()).ok_or("no stdout")?;
+        let _ = ((), ());
 
         let mut child = child;
         let stdin = BufWriter::new(child.stdin.take().unwrap());

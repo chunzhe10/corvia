@@ -46,14 +46,14 @@ impl AgentIdentity {
     /// Whether this identity type has write access.
     /// Registered: yes. McpClient with _meta.agent_id: yes. Others: no.
     pub fn can_write(&self) -> bool {
-        match self {
-            Self::Registered { .. } => true,
-            Self::McpClient {
-                agent_hint: Some(_),
-                ..
-            } => true,
-            _ => false,
-        }
+        matches!(
+            self,
+            Self::Registered { .. }
+                | Self::McpClient {
+                    agent_hint: Some(_),
+                    ..
+                }
+        )
     }
 
     /// Whether this identity gets full D43 staging hybrid (staging dir + git branch).

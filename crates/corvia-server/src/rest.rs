@@ -7,6 +7,7 @@ use axum::{
 };
 use chrono::{DateTime, Duration, Utc};
 use corvia_common::agent_types::*;
+use corvia_common::constants::{CLAUDE_SESSIONS_ADAPTER, USER_HISTORY_SCOPE};
 use corvia_common::types::{EdgeDirection, GraphEdge, KnowledgeEntry, SearchResult};
 use corvia_kernel::agent_coordinator::AgentCoordinator;
 use corvia_kernel::ops::GcHistory;
@@ -645,7 +646,7 @@ async fn entry_edges(
 
     let filtered: Vec<EdgeDto> = edges.iter()
         .filter(|e| {
-            query.relation.as_ref().map_or(true, |r| &e.relation == r)
+            query.relation.as_ref().is_none_or(|r| &e.relation == r)
         })
         .map(Into::into)
         .collect();
@@ -753,9 +754,9 @@ async fn ingest_sessions(
 
     // Check user-history scope exists
     let has_scope = config.scope.as_ref()
-        .map_or(false, |scopes| scopes.iter().any(|s| s.id == "user-history"));
+        .is_some_and(|scopes| scopes.iter().any(|s| s.id == USER_HISTORY_SCOPE));
     if !has_scope {
-        return Err((StatusCode::BAD_REQUEST, "No 'user-history' scope in config".into()));
+        return Err((StatusCode::BAD_REQUEST, format!("No '{}' scope in config", USER_HISTORY_SCOPE)));
     }
 
     // Discover and run the adapter (blocking I/O — must be in spawn_blocking)
@@ -768,8 +769,8 @@ async fn ingest_sessions(
     let source_files = tokio::task::spawn_blocking(move || -> Result<Vec<corvia_kernel::chunking_strategy::SourceFile>, String> {
         let discovered = corvia_kernel::adapter_discovery::discover_adapters(&extra_dirs);
         let adapter_info = discovered.iter()
-            .find(|a| a.metadata.domain == "claude-sessions")
-            .ok_or_else(|| "claude-sessions adapter not found on PATH".to_string())?;
+            .find(|a| a.metadata.domain == CLAUDE_SESSIONS_ADAPTER)
+            .ok_or_else(|| format!("{CLAUDE_SESSIONS_ADAPTER} adapter not found on PATH"))?;
 
         let mut process = corvia_kernel::process_adapter::ProcessAdapter::new(
             adapter_info.binary_path.clone(),
@@ -778,7 +779,7 @@ async fn ingest_sessions(
         process.spawn()?;
         // ProcessAdapter::Drop calls shutdown() if we bail early, but explicit
         // shutdown provides better error reporting.
-        let files = match process.ingest(&sessions_dir_str, "user-history") {
+        let files = match process.ingest(&sessions_dir_str, USER_HISTORY_SCOPE) {
             Ok(f) => f,
             Err(e) => {
                 let _ = process.shutdown();
@@ -820,7 +821,7 @@ async fn ingest_sessions(
     let entries: Vec<KnowledgeEntry> = source_files.iter().map(|sf| {
         let mut entry = KnowledgeEntry::new(
             sf.content.clone(),
-            "user-history".to_string(),
+            USER_HISTORY_SCOPE.to_string(),
             sf.metadata.source_version.clone(),
         );
         entry.workstream = sf.metadata.workstream.clone().unwrap_or_default();
@@ -907,7 +908,7 @@ async fn classify_sessions(
     // Load user-history entries for source_version lookup (blocking I/O in spawn_blocking)
     let data_dir = state.data_dir.clone();
     let uh_entries = tokio::task::spawn_blocking(move || {
-        corvia_kernel::knowledge_files::read_scope(&data_dir, "user-history")
+        corvia_kernel::knowledge_files::read_scope(&data_dir, USER_HISTORY_SCOPE)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task join error: {e}")))?
@@ -1615,7 +1616,7 @@ mod tests {
         // Write a user-history entry to knowledge files
         let entry = KnowledgeEntry::new(
             "We decided to use LiteStore as the default backend".into(),
-            "user-history".into(),
+            USER_HISTORY_SCOPE.into(),
             "ses-abc:turn-1".into(),
         );
         corvia_kernel::knowledge_files::write_entry(&state.data_dir, &entry).unwrap();
@@ -1653,7 +1654,7 @@ mod tests {
 
         let entry = KnowledgeEntry::new(
             "Hello, how are you?".into(),
-            "user-history".into(),
+            USER_HISTORY_SCOPE.into(),
             "ses-abc:turn-1".into(),
         );
         corvia_kernel::knowledge_files::write_entry(&state.data_dir, &entry).unwrap();
@@ -1692,7 +1693,7 @@ mod tests {
         for i in 1..=3 {
             let entry = KnowledgeEntry::new(
                 format!("Turn {i} content"),
-                "user-history".into(),
+                USER_HISTORY_SCOPE.into(),
                 format!("ses-abc:turn-{i}"),
             );
             corvia_kernel::knowledge_files::write_entry(&state.data_dir, &entry).unwrap();

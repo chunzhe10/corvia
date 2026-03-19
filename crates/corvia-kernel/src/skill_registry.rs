@@ -183,8 +183,8 @@ fn parse_skill_file(raw: &str) -> (String, String) {
     let trimmed = raw.trim();
 
     // Try YAML frontmatter.
-    if trimmed.starts_with("---") {
-        if let Some(end) = trimmed[3..].find("\n---") {
+    if trimmed.starts_with("---")
+        && let Some(end) = trimmed[3..].find("\n---") {
             let frontmatter = &trimmed[3..3 + end].trim();
             let content = trimmed[3 + end + 4..].trim().to_string();
 
@@ -203,7 +203,6 @@ fn parse_skill_file(raw: &str) -> (String, String) {
             let desc = first_paragraph(&content);
             return (desc, content);
         }
-    }
 
     // No frontmatter — first paragraph is description, full file is content.
     let desc = first_paragraph(trimmed);

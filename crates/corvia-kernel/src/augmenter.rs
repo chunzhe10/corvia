@@ -163,7 +163,7 @@ impl Augmenter for StructuredAugmenter {
                 sources: Vec::new(),
                 metrics: AugmentationMetrics {
                     latency_ms: start.elapsed().as_millis() as u64,
-                    token_estimate: estimate_tokens(&"No relevant context found."),
+                    token_estimate: estimate_tokens("No relevant context found."),
                     token_budget: context_budget,
                     sources_included: 0,
                     sources_truncated: 0,

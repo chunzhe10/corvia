@@ -189,14 +189,13 @@ impl AgentCoordinator {
             .ok_or_else(|| CorviaError::NotFound(format!("Session {session_id} not found")))?;
 
         // RBAC check: verify agent has write permission for this scope
-        if let Some(agent) = self.registry.get(&session.agent_id)? {
-            if !agent.permissions.can_write_scope(scope_id) {
+        if let Some(agent) = self.registry.get(&session.agent_id)?
+            && !agent.permissions.can_write_scope(scope_id) {
                 return Err(CorviaError::Agent(format!(
                     "Agent '{}' does not have write permission for scope '{scope_id}'",
                     session.agent_id
                 )));
             }
-        }
 
         let staging_dir = session.staging_dir.as_ref().map(|s| {
             self.staging.resolve_staging_path(s)
@@ -370,15 +369,14 @@ impl AgentCoordinator {
 
         // Check if any sessions are now complete (all entries merged)
         for session_id in &session_ids {
-            if let Ok(Some(session)) = self.sessions.get(session_id) {
-                if session.state == SessionState::Merging
+            if let Ok(Some(session)) = self.sessions.get(session_id)
+                && session.state == SessionState::Merging
                     && session.entries_merged >= session.entries_written
                     && session.entries_written > 0
                 {
                     self.sessions.transition(session_id, SessionState::Closed).ok();
                     info!(session_id, "session_closed_all_merged");
                 }
-            }
         }
 
         Ok(())

@@ -162,13 +162,12 @@ impl MergeWorker {
 
     /// Move a staging file to the knowledge directory if the session has staging.
     fn move_to_knowledge_if_staged(&self, entry: &KnowledgeEntry, session_id: &str) -> Result<()> {
-        if let Ok(Some(session)) = self.session_mgr.get(session_id) {
-            if let Some(ref staging_dir_str) = session.staging_dir {
+        if let Ok(Some(session)) = self.session_mgr.get(session_id)
+            && let Some(ref staging_dir_str) = session.staging_dir {
                 let staging_dir = self.staging.resolve_staging_path(staging_dir_str);
                 // Ignore errors — file may already have been moved (idempotent)
                 let _ = self.staging.move_to_knowledge(&staging_dir, &entry.id, &entry.scope_id);
             }
-        }
         Ok(())
     }
 

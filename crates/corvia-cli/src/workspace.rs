@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use corvia_common::config::{CorviaConfig, InferenceProvider, RepoConfig, WorkspaceConfig};
+use corvia_common::constants::{CLAUDE_SESSIONS_ADAPTER, USER_HISTORY_SCOPE};
 use corvia_kernel::adapter_discovery;
 use corvia_kernel::chunking_pipeline::register_adapter_chunking;
 use corvia_kernel::process_adapter::ProcessAdapter;
@@ -600,9 +601,9 @@ pub async fn ingest_workspace(
     }
 
     // --- Ingest workspace docs (only on full ingest, not single-repo) ---
-    if repo_filter.is_none() {
-        if let Some(docs_config) = ws.docs.as_ref() {
-            if let Some(workspace_docs_dir) = &docs_config.workspace_docs {
+    if repo_filter.is_none()
+        && let Some(docs_config) = ws.docs.as_ref()
+            && let Some(workspace_docs_dir) = &docs_config.workspace_docs {
                 let docs_path = root.join(workspace_docs_dir);
                 if docs_path.exists() && docs_path.is_dir() {
                     let docs_path_str = docs_path
@@ -772,8 +773,6 @@ pub async fn ingest_workspace(
                     }
                 }
             }
-        }
-    }
 
     // --- Ingest Claude Code session history (only on full ingest) ---
     if repo_filter.is_none() {
@@ -781,10 +780,10 @@ pub async fn ingest_workspace(
         let session_scope = config
             .scope
             .as_ref()
-            .and_then(|scopes| scopes.iter().find(|s| s.id == "user-history"));
+            .and_then(|scopes| scopes.iter().find(|s| s.id == USER_HISTORY_SCOPE));
 
         if session_scope.is_some() {
-            let adapter_info = discovered.iter().find(|a| a.metadata.domain == "claude-sessions");
+            let adapter_info = discovered.iter().find(|a| a.metadata.domain == CLAUDE_SESSIONS_ADAPTER);
             if let Some(adapter_info) = adapter_info {
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
                 let sessions_dir = PathBuf::from(home)
@@ -805,7 +804,7 @@ pub async fn ingest_workspace(
                     process.spawn().map_err(|e| anyhow::anyhow!(e))?;
 
                     let source_files = process
-                        .ingest(sessions_path, "user-history")
+                        .ingest(sessions_path, USER_HISTORY_SCOPE)
                         .map_err(|e| anyhow::anyhow!(e))?;
 
                     if source_files.is_empty() {
@@ -835,7 +834,7 @@ pub async fn ingest_workspace(
                                     let mut entry =
                                         corvia_common::types::KnowledgeEntry::new(
                                             sf.content.clone(),
-                                            "user-history".to_string(),
+                                            USER_HISTORY_SCOPE.to_string(),
                                             sf.metadata.source_version.clone(),
                                         );
                                     entry.workstream = sf.metadata.workstream.clone()

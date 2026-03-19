@@ -184,8 +184,8 @@ impl MergeQueue {
             .map_err(|e| CorviaError::Agent(format!("Failed to begin read txn: {e}")))?;
         let table = read_txn.open_table(MERGE_QUEUE)
             .map_err(|e| CorviaError::Agent(format!("Failed to open merge_queue: {e}")))?;
-        Ok(table.len()
-            .map_err(|e| CorviaError::Agent(format!("Failed to get queue depth: {e}")))?)
+        table.len()
+            .map_err(|e| CorviaError::Agent(format!("Failed to get queue depth: {e}")))
     }
 }
 

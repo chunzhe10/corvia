@@ -95,8 +95,7 @@ pub fn parse_trace_line(line: &str) -> Option<ParsedTrace> {
         .get("span")
         .and_then(|s| s.get("name"))
         .and_then(|n| n.as_str())
-    {
-        if let Some(elapsed_ms) = v.get("elapsed_ms").and_then(|e| e.as_f64()) {
+        && let Some(elapsed_ms) = v.get("elapsed_ms").and_then(|e| e.as_f64()) {
             let trace_id = v.get("otel.trace_id").and_then(|t| t.as_str()).map(String::from);
             let span_id = v.get("otel.span_id").and_then(|t| t.as_str()).map(String::from);
             let parent_span_id = v.get("otel.parent_span_id").and_then(|t| t.as_str()).map(String::from);
@@ -110,7 +109,6 @@ pub fn parse_trace_line(line: &str) -> Option<ParsedTrace> {
                 parent_span_id,
             });
         }
-    }
 
     // Structured event
     let msg = v
@@ -213,14 +211,13 @@ pub fn collect_traces_from_lines(lines: &[&str]) -> TracesData {
                     .or_default()
                     .push(elapsed_ms);
 
-                if let Some(epoch) = timestamp_to_epoch(&timestamp) {
-                    if epoch >= one_hour_ago {
+                if let Some(epoch) = timestamp_to_epoch(&timestamp)
+                    && epoch >= one_hour_ago {
                         span_1h
                             .entry(span_name.clone())
                             .or_default()
                             .push(elapsed_ms);
                     }
-                }
 
                 let level_lower = level.to_lowercase();
                 if level_lower == "error" || level_lower == "err" {
@@ -468,11 +465,10 @@ pub fn tail_lines(path: &Path, n: usize) -> Vec<String> {
     use std::io::{BufRead, BufReader};
 
     // Check file size before reading
-    if let Ok(meta) = fs::metadata(path) {
-        if meta.len() > MAX_LOG_FILE_SIZE {
+    if let Ok(meta) = fs::metadata(path)
+        && meta.len() > MAX_LOG_FILE_SIZE {
             return Vec::new();
         }
-    }
 
     let file = match File::open(path) {
         Ok(f) => f,

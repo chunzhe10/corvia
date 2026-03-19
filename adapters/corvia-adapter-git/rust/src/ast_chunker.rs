@@ -16,6 +16,12 @@ use crate::treesitter;
 /// to the kernel's [`RawChunk`] and [`ChunkRelation`] types.
 pub struct AstChunker;
 
+impl Default for AstChunker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AstChunker {
     pub fn new() -> Self {
         Self

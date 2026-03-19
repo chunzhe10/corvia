@@ -10,6 +10,8 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use corvia_common::constants::DEFAULT_SCOPE_ID;
+
 use crate::rest::AppState;
 
 // ---------------------------------------------------------------------------
@@ -62,7 +64,7 @@ pub async fn activity_feed_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ActivityFeedParams>,
 ) -> impl IntoResponse {
-    let scope_id = state.default_scope_id.as_deref().unwrap_or("corvia");
+    let scope_id = state.default_scope_id.as_deref().unwrap_or(DEFAULT_SCOPE_ID);
     let data_dir = &state.data_dir;
 
     let mut entries =

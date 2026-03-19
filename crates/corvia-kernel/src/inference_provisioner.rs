@@ -58,7 +58,7 @@ impl InferenceProvisioner {
     /// Start the inference server as a background process.
     pub fn start(&self) -> Result<()> {
         info!("Starting corvia-inference server...");
-        let port = self.grpc_addr.split(':').last().unwrap_or("8030");
+        let port = self.grpc_addr.split(':').next_back().unwrap_or("8030");
         std::process::Command::new("corvia-inference")
             .arg("serve")
             .arg("--port")

@@ -79,19 +79,17 @@ pub fn resolve_adapter<'a>(
     }
 
     // 2. Auto-detect: .git/ -> git adapter
-    if Path::new(source_path).join(".git").exists() {
-        if let Some(a) = find_by_name(discovered, "git") {
+    if Path::new(source_path).join(".git").exists()
+        && let Some(a) = find_by_name(discovered, "git") {
             debug!("Auto-detected git adapter for {}", source_path);
             return Some(a);
         }
-    }
 
     // 3. Config default
-    if let Some(name) = default_adapter {
-        if let Some(a) = find_by_name(discovered, name) {
+    if let Some(name) = default_adapter
+        && let Some(a) = find_by_name(discovered, name) {
             return Some(a);
         }
-    }
 
     // 4. Fall back to "basic"
     find_by_name(discovered, "basic")
@@ -204,11 +202,10 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 fn shellexpand_home(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = home_dir() {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = home_dir() {
             return home.join(rest);
         }
-    }
     PathBuf::from(path)
 }
 

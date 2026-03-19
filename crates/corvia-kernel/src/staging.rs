@@ -73,11 +73,10 @@ impl StagingManager {
                 .map_err(|e| CorviaError::Agent(format!("Failed to read dir entry: {e}")))?;
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if let Some(stem) = name_str.strip_suffix(".json") {
-                if let Ok(uuid) = Uuid::parse_str(stem) {
+            if let Some(stem) = name_str.strip_suffix(".json")
+                && let Ok(uuid) = Uuid::parse_str(stem) {
                     ids.push(uuid);
                 }
-            }
         }
         Ok(ids)
     }

@@ -95,14 +95,12 @@ impl OllamaProvisioner {
             .build()
             .unwrap_or_default();
 
-        if let Ok(resp) = client.get(&tags_url).send().await {
-            if let Ok(body) = resp.text().await {
-                if body.contains(model) {
+        if let Ok(resp) = client.get(&tags_url).send().await
+            && let Ok(body) = resp.text().await
+                && body.contains(model) {
                     info!("Model {model} already available");
                     return Ok(());
                 }
-            }
-        }
 
         info!("Pulling model {model}...");
         let status = std::process::Command::new("ollama")

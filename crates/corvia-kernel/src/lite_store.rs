@@ -767,11 +767,10 @@ impl crate::traits::TemporalStore for LiteStore {
                     CorviaError::Storage(format!("Failed to parse temporal value: {e}"))
                 })?;
 
-            if let Some(valid_to_millis) = val_json["valid_to_millis"].as_i64() {
-                if valid_to_millis <= ts_millis {
+            if let Some(valid_to_millis) = val_json["valid_to_millis"].as_i64()
+                && valid_to_millis <= ts_millis {
                     continue; // Entry expired before the query timestamp
                 }
-            }
 
             // Extract entry_id from compound key (UUID is after the last colon group)
             let parts: Vec<&str> = key_str.rsplitn(2, ':').collect();
@@ -782,14 +781,13 @@ impl crate::traits::TemporalStore for LiteStore {
             let entry_uuid_str = parts[0];
 
             // Look up entry from ENTRIES table
-            if let Ok(Some(entry_val)) = entries_table.get(entry_uuid_str) {
-                if let Ok(entry) = serde_json::from_slice::<KnowledgeEntry>(entry_val.value()) {
+            if let Ok(Some(entry_val)) = entries_table.get(entry_uuid_str)
+                && let Ok(entry) = serde_json::from_slice::<KnowledgeEntry>(entry_val.value()) {
                     results.push(entry);
                     if results.len() >= limit {
                         break;
                     }
                 }
-            }
         }
 
         Ok(results)
@@ -817,14 +815,9 @@ impl crate::traits::TemporalStore for LiteStore {
         // Walk backward: find who was superseded by current entry, then who was
         // superseded by that, etc.
         let mut current = entry_id;
-        loop {
-            match by_superseded.remove(current) {
-                Some(predecessor) => {
-                    chain.push(predecessor);
-                    current = &chain.last().unwrap().id;
-                }
-                None => break,
-            }
+        while let Some(predecessor) = by_superseded.remove(current) {
+            chain.push(predecessor);
+            current = &chain.last().unwrap().id;
         }
 
         Ok(chain)
@@ -870,11 +863,10 @@ impl crate::traits::TemporalStore for LiteStore {
             }
             let entry_uuid_str = parts[0];
 
-            if let Ok(Some(entry_val)) = entries_table.get(entry_uuid_str) {
-                if let Ok(entry) = serde_json::from_slice::<KnowledgeEntry>(entry_val.value()) {
+            if let Ok(Some(entry_val)) = entries_table.get(entry_uuid_str)
+                && let Ok(entry) = serde_json::from_slice::<KnowledgeEntry>(entry_val.value()) {
                     results.push(entry);
                 }
-            }
         }
 
         Ok(results)

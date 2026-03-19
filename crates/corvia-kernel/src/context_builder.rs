@@ -49,13 +49,11 @@ impl ContextBuilder {
         // - Admin: can read all scopes
         // - ReadOnly: can read all scopes (D39 — isolation is for correctness, not security)
         // - ReadWrite: can only read scopes in their allowed list
-        if let Some(perms) = permissions {
-            if let AgentPermission::ReadWrite { scopes } = perms {
-                if !scopes.iter().any(|s| s == scope_id || s == "*") {
+        if let Some(perms) = permissions
+            && let AgentPermission::ReadWrite { scopes } = perms
+                && !scopes.iter().any(|s| s == scope_id || s == "*") {
                     return Ok(Vec::new());
                 }
-            }
-        }
 
         // Embed the query
         let embedding = self.engine.embed(query).await?;

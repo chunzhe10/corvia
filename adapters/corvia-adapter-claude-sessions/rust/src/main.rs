@@ -16,6 +16,12 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_OUTPUT_LEN: usize = 500;
 
+/// Adapter domain identifier (matches `corvia_common::constants::CLAUDE_SESSIONS_ADAPTER`).
+const ADAPTER_DOMAIN: &str = "claude-sessions";
+
+/// Default scope for session ingestion (matches `corvia_common::constants::USER_HISTORY_SCOPE`).
+const DEFAULT_SCOPE: &str = "user-history";
+
 // ---------------------------------------------------------------------------
 // Protocol types (matches corvia-kernel/src/adapter_protocol.rs)
 // ---------------------------------------------------------------------------
@@ -212,7 +218,7 @@ fn main() {
         "ingest" => {
             let stdout = io::stdout();
             let mut out = io::BufWriter::new(stdout.lock());
-            let scope_id = if args.len() > 3 { &args[3] } else { "user-history" };
+            let scope_id = if args.len() > 3 { &args[3] } else { DEFAULT_SCOPE };
             ingest_sessions(scope_id, &mut out);
         }
         _ => {
@@ -224,9 +230,9 @@ fn main() {
 
 fn metadata() -> Metadata {
     Metadata {
-        name: "claude-sessions",
+        name: ADAPTER_DOMAIN,
         version: VERSION.to_string(),
-        domain: "claude-sessions",
+        domain: ADAPTER_DOMAIN,
         protocol_version: PROTOCOL_VERSION,
         description: "Claude Code session history adapter — ingests ~/.claude/sessions/*.jsonl.gz",
         supported_extensions: vec!["jsonl.gz".into()],
@@ -307,7 +313,7 @@ fn ingest_sessions_from<W: Write>(scope_id: &str, dir: &Path, out: &mut W) {
     let mut newly_ingested: Vec<String> = Vec::new();
     let mut classify_entries: Vec<String> = Vec::new();
 
-    let mut entries: Vec<_> = std::fs::read_dir(&dir)
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
@@ -649,15 +655,14 @@ fn summarize_tool_input(tool: &str, input: &serde_json::Value) -> String {
         }
         _ => {
             // Generic: show first key-value pair
-            if let Some(obj) = input.as_object() {
-                if let Some((k, v)) = obj.iter().next() {
+            if let Some(obj) = input.as_object()
+                && let Some((k, v)) = obj.iter().next() {
                     let val_str = match v.as_str() {
                         Some(s) => truncate_str(s, 50).to_string(),
                         None => truncate_str(&v.to_string(), 50).to_string(),
                     };
                     return format!("{}={}", k, val_str);
                 }
-            }
             String::new()
         }
     }
@@ -792,7 +797,7 @@ mod tests {
         encoder.finish().unwrap();
 
         let mut output = Vec::new();
-        ingest_sessions_from("user-history", sessions, &mut output);
+        ingest_sessions_from(DEFAULT_SCOPE, sessions, &mut output);
 
         let text = String::from_utf8(output).unwrap();
         let lines: Vec<&str> = text.trim().lines().collect();
@@ -835,7 +840,7 @@ mod tests {
         enc.finish().unwrap();
 
         let mut output = Vec::new();
-        ingest_sessions_from("user-history", sessions, &mut output);
+        ingest_sessions_from(DEFAULT_SCOPE, sessions, &mut output);
 
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("\"total_files\":0"));

@@ -7,7 +7,6 @@ use corvia_adapter_git::{AstChunker, GitAdapter};
 use corvia_kernel::adapter_protocol::{AdapterMetadata, AdapterRequest, AdapterResponse, SourceFilePayload, AdapterError};
 use corvia_kernel::chunking_strategy::{ChunkingStrategy, SourceMetadata};
 use corvia_kernel::traits::IngestionAdapter;
-use serde_json;
 use std::io::{self, BufRead, Write};
 
 const PROTOCOL_VERSION: u32 = 1;

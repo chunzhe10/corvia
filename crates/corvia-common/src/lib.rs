@@ -21,6 +21,7 @@
 pub mod types;
 pub mod namespace;
 pub mod config;
+pub mod constants;
 pub mod errors;
 pub mod events;
 pub mod agent_types;

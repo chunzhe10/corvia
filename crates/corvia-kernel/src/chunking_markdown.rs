@@ -91,7 +91,7 @@ impl MarkdownChunker {
     }
 
     /// Find the chunk whose line range contains the given 1-indexed line number.
-    fn find_chunk_for_line<'a>(chunks: &'a [RawChunk], line: u32) -> Option<&'a RawChunk> {
+    fn find_chunk_for_line(chunks: &[RawChunk], line: u32) -> Option<&RawChunk> {
         chunks
             .iter()
             .find(|c| line >= c.start_line && line <= c.end_line)
@@ -188,8 +188,8 @@ impl MarkdownChunker {
                         let cleaned = word.trim_matches(|c: char| {
                             c == '"' || c == '\'' || c == ',' || c == ';' || c == '('  || c == ')'
                         });
-                        if Self::is_file_path_reference(cleaned) {
-                            if let Some(chunk) = Self::find_chunk_for_line(chunks, line) {
+                        if Self::is_file_path_reference(cleaned)
+                            && let Some(chunk) = Self::find_chunk_for_line(chunks, line) {
                                 let key = (
                                     chunk.start_line,
                                     cleaned.to_string(),
@@ -205,7 +205,6 @@ impl MarkdownChunker {
                                     });
                                 }
                             }
-                        }
                     }
                 }
                 _ => {}

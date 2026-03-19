@@ -1,7 +1,7 @@
-/// GPU/CPU backend resolution for corvia-inference.
-///
-/// Probes hardware once at startup and caches availability.
-/// `resolve_backend()` maps (device, backend, model_type) → ResolvedBackend.
+//! GPU/CPU backend resolution for corvia-inference.
+//!
+//! Probes hardware once at startup and caches availability.
+//! `resolve_backend()` maps (device, backend, model_type) → ResolvedBackend.
 
 use llama_cpp_2::context::params::KvCacheType;
 

@@ -80,14 +80,13 @@ impl CommitPipeline {
             let staging_dir = self.staging.resolve_staging_path(staging_dir_str);
             let entry_ids = self.staging.list_staging_files(&staging_dir)?;
             for entry_id in &entry_ids {
-                if let Ok(Some(mut entry)) = self.store.get(entry_id).await {
-                    if entry.entry_status == EntryStatus::Pending {
+                if let Ok(Some(mut entry)) = self.store.get(entry_id).await
+                    && entry.entry_status == EntryStatus::Pending {
                         entry.entry_status = EntryStatus::Committed;
                         if let Err(e) = self.store.insert(&entry).await {
                             warn!(entry_id = %entry_id, error = %e, "commit_step3: failed to update entry status");
                         }
                     }
-                }
             }
             info!(session_id, count = entry_ids.len(), "commit_step3: entries → Committed");
         }

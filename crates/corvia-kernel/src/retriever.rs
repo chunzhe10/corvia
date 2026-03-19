@@ -31,9 +31,9 @@ fn check_rbac_scope(
     retriever_name: &str,
     start: &Instant,
 ) -> Option<RetrievalResult> {
-    if let Some(ref perms) = opts.permissions {
-        if let AgentPermission::ReadWrite { scopes } = perms {
-            if !scopes.iter().any(|s| s == scope_id || s == "*") {
+    if let Some(ref perms) = opts.permissions
+        && let AgentPermission::ReadWrite { scopes } = perms
+            && !scopes.iter().any(|s| s == scope_id || s == "*") {
                 info!(
                     retriever = retriever_name,
                     scope_id,
@@ -57,8 +57,6 @@ fn check_rbac_scope(
                     query_embedding: None,
                 });
             }
-        }
-    }
     None
 }
 
@@ -502,21 +500,18 @@ pub fn post_filter_metadata(
         return results;
     }
     results.into_iter().filter(|r| {
-        if let Some(role) = content_role {
-            if r.entry.metadata.content_role.as_deref() != Some(role) {
+        if let Some(role) = content_role
+            && r.entry.metadata.content_role.as_deref() != Some(role) {
                 return false;
             }
-        }
-        if let Some(origin) = source_origin {
-            if r.entry.metadata.source_origin.as_deref() != Some(origin) {
+        if let Some(origin) = source_origin
+            && r.entry.metadata.source_origin.as_deref() != Some(origin) {
                 return false;
             }
-        }
-        if let Some(ws) = workstream {
-            if r.entry.workstream.as_str() != ws {
+        if let Some(ws) = workstream
+            && r.entry.workstream.as_str() != ws {
                 return false;
             }
-        }
         true
     }).collect()
 }

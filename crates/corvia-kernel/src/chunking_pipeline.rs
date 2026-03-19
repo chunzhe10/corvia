@@ -391,9 +391,9 @@ impl ChunkingPipeline {
                 let count = split_chunks.len();
                 result.extend(split_chunks);
                 // All chunks produced from a split are marked as split.
-                split_flags.extend(std::iter::repeat(count > 1).take(count));
+                split_flags.extend(std::iter::repeat_n(count > 1, count));
                 // Propagate the merge flag to all split pieces.
-                expanded_merge_flags.extend(std::iter::repeat(was_merged).take(count));
+                expanded_merge_flags.extend(std::iter::repeat_n(was_merged, count));
             } else {
                 result.push(chunk);
                 split_flags.push(false);

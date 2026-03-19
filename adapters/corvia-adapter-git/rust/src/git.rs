@@ -17,6 +17,12 @@ pub struct IngestionResult {
 
 pub struct GitAdapter;
 
+impl Default for GitAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GitAdapter {
     pub fn new() -> Self {
         Self

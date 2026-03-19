@@ -712,15 +712,14 @@ async fn cmd_ingest(path: Option<&str>, incremental: bool, files: &[String]) -> 
                         && e.is_current()
                 })
                 .collect();
-            if !old_entries.is_empty() {
-                if let Some(lite) = store.as_any().downcast_ref::<corvia_kernel::lite_store::LiteStore>() {
+            if !old_entries.is_empty()
+                && let Some(lite) = store.as_any().downcast_ref::<corvia_kernel::lite_store::LiteStore>() {
                     let first_new_id = stored_ids[0];
                     for old in &old_entries {
                         let _ = lite.supersede(&old.id, &first_new_id).await;
                     }
                     println!("    Superseded {} old entries", old_entries.len());
                 }
-            }
 
             // Wire graph edges from pipeline relations
             if !pipeline_relations.is_empty() {
@@ -1221,7 +1220,7 @@ async fn cmd_agent(command: AgentCommands) -> Result<()> {
             if agents.is_empty() {
                 println!("No registered agents.");
             } else {
-                println!("{:<30} {:<12} {}", "AGENT ID", "STATUS", "DISPLAY NAME");
+                println!("{:<30} {:<12} DISPLAY NAME", "AGENT ID", "STATUS");
                 for a in &agents {
                     println!("{:<30} {:<12} {}", a.agent_id, format!("{:?}", a.status), a.display_name);
                 }
@@ -1431,14 +1430,12 @@ async fn cmd_workspace(command: WorkspaceCommands) -> Result<()> {
             config.save(&config_path)?;
             println!("Removed repo '{}' from config", name);
 
-            if purge {
-                if let Some(path) = repo_path {
-                    if path.exists() && path.starts_with(root.join(&repos_dir)) {
+            if purge
+                && let Some(path) = repo_path
+                    && path.exists() && path.starts_with(root.join(&repos_dir)) {
                         std::fs::remove_dir_all(&path)?;
                         println!("Deleted cloned repo at {}", path.display());
                     }
-                }
-            }
             Ok(())
         }
         WorkspaceCommands::Ingest { repo, fresh } => {
@@ -1817,8 +1814,8 @@ async fn cmd_reason(scope: Option<&str>, check: Option<&str>, llm: bool) -> Resu
     let scope_id = scope.unwrap_or(&config.project.scope_id);
 
     // Try routing through running server (deterministic checks only)
-    if !llm {
-        if let Some(client) = server_client::ServerClient::detect(&config).await {
+    if !llm
+        && let Some(client) = server_client::ServerClient::detect(&config).await {
             println!("(via server at {})\n", client.url());
             let response = client.reason(scope_id, check).await?;
 
@@ -1846,7 +1843,6 @@ async fn cmd_reason(scope: Option<&str>, check: Option<&str>, llm: bool) -> Resu
             }
             return Ok(());
         }
-    }
 
     let (store, graph, _temporal) = connect_full_store(&config).await?;
 
@@ -2118,11 +2114,10 @@ fn wire_doc_to_code_relations(
         // Only index code files (not markdown) for basename matching
         if !src.ends_with(".md") {
             // Extract basename without extension: "crates/.../rest.rs" → "rest"
-            if let Some(filename) = src.rsplit('/').next() {
-                if let Some(stem) = filename.rsplit_once('.').map(|(s, _)| s) {
+            if let Some(filename) = src.rsplit('/').next()
+                && let Some(stem) = filename.rsplit_once('.').map(|(s, _)| s) {
                     code_index.entry(stem).or_default().push((idx, pc));
                 }
-            }
         }
     }
 
@@ -2149,14 +2144,13 @@ fn wire_doc_to_code_relations(
             // Look up code chunks by basename
             if let Some(code_chunks) = code_index.get(stem) {
                 // Use the first code chunk from the matched file
-                if let Some((target_idx, _)) = code_chunks.first() {
-                    if *target_idx < stored_ids.len() {
+                if let Some((target_idx, _)) = code_chunks.first()
+                    && *target_idx < stored_ids.len() {
                         let to_id = stored_ids[*target_idx];
                         if to_id != from_id && seen_targets.insert(to_id) {
                             edges.push((from_id, "references".to_string(), to_id));
                         }
                     }
-                }
             }
         }
 

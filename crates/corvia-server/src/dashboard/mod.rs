@@ -14,6 +14,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 
+use corvia_common::constants::DEFAULT_SCOPE_ID;
 use corvia_common::dashboard::{
     DashboardConfig, DashboardStatusResponse, LogEntry, LogsResponse, ModuleStats, TracesResponse,
 };
@@ -90,7 +91,7 @@ async fn status_handler(
     let scope_id = state
         .default_scope_id
         .as_deref()
-        .unwrap_or("corvia");
+        .unwrap_or(DEFAULT_SCOPE_ID);
 
     let entry_count = state
         .store
@@ -207,18 +208,16 @@ async fn logs_handler(
     if let Ok(dir_entries) = std::fs::read_dir(&log_dir_path) {
         for entry in dir_entries.filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.extension().is_some_and(|ext| ext == "log") {
+            if path.extension().is_none_or(|ext| ext != "log") {
                 continue;
             }
 
             // Filter by service (file stem)
-            if let Some(ref svc) = params.service {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if stem != svc.as_str() {
+            if let Some(ref svc) = params.service
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                    && stem != svc.as_str() {
                         continue;
                     }
-                }
-            }
 
             let lines = traces::tail_lines(&path, 500);
             for line in &lines {
@@ -246,16 +245,14 @@ async fn logs_handler(
                 let norm_level = traces::normalize_level(&level);
 
                 // Apply filters
-                if let Some(ref filter_module) = params.module {
-                    if module != *filter_module {
+                if let Some(ref filter_module) = params.module
+                    && module != *filter_module {
                         continue;
                     }
-                }
-                if let Some(ref filter_level) = params.level {
-                    if norm_level != filter_level.as_str() {
+                if let Some(ref filter_level) = params.level
+                    && norm_level != filter_level.as_str() {
                         continue;
                     }
-                }
 
                 entries.push(LogEntry {
                     timestamp: traces::short_timestamp(&timestamp),
@@ -333,7 +330,7 @@ async fn graph_scope_handler(
     let scope_id = state
         .default_scope_id
         .as_deref()
-        .unwrap_or("corvia");
+        .unwrap_or(DEFAULT_SCOPE_ID);
 
     // Load all entries from knowledge files
     let entries = corvia_kernel::knowledge_files::read_scope(&state.data_dir, scope_id)
@@ -458,7 +455,7 @@ async fn clustered_graph_handler(
         None => {
             // Degraded mode: cluster store not yet computed.
             // Try an immediate computation.
-            let scope_id = state.default_scope_id.as_deref().unwrap_or("corvia");
+            let scope_id = state.default_scope_id.as_deref().unwrap_or(DEFAULT_SCOPE_ID);
             let entries = corvia_kernel::knowledge_files::read_scope(&state.data_dir, scope_id)
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load entries: {e}")))?;
             let pairs: Vec<(String, Vec<f32>)> = entries
@@ -490,7 +487,7 @@ async fn clustered_graph_handler(
     match level {
         0 => {
             // Super-clusters as nodes
-            let scope_id = state.default_scope_id.as_deref().unwrap_or("corvia");
+            let scope_id = state.default_scope_id.as_deref().unwrap_or(DEFAULT_SCOPE_ID);
             let entries = corvia_kernel::knowledge_files::read_scope(&state.data_dir, scope_id)
                 .unwrap_or_default();
             let entry_map: std::collections::HashMap<String, &corvia_common::types::KnowledgeEntry> =
@@ -573,7 +570,7 @@ async fn clustered_graph_handler(
                 .find(|sc| sc.cluster_id == parent_id)
                 .or_else(|| hierarchy.super_clusters.iter().find(|sc| sc.cluster_id == parent_id));
 
-            let scope_id = state.default_scope_id.as_deref().unwrap_or("corvia");
+            let scope_id = state.default_scope_id.as_deref().unwrap_or(DEFAULT_SCOPE_ID);
             let entries = corvia_kernel::knowledge_files::read_scope(&state.data_dir, scope_id)
                 .unwrap_or_default();
             let entry_map: std::collections::HashMap<String, &corvia_common::types::KnowledgeEntry> =
@@ -706,7 +703,7 @@ async fn health_handler(
     let scope_id = state
         .default_scope_id
         .as_deref()
-        .unwrap_or("corvia");
+        .unwrap_or(DEFAULT_SCOPE_ID);
 
     // Load entries from knowledge files (direct disk read)
     let entries = corvia_kernel::knowledge_files::read_scope(&state.data_dir, scope_id)
@@ -883,7 +880,7 @@ async fn refresh_summary_handler(
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Agent {agent_id} not found")))?;
 
     // Load entries from knowledge files and compute topic tags
-    let scope_id = state.default_scope_id.as_deref().unwrap_or("corvia");
+    let scope_id = state.default_scope_id.as_deref().unwrap_or(DEFAULT_SCOPE_ID);
     let entries = corvia_kernel::knowledge_files::read_scope(&state.data_dir, scope_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load entries: {e}")))?;
 

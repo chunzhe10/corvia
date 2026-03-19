@@ -1,8 +1,7 @@
 use crate::backend::{BackendKind, ResolvedBackend};
 use corvia_proto::embedding_service_server::EmbeddingService;
 use corvia_proto::*;
-use ort::ep::ExecutionProvider;
-use ort::execution_providers::{self, CUDAExecutionProvider, OpenVINOExecutionProvider, ExecutionProviderDispatch};
+use ort::ep::{self, ExecutionProvider, CUDAExecutionProvider, OpenVINOExecutionProvider, ExecutionProviderDispatch};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -30,7 +29,7 @@ fn verify_ep_available(backend: &BackendKind) -> bool {
         BackendKind::Cuda => {
             // CUDA EP: check compiled-in first (cu12 prebuilt includes it),
             // then fall back to checking the provider .so.
-            if execution_providers::CUDAExecutionProvider::default()
+            if ep::CUDAExecutionProvider::default()
                 .is_available()
                 .unwrap_or(false)
             {

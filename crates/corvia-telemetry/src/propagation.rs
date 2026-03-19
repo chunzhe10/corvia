@@ -8,11 +8,10 @@ pub struct MetadataInjector<'a>(pub &'a mut MetadataMap);
 
 impl Injector for MetadataInjector<'_> {
     fn set(&mut self, key: &str, value: String) {
-        if let Ok(name) = tonic::metadata::MetadataKey::from_bytes(key.as_bytes()) {
-            if let Ok(val) = value.parse() {
+        if let Ok(name) = tonic::metadata::MetadataKey::from_bytes(key.as_bytes())
+            && let Ok(val) = value.parse() {
                 self.0.insert(name, val);
             }
-        }
     }
 }
 

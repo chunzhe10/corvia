@@ -121,11 +121,10 @@ impl LiteGraphStore {
                     };
 
                     // Filter by relation if specified
-                    if let Some(rel) = relation {
-                        if edge.weight() != rel {
+                    if let Some(rel) = relation
+                        && edge.weight() != rel {
                             continue;
                         }
-                    }
 
                     if visited.insert(neighbor) {
                         results.push(graph[neighbor]);

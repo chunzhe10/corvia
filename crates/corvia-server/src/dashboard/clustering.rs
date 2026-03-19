@@ -471,6 +471,12 @@ pub struct ClusterStore {
     last_entry_count: Arc<RwLock<usize>>,
 }
 
+impl Default for ClusterStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClusterStore {
     pub fn new() -> Self {
         Self {

@@ -1,6 +1,8 @@
-use bollard::container::{Config, CreateContainerOptions, ListContainersOptions, StartContainerOptions};
-use bollard::image::CreateImageOptions;
-use bollard::models::{HostConfig, PortBinding};
+use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
+use bollard::query_parameters::{
+    CreateContainerOptionsBuilder, CreateImageOptionsBuilder, ListContainersOptionsBuilder,
+    RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
+};
 use bollard::Docker;
 use corvia_common::errors::{CorviaError, Result};
 use futures_util::TryStreamExt;
@@ -32,10 +34,9 @@ impl DockerProvisioner {
         let filters: HashMap<String, Vec<String>> = HashMap::from([
             ("name".into(), vec![VLLM_CONTAINER_NAME.into()]),
         ]);
-        let options = ListContainersOptions {
-            filters,
-            ..Default::default()
-        };
+        let options = ListContainersOptionsBuilder::new()
+            .filters(&filters)
+            .build();
         let containers = self.docker.list_containers(Some(options)).await
             .map_err(|e| CorviaError::Docker(format!("vLLM: Failed to list containers: {e}")))?;
         Ok(!containers.is_empty())
@@ -50,10 +51,9 @@ impl DockerProvisioner {
 
         // Pull image (idempotent)
         info!("Pulling vLLM image: {VLLM_IMAGE}");
-        let options = CreateImageOptions {
-            from_image: VLLM_IMAGE,
-            ..Default::default()
-        };
+        let options = CreateImageOptionsBuilder::new()
+            .from_image(VLLM_IMAGE)
+            .build();
         self.docker.create_image(Some(options), None, None)
             .try_collect::<Vec<_>>().await
             .map_err(|e| CorviaError::Docker(format!("vLLM: Failed to pull image: {e}")))?;
@@ -71,7 +71,7 @@ impl DockerProvisioner {
             ..Default::default()
         };
 
-        let config: Config<String> = Config {
+        let config = ContainerCreateBody {
             image: Some(VLLM_IMAGE.to_string()),
             cmd: Some(vec![
                 "--model".into(),
@@ -84,19 +84,18 @@ impl DockerProvisioner {
             ..Default::default()
         };
 
-        let create_options = CreateContainerOptions {
-            name: VLLM_CONTAINER_NAME.to_string(),
-            ..Default::default()
-        };
+        let create_options = CreateContainerOptionsBuilder::new()
+            .name(VLLM_CONTAINER_NAME)
+            .build();
 
         // Remove existing stopped container if present
-        let _ = self.docker.remove_container(VLLM_CONTAINER_NAME, None::<bollard::container::RemoveContainerOptions>).await;
+        let _ = self.docker.remove_container(VLLM_CONTAINER_NAME, None::<RemoveContainerOptions>).await;
 
         info!("Creating vLLM container: {VLLM_CONTAINER_NAME}");
         self.docker.create_container(Some(create_options), config).await
             .map_err(|e| CorviaError::Docker(format!("vLLM: Failed to create container: {e}")))?;
 
-        self.docker.start_container(VLLM_CONTAINER_NAME, None::<StartContainerOptions<String>>).await
+        self.docker.start_container(VLLM_CONTAINER_NAME, None::<StartContainerOptions>).await
             .map_err(|e| CorviaError::Docker(format!("vLLM: Failed to start container: {e}")))?;
 
         info!("vLLM started on port {VLLM_PORT}");
@@ -110,9 +109,9 @@ impl DockerProvisioner {
     /// Stop and remove the vLLM container.
     pub async fn stop_vllm(&self) -> Result<()> {
         info!("Stopping vLLM container");
-        self.docker.stop_container(VLLM_CONTAINER_NAME, None::<bollard::container::StopContainerOptions>).await
+        self.docker.stop_container(VLLM_CONTAINER_NAME, None::<StopContainerOptions>).await
             .map_err(|e| CorviaError::Docker(format!("vLLM: Failed to stop container: {e}")))?;
-        self.docker.remove_container(VLLM_CONTAINER_NAME, None::<bollard::container::RemoveContainerOptions>).await
+        self.docker.remove_container(VLLM_CONTAINER_NAME, None::<RemoveContainerOptions>).await
             .map_err(|e| CorviaError::Docker(format!("vLLM: Failed to remove container: {e}")))?;
         Ok(())
     }
@@ -122,10 +121,9 @@ impl DockerProvisioner {
         let filters: HashMap<String, Vec<String>> = HashMap::from([
             ("name".into(), vec![OLLAMA_CONTAINER_NAME.into()]),
         ]);
-        let options = ListContainersOptions {
-            filters,
-            ..Default::default()
-        };
+        let options = ListContainersOptionsBuilder::new()
+            .filters(&filters)
+            .build();
         let containers = self.docker.list_containers(Some(options)).await
             .map_err(|e| CorviaError::Docker(format!("Ollama: Failed to list containers: {e}")))?;
         Ok(!containers.is_empty())
@@ -140,10 +138,9 @@ impl DockerProvisioner {
 
         // Pull image
         info!("Pulling Ollama image: {OLLAMA_IMAGE}");
-        let options = CreateImageOptions {
-            from_image: OLLAMA_IMAGE,
-            ..Default::default()
-        };
+        let options = CreateImageOptionsBuilder::new()
+            .from_image(OLLAMA_IMAGE)
+            .build();
         self.docker.create_image(Some(options), None, None)
             .try_collect::<Vec<_>>().await
             .map_err(|e| CorviaError::Docker(format!("Ollama: Failed to pull image: {e}")))?;
@@ -161,26 +158,25 @@ impl DockerProvisioner {
             ..Default::default()
         };
 
-        let config: Config<String> = Config {
+        let config = ContainerCreateBody {
             image: Some(OLLAMA_IMAGE.to_string()),
             exposed_ports: Some(HashMap::from([(port_str, HashMap::new())])),
             host_config: Some(host_config),
             ..Default::default()
         };
 
-        let create_options = CreateContainerOptions {
-            name: OLLAMA_CONTAINER_NAME.to_string(),
-            ..Default::default()
-        };
+        let create_options = CreateContainerOptionsBuilder::new()
+            .name(OLLAMA_CONTAINER_NAME)
+            .build();
 
         // Remove existing stopped container if present
-        let _ = self.docker.remove_container(OLLAMA_CONTAINER_NAME, None::<bollard::container::RemoveContainerOptions>).await;
+        let _ = self.docker.remove_container(OLLAMA_CONTAINER_NAME, None::<RemoveContainerOptions>).await;
 
         info!("Creating Ollama container: {OLLAMA_CONTAINER_NAME}");
         self.docker.create_container(Some(create_options), config).await
             .map_err(|e| CorviaError::Docker(format!("Ollama: Failed to create container: {e}")))?;
 
-        self.docker.start_container(OLLAMA_CONTAINER_NAME, None::<StartContainerOptions<String>>).await
+        self.docker.start_container(OLLAMA_CONTAINER_NAME, None::<StartContainerOptions>).await
             .map_err(|e| CorviaError::Docker(format!("Ollama: Failed to start container: {e}")))?;
 
         info!("Ollama started on port {OLLAMA_PORT}");
@@ -216,9 +212,9 @@ impl DockerProvisioner {
     /// Stop and remove the Ollama container.
     pub async fn stop_ollama(&self) -> Result<()> {
         info!("Stopping Ollama container");
-        self.docker.stop_container(OLLAMA_CONTAINER_NAME, None::<bollard::container::StopContainerOptions>).await
+        self.docker.stop_container(OLLAMA_CONTAINER_NAME, None::<StopContainerOptions>).await
             .map_err(|e| CorviaError::Docker(format!("Ollama: Failed to stop container: {e}")))?;
-        self.docker.remove_container(OLLAMA_CONTAINER_NAME, None::<bollard::container::RemoveContainerOptions>).await
+        self.docker.remove_container(OLLAMA_CONTAINER_NAME, None::<RemoveContainerOptions>).await
             .map_err(|e| CorviaError::Docker(format!("Ollama: Failed to remove container: {e}")))?;
         Ok(())
     }
