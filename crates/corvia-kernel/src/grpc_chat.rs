@@ -8,8 +8,9 @@ use crate::traits::{GenerationEngine, GenerationResult};
 
 /// Default temperature for merge/reasoning chat calls.
 const DEFAULT_TEMPERATURE: f32 = 0.7;
-/// Default max tokens for merge/reasoning chat calls.
-const DEFAULT_MAX_TOKENS: u32 = 2048;
+/// Default max tokens for RAG answers. 512 is sufficient for knowledge-base
+/// answers and avoids multi-minute generation on CPU-fallback models.
+const DEFAULT_MAX_TOKENS: u32 = 512;
 
 pub struct GrpcChatEngine {
     endpoint: String,

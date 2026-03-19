@@ -228,6 +228,7 @@ fn build_context_params(ctx_size: u32, kv_cache_type: KvCacheType, flash_attenti
 
 /// Run full generation (blocking). Returns the generated text and token counts.
 fn generate_blocking(params: &GenerateParams) -> Result<GenerateResult, Status> {
+    let gen_start = std::time::Instant::now();
     let model = &params.model;
 
     // Tokenize the prompt
@@ -325,6 +326,26 @@ fn generate_blocking(params: &GenerateParams) -> Result<GenerateResult, Status> 
 
         ctx.decode(&mut batch)
             .map_err(|e| Status::internal(format!("Decode failed: {e}")))?;
+    }
+
+    let elapsed = gen_start.elapsed();
+    let tokens_per_sec = if elapsed.as_secs_f64() > 0.0 {
+        n_decoded as f64 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    tracing::info!(
+        prompt_tokens = n_prompt,
+        completion_tokens = n_decoded,
+        elapsed_ms = elapsed.as_millis() as u64,
+        tokens_per_sec = format!("{tokens_per_sec:.1}"),
+        "generation_complete"
+    );
+    if tokens_per_sec < 5.0 && n_decoded > 10 {
+        tracing::warn!(
+            tokens_per_sec = format!("{tokens_per_sec:.1}"),
+            "generation_slow — model may be running on CPU. Consider a smaller model."
+        );
     }
 
     Ok(GenerateResult {

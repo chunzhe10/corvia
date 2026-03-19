@@ -1010,7 +1010,15 @@ async fn tool_corvia_ask(
         ..Default::default()
     };
 
-    let response = rag.ask(query, scope_id, Some(opts)).await
+    // Timeout prevents CPU-bound LLM inference from blocking indefinitely.
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(corvia_common::constants::RAG_ASK_TIMEOUT_SECS),
+        rag.ask(query, scope_id, Some(opts)),
+    ).await
+        .map_err(|_| (INTERNAL_ERROR, format!(
+            "RAG ask timed out after {}s — model may be running on CPU. Check inference logs.",
+            corvia_common::constants::RAG_ASK_TIMEOUT_SECS
+        )))?
         .map_err(|e| (INTERNAL_ERROR, format!("RAG failed: {e}")))?;
 
     let sources: Vec<Value> = response.context.sources.iter().map(|r| {
