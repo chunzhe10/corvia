@@ -472,7 +472,13 @@ async fn rag_ask(
         ..Default::default()
     };
 
-    let response = rag.ask(&req.query, &req.scope_id, Some(opts)).await
+    // Timeout prevents LLM inference from blocking the server indefinitely.
+    // The /v1/ask endpoint can OOM or hang if the model is large.
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        rag.ask(&req.query, &req.scope_id, Some(opts)),
+    ).await
+        .map_err(|_| (StatusCode::GATEWAY_TIMEOUT, "RAG ask timed out after 120s".into()))?
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("RAG failed: {e}")))?;
 
     Ok(Json(RagResponseDto {

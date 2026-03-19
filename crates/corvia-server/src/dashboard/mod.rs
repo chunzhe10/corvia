@@ -808,7 +808,11 @@ async fn rag_ask_handler(
         ..Default::default()
     };
 
-    let response = rag.ask(&req.query, &req.scope_id, Some(opts)).await
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        rag.ask(&req.query, &req.scope_id, Some(opts)),
+    ).await
+        .map_err(|_| (StatusCode::GATEWAY_TIMEOUT, "RAG ask timed out after 120s".into()))?
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("RAG failed: {e}")))?;
 
     let sources: Vec<serde_json::Value> = response.context.sources.iter().map(|s| {
