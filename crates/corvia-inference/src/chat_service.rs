@@ -280,10 +280,11 @@ fn generate_blocking(params: &GenerateParams) -> Result<GenerateResult, Status> 
     while i < n_prompt {
         batch.clear();
         let end = (i + n_batch).min(n_prompt);
-        for j in i..end {
-            let is_last = j == n_prompt - 1;
+        for (j, &token) in prompt_tokens[i..end].iter().enumerate() {
+            let pos = i + j;
+            let is_last = pos == n_prompt - 1;
             batch
-                .add(prompt_tokens[j], j as i32, &[0], is_last)
+                .add(token, pos as i32, &[0], is_last)
                 .map_err(|e| Status::internal(format!("Batch add failed: {e}")))?;
         }
         ctx.decode(&mut batch)
@@ -384,10 +385,11 @@ fn generate_streaming_blocking(
     while i < n_prompt {
         batch.clear();
         let end = (i + n_batch).min(n_prompt);
-        for j in i..end {
-            let is_last = j == n_prompt - 1;
+        for (j, &token) in prompt_tokens[i..end].iter().enumerate() {
+            let pos = i + j;
+            let is_last = pos == n_prompt - 1;
             batch
-                .add(prompt_tokens[j], j as i32, &[0], is_last)
+                .add(token, pos as i32, &[0], is_last)
                 .map_err(|e| Status::internal(format!("Batch add failed: {e}")))?;
         }
         ctx.decode(&mut batch)

@@ -88,6 +88,7 @@ impl InferenceProvisioner {
     }
 
     /// Load models on the server.
+    #[allow(clippy::too_many_arguments)] // gRPC model loading params are all distinct
     pub async fn load_models(
         &self,
         embed_model: &str,
@@ -216,6 +217,7 @@ impl InferenceProvisioner {
     }
 
     /// Full provisioning: start if not running → wait → load models.
+    #[allow(clippy::too_many_arguments)] // Mirrors load_models params
     pub async fn ensure_ready(
         &self,
         embed_model: &str,

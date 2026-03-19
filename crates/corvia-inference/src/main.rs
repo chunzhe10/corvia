@@ -1,3 +1,6 @@
+// tonic::Status is >=176 bytes (required by gRPC trait signatures); boxing is impractical.
+#![allow(clippy::result_large_err)]
+
 mod backend;
 mod chat_service;
 mod embedding_service;

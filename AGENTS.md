@@ -14,6 +14,10 @@ in CLAUDE.md), Gemini CLI (settings.json), and Aider (`--read AGENTS.md`).
 cargo build --workspace          # Build everything
 cargo test --workspace           # Run all tests (PG tests auto-skip if unreachable)
 make test-postgres               # Start PostgreSQL + run tests with --features postgres
+
+# Build with embedded dashboard
+cd tools/corvia-dashboard && npm run build
+CORVIA_DASHBOARD_DIR=tools/corvia-dashboard/dist cargo build
 ```
 
 ## Test Tiers

@@ -31,6 +31,7 @@ impl AgentWriter {
     /// - Embeds the content
     /// - Writes to staging dir (if provided — Registered agents only)
     /// - Inserts into the shared store (immediately searchable via HNSW)
+    #[allow(clippy::too_many_arguments)] // Agent write params are all semantically distinct
     pub async fn write(
         &self,
         content: &str,
