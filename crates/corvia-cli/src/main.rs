@@ -199,6 +199,30 @@ enum Commands {
         #[command(subcommand)]
         command: InferenceCommands,
     },
+
+    /// Run retrieval quality benchmarks against the knowledge store
+    Bench {
+        #[command(subcommand)]
+        command: BenchCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum BenchCommands {
+    /// Run the eval suite and print results
+    Run {
+        /// Server URL
+        #[arg(long, default_value = "http://localhost:8020")]
+        server: String,
+        /// Number of results to retrieve per query
+        #[arg(long, default_value = "10")]
+        limit: usize,
+        /// Run A/B test: compare vector vs graph_expand
+        #[arg(long)]
+        ab: bool,
+    },
+    /// Show the latest benchmark results
+    Report,
 }
 
 #[derive(Subcommand)]
@@ -362,6 +386,10 @@ async fn main() -> Result<()> {
             InferenceCommands::Reload { device, backend, model, kv_quant, flash_attention, no_persist } =>
                 cmd_inference_reload(device.as_deref(), backend.as_deref(), model.as_deref(), kv_quant.as_deref(), flash_attention, no_persist).await?,
             InferenceCommands::Status => cmd_inference_status().await?,
+        },
+        Commands::Bench { command } => match command {
+            BenchCommands::Run { server, limit, ab } => cmd_bench_run(&server, limit, ab).await?,
+            BenchCommands::Report => cmd_bench_report()?,
         },
     }
 
@@ -2391,3 +2419,136 @@ mod tests {
         assert!(edges.is_empty(), "code-only should produce no doc-to-code edges");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Bench commands
+// ---------------------------------------------------------------------------
+
+/// Run the eval suite against a corvia server.
+async fn cmd_bench_run(server: &str, limit: usize, ab: bool) -> Result<()> {
+    use std::process::Command;
+
+    println!("corvia bench — Retrieval Quality Evaluation");
+    println!("Server: {server}");
+    println!("Top-K:  {limit}");
+    println!();
+
+    // Check server health
+    let health_url = format!("{server}/health");
+    let client = reqwest::Client::new();
+    match client.get(&health_url).timeout(std::time::Duration::from_secs(5)).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            println!("Server: OK");
+        }
+        _ => {
+            eprintln!("Error: Server at {server} is not responding. Start with 'corvia serve'.");
+            return Ok(());
+        }
+    }
+
+    // Determine which script to run
+    let script = if ab {
+        "benchmarks/rag-retrieval/ab-test.py"
+    } else {
+        "benchmarks/rag-retrieval/eval.py"
+    };
+
+    // Find the script relative to workspace root
+    let workspace_root = std::env::var("CORVIA_WORKSPACE_ROOT")
+        .unwrap_or_else(|_| ".".to_string());
+    let script_path = std::path::Path::new(&workspace_root).join(script);
+
+    if !script_path.exists() {
+        // Try relative to current dir
+        let alt_path = std::path::Path::new(script);
+        if !alt_path.exists() {
+            eprintln!("Error: Eval script not found at {script_path:?} or {alt_path:?}");
+            eprintln!("Run from workspace root or set CORVIA_WORKSPACE_ROOT.");
+            return Ok(());
+        }
+    }
+
+    let actual_path = if script_path.exists() {
+        script_path
+    } else {
+        std::path::Path::new(script).to_path_buf()
+    };
+
+    println!("Running: python3 {}", actual_path.display());
+    println!("{}", "-".repeat(70));
+
+    let mut args = vec![
+        actual_path.to_string_lossy().to_string(),
+    ];
+    if !ab {
+        args.push("--server".into());
+        args.push(server.into());
+        args.push("--limit".into());
+        args.push(limit.to_string());
+    }
+
+    let status = Command::new("python3")
+        .args(&args)
+        .status()
+        .map_err(|e| anyhow::anyhow!("Failed to run eval: {e}"))?;
+
+    if !status.success() {
+        eprintln!("Eval exited with non-zero status");
+    }
+
+    Ok(())
+}
+
+/// Show the latest benchmark results.
+fn cmd_bench_report() -> Result<()> {
+    let results_dir = std::path::Path::new("benchmarks/rag-retrieval/results");
+    if !results_dir.exists() {
+        eprintln!("No benchmark results found. Run 'corvia bench run' first.");
+        return Ok(());
+    }
+
+    // Find most recent result file
+    let mut files: Vec<_> = std::fs::read_dir(results_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    files.sort_by_key(|e| std::cmp::Reverse(e.metadata().ok().and_then(|m| m.modified().ok())));
+
+    if files.is_empty() {
+        eprintln!("No benchmark results found. Run 'corvia bench run' first.");
+        return Ok(());
+    }
+
+    let latest = &files[0];
+    let content = std::fs::read_to_string(latest.path())?;
+    let data: serde_json::Value = serde_json::from_str(&content)?;
+
+    println!("corvia bench report — Latest Results");
+    println!("File: {}", latest.path().display());
+    println!("{}", "-".repeat(70));
+
+    if let Some(summary) = data.get("summary") {
+        println!("Source Recall@5:  {:.1}%", summary["avg_source_recall_at_5"].as_f64().unwrap_or(0.0) * 100.0);
+        println!("Source Recall@10: {:.1}%", summary["avg_source_recall_at_10"].as_f64().unwrap_or(0.0) * 100.0);
+        println!("Keyword Recall:   {:.1}%", summary["avg_keyword_recall"].as_f64().unwrap_or(0.0) * 100.0);
+        println!("MRR:              {:.3}", summary["avg_mrr"].as_f64().unwrap_or(0.0));
+        println!("Relevance Score:  {:.3}", summary["avg_relevance_score"].as_f64().unwrap_or(0.0));
+        println!("Avg Latency:      {:.0}ms", summary["avg_latency_ms"].as_f64().unwrap_or(0.0));
+    } else if let Some(graph) = data.get("graph_expand") {
+        // A/B test result
+        println!("A/B Test Results:");
+        println!("  Graph Expand: Recall@5={:.1}% MRR={:.3} Lat={:.0}ms",
+            graph["avg_recall_5"].as_f64().unwrap_or(0.0) * 100.0,
+            graph["avg_mrr"].as_f64().unwrap_or(0.0),
+            graph["avg_latency"].as_f64().unwrap_or(0.0));
+        if let Some(vector) = data.get("vector") {
+            println!("  Vector Only:  Recall@5={:.1}% MRR={:.3} Lat={:.0}ms",
+                vector["avg_recall_5"].as_f64().unwrap_or(0.0) * 100.0,
+                vector["avg_mrr"].as_f64().unwrap_or(0.0),
+                vector["avg_latency"].as_f64().unwrap_or(0.0));
+        }
+    }
+
+    Ok(())
+}
+
