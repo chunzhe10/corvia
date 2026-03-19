@@ -69,8 +69,9 @@ impl CommitPipeline {
                     let msg = format!("agent commit: {} ({} entries)", session_id, files.len());
                     if let Err(e) = self.staging.commit_on_branch(branch, &msg, &file_refs) {
                         warn!(session_id, branch, error = %e, "commit_step2: git commit failed");
+                    } else {
+                        info!(session_id, branch, "commit_step2: git commit on branch");
                     }
-                    info!(session_id, branch, "commit_step2: git commit on branch");
                 }
             }
         }

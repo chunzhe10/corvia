@@ -172,8 +172,8 @@ impl EmbeddingServiceImpl {
                 Ok(fastembed::EmbeddingModel::GTEBaseENV15)
             }
             other => Err(Status::not_found(format!("Unknown embedding model: {other}. \
-                Supported: nomic-embed-text-v1.5, all-MiniLM-L6-v2, bge-small/base/large-en-v1.5, \
-                snowflake-arctic-embed-s/m/l, gte-base/large-en-v1.5"))),
+                Supported: nomic-embed-text-v1.5, all-MiniLM-L6-v2, all-MiniLM-L12-v2, \
+                bge-small/base/large-en-v1.5, snowflake-arctic-embed-s/m/l, gte-base/large-en-v1.5"))),
         }
     }
 

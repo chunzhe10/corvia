@@ -362,6 +362,8 @@ fn coordinator(state: &AppState) -> &AgentCoordinator {
 async fn dashboard_handler(uri: axum::http::Uri) -> impl IntoResponse {
     let path = uri.path().trim_start_matches('/');
 
+    let csp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'";
+
     // Try exact file match first
     if let Some(content) = DashboardAssets::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
@@ -376,6 +378,7 @@ async fn dashboard_handler(uri: axum::http::Uri) -> impl IntoResponse {
             [
                 (axum::http::header::CONTENT_TYPE, mime.as_ref().to_string()),
                 (axum::http::header::CACHE_CONTROL, cache.to_string()),
+                (axum::http::header::CONTENT_SECURITY_POLICY, csp.to_string()),
             ],
             content.data.into_owned(),
         )
@@ -401,6 +404,7 @@ async fn dashboard_handler(uri: axum::http::Uri) -> impl IntoResponse {
             [
                 (axum::http::header::CONTENT_TYPE, "text/html".to_string()),
                 (axum::http::header::CACHE_CONTROL, "no-cache".to_string()),
+                (axum::http::header::CONTENT_SECURITY_POLICY, csp.to_string()),
             ],
             index.data.into_owned(),
         )

@@ -1372,6 +1372,7 @@ mod tests {
     }
 
     /// Helper: send a GET request to the dashboard router and return (status, body JSON).
+    /// If the response is not valid JSON (e.g. plain text error), wraps it as a JSON string value.
     async fn get_json(
         state: Arc<crate::rest::AppState>,
         uri: &str,
@@ -1384,7 +1385,8 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let json = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned()));
         (status, json)
     }
 

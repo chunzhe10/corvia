@@ -50,9 +50,8 @@ impl ProcessAdapter {
             .spawn()
             .map_err(|e| format!("Failed to spawn {}: {e}", self.binary_path.display()))?;
 
-        child.stdin.as_ref().map(|_| ()).ok_or("no stdin")?;
-        child.stdout.as_ref().map(|_| ()).ok_or("no stdout")?;
-        let _ = ((), ());
+        child.stdin.as_ref().ok_or("no stdin")?;
+        child.stdout.as_ref().ok_or("no stdout")?;
 
         let mut child = child;
         let stdin = BufWriter::new(child.stdin.take().unwrap());
@@ -330,7 +329,7 @@ for line in sys.stdin:
             .join("adapters/corvia-adapter-basic/python/corvia-adapter-basic");
 
         if !adapter_path.exists() {
-            eprintln!("Skipping: Python adapter not found at {}", adapter_path.display());
+            tracing::info!(path = %adapter_path.display(), "Skipping: Python adapter not found");
             return;
         }
 

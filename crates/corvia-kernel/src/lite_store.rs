@@ -454,9 +454,9 @@ impl LiteStore {
 impl Drop for LiteStore {
     fn drop(&mut self) {
         if let Err(e) = self.flush_hnsw() {
-            eprintln!("LiteStore: failed to flush HNSW on drop: {e}");
+            tracing::warn!(error = %e, "LiteStore: failed to flush HNSW on drop");
         } else {
-            eprintln!("LiteStore: HNSW index persisted to disk");
+            tracing::info!("LiteStore: HNSW index persisted to disk");
         }
     }
 }

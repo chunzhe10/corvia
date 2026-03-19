@@ -60,8 +60,8 @@ impl GpuCapabilities {
         }
     }
 
-    /// Create with explicit values (for testing).
-    #[cfg(test)]
+    /// Create with explicit values (for testing or programmatic construction).
+    #[allow(dead_code)]
     pub fn new(cuda: bool, openvino: bool) -> Self {
         Self {
             cuda_available: cuda,
