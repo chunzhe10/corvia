@@ -48,8 +48,7 @@ fn nearest_centroid(point: &[f32], centroids: &[Vec<f32>]) -> usize {
 }
 
 /// K-means++ centroid initialization.
-fn kmeans_pp_init(data: &[Vec<f32>], k: usize) -> Vec<Vec<f32>> {
-    let mut rng = rand::thread_rng();
+fn kmeans_pp_init(data: &[Vec<f32>], k: usize, rng: &mut impl Rng) -> Vec<Vec<f32>> {
     let mut centroids = vec![data[rng.gen_range(0..data.len())].clone()];
 
     for _ in 1..k {
@@ -68,7 +67,7 @@ fn kmeans_pp_init(data: &[Vec<f32>], k: usize) -> Vec<Vec<f32>> {
             centroids.push(data[rng.gen_range(0..data.len())].clone());
             continue;
         }
-        let threshold = Rng::r#gen::<f32>(&mut rng) * total;
+        let threshold = Rng::r#gen::<f32>(rng) * total;
         let mut cumulative = 0.0;
         for (i, &d) in distances.iter().enumerate() {
             cumulative += d;
@@ -84,6 +83,11 @@ fn kmeans_pp_init(data: &[Vec<f32>], k: usize) -> Vec<Vec<f32>> {
 /// Assign each vector to one of `k` clusters via Lloyd's algorithm.
 /// Returns cluster assignments (0..k) for each data point.
 pub fn kmeans(data: &[Vec<f32>], k: usize, max_iters: usize) -> Vec<usize> {
+    kmeans_with_rng(data, k, max_iters, &mut rand::thread_rng())
+}
+
+/// K-means with a caller-provided RNG (for deterministic tests).
+pub fn kmeans_with_rng(data: &[Vec<f32>], k: usize, max_iters: usize, rng: &mut impl Rng) -> Vec<usize> {
     let n = data.len();
     let dim = data[0].len();
     if n <= k {
@@ -91,7 +95,7 @@ pub fn kmeans(data: &[Vec<f32>], k: usize, max_iters: usize) -> Vec<usize> {
     }
 
     // Initialize centroids with k-means++ seeding
-    let mut centroids = kmeans_pp_init(data, k);
+    let mut centroids = kmeans_pp_init(data, k, rng);
     let mut assignments = vec![0usize; n];
 
     for _ in 0..max_iters {
@@ -136,6 +140,11 @@ pub fn kmeans(data: &[Vec<f32>], k: usize, max_iters: usize) -> Vec<usize> {
 /// Compute the mean silhouette coefficient for a clustering.
 /// Samples up to 500 points for efficiency on large datasets.
 pub fn silhouette_score(data: &[Vec<f32>], assignments: &[usize], k: usize) -> f32 {
+    silhouette_score_with_rng(data, assignments, k, &mut rand::thread_rng())
+}
+
+/// Silhouette score with a caller-provided RNG (for deterministic tests).
+pub fn silhouette_score_with_rng(data: &[Vec<f32>], assignments: &[usize], k: usize, rng: &mut impl Rng) -> f32 {
     let n = data.len();
     if n <= 1 || k <= 1 {
         return 0.0;
@@ -143,9 +152,8 @@ pub fn silhouette_score(data: &[Vec<f32>], assignments: &[usize], k: usize) -> f
 
     let indices: Vec<usize> = (0..n).collect();
     let sample: Vec<usize> = if n > 500 {
-        let mut rng = rand::thread_rng();
         let mut shuffled = indices.clone();
-        shuffled.shuffle(&mut rng);
+        shuffled.shuffle(rng);
         shuffled.into_iter().take(500).collect()
     } else {
         indices
@@ -201,11 +209,16 @@ pub fn silhouette_score(data: &[Vec<f32>], assignments: &[usize], k: usize) -> f
 
 /// Find the best K by trying k_min..=k_max and picking highest silhouette score.
 pub fn find_best_k(data: &[Vec<f32>], k_min: usize, k_max: usize, _max_sample: usize) -> usize {
+    find_best_k_with_rng(data, k_min, k_max, _max_sample, &mut rand::thread_rng())
+}
+
+/// Find best K with a caller-provided RNG (for deterministic tests).
+pub fn find_best_k_with_rng(data: &[Vec<f32>], k_min: usize, k_max: usize, _max_sample: usize, rng: &mut impl Rng) -> usize {
     let mut best_k = k_min;
     let mut best_score = f32::NEG_INFINITY;
     for k in k_min..=k_max {
-        let assignments = kmeans(data, k, 100);
-        let score = silhouette_score(data, &assignments, k);
+        let assignments = kmeans_with_rng(data, k, 100, rng);
+        let score = silhouette_score_with_rng(data, &assignments, k, rng);
         if score > best_score {
             best_score = score;
             best_k = k;
@@ -271,13 +284,24 @@ impl ClusterHierarchy {
         k_max: usize,
         labels: &std::collections::HashMap<String, String>,
     ) -> Self {
+        Self::build_with_labels_and_rng(entries, k_min, k_max, labels, &mut rand::thread_rng())
+    }
+
+    /// Build hierarchy with a caller-provided RNG (for deterministic tests).
+    pub fn build_with_labels_and_rng(
+        entries: &[(String, Vec<f32>)],
+        k_min: usize,
+        k_max: usize,
+        labels: &std::collections::HashMap<String, String>,
+        rng: &mut impl Rng,
+    ) -> Self {
         let embeddings: Vec<Vec<f32>> = entries.iter().map(|(_, e)| e.clone()).collect();
         let k_max = k_max.min(entries.len());
         let k_min = k_min.min(k_max);
 
         // L0: super-clusters
-        let best_k = find_best_k(&embeddings, k_min, k_max, 500);
-        let l0_assignments = kmeans(&embeddings, best_k, 100);
+        let best_k = find_best_k_with_rng(&embeddings, k_min, k_max, 500, rng);
+        let l0_assignments = kmeans_with_rng(&embeddings, best_k, 100, rng);
 
         let mut super_clusters = Vec::new();
         for c in 0..best_k {
@@ -352,8 +376,8 @@ impl ClusterHierarchy {
                 .collect();
 
             let sub_k_max = (sc.entry_ids.len() / 2).clamp(2, 8);
-            let sub_k = find_best_k(&sc_embeddings, 2, sub_k_max, 200);
-            let sub_assignments = kmeans(&sc_embeddings, sub_k, 100);
+            let sub_k = find_best_k_with_rng(&sc_embeddings, 2, sub_k_max, 200, rng);
+            let sub_assignments = kmeans_with_rng(&sc_embeddings, sub_k, 100, rng);
 
             for s in 0..sub_k {
                 let member_indices: Vec<usize> = sub_assignments
@@ -529,6 +553,7 @@ impl ClusterStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::SeedableRng;
 
     #[test]
     fn test_kmeans_two_obvious_clusters() {
@@ -626,7 +651,11 @@ mod tests {
             ("c2".into(), vec![0.0, 0.0, 10.1, 10.0]),
             ("c3".into(), vec![0.0, 0.0, 10.0, 10.1]),
         ];
-        let hierarchy = ClusterHierarchy::build(&entries, 2, 5);
+        // Use a seeded RNG for deterministic clustering (avoids flaky test from thread_rng)
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let hierarchy = ClusterHierarchy::build_with_labels_and_rng(
+            &entries, 2, 5, &std::collections::HashMap::new(), &mut rng,
+        );
         assert!(
             hierarchy.super_clusters.len() >= 2 && hierarchy.super_clusters.len() <= 5,
             "Expected 2-5 super-clusters, got {}",

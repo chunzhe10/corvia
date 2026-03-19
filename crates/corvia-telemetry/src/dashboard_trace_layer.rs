@@ -51,8 +51,10 @@ impl DashboardTraceLayer {
 
 
     /// Default path: the same directory corvia-dev writes service logs to.
+    /// Checks `CORVIA_LOG_DIR`, then `XDG_RUNTIME_DIR/corvia`, then `/tmp/corvia-dev-logs`.
     pub fn default_path() -> PathBuf {
         let dir = std::env::var("CORVIA_LOG_DIR")
+            .or_else(|_| std::env::var("XDG_RUNTIME_DIR").map(|d| format!("{d}/corvia")))
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/tmp/corvia-dev-logs"));
         dir.join("corvia-traces.log")

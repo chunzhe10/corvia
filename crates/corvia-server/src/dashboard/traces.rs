@@ -483,9 +483,10 @@ pub fn tail_lines(path: &Path, n: usize) -> Vec<String> {
     all_lines[start..].to_vec()
 }
 
-/// Resolve the log directory — checks env var, then default path
+/// Resolve the log directory — checks env var, then XDG_RUNTIME_DIR, then default path.
 pub fn log_dir() -> std::path::PathBuf {
     std::env::var("CORVIA_LOG_DIR")
+        .or_else(|_| std::env::var("XDG_RUNTIME_DIR").map(|d| format!("{d}/corvia")))
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/corvia-dev-logs"))
 }
