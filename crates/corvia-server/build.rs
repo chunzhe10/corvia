@@ -1,4 +1,7 @@
 fn main() {
+    // Rebuild when the env var changes (toggling dashboard embedding)
+    println!("cargo:rerun-if-env-changed=CORVIA_DASHBOARD_DIR");
+
     // Set CORVIA_DASHBOARD_DIR for rust-embed if not already set.
     // This ensures `cargo build` works without the env var — the embed
     // will simply be empty (placeholder directory with no files).

@@ -2441,8 +2441,7 @@ async fn cmd_bench_run(server: &str, limit: usize, ab: bool) -> Result<()> {
             println!("Server: OK");
         }
         _ => {
-            eprintln!("Error: Server at {server} is not responding. Start with 'corvia serve'.");
-            return Ok(());
+            anyhow::bail!("Server at {server} is not responding. Start with 'corvia serve'.");
         }
     }
 
@@ -2480,12 +2479,11 @@ async fn cmd_bench_run(server: &str, limit: usize, ab: bool) -> Result<()> {
     let mut args = vec![
         actual_path.to_string_lossy().to_string(),
     ];
-    if !ab {
-        args.push("--server".into());
-        args.push(server.into());
-        args.push("--limit".into());
-        args.push(limit.to_string());
-    }
+    // Both eval and ab-test scripts accept --server and --limit
+    args.push("--server".into());
+    args.push(server.into());
+    args.push("--limit".into());
+    args.push(limit.to_string());
 
     let status = Command::new("python3")
         .args(&args)

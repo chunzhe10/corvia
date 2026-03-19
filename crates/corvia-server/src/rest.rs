@@ -382,7 +382,19 @@ async fn dashboard_handler(uri: axum::http::Uri) -> impl IntoResponse {
             .into_response();
     }
 
-    // SPA fallback: serve index.html for navigation paths (not file extensions)
+    // Don't serve dashboard HTML for API-like paths — return JSON 404 instead.
+    if path.starts_with("v1/") || path.starts_with("api/") || path.starts_with("mcp") {
+        return (
+            StatusCode::NOT_FOUND,
+            [
+                (axum::http::header::CONTENT_TYPE, "application/json".to_string()),
+                (axum::http::header::CACHE_CONTROL, "no-store".to_string()),
+            ],
+            b"{\"error\":\"Not Found\"}".to_vec(),
+        ).into_response();
+    }
+
+    // SPA fallback: serve index.html for navigation paths
     if let Some(index) = DashboardAssets::get("index.html") {
         return (
             StatusCode::OK,

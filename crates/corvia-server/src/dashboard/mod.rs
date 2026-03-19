@@ -1274,3 +1274,295 @@ async fn entry_history_handler(
         "count": chain_json.len(),
     })))
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use corvia_kernel::agent_coordinator::AgentCoordinator;
+    use corvia_kernel::lite_store::LiteStore;
+    use corvia_kernel::traits::{
+        GenerationEngine, GenerationResult, GraphStore, InferenceEngine, QueryableStore,
+        TemporalStore,
+    };
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    struct MockEngine;
+    #[async_trait::async_trait]
+    impl InferenceEngine for MockEngine {
+        async fn embed(&self, _text: &str) -> corvia_common::errors::Result<Vec<f32>> {
+            Ok(vec![1.0, 0.0, 0.0])
+        }
+        async fn embed_batch(
+            &self,
+            texts: &[String],
+        ) -> corvia_common::errors::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect())
+        }
+        fn dimensions(&self) -> usize {
+            3
+        }
+    }
+
+    struct MockGenerationEngine;
+    #[async_trait::async_trait]
+    impl GenerationEngine for MockGenerationEngine {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn generate(
+            &self,
+            _system_prompt: &str,
+            _user_message: &str,
+        ) -> corvia_common::errors::Result<GenerationResult> {
+            Ok(GenerationResult {
+                text: "mock".into(),
+                model: "mock".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+            })
+        }
+        fn context_window(&self) -> usize {
+            4096
+        }
+    }
+
+    async fn test_state(dir: &std::path::Path) -> Arc<crate::rest::AppState> {
+        let store = Arc::new(LiteStore::open(dir, 3).unwrap());
+        store.init_schema().await.unwrap();
+        let engine = Arc::new(MockEngine) as Arc<dyn InferenceEngine>;
+        let gen_engine =
+            Arc::new(MockGenerationEngine) as Arc<dyn GenerationEngine>;
+        let coordinator = Arc::new(
+            AgentCoordinator::new(
+                store.clone() as Arc<dyn QueryableStore>,
+                engine.clone(),
+                dir,
+                corvia_common::config::AgentLifecycleConfig::default(),
+                corvia_common::config::MergeConfig {
+                    similarity_threshold: 2.0,
+                    ..Default::default()
+                },
+                gen_engine,
+            )
+            .unwrap(),
+        );
+        Arc::new(crate::rest::AppState {
+            store: store.clone() as Arc<dyn QueryableStore>,
+            engine,
+            coordinator,
+            graph: store.clone() as Arc<dyn GraphStore>,
+            temporal: store as Arc<dyn TemporalStore>,
+            data_dir: dir.to_path_buf(),
+            rag: None,
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            default_scope_id: None,
+            config: Arc::new(std::sync::RwLock::new(
+                corvia_common::config::CorviaConfig::default(),
+            )),
+            config_path: dir.join("corvia.toml"),
+            cluster_store: Arc::new(super::clustering::ClusterStore::new()),
+            gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
+            session_ingest_lock: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    /// Helper: send a GET request to the dashboard router and return (status, body JSON).
+    async fn get_json(
+        state: Arc<crate::rest::AppState>,
+        uri: &str,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        let app = router(state);
+        let req = axum::http::Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn test_status_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        let (status, json) = get_json(state, "/api/dashboard/status").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(json.get("entry_count").is_some(), "missing entry_count");
+        assert!(json.get("agent_count").is_some(), "missing agent_count");
+        assert!(json.get("merge_queue_depth").is_some(), "missing merge_queue_depth");
+        assert!(json.get("session_count").is_some(), "missing session_count");
+        assert!(json.get("config").is_some(), "missing config");
+        assert!(json.get("services").is_some(), "missing services");
+
+        // Verify values are zero for empty store
+        assert_eq!(json["entry_count"], 0);
+        assert_eq!(json["agent_count"], 0);
+        assert_eq!(json["merge_queue_depth"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_recent_traces_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        let (status, json) = get_json(state, "/api/dashboard/traces/recent").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(json.get("traces").is_some(), "missing traces array");
+        assert!(json["traces"].is_array(), "traces should be an array");
+    }
+
+    #[tokio::test]
+    async fn test_agents_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        let (status, json) = get_json(state, "/api/dashboard/agents").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(json.is_array(), "response should be an array of agents");
+        // Empty coordinator should produce an empty list
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_health_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        let (status, json) = get_json(state, "/api/dashboard/health").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(json.get("findings").is_some(), "missing findings");
+        assert!(json["findings"].is_array(), "findings should be an array");
+        assert!(json.get("count").is_some(), "missing count");
+        assert!(json.get("scope_id").is_some(), "missing scope_id");
+        // Empty store should have no findings (or a small deterministic set)
+        let count = json["count"].as_u64().unwrap();
+        assert_eq!(count, json["findings"].as_array().unwrap().len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_graph_handler_no_entry_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        // Without entry_id, should return empty edges
+        let (status, json) = get_json(state, "/api/dashboard/graph").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(json.get("edges").is_some(), "missing edges");
+        assert!(json["edges"].is_array(), "edges should be an array");
+        assert_eq!(json["edges"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_graph_handler_invalid_entry_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        let (status, _json) =
+            get_json(state, "/api/dashboard/graph?entry_id=not-a-uuid").await;
+
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_traces_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        let (status, json) = get_json(state, "/api/dashboard/traces").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(json.get("spans").is_some(), "missing spans");
+        assert!(json.get("recent_events").is_some(), "missing recent_events");
+        assert!(json.get("modules").is_some(), "missing modules");
+    }
+
+    #[tokio::test]
+    async fn test_config_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        let (status, json) = get_json(state, "/api/dashboard/config").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(json.get("embedding_provider").is_some(), "missing embedding_provider");
+        assert!(json.get("storage").is_some(), "missing storage");
+        assert!(json.get("workspace").is_some(), "missing workspace");
+    }
+
+    #[tokio::test]
+    async fn test_logs_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        let (status, json) = get_json(state, "/api/dashboard/logs").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(json.get("entries").is_some(), "missing entries");
+        assert!(json["entries"].is_array(), "entries should be an array");
+        assert!(json.get("total").is_some(), "missing total");
+    }
+
+    #[tokio::test]
+    async fn test_merge_queue_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        let (status, json) = get_json(state, "/api/dashboard/merge/queue").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        // merge_queue_status returns a serialized struct; check it parsed as valid JSON
+        assert!(json.is_object() || json.is_array(), "response should be valid JSON");
+    }
+
+    #[tokio::test]
+    async fn test_gc_status_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        let (status, json) = get_json(state, "/api/dashboard/gc").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(json.get("history").is_some(), "missing history");
+        assert!(json["history"].is_array(), "history should be an array");
+        assert_eq!(json["scheduled"], false);
+    }
+
+    #[tokio::test]
+    async fn test_live_sessions_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        let (status, json) = get_json(state, "/api/dashboard/sessions/live").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(json.get("sessions").is_some(), "missing sessions");
+        assert!(json["sessions"].is_array(), "sessions should be an array");
+        assert!(json.get("summary").is_some(), "missing summary");
+        assert_eq!(json["summary"]["total_active"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_gpu_status_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        let (status, json) = get_json(state, "/api/dashboard/gpu").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        // GPU handler returns a GpuStatusResponse; just verify it's valid JSON
+        assert!(json.is_object(), "response should be a JSON object");
+    }
+}

@@ -268,8 +268,7 @@ pub async fn create_rag_pipeline(
     // Falls back to "vector" if requested retriever requires unavailable dependencies.
     let ret: Arc<dyn retriever::Retriever> = match config.rag.retriever.as_str() {
         "vector" => Arc::new(retriever::VectorRetriever::new(store.clone(), engine.clone())),
-        _ => {
-            // Default: use graph_expand if graph store is available, else vector
+        "graph_expand" => {
             match graph {
                 Some(g) => Arc::new(retriever::GraphExpandRetriever::new(
                     store.clone(),
@@ -278,15 +277,22 @@ pub async fn create_rag_pipeline(
                     config.rag.graph_alpha,
                 )),
                 None => {
-                    if config.rag.retriever != "vector" {
-                        info!(
-                            requested = %config.rag.retriever,
-                            fallback = "vector",
-                            "graph store unavailable, falling back to vector retriever"
-                        );
-                    }
+                    info!(fallback = "vector", "graph store unavailable, falling back to vector retriever");
                     Arc::new(retriever::VectorRetriever::new(store.clone(), engine.clone()))
                 }
+            }
+        }
+        other => {
+            warn!(
+                retriever = other,
+                "unknown retriever '{other}', falling back to graph_expand. \
+                 Valid options: \"vector\", \"graph_expand\""
+            );
+            match graph {
+                Some(g) => Arc::new(retriever::GraphExpandRetriever::new(
+                    store.clone(), engine.clone(), g, config.rag.graph_alpha,
+                )),
+                None => Arc::new(retriever::VectorRetriever::new(store.clone(), engine.clone())),
             }
         }
     };
