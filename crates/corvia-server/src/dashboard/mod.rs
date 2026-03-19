@@ -1470,10 +1470,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(tmp.path()).await;
 
-        let (status, _json) =
-            get_json(state, "/api/dashboard/graph?entry_id=not-a-uuid").await;
-
-        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        let app = router(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/dashboard/graph?entry_id=not-a-uuid")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
