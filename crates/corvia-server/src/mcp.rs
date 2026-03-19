@@ -861,9 +861,15 @@ async fn tool_corvia_reason(
     let scope_id = resolve_scope_id(args, state)?;
     let check_str = args.get("check").and_then(|v| v.as_str());
 
-    // Load entries from knowledge files (direct disk read, not HNSW search)
-    let entries = corvia_kernel::knowledge_files::read_scope(&state.data_dir, scope_id)
-        .map_err(|e| (INTERNAL_ERROR, format!("Failed to load entries: {e}")))?;
+    // Load entries on a blocking thread to avoid starving the async runtime.
+    let data_dir = state.data_dir.clone();
+    let scope_owned = scope_id.to_string();
+    let entries = tokio::task::spawn_blocking(move || {
+        corvia_kernel::knowledge_files::read_scope(&data_dir, &scope_owned)
+    })
+    .await
+    .map_err(|e| (INTERNAL_ERROR, format!("Task join failed: {e}")))?
+    .map_err(|e| (INTERNAL_ERROR, format!("Failed to load entries: {e}")))?;
 
     let reasoner = corvia_kernel::reasoner::Reasoner::new(&*state.store, &*state.graph);
 

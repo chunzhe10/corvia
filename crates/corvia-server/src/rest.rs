@@ -783,9 +783,15 @@ async fn reason(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ReasonRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Load entries from knowledge files (direct disk read, not HNSW search)
-    let entries = corvia_kernel::knowledge_files::read_scope(&state.data_dir, &req.scope_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load entries: {e}")))?;
+    // Load entries on a blocking thread to avoid starving the async runtime.
+    let data_dir = state.data_dir.clone();
+    let scope_id = req.scope_id.clone();
+    let entries = tokio::task::spawn_blocking(move || {
+        corvia_kernel::knowledge_files::read_scope(&data_dir, &scope_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task join failed: {e}")))?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load entries: {e}")))?;
 
     let reasoner = corvia_kernel::reasoner::Reasoner::new(&*state.store, &*state.graph);
 

@@ -72,7 +72,10 @@ pub async fn activity_feed_handler(
         corvia_kernel::knowledge_files::read_scope(&data_dir, &scope_id).unwrap_or_default()
     })
     .await
-    .unwrap_or_default();
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "activity_feed_load_failed");
+        Vec::new()
+    });
 
     // Sort by recorded_at descending (newest first)
     entries.sort_by_key(|e| std::cmp::Reverse(e.recorded_at));
