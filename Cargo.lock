@@ -959,6 +959,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "serde_json",
  "tonic",
  "tracing",
  "tracing-appender",

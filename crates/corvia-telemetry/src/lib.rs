@@ -1,3 +1,4 @@
+pub mod dashboard_trace_layer;
 pub mod otel_context_layer;
 pub mod propagation;
 
@@ -68,8 +69,13 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<TelemetryGuard
     let service_name =
         std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| config.service_name.clone());
 
-    // 5. Build OTLP tracer provider + layer if endpoint is non-empty
-    let mut tracer_provider = None;
+    // 5. Build tracer provider + OTEL layer.
+    //
+    // When an OTLP endpoint is configured, spans are exported externally.
+    // Otherwise, a local-only provider is created so that trace_id/span_id
+    // still appear in structured logs — the dashboard traces page depends
+    // on these fields even without an external collector.
+    let tracer_provider;
     let otel_layer = if !otlp_endpoint.is_empty() {
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
@@ -90,11 +96,35 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<TelemetryGuard
         tracer_provider = Some(provider);
         Some(layer)
     } else {
-        None
+        // Local-only provider: generates trace_id/span_id for structured
+        // logs without exporting to any external collector.
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_resource(
+                opentelemetry_sdk::Resource::builder()
+                    .with_service_name(service_name)
+                    .build(),
+            )
+            .build();
+
+        let tracer = provider.tracer("corvia");
+        let layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        tracer_provider = Some(provider);
+        Some(layer)
     };
 
-    // 6. Build local output layer + compose registry
+    // 6. Build dashboard trace layer — writes span-close events with OTEL
+    //    context to a file the dashboard can read, regardless of exporter mode.
+    let dashboard_layer = dashboard_trace_layer::DashboardTraceLayer::new(
+        dashboard_trace_layer::DashboardTraceLayer::default_path(),
+    )
+    .ok();
+
+    // 7. Build local output layer + compose registry
     let mut file_guard = None;
+
+    // OtelContextLayer bridges trace_id/span_id into span extensions.
+    // Always active — the local-only provider ensures IDs exist.
+    let context_layer = Some(otel_context_layer::OtelContextLayer);
 
     match config.exporter.as_str() {
         "file" => {
@@ -113,16 +143,11 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<TelemetryGuard
                     .boxed()
             };
 
-            let context_layer = if otel_layer.is_some() {
-                Some(otel_context_layer::OtelContextLayer)
-            } else {
-                None
-            };
-
             tracing_subscriber::registry()
                 .with(env_filter)
                 .with(otel_layer)
                 .with(context_layer)
+                .with(dashboard_layer)
                 .with(local_layer)
                 .init();
         }
@@ -134,16 +159,11 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<TelemetryGuard
                 fmt::layer().boxed()
             };
 
-            let context_layer = if otel_layer.is_some() {
-                Some(otel_context_layer::OtelContextLayer)
-            } else {
-                None
-            };
-
             tracing_subscriber::registry()
                 .with(env_filter)
                 .with(otel_layer)
                 .with(context_layer)
+                .with(dashboard_layer)
                 .with(local_layer)
                 .init();
         }
