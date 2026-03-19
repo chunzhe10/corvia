@@ -301,6 +301,7 @@ async fn write_to_postgres(
 }
 
 /// Shared logic: bulk insert entries + edges, then verify counts.
+#[allow(dead_code)] // Reserved for future store-to-store migration (e.g., LiteStore → PostgresStore)
 async fn bulk_insert_and_verify(
     queryable: Arc<dyn QueryableStore>,
     graph: Arc<dyn GraphStore>,

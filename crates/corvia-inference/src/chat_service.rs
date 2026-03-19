@@ -82,6 +82,7 @@ fn llama_backend() -> &'static LlamaBackend {
 
 struct ChatModelEntry {
     model: Arc<LlamaModel>,
+    #[allow(dead_code)] // Used by get_backend(), not yet called from gRPC handlers
     backend: ResolvedBackend,
     kv_cache_type: KvCacheType,
     flash_attention: bool,
@@ -150,6 +151,7 @@ impl ChatServiceImpl {
     }
 
     /// Get the resolved backend for a loaded model.
+    #[allow(dead_code)] // API reserved for future gRPC handler / dashboard introspection
     pub async fn get_backend(&self, name: &str) -> Option<ResolvedBackend> {
         let models = self.models.read().await;
         models.get(name).map(|e| e.backend.clone())
