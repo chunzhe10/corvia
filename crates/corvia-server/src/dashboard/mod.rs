@@ -22,6 +22,23 @@ use corvia_kernel::agent_coordinator::GcReport;
 use serde::{Deserialize, Serialize};
 use crate::rest::AppState;
 
+/// Helper: read knowledge files on a blocking thread to avoid starving the async runtime.
+/// All dashboard handlers that need scope entries MUST use this instead of calling
+/// `knowledge_files::read_scope` directly in async context.
+async fn load_scope_entries(
+    data_dir: &std::path::Path,
+    scope_id: &str,
+) -> Result<Vec<corvia_common::types::KnowledgeEntry>, (StatusCode, String)> {
+    let data_dir = data_dir.to_path_buf();
+    let scope_id = scope_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        corvia_kernel::knowledge_files::read_scope(&data_dir, &scope_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task join failed: {e}")))?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load entries: {e}")))
+}
+
 fn gc_report_to_dto(r: GcReport) -> corvia_common::dashboard::GcReportDto {
     corvia_common::dashboard::GcReportDto {
         orphans_rolled_back: r.orphans_rolled_back,
@@ -334,15 +351,7 @@ async fn graph_scope_handler(
         .unwrap_or(DEFAULT_SCOPE_ID)
         .to_string();
 
-    // Load entries on a blocking thread to avoid starving the async runtime.
-    // With ~8,774 JSON files, this I/O is too heavy for the async executor.
-    let data_dir = state.data_dir.clone();
-    let entries = tokio::task::spawn_blocking(move || {
-        corvia_kernel::knowledge_files::read_scope(&data_dir, &scope_id)
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task join failed: {e}")))?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load entries: {e}")))?;
+    let entries = load_scope_entries(&state.data_dir, &scope_id).await?;
 
     // Collect edges for every entry, deduplicating by from:relation:to
     let mut seen = std::collections::HashSet::<String>::new();
@@ -464,8 +473,7 @@ async fn clustered_graph_handler(
             // Degraded mode: cluster store not yet computed.
             // Try an immediate computation.
             let scope_id = state.default_scope_id.as_deref().unwrap_or(DEFAULT_SCOPE_ID);
-            let entries = corvia_kernel::knowledge_files::read_scope(&state.data_dir, scope_id)
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load entries: {e}")))?;
+            let entries = load_scope_entries(&state.data_dir, scope_id).await?;
             let pairs: Vec<(String, Vec<f32>)> = entries
                 .iter()
                 .filter_map(|e| e.embedding.as_ref().map(|emb| (e.id.to_string(), emb.clone())))
@@ -496,8 +504,7 @@ async fn clustered_graph_handler(
         0 => {
             // Super-clusters as nodes
             let scope_id = state.default_scope_id.as_deref().unwrap_or(DEFAULT_SCOPE_ID);
-            let entries = corvia_kernel::knowledge_files::read_scope(&state.data_dir, scope_id)
-                .unwrap_or_default();
+            let entries = load_scope_entries(&state.data_dir, scope_id).await.unwrap_or_default();
             let entry_map: std::collections::HashMap<String, &corvia_common::types::KnowledgeEntry> =
                 entries.iter().map(|e| (e.id.to_string(), e)).collect();
 
@@ -579,8 +586,7 @@ async fn clustered_graph_handler(
                 .or_else(|| hierarchy.super_clusters.iter().find(|sc| sc.cluster_id == parent_id));
 
             let scope_id = state.default_scope_id.as_deref().unwrap_or(DEFAULT_SCOPE_ID);
-            let entries = corvia_kernel::knowledge_files::read_scope(&state.data_dir, scope_id)
-                .unwrap_or_default();
+            let entries = load_scope_entries(&state.data_dir, scope_id).await.unwrap_or_default();
             let entry_map: std::collections::HashMap<String, &corvia_common::types::KnowledgeEntry> =
                 entries.iter().map(|e| (e.id.to_string(), e)).collect();
 
@@ -713,9 +719,7 @@ async fn health_handler(
         .as_deref()
         .unwrap_or(DEFAULT_SCOPE_ID);
 
-    // Load entries from knowledge files (direct disk read)
-    let entries = corvia_kernel::knowledge_files::read_scope(&state.data_dir, scope_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load entries: {e}")))?;
+    let entries = load_scope_entries(&state.data_dir, scope_id).await?;
 
     // Extract DocsRulesConfig from live config for MisplacedDoc checks
     let docs_rules = state
@@ -893,8 +897,7 @@ async fn refresh_summary_handler(
 
     // Load entries from knowledge files and compute topic tags
     let scope_id = state.default_scope_id.as_deref().unwrap_or(DEFAULT_SCOPE_ID);
-    let entries = corvia_kernel::knowledge_files::read_scope(&state.data_dir, scope_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load entries: {e}")))?;
+    let entries = load_scope_entries(&state.data_dir, scope_id).await?;
 
     // Get embeddings for entries (all entries for now — filtering by agent would require metadata)
     let pairs: Vec<(String, Vec<f32>)> = entries.iter()
