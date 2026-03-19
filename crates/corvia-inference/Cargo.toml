@@ -34,8 +34,9 @@ libc = "0.2"
 
 [features]
 # CUDA for llama.cpp chat models. Requires CUDA Toolkit (nvcc) at build time.
+# Currently blocked: CUDA 12.8 nvcc is incompatible with Debian trixie glibc 2.40+
+# headers (C23 'exception' keyword in mathcalls.h). NVIDIA needs to release a fix.
+# Workaround: use a Ubuntu-based container or wait for CUDA 12.9+.
 # Enable with: cargo build -p corvia-inference --features cuda
-# The devcontainer has CUDA runtime (for ORT embedding) but not the build toolkit.
-# See: docs/decisions/gpu-inference.md for setup instructions.
 default = []
 cuda = ["llama-cpp-2/cuda"]
