@@ -16,11 +16,15 @@
   <a href="Cargo.toml"><img src="https://img.shields.io/badge/version-0.4.3-green.svg" alt="Version 0.4.3"></a>
 </p>
 
-> **Pre-release (v0.4.3).** Core kernel, two-tier storage (LiteStore + PostgresStore),
-> multi-agent coordination, temporal queries, knowledge graph, automated reasoning, RAG
-> pipeline, chunking pipeline, adapter plugin system, observability, control plane, CLI
-> metrics, standalone dashboard (10 features), GPU-accelerated inference (OpenVINO/CUDA),
-> and docs workflow are implemented and tested (433+ tests). API surface may change before 1.0.
+> **Pre-release (v0.4.3).** Single-binary server with embedded dashboard, two-tier storage
+> (LiteStore + PostgresStore), multi-agent coordination, temporal queries, knowledge graph,
+> automated reasoning, config-driven RAG with swappable retrievers, chunking pipeline,
+> adapter plugin system, 12 embedding models, observability, MCP control plane,
+> GPU-accelerated inference (OpenVINO/CUDA), and docs workflow enforcement.
+> Zero-warning build, 625+ tests. API surface may change before 1.0.
+>
+> **Dogfooding:** corvia manages its own development knowledge — 8,769+ entries,
+> 11,756+ graph edges, queried by AI agents in every coding session.
 
 ---
 
@@ -44,18 +48,19 @@ Organizational memory:  why the auth system was redesigned, which decisions led 
 
 ## How it works
 
-1. **Ingest** — tree-sitter parses code into semantic chunks, corvia-inference generates embeddings locally (ONNX Runtime; Ollama also supported)
+1. **Ingest** — tree-sitter parses code into semantic chunks, corvia-inference generates embeddings locally (ONNX Runtime, 12 models; Ollama also supported)
 2. **Store** — knowledge files land in `.corvia/knowledge/` as Git-trackable JSON (the database is a cache, these files are truth)
 3. **Connect** — a knowledge graph links related entries with directed, labeled edges
-4. **Query** — semantic search, temporal queries ("what did we know last week?"), graph traversal
+4. **Query** — config-driven RAG with swappable retrievers: vector similarity, graph expansion, temporal queries ("what did we know last week?")
 5. **Reason** — five deterministic health checks catch stale knowledge, broken chains, orphans, dangling edges, and dependency cycles
 6. **Coordinate** — each agent writes to its own staging area, conflicts go through LLM-assisted merge
+7. **Measure** — `corvia bench` evaluates retrieval quality (NDCG, MRR, Precision@K) against your own knowledge base
 
 ## Features
 
 | Feature | What it does |
 |---------|-------------|
-| **Semantic search** | Vector similarity over ingested knowledge. Local embeddings via corvia-inference (ONNX) or Ollama — no API keys |
+| **Semantic search** | Vector similarity over ingested knowledge. 12 local embedding models via corvia-inference (ONNX) or Ollama — no API keys |
 | **Knowledge graph** | Directed edges between entries. BFS traversal, shortest path, cycle detection |
 | **Temporal queries** | Bi-temporal model. Point-in-time snapshots, supersession chains, time-range evolution |
 | **Automated reasoning** | 5 deterministic checks + 2 opt-in LLM checks. Same input, same findings, every time |
@@ -64,8 +69,10 @@ Organizational memory:  why the auth system was redesigned, which decisions led 
 | **Git as truth** | All knowledge stored as JSON in `.corvia/knowledge/`. `corvia rebuild` reconstructs everything from files alone |
 | **Observability** | Structured tracing across all kernel subsystems. Configurable exporters (stdout, file, OTLP). CLI metrics via `corvia status --metrics` |
 | **MCP control plane** | 18 MCP tools across 3 safety tiers (read-only, low-risk, medium-risk). Config hot-reload, GC, index rebuild |
+| **Retrieval quality** | Built-in `corvia bench` measures NDCG, MRR, Precision@K against your own knowledge. Current dogfood scores: NDCG 0.656, MRR 0.608, Precision@5 49.6% |
+| **Config-driven RAG** | Swappable retrievers (vector, graph-expanded), configurable augmentation, multiple generation backends. Tune retrieval without changing code |
 | **Three integration paths** | Rust crate, REST API (`:8020`), or MCP server for Claude and other agent frameworks |
-| **Dashboard** | Standalone web dashboard (`:8021`) with knowledge browser, semantic clustering, activity feed, agent status, and system health |
+| **Embedded dashboard** | Single-binary serves dashboard on `:8021` with knowledge browser, semantic clustering, activity feed, agent status, and system health |
 | **GPU inference** | OpenVINO for Intel iGPU, CUDA for NVIDIA GPU. Runtime backend switching via config. CPU fallback with automatic detection |
 | **Docs workflow** | Doc placement enforcement (hooks), docs health checks (Aggregator), multi-repo ownership tracking |
 
@@ -109,6 +116,8 @@ corvia serve                             # REST API on :8020
 corvia serve --mcp                       # + MCP endpoint for agents
 corvia status --metrics                   # extended metrics (entries, agents, latency)
 corvia demo                              # ingest corvia's own source code
+corvia bench run                         # evaluate retrieval quality (NDCG, MRR, P@K)
+corvia bench report                      # show latest benchmark results
 ```
 
 ### REST API
@@ -177,7 +186,7 @@ Frontends:           CLI  ·  VS Code Extension (planned)
                             │
 Adapters:            Git/Code (tree-sitter)  ·  Basic (filesystem)  ·  Community adapters
                             │
-Inference:           gRPC inference server (ONNX/candle)  ·  Ollama
+Inference:           gRPC inference server (ONNX, 12 models)  ·  Ollama
                             │
 Kernel:              Knowledge Store  ·  Agent Coordinator  ·  RAG Pipeline
                      Embedding Pipeline  ·  Context Builder  ·  Chunking Pipeline
@@ -205,10 +214,12 @@ Storage:             LiteStore ─── hnsw_rs · petgraph · Redb · Git
 
 ### Design principles
 
-- **Local-first** — zero cost, no API keys. corvia-inference (ONNX) or Ollama provides local embeddings
+- **Single-binary** — `corvia serve` runs API server + embedded dashboard. No separate frontend deployment
+- **Local-first** — zero cost, no API keys. corvia-inference (ONNX, 12 models) or Ollama provides local embeddings
 - **Provider-agnostic** — any LLM, any embedding model. All inference goes through traits
 - **Domain-agnostic kernel** — adapters bring domain knowledge. The kernel doesn't assume code
 - **Trait-bounded** — `QueryableStore`, `InferenceEngine`, `TemporalStore`, `GraphStore`, `IngestionAdapter` are all swappable
+- **Measurable** — `corvia bench` evaluates retrieval quality against your own data. No separate eval infrastructure needed
 
 For detailed internals, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -225,13 +236,13 @@ For detailed internals, see [ARCHITECTURE.md](ARCHITECTURE.md).
 - [x] **M4.2** — Standalone dashboard (semantic clustering, activity feed, agent identity, knowledge browser)
 - [x] **M4.3** — GPU-accelerated inference (OpenVINO/CUDA), docs workflow enforcement
 - [ ] **M5** — VS Code extension + Python SDK
-- [ ] **M6** — Eval framework (precision@k, MRR, NDCG)
+- [x] **M6** — Eval framework (`corvia bench`: NDCG 0.656, MRR 0.608, Precision@5 49.6%)
 - [ ] **M7** — 1.0 + PyPI publish
 
 ## Contributing
 
-corvia is pre-release software built by a solo developer. The adapter system, trait-based
-storage, and modular kernel all provide clean extension points.
+corvia is pre-release software built by a solo developer (625+ tests, zero-warning build).
+The adapter system, trait-based storage, and modular kernel all provide clean extension points.
 
 **Most valuable right now:**
 
