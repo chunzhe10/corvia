@@ -15,8 +15,16 @@ use corvia_kernel::traits::{GraphStore, InferenceEngine, QueryableStore, Tempora
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use rust_embed::Embed;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
+
+/// Embedded dashboard static assets. Built from the workspace's dashboard dist/.
+/// The path is resolved at compile time via CORVIA_DASHBOARD_DIR env var,
+/// defaulting to a placeholder that produces an empty embed.
+#[derive(Embed)]
+#[folder = "$CORVIA_DASHBOARD_DIR"]
+struct DashboardAssets;
 
 /// Map a CorviaError to the appropriate HTTP status code + message.
 fn map_corvia_err(prefix: &str, e: corvia_common::errors::CorviaError) -> (StatusCode, String) {
@@ -334,6 +342,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/ingest/sessions", post(ingest_sessions))
         .route("/v1/classify/sessions", post(classify_sessions))
         .route("/health", get(health))
+        // Embedded dashboard: serves static assets at root path.
+        // API routes take priority over the fallback.
+        .fallback(dashboard_handler)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -342,6 +353,66 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 fn coordinator(state: &AppState) -> &AgentCoordinator {
     &state.coordinator
+}
+
+// --- Embedded dashboard handler ---
+
+/// Serve embedded dashboard static assets. Falls back to index.html for SPA
+/// routing. Returns 404 if no dashboard is embedded.
+async fn dashboard_handler(uri: axum::http::Uri) -> impl IntoResponse {
+    let path = uri.path().trim_start_matches('/');
+
+    // Try exact file match first
+    if let Some(content) = DashboardAssets::get(path) {
+        let mime = mime_guess::from_path(path).first_or_octet_stream();
+        let cache = if path.starts_with("assets/") {
+            // Hashed assets are safe for long-term caching
+            "public, max-age=31536000, immutable"
+        } else {
+            "no-cache"
+        };
+        return (
+            StatusCode::OK,
+            [
+                (axum::http::header::CONTENT_TYPE, mime.as_ref().to_string()),
+                (axum::http::header::CACHE_CONTROL, cache.to_string()),
+            ],
+            content.data.into_owned(),
+        )
+            .into_response();
+    }
+
+    // SPA fallback: serve index.html for navigation paths (not file extensions)
+    if let Some(index) = DashboardAssets::get("index.html") {
+        return (
+            StatusCode::OK,
+            [
+                (axum::http::header::CONTENT_TYPE, "text/html".to_string()),
+                (axum::http::header::CACHE_CONTROL, "no-cache".to_string()),
+            ],
+            index.data.into_owned(),
+        )
+            .into_response();
+    }
+
+    // No dashboard embedded — return 404 with helpful message
+    (
+        StatusCode::NOT_FOUND,
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html".to_string()),
+            (axum::http::header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        b"<html><body><h1>Corvia</h1>\
+          <p>Dashboard not embedded. Build with: \
+          <code>cd tools/corvia-dashboard && npm run build</code>, \
+          then recompile with: \
+          <code>CORVIA_DASHBOARD_DIR=tools/corvia-dashboard/dist cargo build</code></p>\
+          <p>API: <a href=\"/health\">/health</a> | \
+          <a href=\"/api/dashboard/status\">/api/dashboard/status</a></p>\
+          </body></html>"
+            .to_vec(),
+    )
+        .into_response()
 }
 
 // --- Existing handlers ---
