@@ -475,6 +475,9 @@ pub fn tail_lines(path: &Path, n: usize) -> Vec<String> {
         Err(_) => return Vec::new(),
     };
     let reader = BufReader::new(file);
+    // filter_map skips corrupted lines rather than stopping (deliberate choice
+    // over map_while — a single bad byte shouldn't truncate the entire tail view).
+    #[allow(clippy::lines_filter_map_ok)]
     let all_lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
     let start = all_lines.len().saturating_sub(n);
     all_lines[start..].to_vec()

@@ -48,27 +48,7 @@ impl DashboardTraceLayer {
         })
     }
 
-    /// Rotate the trace log if it exceeds the size cap.
-    /// Renames the current file to `.old` and opens a fresh file.
-    fn maybe_rotate(&self) {
-        let size = std::fs::metadata(&self.path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        if size <= MAX_TRACE_LOG_SIZE {
-            return;
-        }
-        let old_path = self.path.with_extension("log.old");
-        let _ = std::fs::rename(&self.path, &old_path);
-        if let Ok(file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
-            if let Ok(mut writer) = self.writer.lock() {
-                *writer = std::io::BufWriter::new(file);
-            }
-        }
-    }
+
 
     /// Default path: the same directory corvia-dev writes service logs to.
     pub fn default_path() -> PathBuf {
@@ -168,17 +148,17 @@ where
             let _ = writer.flush();
 
             // Rotate while holding the lock to avoid TOCTOU race
-            if let Ok(meta) = std::fs::metadata(&self.path) {
-                if meta.len() > MAX_TRACE_LOG_SIZE {
-                    let old_path = self.path.with_extension("log.old");
-                    let _ = std::fs::rename(&self.path, &old_path);
-                    if let Ok(file) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&self.path)
-                    {
-                        *writer = std::io::BufWriter::new(file);
-                    }
+            if let Ok(meta) = std::fs::metadata(&self.path)
+                && meta.len() > MAX_TRACE_LOG_SIZE
+            {
+                let old_path = self.path.with_extension("log.old");
+                let _ = std::fs::rename(&self.path, &old_path);
+                if let Ok(file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)
+                {
+                    *writer = std::io::BufWriter::new(file);
                 }
             }
         }

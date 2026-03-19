@@ -1627,10 +1627,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(dir.path()).await;
 
-        // Insert entries with no graph edges — they should be flagged as orphaned
-        let e1 = corvia_common::types::KnowledgeEntry::new(
+        // Insert entries with no graph edges — they should be flagged as orphaned.
+        // Must have a code language to be eligible for the orphan check.
+        let mut e1 = corvia_common::types::KnowledgeEntry::new(
             "orphaned knowledge".into(), "test-scope".into(), "v1".into(),
         ).with_embedding(vec![1.0, 0.0, 0.0]);
+        e1.metadata.language = Some("rs".into());
         state.store.insert(&e1).await.unwrap();
 
         let args = json!({ "scope_id": "test-scope", "check": "orphan" });

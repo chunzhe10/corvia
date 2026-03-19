@@ -210,7 +210,8 @@ async fn test_reasoner_finds_issues() {
     store.init_schema().await.unwrap();
 
     // 1. Create an orphaned node (no edges)
-    let orphan = entry("Lonely module with no connections", "reason", "v1");
+    let mut orphan = entry("Lonely module with no connections", "reason", "v1");
+    orphan.metadata.language = Some("rs".into()); // Must have language to be eligible for orphan check
     store.insert(&orphan).await.unwrap();
 
     // 2. Create a dangling import (edge to nonexistent target)
@@ -224,6 +225,7 @@ async fn test_reasoner_finds_issues() {
 
     // 3. Create a stale entry (valid_to set but no superseded_by)
     let mut stale = entry("Outdated documentation", "reason", "v1");
+    stale.metadata.language = Some("rs".into()); // Eligible for orphan check
     stale.valid_to = Some(Utc::now());
     // No superseded_by set — this is stale
     store.insert(&stale).await.unwrap();
