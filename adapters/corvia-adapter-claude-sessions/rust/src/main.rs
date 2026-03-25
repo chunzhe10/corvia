@@ -313,24 +313,42 @@ fn ingest_sessions_from<W: Write>(scope_id: &str, dir: &Path, out: &mut W) {
     let mut newly_ingested: Vec<String> = Vec::new();
     let mut classify_entries: Vec<String> = Vec::new();
 
+    // Stale session threshold: raw .jsonl files older than this are treated as
+    // sessions that never received SessionEnd (user did /clear or auto-compact).
+    let stale_threshold = std::time::Duration::from_secs(4 * 3600); // 4 hours
+    let now = std::time::SystemTime::now();
+
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
         .filter(|e| {
-            e.path()
-                .to_string_lossy()
-                .ends_with(".jsonl.gz")
+            let path_str = e.path().to_string_lossy().to_string();
+            if path_str.ends_with(".jsonl.gz") {
+                return true;
+            }
+            // Include raw .jsonl files only if they are stale (no recent writes)
+            if path_str.ends_with(".jsonl") {
+                if let Ok(meta) = e.metadata() {
+                    if let Ok(modified) = meta.modified() {
+                        if let Ok(age) = now.duration_since(modified) {
+                            return age > stale_threshold;
+                        }
+                    }
+                }
+            }
+            false
         })
         .collect();
     entries.sort_by_key(|e| e.file_name());
 
     for entry in entries {
         let path = entry.path();
-        let session_id = path
-            .file_stem() // "ses-abc123.jsonl"
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.strip_suffix(".jsonl"))
+        // Extract session_id from filename: "ses-abc123.jsonl.gz" or "ses-abc123.jsonl"
+        let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let session_id = filename
+            .strip_suffix(".jsonl.gz")
+            .or_else(|| filename.strip_suffix(".jsonl"))
             .unwrap_or("")
             .to_string();
 
@@ -426,8 +444,12 @@ fn ingest_sessions_from<W: Write>(scope_id: &str, dir: &Path, out: &mut W) {
 
 fn parse_session(path: &Path) -> Result<(SessionInfo, BTreeMap<u32, TurnData>), String> {
     let file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
-    let decoder = GzDecoder::new(file);
-    let reader = BufReader::new(decoder);
+    let is_gzip = path.to_string_lossy().ends_with(".jsonl.gz");
+    let reader: Box<dyn BufRead> = if is_gzip {
+        Box::new(BufReader::new(GzDecoder::new(file)))
+    } else {
+        Box::new(BufReader::new(file))
+    };
 
     let mut info = SessionInfo {
         session_id: String::new(),

@@ -831,6 +831,8 @@ dependencies = [
  "corvia-proto",
  "corvia-server",
  "corvia-telemetry",
+ "flate2",
+ "libc",
  "regex",
  "reqwest",
  "serde",

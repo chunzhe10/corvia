@@ -1,4 +1,6 @@
-//! Hook generation for workspace doc enforcement.
+//! Legacy hook generation for workspace doc enforcement.
+//! Kept for `generate_post_commit_hooks` — other functions are superseded
+//! by the new Rust hook system in sibling modules.
 //!
 //! Reads [workspace.docs.rules] from corvia.toml and generates:
 //! - .corvia/hooks/doc-placement-check.sh (PreToolUse validation)
@@ -110,7 +112,7 @@ exit 0
     Ok(())
 }
 
-fn generate_post_commit_hooks(
+pub fn generate_post_commit_hooks(
     root: &Path,
     ws: &corvia_common::config::WorkspaceConfig,
 ) -> Result<()> {

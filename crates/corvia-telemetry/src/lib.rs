@@ -29,6 +29,14 @@ pub mod spans {
     pub const INFERENCE_LOAD: &str = "corvia.inference.load";
     pub const INFERENCE_RELOAD: &str = "corvia.inference.reload";
     pub const INFERENCE_CONFIG_RELOAD: &str = "corvia.inference.config_reload";
+
+    // Hook lifecycle spans (embedded in JSONL events, reconstructed during ingestion)
+    pub const HOOK_DISPATCH: &str = "corvia.hook.dispatch";
+    pub const HOOK_SESSION_RECORD: &str = "corvia.hook.session_record";
+    pub const HOOK_DOC_PLACEMENT: &str = "corvia.hook.doc_placement";
+    pub const HOOK_AGENT_CHECK: &str = "corvia.hook.agent_check";
+    pub const HOOK_ORPHAN_CLEANUP: &str = "corvia.hook.orphan_cleanup";
+    pub const HOOK_WRITE_REMINDER: &str = "corvia.hook.write_reminder";
 }
 
 /// Opaque handle that keeps the telemetry pipeline alive.

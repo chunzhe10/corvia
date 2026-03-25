@@ -52,6 +52,59 @@ pub struct DocsRulesConfig {
     pub repo_docs_pattern: Option<String>,
 }
 
+fn default_true() -> bool { true }
+
+/// Configuration for Claude Code lifecycle hooks.
+/// All hooks default to enabled; set to `false` to disable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HooksConfig {
+    /// Master switch — set to false to disable all hooks at once.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub session_recording: bool,
+    #[serde(default = "default_true")]
+    pub doc_placement: bool,
+    #[serde(default = "default_true")]
+    pub agent_check: bool,
+    #[serde(default = "default_true")]
+    pub write_reminder: bool,
+    #[serde(default = "default_true")]
+    pub orphan_cleanup: bool,
+    #[serde(default = "default_true")]
+    pub corvia_first_reminder: bool,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            session_recording: true,
+            doc_placement: true,
+            agent_check: true,
+            write_reminder: true,
+            orphan_cleanup: true,
+            corvia_first_reminder: true,
+        }
+    }
+}
+
+impl HooksConfig {
+    /// Check if a specific hook is active (enabled globally AND individually).
+    pub fn is_active(&self, hook: &str) -> bool {
+        if !self.enabled { return false; }
+        match hook {
+            "session_recording" => self.session_recording,
+            "doc_placement" => self.doc_placement,
+            "agent_check" => self.agent_check,
+            "write_reminder" => self.write_reminder,
+            "orphan_cleanup" => self.orphan_cleanup,
+            "corvia_first_reminder" => self.corvia_first_reminder,
+            _ => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkspaceConfig {
     #[serde(default = "default_repos_dir")]
@@ -99,6 +152,8 @@ pub struct CorviaConfig {
     pub sources: Option<Vec<SourceConfig>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<Vec<ScopeConfig>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<HooksConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -481,6 +536,7 @@ impl Default for CorviaConfig {
             adapters: None,
             sources: None,
             scope: None,
+            hooks: None,
         }
     }
 }

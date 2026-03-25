@@ -205,6 +205,35 @@ enum Commands {
         #[command(subcommand)]
         command: BenchCommands,
     },
+
+    /// Manage Claude Code lifecycle hooks
+    Hooks {
+        #[command(subcommand)]
+        command: HooksCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum HooksCommands {
+    /// Execute a hook handler for the given event (called by Claude Code)
+    Run {
+        /// Event type: SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, SessionEnd
+        #[arg(long)]
+        event: String,
+        /// Specific handler to run (e.g., doc-placement, write-reminder)
+        #[arg(long)]
+        handler: Option<String>,
+    },
+    /// Generate .claude/settings.json hook entries
+    Init,
+    /// Show which hooks are enabled and registered
+    Status,
+    /// Gzip and ingest stale session files (no SessionEnd received)
+    Sweep {
+        /// Maximum age in hours before a session file is considered stale
+        #[arg(long, default_value = "4")]
+        max_age_hours: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -352,8 +381,22 @@ enum DocsCommands {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Fast path: `corvia hooks run` runs synchronously — no tokio, no telemetry.
+    // Must happen before tokio runtime is created (reqwest::blocking panics inside async).
+    let cli = Cli::parse();
+    if let Commands::Hooks { command: HooksCommands::Run { ref event, ref handler } } = cli.command {
+        return hooks::run_hook_from_args(event, handler.as_deref());
+    }
+
+    // All other commands use the async runtime.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main(cli))
+}
+
+async fn async_main(cli: Cli) -> Result<()> {
     // Load telemetry config if available; otherwise use defaults (stdout + text).
     let telemetry_config = CorviaConfig::config_path();
     let telem_cfg = if telemetry_config.exists() {
@@ -371,8 +414,6 @@ async fn main() -> Result<()> {
             None
         }
     };
-
-    let cli = Cli::parse();
 
     match cli.command {
         Commands::Init { store } => cmd_init(&store).await?,
@@ -400,6 +441,20 @@ async fn main() -> Result<()> {
             BenchCommands::Run { server, limit, ab } => cmd_bench_run(&server, limit, ab).await?,
             BenchCommands::Report => cmd_bench_report()?,
             BenchCommands::Compare { server, limit } => cmd_bench_compare(&server, limit).await?,
+        },
+        Commands::Hooks { command } => match command {
+            HooksCommands::Run { .. } => unreachable!("handled in fast path above"),
+            HooksCommands::Init => {
+                let root = std::env::current_dir()?;
+                let config = load_config()?;
+                hooks::settings::init_hooks(&root, &config)?;
+            }
+            HooksCommands::Status => {
+                hooks::status::print_status()?;
+            }
+            HooksCommands::Sweep { max_age_hours } => {
+                hooks::session::sweep_stale_sessions(max_age_hours);
+            }
         },
     }
 
@@ -1513,9 +1568,10 @@ async fn cmd_workspace(command: WorkspaceCommands) -> Result<()> {
             Ok(())
         }
         WorkspaceCommands::InitHooks => {
+            eprintln!("Note: 'workspace init-hooks' is deprecated. Use 'corvia hooks init' instead.");
             let root = std::env::current_dir()?;
             let config = load_config()?;
-            hooks::generate_hooks(&root, &config)?;
+            hooks::settings::init_hooks(&root, &config)?;
             Ok(())
         }
     }
