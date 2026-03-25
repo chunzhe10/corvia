@@ -86,6 +86,12 @@ impl FromStr for HookHandler {
 /// This function runs synchronously (no tokio, no telemetry init) for minimal
 /// cold-start overhead (~14ms).
 pub fn run_hook_from_args(event_str: &str, handler_str: Option<&str>) -> Result<()> {
+    // Emergency bypass: CORVIA_HOOKS_DISABLED=1 skips all hooks.
+    // Use this when hooks are broken and blocking Claude Code.
+    if std::env::var("CORVIA_HOOKS_DISABLED").map(|v| v == "1").unwrap_or(false) {
+        return Ok(());
+    }
+
     let start = std::time::Instant::now();
     let event: HookEvent = event_str.parse()?;
     let handler: Option<HookHandler> = handler_str.map(|s| s.parse()).transpose()?;

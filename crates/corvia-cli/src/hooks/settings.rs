@@ -149,10 +149,20 @@ fn ensure_array<'a>(obj: &'a mut serde_json::Map<String, serde_json::Value>, key
 }
 
 fn hook_entry(matcher: Option<&str>, command: &str, timeout: u64) -> serde_json::Value {
+    // Wrap command with:
+    // 1. CORVIA_HOOKS_DISABLED=1 env var bypass (emergency escape hatch)
+    // 2. Graceful fallback if `corvia hooks` subcommand doesn't exist (binary mismatch)
+    //
+    // The fallback checks if the exit was due to a missing subcommand (exit code 2 from
+    // clap) vs a legitimate hook block (also exit 2 from doc-placement). We distinguish
+    // by checking stderr for "unrecognized subcommand".
+    let wrapped = format!(
+        r#"[ "$CORVIA_HOOKS_DISABLED" = "1" ] && exit 0; {command} 2>/tmp/.corvia-hook-err || {{ rc=$?; grep -q "unrecognized subcommand" /tmp/.corvia-hook-err 2>/dev/null && exit 0; cat /tmp/.corvia-hook-err >&2; exit $rc; }}"#
+    );
     let mut entry = json!({
         "hooks": [{
             "type": "command",
-            "command": command,
+            "command": wrapped,
             "timeout": timeout,
         }]
     });
@@ -194,7 +204,10 @@ mod tests {
     fn test_hook_entry_with_matcher() {
         let entry = hook_entry(Some("Write|Edit"), "corvia hooks run --event PreToolUse --handler doc-placement", 5000);
         assert_eq!(entry["matcher"], "Write|Edit");
-        assert_eq!(entry["hooks"][0]["command"], "corvia hooks run --event PreToolUse --handler doc-placement");
+        let cmd = entry["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("corvia hooks run --event PreToolUse --handler doc-placement"), "command should contain the corvia hooks call");
+        assert!(cmd.contains("CORVIA_HOOKS_DISABLED"), "command should have bypass check");
+        assert!(cmd.contains("unrecognized subcommand"), "command should have fallback for missing subcommand");
         assert_eq!(entry["hooks"][0]["timeout"], 5000);
     }
 
@@ -202,6 +215,8 @@ mod tests {
     fn test_hook_entry_without_matcher() {
         let entry = hook_entry(None, "corvia hooks run --event SessionStart", 5000);
         assert!(entry.get("matcher").is_none());
+        let cmd = entry["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("corvia hooks run --event SessionStart"));
     }
 
     #[test]
