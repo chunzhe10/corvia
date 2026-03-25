@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "corvia-adapter-basic"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -786,7 +786,7 @@ dependencies = [
 
 [[package]]
 name = "corvia-adapter-claude-sessions"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "flate2",
  "serde",
@@ -796,7 +796,7 @@ dependencies = [
 
 [[package]]
 name = "corvia-adapter-git"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "async-trait",
  "corvia-common",
@@ -818,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "corvia-cli"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -847,7 +847,7 @@ dependencies = [
 
 [[package]]
 name = "corvia-common"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -860,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "corvia-inference"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "clap",
  "corvia-common",
@@ -886,7 +886,7 @@ dependencies = [
 
 [[package]]
 name = "corvia-kernel"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -920,7 +920,7 @@ dependencies = [
 
 [[package]]
 name = "corvia-proto"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "prost",
  "tonic",
@@ -929,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "corvia-server"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "async-trait",

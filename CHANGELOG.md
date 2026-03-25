@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-03-25
+
+### Added
+
+- **Claude session history adapter**: Full implementation of M3 deliverables 1-6 —
+  `corvia-adapter-claude-sessions` crate, session ingest and classify REST endpoints,
+  wired into workspace ingest pipeline
+- **`corvia bench` CLI**: `corvia bench run`, `corvia bench report`, and
+  `corvia bench compare` commands for A/B retriever testing and evaluation
+- **Config-driven RAG**: Retriever and augmenter selection via config, with 120s timeout
+  on RAG ask endpoints
+- **GPU monitoring dashboard**: NVIDIA/Intel detection, GPU dashboard endpoint, canary
+  self-test, file-based EP probe for accurate backend reporting
+- **Embedding model expansion**: Snowflake Arctic and GTE embedding model support in
+  `corvia-inference`
+- **Embedded dashboard**: Static assets bundled into the server binary via `rust-embed`
+- **`embedding_backend` config**: Per-model GPU backend selection (CUDA/OpenVINO/CPU)
+  with runtime fallback chain
+- **Dashboard tests**: 12 handler tests + eval expansion (69 queries + NDCG metrics)
+- **Content-aware doc routing**: Ingestion pipeline routes documents based on content type
+
+### Fixed
+
+- **spawn_blocking coverage**: All `read_scope` calls wrapped in `spawn_blocking` to
+  prevent blocking the async runtime — graph, activity, and cluster endpoints
+- **Reasoner noise reduction**: Skip structurally orphaned entries to reduce false positives
+- **Zero-warning build**: Bollard migration, clippy fixes, magic string elimination across
+  entire workspace
+- **Session endpoints**: Return 404 for missing sessions, log merge errors properly
+- **Telemetry accuracy**: Correct `elapsed_ms` timing in dashboard traces, real trace data
+  in traces page
+- **CLI session bug**: Fixed `source_version` bug + added 34 REST endpoint tests
+- **Incremental ingest rewrite**: Full parity with fresh ingest, hardened hook generation
+- **Test robustness**: Flaky test fixes, absolute-path hook bug, Ollama health check
+- **Chat model investigation**: Timeout, token limit, and generation logging fixes
+- **Clustering RNG**: Seeded for deterministic results, `XDG_RUNTIME_DIR` for trace logs
+- **5 critical issues**: From retroactive deep SWE review across kernel, inference, server
+- **7 code quality issues**: Across kernel, inference, and server crates
+
+### Changed
+
+- **Runtime backend fallback**: Embedding inference falls back CUDA -> OpenVINO -> CPU
+  automatically, with ORT provider libs included in release artifacts
+- **Inference reload**: `embedding_backend` supported in hot-reload config path
+
 ### Removed
 
 - **SurrealDB storage backend**: Removed `SurrealStore`, the `surrealdb` dependency (893
