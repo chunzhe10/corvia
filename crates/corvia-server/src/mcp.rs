@@ -1421,6 +1421,7 @@ mod tests {
             cluster_store: Arc::new(crate::dashboard::clustering::ClusterStore::new()),
             gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
             session_ingest_lock: tokio::sync::Mutex::new(()),
+            hook_sessions: crate::dashboard::session_watcher::SessionWatcherState::new().0,
         })
     }
 
@@ -1727,6 +1728,7 @@ mod tests {
             cluster_store: Arc::new(crate::dashboard::clustering::ClusterStore::new()),
             gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
             session_ingest_lock: tokio::sync::Mutex::new(()),
+            hook_sessions: crate::dashboard::session_watcher::SessionWatcherState::new().0,
         });
 
         let args = json!({ "query": "rag-routed", "scope_id": "rag-scope", "limit": 5 });

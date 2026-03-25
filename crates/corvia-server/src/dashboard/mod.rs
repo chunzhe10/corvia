@@ -4,6 +4,7 @@ pub mod activity;
 pub mod clustering;
 pub mod gpu;
 pub mod health;
+pub mod session_watcher;
 pub mod traces;
 
 use std::sync::Arc;
@@ -77,6 +78,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/dashboard/gc", get(gc_status_handler))
         .route("/api/dashboard/gc/run", post(gc_run_handler))
         .route("/api/dashboard/sessions/live", get(live_sessions_handler))
+        .route("/api/dashboard/sessions/hook", get(hook_sessions_handler))
+        .route("/api/dashboard/sessions/hook/stream", get(hook_sessions_stream))
         .route("/api/dashboard/traces/recent", get(recent_traces_handler))
         .route("/api/dashboard/gpu", get(gpu_status_handler))
         .with_state(state)
@@ -1071,6 +1074,97 @@ async fn live_sessions_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Hook-observed Claude sessions (file watcher)
+// ---------------------------------------------------------------------------
+
+async fn hook_sessions_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<corvia_common::dashboard::HookSessionsResponse>, (StatusCode, String)> {
+    let sessions = state.hook_sessions.snapshot().await;
+    let total_active = sessions
+        .iter()
+        .filter(|s| s.state == corvia_common::dashboard::HookSessionState::Active)
+        .count();
+    let total_stale = sessions
+        .iter()
+        .filter(|s| s.state == corvia_common::dashboard::HookSessionState::Stale)
+        .count();
+    Ok(Json(corvia_common::dashboard::HookSessionsResponse {
+        sessions,
+        total_active,
+        total_stale,
+    }))
+}
+
+async fn hook_sessions_stream(
+    State(state): State<Arc<AppState>>,
+) -> axum::response::sse::Sse<impl futures_core::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>>
+{
+    let mut rx = state.hook_sessions.subscribe();
+    let hook_sessions = state.hook_sessions.clone();
+
+    let stream = async_stream::stream! {
+        // Send initial snapshot.
+        let sessions = hook_sessions.snapshot().await;
+        let total_active = sessions.iter()
+            .filter(|s| s.state == corvia_common::dashboard::HookSessionState::Active)
+            .count();
+        let total_stale = sessions.iter()
+            .filter(|s| s.state == corvia_common::dashboard::HookSessionState::Stale)
+            .count();
+        let initial = corvia_common::dashboard::HookSessionsResponse {
+            sessions,
+            total_active,
+            total_stale,
+        };
+        if let Ok(data) = serde_json::to_string(&initial) {
+            yield Ok(axum::response::sse::Event::default()
+                .event("snapshot")
+                .data(data));
+        }
+
+        // Stream deltas.
+        loop {
+            match rx.recv().await {
+                Ok(update) => {
+                    if let Ok(data) = serde_json::to_string(&update) {
+                        yield Ok(axum::response::sse::Event::default()
+                            .event("update")
+                            .data(data));
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(lagged = n, "SSE client lagged, sending fresh snapshot");
+                    let sessions = hook_sessions.snapshot().await;
+                    let total_active = sessions.iter()
+                        .filter(|s| s.state == corvia_common::dashboard::HookSessionState::Active)
+                        .count();
+                    let total_stale = sessions.iter()
+                        .filter(|s| s.state == corvia_common::dashboard::HookSessionState::Stale)
+                        .count();
+                    let refresh = corvia_common::dashboard::HookSessionsResponse {
+                        sessions,
+                        total_active,
+                        total_stale,
+                    };
+                    if let Ok(data) = serde_json::to_string(&refresh) {
+                        yield Ok(axum::response::sse::Event::default()
+                            .event("snapshot")
+                            .data(data));
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+
+    axum::response::sse::Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15)),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Recent traces endpoint
 // ---------------------------------------------------------------------------
 
@@ -1379,6 +1473,7 @@ mod tests {
             cluster_store: Arc::new(super::clustering::ClusterStore::new()),
             gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
             session_ingest_lock: tokio::sync::Mutex::new(()),
+            hook_sessions: super::session_watcher::SessionWatcherState::new().0,
         })
     }
 

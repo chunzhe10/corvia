@@ -43,3 +43,4 @@ opentelemetry-otlp = { version = "0.28", features = ["grpc-tonic"] }
 tracing-opentelemetry = "0.29"
 libc = "0.2"
 flate2 = "1"
+notify = "7"

@@ -165,6 +165,58 @@ pub struct LiveSessionsResponse {
     pub summary: LiveSessionsSummary,
 }
 
+// ---------------------------------------------------------------------------
+// Hook-observed Claude sessions (file watcher)
+// ---------------------------------------------------------------------------
+
+/// State of a Claude session observed via JSONL file watching.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HookSessionState {
+    Active,
+    Stale,
+    Ended,
+}
+
+/// A Claude session observed via JSONL file watching.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookSession {
+    pub session_id: String,
+    pub state: HookSessionState,
+    pub workspace: String,
+    pub git_branch: String,
+    pub agent_type: String,
+    pub parent_session_id: Option<String>,
+    pub corvia_agent_id: Option<String>,
+    pub started_at: String,
+    pub last_activity: String,
+    pub duration_secs: u64,
+    pub turn_count: u32,
+    pub tool_calls: u32,
+    pub active_tool: Option<String>,
+    pub tools_used: Vec<String>,
+}
+
+/// SSE update delta for a hook session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookSessionUpdate {
+    pub session_id: String,
+    pub event_type: String,
+    pub session: Option<HookSession>,
+}
+
+/// GET /api/dashboard/sessions/hook response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookSessionsResponse {
+    pub sessions: Vec<HookSession>,
+    pub total_active: usize,
+    pub total_stale: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Trace spans
+// ---------------------------------------------------------------------------
+
 /// A node in a span trace tree.
 /// `module` is derived via span_to_module() for waterfall UI color-coding.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -620,6 +620,7 @@ async fn cmd_serve() -> Result<()> {
     let default_scope_id = Some(config.project.scope_id.clone());
     let config_path = CorviaConfig::config_path();
     let cluster_store = Arc::new(corvia_server::dashboard::clustering::ClusterStore::new());
+    let (hook_sessions, _hook_rx) = corvia_server::dashboard::session_watcher::SessionWatcherState::new();
     let state = Arc::new(corvia_server::rest::AppState {
         store, engine, coordinator, graph, temporal, data_dir,
         rag: Some(rag), ready: ready.clone(), default_scope_id,
@@ -628,6 +629,7 @@ async fn cmd_serve() -> Result<()> {
         cluster_store: cluster_store.clone(),
         gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
         session_ingest_lock: tokio::sync::Mutex::new(()),
+        hook_sessions: hook_sessions.clone(),
     });
     // Background cluster recompute every 60s
     {
@@ -673,6 +675,10 @@ async fn cmd_serve() -> Result<()> {
     app = app.layer(tower_http::cors::CorsLayer::permissive());
     println!("MCP endpoint: POST/GET/DELETE /mcp (Streamable HTTP)");
     println!("Dashboard API: GET /api/dashboard/{{status,traces,logs,config,graph}}");
+
+    // Spawn JSONL session watcher for real-time dashboard visibility.
+    corvia_server::dashboard::session_watcher::spawn_session_watcher(hook_sessions).await;
+    println!("Session watcher: monitoring ~/.claude/sessions/");
 
     ready.store(true, std::sync::atomic::Ordering::Relaxed);
     println!("Corvia server listening on {addr}");
