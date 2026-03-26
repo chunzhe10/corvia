@@ -15,12 +15,25 @@ pub struct ChatModelCoords {
 /// Consistent with OllamaProvisioner: install → start → wait → load models.
 pub struct InferenceProvisioner {
     grpc_addr: String,
+    health_probe_interval: u64,
+    health_probe_drift_threshold: f64,
 }
 
 impl InferenceProvisioner {
     pub fn new(grpc_addr: &str) -> Self {
         Self {
             grpc_addr: grpc_addr.to_string(),
+            health_probe_interval: 60,
+            health_probe_drift_threshold: 100.0,
+        }
+    }
+
+    /// Create a provisioner with custom probe config values (from corvia.toml).
+    pub fn with_probe_config(grpc_addr: &str, interval_secs: u64, drift_threshold_pct: f64) -> Self {
+        Self {
+            grpc_addr: grpc_addr.to_string(),
+            health_probe_interval: interval_secs,
+            health_probe_drift_threshold: drift_threshold_pct,
         }
     }
 
@@ -63,6 +76,10 @@ impl InferenceProvisioner {
             .arg("serve")
             .arg("--port")
             .arg(port)
+            .arg("--health-probe-interval")
+            .arg(self.health_probe_interval.to_string())
+            .arg("--health-probe-drift-threshold")
+            .arg(self.health_probe_drift_threshold.to_string())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()

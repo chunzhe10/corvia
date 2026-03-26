@@ -18,6 +18,7 @@ pub struct GpuMetricsCache {
     pub last_result: GpuStatusResponse,
     pub last_fetched: Instant,
     pub refreshing: bool,
+    pub refresh_started: Instant,
 }
 
 impl GpuMetricsCache {
@@ -30,6 +31,7 @@ impl GpuMetricsCache {
             },
             last_fetched: Instant::now() - Duration::from_secs(60), // start stale
             refreshing: false,
+            refresh_started: Instant::now(),
         }
     }
 
