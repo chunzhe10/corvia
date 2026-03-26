@@ -76,6 +76,13 @@ pub struct DashboardStatusResponse {
     pub config: DashboardConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub traces: Option<TracesData>,
+    /// Ratio of indexed entries to knowledge files on disk (0.0–1.0).
+    /// `None` when file count is unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_coverage: Option<f64>,
+    /// `true` when index coverage drops below 90%.
+    #[serde(default)]
+    pub index_stale: bool,
 }
 
 /// A single structured log entry
@@ -353,9 +360,12 @@ mod tests {
                 workspace: "test".to_string(),
             },
             traces: None,
+            index_coverage: None,
+            index_stale: false,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("traces"));
+        assert!(!json.contains("index_coverage"));
     }
 
     #[test]

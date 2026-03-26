@@ -99,6 +99,33 @@ fn config_summary(cfg: &corvia_common::config::CorviaConfig) -> DashboardConfig 
     }
 }
 
+/// Count JSON knowledge files on disk and compute index coverage ratio.
+fn compute_index_coverage(
+    data_dir: &std::path::Path,
+    scope_id: &str,
+    entry_count: u64,
+) -> (Option<f64>, bool) {
+    let dir = data_dir.join("knowledge").join(scope_id);
+    if !dir.exists() {
+        return (None, false);
+    }
+    let file_count = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter(|e| {
+                e.as_ref()
+                    .map(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+                    .unwrap_or(false)
+            })
+            .count() as u64
+        })
+        .unwrap_or(0);
+    if file_count == 0 {
+        return (None, false);
+    }
+    let coverage = (entry_count as f64 / file_count as f64).min(1.0);
+    (Some(coverage), coverage < 0.9)
+}
+
 /// GET /api/dashboard/status
 /// Returns service health, store metrics, config summary, and optional traces.
 async fn status_handler(
@@ -153,6 +180,11 @@ async fn status_handler(
         Some(traces_data)
     };
 
+    // Index coverage: compare indexed entry_count against knowledge files on disk.
+    let (index_coverage, index_stale) = compute_index_coverage(
+        &state.data_dir, scope_id, entry_count,
+    );
+
     Json(DashboardStatusResponse {
         services,
         entry_count,
@@ -161,6 +193,8 @@ async fn status_handler(
         session_count,
         config,
         traces,
+        index_coverage,
+        index_stale,
     })
 }
 
@@ -1675,5 +1709,81 @@ mod tests {
         assert_eq!(status, axum::http::StatusCode::OK);
         // GPU handler returns a GpuStatusResponse; just verify it's valid JSON
         assert!(json.is_object(), "response should be a JSON object");
+    }
+
+    // ── compute_index_coverage unit tests ──
+
+    #[test]
+    fn coverage_dir_not_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(compute_index_coverage(tmp.path(), "no-scope", 0), (None, false));
+    }
+
+    #[test]
+    fn coverage_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("knowledge/test")).unwrap();
+        assert_eq!(compute_index_coverage(tmp.path(), "test", 0), (None, false));
+    }
+
+    #[test]
+    fn coverage_fully_indexed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("knowledge/test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.json"), "{}").unwrap();
+        std::fs::write(dir.join("b.json"), "{}").unwrap();
+        assert_eq!(compute_index_coverage(tmp.path(), "test", 2), (Some(1.0), false));
+    }
+
+    #[test]
+    fn coverage_boundary_exactly_90_pct() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("knowledge/test");
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..10 {
+            std::fs::write(dir.join(format!("{i}.json")), "{}").unwrap();
+        }
+        let (cov, stale) = compute_index_coverage(tmp.path(), "test", 9);
+        assert!((cov.unwrap() - 0.9).abs() < f64::EPSILON);
+        assert!(!stale, "90% should NOT be stale (threshold is < 0.9)");
+    }
+
+    #[test]
+    fn coverage_below_90_pct_is_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("knowledge/test");
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..10 {
+            std::fs::write(dir.join(format!("{i}.json")), "{}").unwrap();
+        }
+        let (cov, stale) = compute_index_coverage(tmp.path(), "test", 8);
+        assert!((cov.unwrap() - 0.8).abs() < f64::EPSILON);
+        assert!(stale, "80% should be stale");
+    }
+
+    #[test]
+    fn coverage_entry_count_exceeds_file_count_clamped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("knowledge/test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.json"), "{}").unwrap();
+        let (cov, stale) = compute_index_coverage(tmp.path(), "test", 5);
+        assert_eq!(cov, Some(1.0));
+        assert!(!stale);
+    }
+
+    #[test]
+    fn coverage_non_json_files_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("knowledge/test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.json"), "{}").unwrap();
+        std::fs::write(dir.join("b.txt"), "not json").unwrap();
+        std::fs::write(dir.join("c.bak"), "backup").unwrap();
+        // 1 json file, entry_count=1 → fully indexed
+        let (cov, stale) = compute_index_coverage(tmp.path(), "test", 1);
+        assert_eq!(cov, Some(1.0));
+        assert!(!stale);
     }
 }

@@ -2299,6 +2299,8 @@ pub(crate) async fn wire_pipeline_relations(
     graph: &dyn GraphStore,
 ) -> usize {
     let mut relations_stored = 0;
+    let mut source_miss = 0u64;
+    let mut target_miss = 0u64;
     for rel in relations {
         // Find the source chunk by (source_file, start_line) match
         let from_idx = processed.iter().position(|pc| {
@@ -2306,7 +2308,16 @@ pub(crate) async fn wire_pipeline_relations(
         });
         let from_uuid = match from_idx {
             Some(idx) if idx < stored_ids.len() => stored_ids[idx],
-            _ => continue,
+            _ => {
+                source_miss += 1;
+                tracing::debug!(
+                    source_file = %rel.from_source_file,
+                    start_line = rel.from_start_line,
+                    relation = %rel.relation,
+                    "wire_pipeline_relations: source chunk not found"
+                );
+                continue;
+            }
         };
 
         // Find the target chunk by file name (and optionally symbol name)
@@ -2333,7 +2344,24 @@ pub(crate) async fn wire_pipeline_relations(
             } else {
                 relations_stored += 1;
             }
+        } else {
+            target_miss += 1;
+            tracing::debug!(
+                target_file = %rel.to_file,
+                target_name = ?rel.to_name,
+                relation = %rel.relation,
+                "wire_pipeline_relations: target chunk not found"
+            );
         }
+    }
+    if source_miss > 0 || target_miss > 0 {
+        tracing::info!(
+            total = relations.len(),
+            stored = relations_stored,
+            source_miss,
+            target_miss,
+            "wire_pipeline_relations: relation wiring summary"
+        );
     }
     relations_stored
 }
