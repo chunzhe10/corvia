@@ -1508,6 +1508,8 @@ mod tests {
             gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
             session_ingest_lock: tokio::sync::Mutex::new(()),
             hook_sessions: super::session_watcher::SessionWatcherState::new().0,
+            workspace_root: dir.to_path_buf(),
+            ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
         })
     }
 
