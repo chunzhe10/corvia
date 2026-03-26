@@ -829,13 +829,22 @@ async fn cmd_ingest(path: Option<&str>, incremental: bool, files: &[String]) -> 
                 }
 
             // Wire graph edges from pipeline relations
-            if !pipeline_relations.is_empty() {
-                let edges = wire_pipeline_relations(
+            let edges = if !pipeline_relations.is_empty() {
+                wire_pipeline_relations(
                     &pipeline_relations, &chunks, &stored_ids, &*graph,
-                ).await;
-                if edges > 0 {
-                    println!("    {edges} graph relations stored");
-                }
+                ).await
+            } else {
+                0
+            };
+            if edges > 0 {
+                println!("    {edges} graph relations stored");
+            } else if chunks.len() > 10 {
+                tracing::warn!(
+                    chunks = chunks.len(),
+                    input_relations = pipeline_relations.len(),
+                    "0 graph relations stored for {} chunks — check adapter version",
+                    chunks.len()
+                );
             }
 
             println!("    Created {} entries", stored_ids.len());
@@ -921,13 +930,22 @@ async fn cmd_ingest(path: Option<&str>, incremental: bool, files: &[String]) -> 
         }
 
         // Step 5: Wire relations from pipeline (now native to ChunkingStrategy)
-        if !pipeline_relations.is_empty() {
-            let relations_stored = wire_pipeline_relations(
+        let relations_stored = if !pipeline_relations.is_empty() {
+            wire_pipeline_relations(
                 &pipeline_relations, &processed, &stored_ids, &*graph,
-            ).await;
-            if relations_stored > 0 {
-                println!("  {relations_stored} graph relations stored");
-            }
+            ).await
+        } else {
+            0
+        };
+        if relations_stored > 0 {
+            println!("  {relations_stored} graph relations stored");
+        } else if processed.len() > 10 {
+            tracing::warn!(
+                chunks = processed.len(),
+                input_relations = pipeline_relations.len(),
+                "0 graph relations stored for {} chunks — check adapter version",
+                processed.len()
+            );
         }
 
         // Step 5b: Wire doc-to-code relations
@@ -2355,13 +2373,25 @@ pub(crate) async fn wire_pipeline_relations(
         }
     }
     if source_miss > 0 || target_miss > 0 {
-        tracing::info!(
-            total = relations.len(),
-            stored = relations_stored,
-            source_miss,
-            target_miss,
-            "wire_pipeline_relations: relation wiring summary"
-        );
+        let total = relations.len();
+        // Warn when less than half of relations resolved — signals adapter/version mismatch
+        if relations_stored * 2 < total {
+            tracing::warn!(
+                total,
+                stored = relations_stored,
+                source_miss,
+                target_miss,
+                "wire_pipeline_relations: most relations failed to resolve — check adapter version"
+            );
+        } else {
+            tracing::info!(
+                total,
+                stored = relations_stored,
+                source_miss,
+                target_miss,
+                "wire_pipeline_relations: relation wiring summary"
+            );
+        }
     }
     relations_stored
 }
