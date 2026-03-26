@@ -1440,6 +1440,8 @@ mod tests {
             gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
             session_ingest_lock: tokio::sync::Mutex::new(()),
             hook_sessions: crate::dashboard::session_watcher::SessionWatcherState::new().0,
+            workspace_root: dir.to_path_buf(),
+            ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
         })
     }
 
@@ -1747,6 +1749,8 @@ mod tests {
             gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
             session_ingest_lock: tokio::sync::Mutex::new(()),
             hook_sessions: crate::dashboard::session_watcher::SessionWatcherState::new().0,
+            workspace_root: dir.path().to_path_buf(),
+            ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
         });
 
         let args = json!({ "query": "rag-routed", "scope_id": "rag-scope", "limit": 5 });
