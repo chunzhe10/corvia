@@ -61,6 +61,8 @@ struct SourceMetadata {
     content_role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source_origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_session_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -373,6 +375,14 @@ fn ingest_sessions_from<W: Write>(scope_id: &str, dir: &Path, out: &mut W) {
                         "claude:main".to_string()
                     };
 
+                    // Only attach parent_session_id on turn 1 — the CLI
+                    // ingest layer uses it to create a single spawned_by edge.
+                    let parent_for_edge = if *turn_num == 1 {
+                        info.parent_session_id.clone()
+                    } else {
+                        None
+                    };
+
                     let msg = SourceFileMsg {
                         source_file: SourceFilePayload {
                             content,
@@ -389,6 +399,7 @@ fn ingest_sessions_from<W: Write>(scope_id: &str, dir: &Path, out: &mut W) {
                                 },
                                 content_role: Some(content_role),
                                 source_origin: Some(source_origin),
+                                parent_session_id: parent_for_edge,
                             },
                         },
                     };
@@ -938,5 +949,87 @@ mod tests {
             has_repo_paths: false,
         };
         assert_eq!(infer_turn_content_role(&info, &turn), "session-turn");
+    }
+
+    #[test]
+    fn test_subagent_parent_session_id_on_turn_1_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path();
+
+        // Create a subagent session with parent_session_id
+        let jsonl = r#"{"type":"session_start","session_id":"ses-sub-001","timestamp":"2026-03-14T05:00:00Z","workspace":"/tmp","git_branch":"feat/auth","agent_type":"subagent","parent_session_id":"ses-parent-001","corvia_agent_id":null}
+{"type":"user_prompt","session_id":"ses-sub-001","turn":1,"timestamp":"2026-03-14T05:01:00Z","content":"find auth patterns"}
+{"type":"tool_end","session_id":"ses-sub-001","turn":1,"timestamp":"2026-03-14T05:01:01Z","tool":"Grep","input":{"pattern":"auth"},"output":"found","truncated":false,"success":true}
+{"type":"tool_end","session_id":"ses-sub-001","turn":1,"timestamp":"2026-03-14T05:01:02Z","tool":"Read","input":{"file_path":"src/auth.rs"},"output":"impl Auth","truncated":false,"success":true}
+{"type":"user_prompt","session_id":"ses-sub-001","turn":2,"timestamp":"2026-03-14T05:02:00Z","content":"summarize findings"}
+{"type":"session_end","session_id":"ses-sub-001","timestamp":"2026-03-14T05:03:00Z","total_turns":2,"duration_ms":180000}"#;
+
+        let gz_path = sessions.join("ses-sub-001.jsonl.gz");
+        let file = std::fs::File::create(&gz_path).unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        encoder.write_all(jsonl.as_bytes()).unwrap();
+        encoder.finish().unwrap();
+
+        let mut output = Vec::new();
+        ingest_sessions_from(DEFAULT_SCOPE, sessions, &mut output);
+
+        let text = String::from_utf8(output).unwrap();
+        let lines: Vec<&str> = text.trim().lines().collect();
+
+        // 2 source_file messages (turn 1 + turn 2) + 1 done
+        assert_eq!(lines.len(), 3, "got: {:?}", lines);
+
+        // Turn 1 should have parent_session_id
+        let turn1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(
+            turn1["source_file"]["metadata"]["parent_session_id"].as_str(),
+            Some("ses-parent-001"),
+            "turn 1 should carry parent_session_id"
+        );
+        assert_eq!(
+            turn1["source_file"]["metadata"]["source_origin"].as_str(),
+            Some("claude:subagent")
+        );
+        assert_eq!(
+            turn1["source_file"]["metadata"]["content_role"].as_str(),
+            Some("research"),
+            "subagent with Grep+Read should be 'research'"
+        );
+
+        // Turn 2 should NOT have parent_session_id (only turn 1 gets it)
+        let turn2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert!(
+            turn2["source_file"]["metadata"]["parent_session_id"].is_null(),
+            "turn 2 should not carry parent_session_id"
+        );
+    }
+
+    #[test]
+    fn test_main_session_no_parent_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path();
+
+        let jsonl = r#"{"type":"session_start","session_id":"ses-main-001","timestamp":"2026-03-14T05:00:00Z","workspace":"/tmp","git_branch":"main","agent_type":"main","parent_session_id":null,"corvia_agent_id":null}
+{"type":"user_prompt","session_id":"ses-main-001","turn":1,"timestamp":"2026-03-14T05:01:00Z","content":"hello"}
+{"type":"session_end","session_id":"ses-main-001","timestamp":"2026-03-14T05:02:00Z","total_turns":1,"duration_ms":60000}"#;
+
+        let gz_path = sessions.join("ses-main-001.jsonl.gz");
+        let file = std::fs::File::create(&gz_path).unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        encoder.write_all(jsonl.as_bytes()).unwrap();
+        encoder.finish().unwrap();
+
+        let mut output = Vec::new();
+        ingest_sessions_from(DEFAULT_SCOPE, sessions, &mut output);
+
+        let text = String::from_utf8(output).unwrap();
+        let lines: Vec<&str> = text.trim().lines().collect();
+        let turn1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+
+        // Main session should never have parent_session_id
+        assert!(
+            turn1["source_file"]["metadata"]["parent_session_id"].is_null(),
+            "main session should not carry parent_session_id"
+        );
     }
 }
