@@ -926,15 +926,42 @@ pub async fn ingest_workspace(
                                             edges_created += 1;
                                         }
                                     } else {
-                                        // Parent was ingested in a prior run. Cross-batch
-                                        // edge resolution requires a source_version index
-                                        // (not yet implemented). Skip gracefully.
-                                        // TODO: implement cross-batch parent lookup via
-                                        // source_version index or metadata query.
-                                        eprintln!(
-                                            "  note: parent session {parent_sid} not in current batch — \
-                                             spawned_by edge skipped"
-                                        );
+                                        // Parent was ingested in a prior run. Look up via
+                                        // source_version index (cross-batch resolution).
+                                        let parent_sv = format!("{parent_sid}:turn-1");
+                                        match store
+                                            .get_by_source_version(USER_HISTORY_SCOPE, &parent_sv)
+                                            .await
+                                        {
+                                            Ok(Some(parent_entry)) => {
+                                                if let Err(e) = graph
+                                                    .relate(
+                                                        &child_entry_id,
+                                                        "spawned_by",
+                                                        &parent_entry.id,
+                                                        None,
+                                                    )
+                                                    .await
+                                                {
+                                                    eprintln!(
+                                                        "  warning: cross-batch spawned_by edge failed: {e}"
+                                                    );
+                                                } else {
+                                                    edges_created += 1;
+                                                }
+                                            }
+                                            Ok(None) => {
+                                                eprintln!(
+                                                    "  note: parent session {parent_sid} not found — \
+                                                     spawned_by edge skipped (not yet ingested or GC'd)"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "  warning: cross-batch parent lookup failed: {e}"
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                             }

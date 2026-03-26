@@ -22,6 +22,12 @@ const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 /// Enables O(log n) range scans for bi-temporal queries via Redb B-tree.
 const TEMPORAL_INDEX: TableDefinition<&str, &[u8]> = TableDefinition::new("temporal_index");
 
+/// Secondary index: "{scope_id}:{source_version}" → UUID string.
+/// Enables O(log n) lookup of entries by source_version within a scope.
+/// Used for cross-batch graph edge resolution (e.g., spawned_by parent lookup).
+const SOURCE_VERSION_INDEX: TableDefinition<&str, &str> =
+    TableDefinition::new("source_version_index");
+
 /// HNSW tuning constants
 const MAX_NB_CONNECTION: usize = 16;
 const MAX_LAYER: usize = 16;
@@ -306,6 +312,17 @@ impl LiteStore {
             u2h_table
                 .insert(uuid_str.as_str(), hnsw_id)
                 .map_err(|e| CorviaError::Storage(format!("Failed to insert uuid_to_hnsw: {e}")))?;
+
+            // Source version secondary index
+            if !entry.source_version.is_empty() {
+                let sv_key = format!("{}:{}", entry.scope_id, entry.source_version);
+                let mut sv_table = write_txn
+                    .open_table(SOURCE_VERSION_INDEX)
+                    .map_err(|e| CorviaError::Storage(format!("Failed to open SOURCE_VERSION_INDEX: {e}")))?;
+                sv_table
+                    .insert(sv_key.as_str(), uuid_str.as_str())
+                    .map_err(|e| CorviaError::Storage(format!("Failed to insert source_version index: {e}")))?;
+            }
         }
         write_txn
             .commit()
@@ -339,6 +356,45 @@ impl LiteStore {
     }
 
     /// Clear the TEMPORAL_INDEX table in Redb by dropping and re-creating it.
+    fn clear_source_version_index(&self) -> Result<()> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| CorviaError::Storage(format!("Failed to begin write txn: {e}")))?;
+        let _ = write_txn.delete_table(SOURCE_VERSION_INDEX);
+        write_txn
+            .open_table(SOURCE_VERSION_INDEX)
+            .map_err(|e| CorviaError::Storage(format!("Failed to re-create SOURCE_VERSION_INDEX: {e}")))?;
+        write_txn
+            .commit()
+            .map_err(|e| CorviaError::Storage(format!("Failed to commit clear sv index: {e}")))?;
+        Ok(())
+    }
+
+    fn write_source_version_index(&self, entry: &KnowledgeEntry) -> Result<()> {
+        if entry.source_version.is_empty() {
+            return Ok(());
+        }
+        let sv_key = format!("{}:{}", entry.scope_id, entry.source_version);
+        let uuid_str = entry.id.to_string();
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| CorviaError::Storage(format!("Failed to begin write txn: {e}")))?;
+        {
+            let mut sv_table = write_txn
+                .open_table(SOURCE_VERSION_INDEX)
+                .map_err(|e| CorviaError::Storage(format!("Failed to open SOURCE_VERSION_INDEX: {e}")))?;
+            sv_table
+                .insert(sv_key.as_str(), uuid_str.as_str())
+                .map_err(|e| CorviaError::Storage(format!("Failed to insert sv index: {e}")))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| CorviaError::Storage(format!("Failed to commit sv index write: {e}")))?;
+        Ok(())
+    }
+
     fn clear_temporal_index(&self) -> Result<()> {
         let write_txn = self
             .db
@@ -387,12 +443,16 @@ impl LiteStore {
         // Reset the counter
         self.next_hnsw_id.store(0, Ordering::SeqCst);
 
-        // Clear the temporal index before rebuilding
+        // Clear the temporal index and source_version index before rebuilding
         self.clear_temporal_index()?;
+        self.clear_source_version_index()?;
 
         for entry in &all_entries {
             if let Some(ref embedding) = entry.embedding {
                 self.index_entry(entry, embedding)?;
+            } else {
+                // For entries without embeddings, still populate source_version index
+                self.write_source_version_index(entry)?;
             }
             // Rebuild temporal index for every entry (even those without embeddings)
             self.write_temporal_index(entry)?;
@@ -488,6 +548,9 @@ impl super::traits::QueryableStore for LiteStore {
             let _ = write_txn
                 .open_table(TEMPORAL_INDEX)
                 .map_err(|e| CorviaError::Storage(format!("Failed to create TEMPORAL_INDEX: {e}")))?;
+            let _ = write_txn
+                .open_table(SOURCE_VERSION_INDEX)
+                .map_err(|e| CorviaError::Storage(format!("Failed to create SOURCE_VERSION_INDEX: {e}")))?;
             let _ = write_txn
                 .open_table(crate::graph_store::GRAPH_EDGES)
                 .map_err(|e| CorviaError::Storage(format!("Failed to create GRAPH_EDGES: {e}")))?;
@@ -700,6 +763,20 @@ impl super::traits::QueryableStore for LiteStore {
                     .open_table(UUID_TO_HNSW)
                     .map_err(|e| CorviaError::Storage(format!("Failed to open UUID_TO_HNSW: {e}")))?;
 
+                // Clear source_version index entries for this scope (range scan)
+                let mut sv_table = write_txn
+                    .open_table(SOURCE_VERSION_INDEX)
+                    .map_err(|e| CorviaError::Storage(format!("Failed to open SOURCE_VERSION_INDEX: {e}")))?;
+                let sv_keys: Vec<String> = {
+                    let range = sv_table
+                        .range(prefix_start.as_str()..prefix_end.as_str())
+                        .map_err(|e| CorviaError::Storage(format!("Failed to range scan sv index: {e}")))?;
+                    range.filter_map(|item| item.ok().map(|(k, _)| k.value().to_string())).collect()
+                };
+                for key in &sv_keys {
+                    let _ = sv_table.remove(key.as_str());
+                }
+
                 for uuid_str in &uuids_to_delete {
                     // Remove entry
                     let _ = entries_table.remove(uuid_str.as_str());
@@ -724,6 +801,41 @@ impl super::traits::QueryableStore for LiteStore {
 
         info!("Deleted scope '{}' ({} entries)", scope_id, uuids_to_delete.len());
         Ok(())
+    }
+
+    async fn get_by_source_version(
+        &self,
+        scope_id: &str,
+        source_version: &str,
+    ) -> Result<Option<KnowledgeEntry>> {
+        if source_version.is_empty() {
+            return Ok(None);
+        }
+        let sv_key = format!("{scope_id}:{source_version}");
+
+        let uuid_str = {
+            let read_txn = self
+                .db
+                .begin_read()
+                .map_err(|e| CorviaError::Storage(format!("Failed to begin read txn: {e}")))?;
+            let sv_table = read_txn
+                .open_table(SOURCE_VERSION_INDEX)
+                .map_err(|e| CorviaError::Storage(format!("Failed to open SOURCE_VERSION_INDEX: {e}")))?;
+            match sv_table.get(sv_key.as_str()) {
+                Ok(Some(val)) => Some(val.value().to_string()),
+                Ok(None) => None,
+                Err(e) => return Err(CorviaError::Storage(format!("SOURCE_VERSION_INDEX lookup failed: {e}"))),
+            }
+        };
+
+        match uuid_str {
+            Some(id_str) => {
+                let id = uuid::Uuid::parse_str(&id_str)
+                    .map_err(|e| CorviaError::Storage(format!("Invalid UUID in sv index: {e}")))?;
+                self.get(&id).await
+            }
+            None => Ok(None),
+        }
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1413,5 +1525,119 @@ mod tests {
             assert!(!entry.content.is_empty());
             assert_eq!(entry.scope_id, "scope");
         }
+    }
+
+    #[tokio::test]
+    async fn test_lite_store_get_by_source_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LiteStore::open(dir.path(), 3).unwrap();
+        store.init_schema().await.unwrap();
+
+        let entry = KnowledgeEntry::new(
+            "session turn 1".into(),
+            "user-history".into(),
+            "ses-abc123:turn-1".into(),
+        )
+        .with_embedding(vec![0.1, 0.2, 0.3]);
+        let expected_id = entry.id;
+        store.insert(&entry).await.unwrap();
+
+        // Found by exact scope + source_version
+        let result = store
+            .get_by_source_version("user-history", "ses-abc123:turn-1")
+            .await
+            .unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().id, expected_id);
+
+        // Not found: wrong scope
+        let result = store
+            .get_by_source_version("other-scope", "ses-abc123:turn-1")
+            .await
+            .unwrap();
+        assert!(result.is_none());
+
+        // Not found: wrong source_version
+        let result = store
+            .get_by_source_version("user-history", "ses-nonexistent:turn-1")
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_lite_store_get_by_source_version_empty_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LiteStore::open(dir.path(), 3).unwrap();
+        store.init_schema().await.unwrap();
+
+        // Entry with empty source_version should not be indexed
+        let entry = KnowledgeEntry::new("no version".into(), "scope".into(), "".into())
+            .with_embedding(vec![0.1, 0.2, 0.3]);
+        store.insert(&entry).await.unwrap();
+
+        let result = store
+            .get_by_source_version("scope", "")
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_lite_store_get_by_source_version_survives_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LiteStore::open(dir.path(), 3).unwrap();
+        store.init_schema().await.unwrap();
+
+        let entry = KnowledgeEntry::new(
+            "rebuild test".into(),
+            "scope".into(),
+            "ses-rebuild:turn-1".into(),
+        )
+        .with_embedding(vec![1.0, 0.0, 0.0]);
+        let expected_id = entry.id;
+        store.insert(&entry).await.unwrap();
+
+        // Rebuild clears and repopulates indexes
+        store.rebuild_from_files().unwrap();
+
+        let result = store
+            .get_by_source_version("scope", "ses-rebuild:turn-1")
+            .await
+            .unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().id, expected_id);
+    }
+
+    #[tokio::test]
+    async fn test_lite_store_get_by_source_version_cleaned_on_delete_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LiteStore::open(dir.path(), 3).unwrap();
+        store.init_schema().await.unwrap();
+
+        let entry = KnowledgeEntry::new(
+            "deletable".into(),
+            "temp-scope".into(),
+            "ses-del:turn-1".into(),
+        )
+        .with_embedding(vec![0.5, 0.5, 0.5]);
+        store.insert(&entry).await.unwrap();
+
+        // Verify it exists
+        assert!(store
+            .get_by_source_version("temp-scope", "ses-del:turn-1")
+            .await
+            .unwrap()
+            .is_some());
+
+        // Delete scope
+        store.delete_scope("temp-scope").await.unwrap();
+
+        // Source version index should be cleaned
+        assert!(store
+            .get_by_source_version("temp-scope", "ses-del:turn-1")
+            .await
+            .unwrap()
+            .is_none());
     }
 }

@@ -25,6 +25,14 @@ pub trait QueryableStore: Send + Sync {
     /// Delete all entries in a scope. Used for test/demo teardown.
     async fn delete_scope(&self, scope_id: &str) -> Result<()>;
 
+    /// Look up an entry by scope and source_version (exact match).
+    /// Used for cross-batch graph edge resolution (e.g., spawned_by parent lookup).
+    async fn get_by_source_version(
+        &self,
+        scope_id: &str,
+        source_version: &str,
+    ) -> Result<Option<KnowledgeEntry>>;
+
     /// Downcast support for store-specific operations (e.g., LiteStore::rebuild_from_files).
     fn as_any(&self) -> &dyn Any;
 }

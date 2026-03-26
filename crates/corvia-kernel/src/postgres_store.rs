@@ -161,6 +161,7 @@ impl crate::traits::QueryableStore for PostgresStore {
 
             CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_id);
             CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_id);
+            CREATE INDEX IF NOT EXISTS idx_knowledge_source_version ON knowledge(scope_id, source_version);
             "#
         );
 
@@ -299,6 +300,26 @@ impl crate::traits::QueryableStore for PostgresStore {
 
         info!("Deleted all entries for scope '{scope_id}'");
         Ok(())
+    }
+
+    async fn get_by_source_version(
+        &self,
+        scope_id: &str,
+        source_version: &str,
+    ) -> Result<Option<KnowledgeEntry>> {
+        if source_version.is_empty() {
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "SELECT * FROM knowledge WHERE scope_id = $1 AND source_version = $2 LIMIT 1",
+        )
+        .bind(scope_id)
+        .bind(source_version)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CorviaError::Storage(format!("Failed to get by source_version: {e}")))?;
+
+        Ok(row.as_ref().and_then(row_to_entry))
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1039,5 +1060,47 @@ mod tests {
 
         store.delete_scope("test-graph").await.unwrap();
         cleanup_test_db("rm_edges").await;
+    }
+
+    #[tokio::test]
+    async fn test_postgres_get_by_source_version() {
+        let store = match connect_test_store("sv_lookup").await {
+            Ok(s) => s,
+            Err(_) => return, // PostgreSQL not available
+        };
+
+        let entry = KnowledgeEntry::new(
+            "session turn 1".into(),
+            "user-history".into(),
+            "ses-pg-abc:turn-1".into(),
+        )
+        .with_embedding(test_embedding(0.1, 0.2, 0.3));
+        let expected_id = entry.id;
+        store.insert(&entry).await.unwrap();
+
+        // Found by exact scope + source_version
+        let result = store
+            .get_by_source_version("user-history", "ses-pg-abc:turn-1")
+            .await
+            .unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().id, expected_id);
+
+        // Not found: wrong scope
+        let result = store
+            .get_by_source_version("other-scope", "ses-pg-abc:turn-1")
+            .await
+            .unwrap();
+        assert!(result.is_none());
+
+        // Not found: wrong source_version
+        let result = store
+            .get_by_source_version("user-history", "ses-nonexistent:turn-1")
+            .await
+            .unwrap();
+        assert!(result.is_none());
+
+        store.delete_scope("user-history").await.unwrap();
+        cleanup_test_db("sv_lookup").await;
     }
 }
