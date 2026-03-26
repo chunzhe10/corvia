@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use corvia_common::errors::{CorviaError, Result};
 use corvia_common::types::{KnowledgeEntry, SearchResult};
 use hnsw_rs::prelude::*;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -353,6 +353,17 @@ impl LiteStore {
         self.persist_next_id()?;
         info!("HNSW flushed to {}", hnsw_dir.display());
         Ok(())
+    }
+
+    /// Count entries in the HNSW_TO_UUID table (entries with vector embeddings).
+    /// This may differ from `count()` (SCOPE_INDEX) if HNSW was rebuilt or corrupted.
+    pub fn hnsw_entry_count(&self) -> Result<u64> {
+        let read_txn = self.db.begin_read()
+            .map_err(|e| CorviaError::Storage(format!("Failed to begin read txn: {e}")))?;
+        let table = read_txn.open_table(HNSW_TO_UUID)
+            .map_err(|e| CorviaError::Storage(format!("Failed to open HNSW_TO_UUID: {e}")))?;
+        table.len()
+            .map_err(|e| CorviaError::Storage(format!("Failed to count HNSW_TO_UUID: {e}")))
     }
 
     /// Clear the TEMPORAL_INDEX table in Redb by dropping and re-creating it.
@@ -1639,5 +1650,30 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_hnsw_entry_count_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LiteStore::open(dir.path(), 3).unwrap();
+        store.init_schema().await.unwrap();
+        assert_eq!(store.hnsw_entry_count().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_hnsw_entry_count_after_insert() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LiteStore::open(dir.path(), 3).unwrap();
+        store.init_schema().await.unwrap();
+
+        for _ in 0..5 {
+            let mut entry = corvia_common::types::KnowledgeEntry::new(
+                "test".into(), "scope".into(), "file.rs".into(),
+            );
+            entry.embedding = Some(vec![0.1, 0.2, 0.3]);
+            store.insert(&entry).await.unwrap();
+        }
+
+        assert_eq!(store.hnsw_entry_count().unwrap(), 5);
     }
 }

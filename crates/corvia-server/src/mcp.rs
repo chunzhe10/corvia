@@ -238,7 +238,7 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "section": { "type": "string", "description": "Config section to retrieve. Valid sections: storage, server, embedding, project, telemetry (restart-required), agent_lifecycle, merge, rag, chunking, reasoning, adapters (hot-reloadable). Omit for full config." }
+                    "section": { "type": "string", "description": "Config section to retrieve. Valid sections: storage, server, embedding, project, telemetry (restart-required), agent_lifecycle, merge, rag, chunking, reasoning, adapters, dashboard (hot-reloadable). Omit for full config." }
                 }
             }
         }),
@@ -275,7 +275,7 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "section": { "type": "string", "description": "Config section (hot-reloadable only: agent_lifecycle, merge, rag, chunking, reasoning, adapters). Restart-required sections (storage, server, embedding, project, telemetry) are rejected." },
+                    "section": { "type": "string", "description": "Config section (hot-reloadable only: agent_lifecycle, merge, rag, chunking, reasoning, adapters, dashboard). Restart-required sections (storage, server, embedding, project, telemetry) are rejected." },
                     "key": { "type": "string", "description": "Config key within the section" },
                     "value": { "description": "New value to set" }
                 },
@@ -1440,6 +1440,9 @@ mod tests {
             gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
             session_ingest_lock: tokio::sync::Mutex::new(()),
             hook_sessions: crate::dashboard::session_watcher::SessionWatcherState::new().0,
+            coverage_cache: Arc::new(
+                crate::dashboard::coverage::IndexCoverageCache::new(0.9, 60),
+            ),
             workspace_root: dir.to_path_buf(),
             ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
         })
@@ -1749,6 +1752,9 @@ mod tests {
             gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
             session_ingest_lock: tokio::sync::Mutex::new(()),
             hook_sessions: crate::dashboard::session_watcher::SessionWatcherState::new().0,
+            coverage_cache: Arc::new(
+                crate::dashboard::coverage::IndexCoverageCache::new(0.9, 60),
+            ),
             workspace_root: dir.path().to_path_buf(),
             ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
         });

@@ -24,7 +24,7 @@ fn entry_path(data_dir: &Path, scope_id: &str, entry_id: &Uuid) -> PathBuf {
         .join(format!("{}.json", entry_id))
 }
 
-fn scope_dir(data_dir: &Path, scope_id: &str) -> PathBuf {
+pub fn scope_dir(data_dir: &Path, scope_id: &str) -> PathBuf {
     data_dir.join("knowledge").join(scope_id)
 }
 

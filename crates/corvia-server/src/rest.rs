@@ -59,6 +59,8 @@ pub struct AppState {
     pub session_ingest_lock: tokio::sync::Mutex<()>,
     /// Hook-observed Claude sessions (JSONL file watcher state).
     pub hook_sessions: std::sync::Arc<crate::dashboard::session_watcher::SessionWatcherState>,
+    /// Cached index coverage metrics (TTL-based, brief lock on cache read).
+    pub coverage_cache: Arc<crate::dashboard::coverage::IndexCoverageCache>,
     /// Workspace root directory for server-side ingestion.
     pub workspace_root: std::path::PathBuf,
     /// Server-side ingestion status (for polling via GET /v1/ingest/status).
@@ -1426,6 +1428,9 @@ mod tests {
             gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
             session_ingest_lock: tokio::sync::Mutex::new(()),
             hook_sessions: crate::dashboard::session_watcher::SessionWatcherState::new().0,
+            coverage_cache: Arc::new(
+                crate::dashboard::coverage::IndexCoverageCache::new(0.9, 60),
+            ),
             workspace_root: dir.to_path_buf(),
             ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
         })
@@ -1486,6 +1491,9 @@ mod tests {
             gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
             session_ingest_lock: tokio::sync::Mutex::new(()),
             hook_sessions: crate::dashboard::session_watcher::SessionWatcherState::new().0,
+            coverage_cache: Arc::new(
+                crate::dashboard::coverage::IndexCoverageCache::new(0.9, 60),
+            ),
             workspace_root: dir.to_path_buf(),
             ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
         })
