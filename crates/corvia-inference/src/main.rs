@@ -5,6 +5,7 @@ mod backend;
 mod chat_service;
 mod embedding_service;
 mod model_manager;
+mod probe;
 
 use clap::Parser;
 use corvia_common::config::TelemetryConfig;
@@ -73,10 +74,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let embed_svc = embedding_service::EmbeddingServiceImpl::new();
             let chat_svc = chat_service::ChatServiceImpl::new();
+            let probe_state = probe::new_shared_probe_state();
             let model_mgr = model_manager::ModelManagerService::new(
                 embed_svc.clone(),
                 chat_svc.clone(),
                 gpu,
+                probe_state,
+                model_manager::ProbeConfig::default(),
             );
 
             tracing::info!(port, "inference_server_starting");

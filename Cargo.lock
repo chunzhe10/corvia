@@ -870,6 +870,7 @@ dependencies = [
 name = "corvia-inference"
 version = "0.4.6"
 dependencies = [
+ "chrono",
  "clap",
  "corvia-common",
  "corvia-proto",

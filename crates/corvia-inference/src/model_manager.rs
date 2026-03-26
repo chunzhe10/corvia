@@ -24,6 +24,24 @@ pub struct ModelEntry {
     pub hf_filename: String,
 }
 
+/// Configuration for the periodic health probe.
+#[derive(Clone)]
+pub struct ProbeConfig {
+    /// How often to run the probe (0 = disabled).
+    pub interval_secs: u64,
+    /// Drift percentage threshold above which status becomes Degraded.
+    pub drift_threshold_pct: f64,
+}
+
+impl Default for ProbeConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: 60,
+            drift_threshold_pct: 100.0,
+        }
+    }
+}
+
 pub struct ModelManagerService {
     /// Registry tracking all loaded models (for health/list).
     models: Arc<RwLock<HashMap<String, ModelEntry>>>,
@@ -33,15 +51,27 @@ pub struct ModelManagerService {
     chat_svc: ChatServiceImpl,
     /// Probed GPU capabilities (re-probeable at runtime).
     gpu: Arc<std::sync::RwLock<GpuCapabilities>>,
+    /// Shared probe state for health reporting.
+    probe_state: crate::probe::SharedProbeState,
+    /// Probe configuration.
+    probe_config: ProbeConfig,
 }
 
 impl ModelManagerService {
-    pub fn new(embed_svc: EmbeddingServiceImpl, chat_svc: ChatServiceImpl, gpu: Arc<std::sync::RwLock<GpuCapabilities>>) -> Self {
+    pub fn new(
+        embed_svc: EmbeddingServiceImpl,
+        chat_svc: ChatServiceImpl,
+        gpu: Arc<std::sync::RwLock<GpuCapabilities>>,
+        probe_state: crate::probe::SharedProbeState,
+        probe_config: ProbeConfig,
+    ) -> Self {
         Self {
             models: Arc::new(RwLock::new(HashMap::new())),
             embed_svc,
             chat_svc,
             gpu,
+            probe_state,
+            probe_config,
         }
     }
 }
@@ -53,9 +83,27 @@ impl ModelManager for ModelManagerService {
         _req: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
         let models = self.models.read().await;
+        let probe = self.probe_state.read().await;
         Ok(Response::new(HealthResponse {
             healthy: true,
             models_loaded: models.values().filter(|m| m.loaded).count() as u32,
+            ep_name: probe.ep_name.clone(),
+            ep_requested: probe.ep_requested.clone(),
+            fallback_used: probe.fallback_used,
+            baseline_us: probe.baseline_us,
+            last_probe_us: probe.last_probe_us,
+            drift_pct: probe.drift_pct,
+            probe_status: match probe.status {
+                crate::probe::ProbeStatus::Pending => "pending",
+                crate::probe::ProbeStatus::Healthy => "healthy",
+                crate::probe::ProbeStatus::Degraded => "degraded",
+                crate::probe::ProbeStatus::Failed => "failed",
+            }
+            .to_string(),
+            last_probe_at: probe
+                .last_probe_at
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_default(),
         }))
     }
 
@@ -168,6 +216,11 @@ impl ModelManager for ModelManagerService {
                     (actual_device, actual_backend)
                 };
 
+                // Determine if fallback was used (actual != requested)
+                let requested_backend = req.backend.clone();
+                let fallback_used =
+                    actual_backend != requested_backend && requested_backend != "auto";
+
                 let mut models = self.models.write().await;
                 models.insert(
                     req.name.clone(),
@@ -183,6 +236,30 @@ impl ModelManager for ModelManagerService {
                         hf_filename: req.hf_filename,
                     },
                 );
+                drop(models);
+
+                // Run canary + spawn probe loop on first embedding model load
+                if model_type == ModelType::Embedding {
+                    let is_pending = self.probe_state.read().await.status
+                        == crate::probe::ProbeStatus::Pending;
+                    if is_pending {
+                        crate::probe::run_canary(
+                            &self.embed_svc,
+                            &actual_backend,
+                            &requested_backend,
+                            fallback_used,
+                            &self.probe_state,
+                        )
+                        .await;
+                        crate::probe::spawn_probe_loop(
+                            self.embed_svc.clone(),
+                            self.probe_state.clone(),
+                            self.probe_config.interval_secs,
+                            self.probe_config.drift_threshold_pct,
+                        );
+                    }
+                }
+
                 Ok(Response::new(LoadModelResponse {
                     success: true,
                     error: String::new(),
