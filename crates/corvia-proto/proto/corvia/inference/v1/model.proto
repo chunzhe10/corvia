@@ -72,4 +72,12 @@ message HealthRequest {}
 message HealthResponse {
   bool healthy = 1;
   uint32 models_loaded = 2;
+  string ep_name = 3;
+  string ep_requested = 4;
+  bool fallback_used = 5;
+  uint64 baseline_us = 6;
+  uint64 last_probe_us = 7;
+  double drift_pct = 8;
+  string probe_status = 9;
+  string last_probe_at = 10;
 }

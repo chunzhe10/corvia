@@ -1273,8 +1273,45 @@ async fn recent_traces_handler(
 async fn gpu_status_handler(
     State(state): State<Arc<AppState>>,
 ) -> Json<corvia_common::dashboard::GpuStatusResponse> {
-    let cfg = state.config.read().unwrap_or_else(|e| e.into_inner());
-    let status = gpu::collect_gpu_status(&cfg);
+    use std::time::Instant;
+
+    let mut cache = state.gpu_cache.lock().await;
+
+    if !cache.is_stale() {
+        return Json(cache.last_result.clone());
+    }
+
+    if cache.refreshing && cache.refresh_started.elapsed() < std::time::Duration::from_secs(10) {
+        // Another request is already refreshing — return stale data
+        return Json(cache.last_result.clone());
+    }
+
+    cache.refreshing = true;
+    cache.refresh_started = Instant::now();
+    let cfg = state.config.read().unwrap_or_else(|e| e.into_inner()).clone();
+    drop(cache); // release lock during shell-outs
+
+    let mut status = gpu::collect_gpu_status(&cfg);
+    status.inference_health = Some(
+        health::check_inference_health("127.0.0.1:8030").await
+            .unwrap_or(corvia_common::dashboard::InferenceHealthStatus {
+                status: corvia_common::dashboard::InferenceProbeStatus::Unreachable,
+                ep_name: String::new(),
+                ep_requested: String::new(),
+                fallback_used: false,
+                baseline_us: 0,
+                last_probe_us: 0,
+                drift_pct: 0.0,
+                models_loaded: 0,
+                last_probe_at: None,
+            })
+    );
+
+    let mut cache = state.gpu_cache.lock().await;
+    cache.last_result = status.clone();
+    cache.last_fetched = Instant::now();
+    cache.refreshing = false;
+
     Json(status)
 }
 
@@ -1543,6 +1580,7 @@ mod tests {
             ),
             workspace_root: dir.to_path_buf(),
             ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
+            gpu_cache: std::sync::Arc::new(tokio::sync::Mutex::new(super::gpu::GpuMetricsCache::new())),
         })
     }
 

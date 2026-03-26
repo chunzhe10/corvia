@@ -377,6 +377,36 @@ impl EmbeddingServiceImpl {
         Ok(())
     }
 
+    /// Run a canary embedding bypassing tonic Request/Response wrapping.
+    /// Returns the embedding dimension count on success.
+    pub async fn embed_canary(&self, text: &str) -> Result<usize, tonic::Status> {
+        let models = self.models.clone();
+        let text = text.to_string();
+        let dims = tokio::task::spawn_blocking(move || {
+            let mut guard = models
+                .lock()
+                .map_err(|e| Status::internal(format!("Lock poisoned: {e}")))?;
+            // Use the first loaded model for the canary probe
+            let loaded = guard
+                .values_mut()
+                .next()
+                .ok_or_else(|| Status::not_found("No embedding models loaded for canary"))?;
+            let result = loaded
+                .engine
+                .embed(vec![text.as_str()], None)
+                .map_err(|e| Status::internal(format!("Canary embed failed: {e}")))?;
+            let embedding = result
+                .into_iter()
+                .next()
+                .ok_or_else(|| Status::internal("Canary returned empty result"))?;
+            Ok::<usize, Status>(embedding.len())
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Canary spawn failed: {e}")))?
+        ?;
+        Ok(dims)
+    }
+
     /// Get the resolved backend for a loaded model.
     pub fn get_backend(&self, name: &str) -> Option<ResolvedBackend> {
         self.models

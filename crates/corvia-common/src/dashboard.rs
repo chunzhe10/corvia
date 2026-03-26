@@ -265,6 +265,14 @@ pub struct RecentTracesResponse {
     pub traces: Vec<TraceTree>,
 }
 
+/// A single process using the GPU.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuProcess {
+    pub pid: u32,
+    pub name: String,
+    pub memory_used_mb: u64,
+}
+
 /// A single detected GPU.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuInfo {
@@ -283,6 +291,21 @@ pub struct GpuInfo {
     /// GPU temperature in Celsius (NVIDIA only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature_c: Option<u32>,
+    /// GPU power draw in watts (NVIDIA only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub power_draw_w: Option<f64>,
+    /// GPU power limit in watts (NVIDIA only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub power_limit_w: Option<f64>,
+    /// Processes using the GPU (NVIDIA only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processes: Option<Vec<GpuProcess>>,
+    /// Render engine busy percentage (Intel only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub render_busy_pct: Option<u32>,
+    /// Video engine busy percentage (Intel only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_busy_pct: Option<u32>,
     /// Current GPU frequency in MHz (Intel only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frequency_mhz: Option<u64>,
@@ -299,11 +322,39 @@ pub struct InferenceBackendInfo {
     pub backend: String,
 }
 
+/// Inference probe health status.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum InferenceProbeStatus {
+    Pending,
+    Healthy,
+    Degraded,
+    Failed,
+    Unreachable,
+}
+
+/// Inference health status from the canary probe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceHealthStatus {
+    pub status: InferenceProbeStatus,
+    pub ep_name: String,
+    pub ep_requested: String,
+    pub fallback_used: bool,
+    pub baseline_us: u64,
+    pub last_probe_us: u64,
+    pub drift_pct: f64,
+    pub models_loaded: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_probe_at: Option<String>,
+}
+
 /// GET /api/dashboard/gpu response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuStatusResponse {
     pub gpus: Vec<GpuInfo>,
     pub inference_backend: HashMap<String, InferenceBackendInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inference_health: Option<InferenceHealthStatus>,
 }
 
 #[cfg(test)]
@@ -395,6 +446,11 @@ mod tests {
                     memory_used_mb: Some(2048),
                     memory_total_mb: Some(24576),
                     temperature_c: Some(65),
+                    power_draw_w: None,
+                    power_limit_w: None,
+                    processes: None,
+                    render_busy_pct: None,
+                    video_busy_pct: None,
                     frequency_mhz: None,
                     frequency_max_mhz: None,
                 },
@@ -406,6 +462,11 @@ mod tests {
                     memory_used_mb: None,
                     memory_total_mb: None,
                     temperature_c: None,
+                    power_draw_w: None,
+                    power_limit_w: None,
+                    processes: None,
+                    render_busy_pct: None,
+                    video_busy_pct: None,
                     frequency_mhz: Some(1200),
                     frequency_max_mhz: Some(1550),
                 },
@@ -417,6 +478,7 @@ mod tests {
                     backend: "cpu".to_string(),
                 }),
             ]),
+            inference_health: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"vendor\":\"nvidia\""));
@@ -437,8 +499,77 @@ mod tests {
         let resp = GpuStatusResponse {
             gpus: vec![],
             inference_backend: HashMap::new(),
+            inference_health: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"gpus\":[]"));
+    }
+
+    #[test]
+    fn test_gpu_status_response_without_inference_health() {
+        let resp = GpuStatusResponse {
+            gpus: vec![],
+            inference_backend: Default::default(),
+            inference_health: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("inference_health"), "inference_health should be absent when None");
+    }
+
+    #[test]
+    fn test_gpu_status_response_with_inference_health() {
+        let resp = GpuStatusResponse {
+            gpus: vec![],
+            inference_backend: Default::default(),
+            inference_health: Some(InferenceHealthStatus {
+                status: InferenceProbeStatus::Healthy,
+                ep_name: "cuda".to_string(),
+                ep_requested: "gpu".to_string(),
+                fallback_used: false,
+                baseline_us: 12000,
+                last_probe_us: 13000,
+                drift_pct: 8.3,
+                models_loaded: 1,
+                last_probe_at: Some("2026-03-26T12:00:00Z".to_string()),
+            }),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"inference_health\""));
+        assert!(json.contains("\"healthy\""));
+    }
+
+    #[test]
+    fn test_probe_status_serialization() {
+        assert_eq!(serde_json::to_string(&InferenceProbeStatus::Pending).unwrap(), "\"pending\"");
+        assert_eq!(serde_json::to_string(&InferenceProbeStatus::Healthy).unwrap(), "\"healthy\"");
+        assert_eq!(serde_json::to_string(&InferenceProbeStatus::Degraded).unwrap(), "\"degraded\"");
+        assert_eq!(serde_json::to_string(&InferenceProbeStatus::Failed).unwrap(), "\"failed\"");
+        assert_eq!(serde_json::to_string(&InferenceProbeStatus::Unreachable).unwrap(), "\"unreachable\"");
+    }
+
+    #[test]
+    fn test_gpu_info_new_fields_absent_when_none() {
+        let gpu = GpuInfo {
+            index: 0,
+            name: "Test GPU".to_string(),
+            vendor: "nvidia".to_string(),
+            utilization_pct: Some(50),
+            memory_used_mb: None,
+            memory_total_mb: None,
+            temperature_c: None,
+            power_draw_w: None,
+            power_limit_w: None,
+            processes: None,
+            render_busy_pct: None,
+            video_busy_pct: None,
+            frequency_mhz: None,
+            frequency_max_mhz: None,
+        };
+        let json = serde_json::to_string(&gpu).unwrap();
+        assert!(!json.contains("power_draw_w"));
+        assert!(!json.contains("processes"));
+        assert!(!json.contains("render_busy_pct"));
+        assert!(!json.contains("video_busy_pct"));
+        assert!(json.contains("utilization_pct")); // present because it's Some
     }
 }

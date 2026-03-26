@@ -515,8 +515,10 @@ async fn cmd_init(store: &str) -> Result<()> {
             match config.embedding.provider {
                 corvia_common::config::InferenceProvider::Corvia => {
                     println!("  Provisioning Corvia inference server...");
-                    let provisioner = corvia_kernel::inference_provisioner::InferenceProvisioner::new(
+                    let provisioner = corvia_kernel::inference_provisioner::InferenceProvisioner::with_probe_config(
                         &config.embedding.url,
+                        config.inference.health_probe_interval_secs,
+                        config.inference.health_probe_drift_threshold_pct,
                     );
                     let chat_coords = resolve_chat_model_coords(&config);
                     provisioner.ensure_ready(
@@ -643,6 +645,7 @@ async fn cmd_serve() -> Result<()> {
         coverage_cache,
         workspace_root,
         ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
+        gpu_cache: Arc::new(tokio::sync::Mutex::new(corvia_server::dashboard::gpu::GpuMetricsCache::new())),
     });
     // Initial coverage cache population + background refresh
     {
@@ -2212,8 +2215,10 @@ fn resolve_chat_model_coords(config: &CorviaConfig) -> Option<corvia_kernel::inf
 async fn ensure_inference_ready(config: &CorviaConfig) -> Result<()> {
     match config.embedding.provider {
         corvia_common::config::InferenceProvider::Corvia => {
-            let provisioner = corvia_kernel::inference_provisioner::InferenceProvisioner::new(
+            let provisioner = corvia_kernel::inference_provisioner::InferenceProvisioner::with_probe_config(
                 &config.embedding.url,
+                config.inference.health_probe_interval_secs,
+                config.inference.health_probe_drift_threshold_pct,
             );
             let chat_coords = resolve_chat_model_coords(config);
             provisioner.ensure_ready(

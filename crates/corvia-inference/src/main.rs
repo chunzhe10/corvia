@@ -5,6 +5,7 @@ mod backend;
 mod chat_service;
 mod embedding_service;
 mod model_manager;
+mod probe;
 
 use clap::Parser;
 use corvia_common::config::TelemetryConfig;
@@ -30,6 +31,12 @@ enum Commands {
     Serve {
         #[arg(long, default_value = "8030")]
         port: u16,
+        /// Health probe interval in seconds (0 = disabled)
+        #[arg(long, default_value = "60")]
+        health_probe_interval: u64,
+        /// Drift percentage threshold for degraded status
+        #[arg(long, default_value = "100.0")]
+        health_probe_drift_threshold: f64,
     },
 }
 
@@ -59,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Serve { port } => {
+        Commands::Serve { port, health_probe_interval, health_probe_drift_threshold } => {
             let addr = format!("0.0.0.0:{port}").parse()?;
 
             // Probe GPU capabilities once at startup (wrapped for runtime re-probing)
@@ -73,10 +80,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let embed_svc = embedding_service::EmbeddingServiceImpl::new();
             let chat_svc = chat_service::ChatServiceImpl::new();
+            let probe_state = probe::new_shared_probe_state();
             let model_mgr = model_manager::ModelManagerService::new(
                 embed_svc.clone(),
                 chat_svc.clone(),
                 gpu,
+                probe_state,
+                model_manager::ProbeConfig {
+                    interval_secs: health_probe_interval,
+                    drift_threshold_pct: health_probe_drift_threshold,
+                },
             );
 
             tracing::info!(port, "inference_server_starting");
