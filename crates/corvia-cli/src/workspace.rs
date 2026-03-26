@@ -582,13 +582,22 @@ pub async fn ingest_workspace(
         }
 
         // Wire relations from pipeline
-        if !pipeline_relations.is_empty() {
-            let relations_stored = crate::wire_pipeline_relations(
+        let relations_stored = if !pipeline_relations.is_empty() {
+            crate::wire_pipeline_relations(
                 &pipeline_relations, &processed, &stored_ids, &*graph,
-            ).await;
-            if relations_stored > 0 {
-                println!("  {relations_stored} graph relations stored");
-            }
+            ).await
+        } else {
+            0
+        };
+        if relations_stored > 0 {
+            println!("  {relations_stored} graph relations stored");
+        } else if processed.len() > 10 {
+            tracing::warn!(
+                chunks = processed.len(),
+                input_relations = pipeline_relations.len(),
+                "0 graph relations stored for {} chunks — check adapter version",
+                processed.len()
+            );
         }
 
         // Shutdown adapter
@@ -757,6 +766,8 @@ pub async fn ingest_workspace(
                                     );
                                 }
                             }
+                            // No zero-relations warning here — workspace docs
+                            // (markdown/text) are not expected to produce graph relations.
 
                             println!(
                                 "  {} chunks stored for workspace docs",
