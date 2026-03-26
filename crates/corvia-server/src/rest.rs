@@ -61,6 +61,10 @@ pub struct AppState {
     pub hook_sessions: std::sync::Arc<crate::dashboard::session_watcher::SessionWatcherState>,
     /// Cached index coverage metrics (TTL-based, brief lock on cache read).
     pub coverage_cache: Arc<crate::dashboard::coverage::IndexCoverageCache>,
+    /// Workspace root directory for server-side ingestion.
+    pub workspace_root: std::path::PathBuf,
+    /// Server-side ingestion status (for polling via GET /v1/ingest/status).
+    pub ingest_status: Arc<std::sync::RwLock<corvia_kernel::ingest::IngestStatus>>,
 }
 
 // --- Existing memory types ---
@@ -345,6 +349,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Session history endpoints
         .route("/v1/ingest/sessions", post(ingest_sessions))
         .route("/v1/classify/sessions", post(classify_sessions))
+        // Workspace ingestion endpoints
+        .route("/v1/ingest", post(ingest_workspace_handler))
+        .route("/v1/ingest/status", get(ingest_status_handler))
         .route("/health", get(health))
         // Embedded dashboard: serves static assets at root path.
         // API routes take priority over the fallback.
@@ -433,6 +440,141 @@ async fn dashboard_handler(uri: axum::http::Uri) -> impl IntoResponse {
             .to_vec(),
     )
         .into_response()
+}
+
+// --- Workspace ingestion handlers ---
+
+#[derive(Deserialize)]
+struct IngestRequest {
+    repo: Option<String>,
+}
+
+#[derive(Serialize)]
+struct IngestResponse {
+    status: String,
+    message: String,
+}
+
+/// POST /v1/ingest — trigger server-side workspace ingestion.
+///
+/// Returns 202 Accepted and runs ingestion in the background.
+/// Returns 409 Conflict if ingestion is already in progress.
+async fn ingest_workspace_handler(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<IngestRequest>>,
+) -> impl IntoResponse {
+    use corvia_kernel::ingest::{IngestState, IngestStatus, TracingProgress};
+
+    // Atomically check-and-set: reject if already running (single write lock scope).
+    // Use unwrap_or_else to recover from poisoned locks (data is still valid).
+    {
+        let mut status = state.ingest_status.write().unwrap_or_else(|e| e.into_inner());
+        if status.state == IngestState::Running {
+            return (
+                StatusCode::CONFLICT,
+                Json(IngestResponse {
+                    status: "already_in_progress".into(),
+                    message: "Workspace ingestion is already running. Check GET /v1/ingest/status for progress.".into(),
+                }),
+            ).into_response();
+        }
+        // Mark as running while still holding the write lock (atomic transition)
+        *status = IngestStatus {
+            state: IngestState::Running,
+            started_at: Some(chrono::Utc::now()),
+            finished_at: None,
+            error: None,
+            report: None,
+        };
+    }
+
+    let repo_filter = body.and_then(|b| b.0.repo);
+
+    // Snapshot config to avoid mid-ingest changes
+    let config = state.config.read().unwrap().clone();
+
+    // Clone state Arc for the background task (gives access to session_ingest_lock)
+    let state_bg = state.clone();
+
+    // Spawn on a blocking thread because ProcessAdapter uses synchronous I/O
+    // (stdin/stdout pipes to child processes). Running on the async runtime would
+    // stall tokio worker threads for the duration of adapter IPC.
+    tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Handle::current();
+        let progress = TracingProgress;
+        let repo_filter_ref = repo_filter.as_deref();
+
+        // Wrap in a timeout (10 minutes)
+        let result = rt.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(600),
+                corvia_kernel::ingest::run_workspace_ingest(
+                    &state_bg.workspace_root,
+                    &config,
+                    state_bg.store.clone(),
+                    state_bg.graph.clone(),
+                    state_bg.engine.clone(),
+                    repo_filter_ref,
+                    Some(&state_bg.session_ingest_lock),
+                    &progress,
+                ),
+            ).await
+        });
+
+        let mut status = state_bg.ingest_status.write().unwrap_or_else(|e| e.into_inner());
+        match result {
+            Ok(Ok(report)) => {
+                info!(
+                    total_chunks = report.total_chunks,
+                    repos = report.repos.len(),
+                    "Workspace ingestion completed"
+                );
+                *status = IngestStatus {
+                    state: IngestState::Completed,
+                    started_at: status.started_at,
+                    finished_at: Some(chrono::Utc::now()),
+                    error: None,
+                    report: Some(report),
+                };
+            }
+            Ok(Err(e)) => {
+                warn!("Workspace ingestion failed: {e}");
+                *status = IngestStatus {
+                    state: IngestState::Failed,
+                    started_at: status.started_at,
+                    finished_at: Some(chrono::Utc::now()),
+                    error: Some(format!("{e}")),
+                    report: None,
+                };
+            }
+            Err(_) => {
+                warn!("Workspace ingestion timed out after 600s");
+                *status = IngestStatus {
+                    state: IngestState::Failed,
+                    started_at: status.started_at,
+                    finished_at: Some(chrono::Utc::now()),
+                    error: Some("Ingestion timed out after 10 minutes".into()),
+                    report: None,
+                };
+            }
+        }
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(IngestResponse {
+            status: "started".into(),
+            message: "Workspace ingestion started. Check GET /v1/ingest/status for progress.".into(),
+        }),
+    ).into_response()
+}
+
+/// GET /v1/ingest/status — poll ingestion status.
+async fn ingest_status_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let status = state.ingest_status.read().unwrap_or_else(|e| e.into_inner()).clone();
+    (StatusCode::OK, Json(status))
 }
 
 // --- Existing handlers ---
@@ -1289,6 +1431,8 @@ mod tests {
             coverage_cache: Arc::new(
                 crate::dashboard::coverage::IndexCoverageCache::new(0.9, 60),
             ),
+            workspace_root: dir.to_path_buf(),
+            ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
         })
     }
 
@@ -1350,6 +1494,8 @@ mod tests {
             coverage_cache: Arc::new(
                 crate::dashboard::coverage::IndexCoverageCache::new(0.9, 60),
             ),
+            workspace_root: dir.to_path_buf(),
+            ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
         })
     }
 

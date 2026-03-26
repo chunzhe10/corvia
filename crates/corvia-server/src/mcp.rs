@@ -1443,6 +1443,8 @@ mod tests {
             coverage_cache: Arc::new(
                 crate::dashboard::coverage::IndexCoverageCache::new(0.9, 60),
             ),
+            workspace_root: dir.to_path_buf(),
+            ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
         })
     }
 
@@ -1753,6 +1755,8 @@ mod tests {
             coverage_cache: Arc::new(
                 crate::dashboard::coverage::IndexCoverageCache::new(0.9, 60),
             ),
+            workspace_root: dir.path().to_path_buf(),
+            ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
         });
 
         let args = json!({ "query": "rag-routed", "scope_id": "rag-scope", "limit": 5 });

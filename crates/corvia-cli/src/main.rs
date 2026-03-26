@@ -627,6 +627,10 @@ async fn cmd_serve() -> Result<()> {
             config.dashboard.coverage_ttl_secs,
         ),
     );
+    // Derive workspace root from config_path parent (not current_dir)
+    let workspace_root = config_path.parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
     let state = Arc::new(corvia_server::rest::AppState {
         store, engine, coordinator, graph, temporal, data_dir,
         rag: Some(rag), ready: ready.clone(), default_scope_id,
@@ -637,6 +641,8 @@ async fn cmd_serve() -> Result<()> {
         session_ingest_lock: tokio::sync::Mutex::new(()),
         hook_sessions: hook_sessions.clone(),
         coverage_cache,
+        workspace_root,
+        ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
     });
     // Initial coverage cache population + background refresh
     {
@@ -854,13 +860,22 @@ async fn cmd_ingest(path: Option<&str>, incremental: bool, files: &[String]) -> 
                 }
 
             // Wire graph edges from pipeline relations
-            if !pipeline_relations.is_empty() {
-                let edges = wire_pipeline_relations(
+            let edges = if !pipeline_relations.is_empty() {
+                corvia_kernel::ingest::wire_pipeline_relations(
                     &pipeline_relations, &chunks, &stored_ids, &*graph,
-                ).await;
-                if edges > 0 {
-                    println!("    {edges} graph relations stored");
-                }
+                ).await
+            } else {
+                0
+            };
+            if edges > 0 {
+                println!("    {edges} graph relations stored");
+            } else if chunks.len() > 10 {
+                tracing::warn!(
+                    chunks = chunks.len(),
+                    input_relations = pipeline_relations.len(),
+                    "0 graph relations stored for {} chunks — check adapter version",
+                    chunks.len()
+                );
             }
 
             println!("    Created {} entries", stored_ids.len());
@@ -946,13 +961,22 @@ async fn cmd_ingest(path: Option<&str>, incremental: bool, files: &[String]) -> 
         }
 
         // Step 5: Wire relations from pipeline (now native to ChunkingStrategy)
-        if !pipeline_relations.is_empty() {
-            let relations_stored = wire_pipeline_relations(
+        let relations_stored = if !pipeline_relations.is_empty() {
+            corvia_kernel::ingest::wire_pipeline_relations(
                 &pipeline_relations, &processed, &stored_ids, &*graph,
-            ).await;
-            if relations_stored > 0 {
-                println!("  {relations_stored} graph relations stored");
-            }
+            ).await
+        } else {
+            0
+        };
+        if relations_stored > 0 {
+            println!("  {relations_stored} graph relations stored");
+        } else if processed.len() > 10 {
+            tracing::warn!(
+                chunks = processed.len(),
+                input_relations = pipeline_relations.len(),
+                "0 graph relations stored for {} chunks — check adapter version",
+                processed.len()
+            );
         }
 
         // Step 5b: Wire doc-to-code relations
@@ -2313,56 +2337,6 @@ fn wire_doc_to_code_relations(
     }
 
     edges
-}
-
-/// Resolve pipeline relations and store them as graph edges.
-///
-/// Uses `(source_file, start_line)` to match relations to stored chunks.
-/// Best-effort: unresolvable cross-file references are silently skipped.
-pub(crate) async fn wire_pipeline_relations(
-    relations: &[corvia_kernel::chunking_strategy::ChunkRelation],
-    processed: &[corvia_kernel::chunking_strategy::ProcessedChunk],
-    stored_ids: &[uuid::Uuid],
-    graph: &dyn GraphStore,
-) -> usize {
-    let mut relations_stored = 0;
-    for rel in relations {
-        // Find the source chunk by (source_file, start_line) match
-        let from_idx = processed.iter().position(|pc| {
-            pc.metadata.source_file == rel.from_source_file && pc.start_line == rel.from_start_line
-        });
-        let from_uuid = match from_idx {
-            Some(idx) if idx < stored_ids.len() => stored_ids[idx],
-            _ => continue,
-        };
-
-        // Find the target chunk by file name (and optionally symbol name)
-        let to_uuid = processed.iter().zip(stored_ids.iter()).find_map(|(pc, id)| {
-            if pc.metadata.source_file == rel.to_file {
-                if let Some(ref name) = rel.to_name {
-                    if pc.content.contains(name) {
-                        return Some(*id);
-                    }
-                } else {
-                    return Some(*id);
-                }
-            }
-            None
-        });
-
-        if let Some(to_uuid) = to_uuid {
-            // Filter self-edges for "imports" and "calls" relations
-            if (rel.relation == "imports" || rel.relation == "calls") && to_uuid == from_uuid {
-                continue;
-            }
-            if let Err(e) = graph.relate(&from_uuid, &rel.relation, &to_uuid, None).await {
-                tracing::warn!("Failed to store relation: {e}");
-            } else {
-                relations_stored += 1;
-            }
-        }
-    }
-    relations_stored
 }
 
 fn print_server_search_results(results: &[server_client::SearchResultDto], _show_namespace: bool) {

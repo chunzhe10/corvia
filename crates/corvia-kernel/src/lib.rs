@@ -93,6 +93,7 @@ pub mod grpc_engine;
 pub mod grpc_chat;
 pub mod inference_provisioner;
 pub mod skill_registry;
+pub mod ingest;
 #[cfg(feature = "postgres")]
 pub mod postgres_store;
 
