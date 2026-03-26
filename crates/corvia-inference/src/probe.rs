@@ -74,10 +74,11 @@ pub async fn run_canary(
     match embed_svc.embed_canary("corvia health probe").await {
         Ok(dims) => {
             let elapsed_us = start.elapsed().as_micros() as u64;
+            let now = Utc::now(); // capture before lock wait
             let mut s = state.write().await;
             s.baseline_us = elapsed_us;
             s.last_probe_us = elapsed_us;
-            s.last_probe_at = Some(Utc::now());
+            s.last_probe_at = Some(now);
             s.ep_name = ep_name.to_string();
             s.ep_requested = ep_requested.to_string();
             s.fallback_used = fallback_used;
@@ -107,12 +108,12 @@ pub fn spawn_probe_loop(
     state: SharedProbeState,
     interval_secs: u64,
     drift_threshold_pct: f64,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     if interval_secs == 0 {
         info!("periodic health probe disabled (interval = 0)");
-        return;
+        return None;
     }
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let interval = tokio::time::Duration::from_secs(interval_secs);
         loop {
             tokio::time::sleep(interval).await;
@@ -120,10 +121,11 @@ pub fn spawn_probe_loop(
             match embed_svc.embed_canary("corvia health probe").await {
                 Ok(_) => {
                     let elapsed_us = start.elapsed().as_micros() as u64;
+                    let now = Utc::now(); // capture before lock wait
                     let mut s = state.write().await;
                     let drift = ProbeState::calc_drift(s.baseline_us, elapsed_us);
                     s.last_probe_us = elapsed_us;
-                    s.last_probe_at = Some(Utc::now());
+                    s.last_probe_at = Some(now);
                     s.drift_pct = drift;
                     s.status = ProbeState::status_from_drift(drift, drift_threshold_pct);
                     if s.status == ProbeStatus::Degraded {
@@ -136,14 +138,15 @@ pub fn spawn_probe_loop(
                     }
                 }
                 Err(e) => {
+                    let now = Utc::now(); // capture before lock wait
                     let mut s = state.write().await;
                     s.status = ProbeStatus::Failed;
-                    s.last_probe_at = Some(Utc::now());
+                    s.last_probe_at = Some(now);
                     warn!(error = %e, "periodic health probe failed");
                 }
             }
         }
-    });
+    }))
 }
 
 #[cfg(test)]

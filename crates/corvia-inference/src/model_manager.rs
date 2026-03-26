@@ -55,6 +55,8 @@ pub struct ModelManagerService {
     probe_state: crate::probe::SharedProbeState,
     /// Probe configuration.
     probe_config: ProbeConfig,
+    /// Handle to the background probe loop task (if running).
+    probe_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl ModelManagerService {
@@ -72,6 +74,7 @@ impl ModelManagerService {
             gpu,
             probe_state,
             probe_config,
+            probe_handle: tokio::sync::Mutex::new(None),
         }
     }
 }
@@ -238,11 +241,21 @@ impl ModelManager for ModelManagerService {
                 );
                 drop(models);
 
-                // Run canary + spawn probe loop on first embedding model load
+                // Run canary + spawn probe loop on first embedding model load.
+                // Use a write lock for atomic check-and-transition to prevent
+                // concurrent LoadModel calls from spawning duplicate probe loops.
                 if model_type == ModelType::Embedding {
-                    let is_pending = self.probe_state.read().await.status
-                        == crate::probe::ProbeStatus::Pending;
-                    if is_pending {
+                    let should_probe = {
+                        let mut state = self.probe_state.write().await;
+                        if state.status == crate::probe::ProbeStatus::Pending {
+                            // Claim the transition so no other caller can enter this branch.
+                            state.status = crate::probe::ProbeStatus::Failed;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if should_probe {
                         crate::probe::run_canary(
                             &self.embed_svc,
                             &actual_backend,
@@ -251,12 +264,15 @@ impl ModelManager for ModelManagerService {
                             &self.probe_state,
                         )
                         .await;
-                        crate::probe::spawn_probe_loop(
+                        let handle = crate::probe::spawn_probe_loop(
                             self.embed_svc.clone(),
                             self.probe_state.clone(),
                             self.probe_config.interval_secs,
                             self.probe_config.drift_threshold_pct,
                         );
+                        if let Some(h) = handle {
+                            *self.probe_handle.lock().await = Some(h);
+                        }
                     }
                 }
 
