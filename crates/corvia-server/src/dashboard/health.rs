@@ -159,6 +159,64 @@ pub async fn check_all_services() -> Vec<ServiceStatus> {
     statuses
 }
 
+/// Query the inference server's Health() gRPC RPC for detailed probe status.
+pub async fn check_inference_health(addr: &str) -> Option<corvia_common::dashboard::InferenceHealthStatus> {
+    use corvia_common::dashboard::{InferenceHealthStatus, InferenceProbeStatus};
+    use corvia_proto::corvia::inference::v1::model_manager_client::ModelManagerClient;
+    use corvia_proto::corvia::inference::v1::HealthRequest;
+
+    let endpoint = if addr.starts_with("http") {
+        addr.to_string()
+    } else {
+        format!("http://{}", addr)
+    };
+
+    let channel = match tokio::time::timeout(
+        Duration::from_secs(2),
+        tonic::transport::Channel::from_shared(endpoint).ok()?.connect(),
+    )
+    .await
+    {
+        Ok(Ok(ch)) => ch,
+        _ => return None,
+    };
+
+    let mut client = ModelManagerClient::new(channel);
+    let resp = match tokio::time::timeout(
+        Duration::from_secs(2),
+        client.health(HealthRequest {}),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r.into_inner(),
+        _ => return None,
+    };
+
+    let status = match resp.probe_status.as_str() {
+        "pending" => InferenceProbeStatus::Pending,
+        "healthy" => InferenceProbeStatus::Healthy,
+        "degraded" => InferenceProbeStatus::Degraded,
+        "failed" => InferenceProbeStatus::Failed,
+        _ => InferenceProbeStatus::Pending,
+    };
+
+    Some(InferenceHealthStatus {
+        status,
+        ep_name: resp.ep_name,
+        ep_requested: resp.ep_requested,
+        fallback_used: resp.fallback_used,
+        baseline_us: resp.baseline_us,
+        last_probe_us: resp.last_probe_us,
+        drift_pct: resp.drift_pct,
+        models_loaded: resp.models_loaded,
+        last_probe_at: if resp.last_probe_at.is_empty() {
+            None
+        } else {
+            Some(resp.last_probe_at)
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

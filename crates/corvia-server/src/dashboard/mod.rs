@@ -1290,8 +1290,8 @@ async fn gpu_status_handler(
     let cfg = state.config.read().unwrap_or_else(|e| e.into_inner()).clone();
     drop(cache); // release lock during shell-outs
 
-    let status = gpu::collect_gpu_status(&cfg);
-    // Note: inference_health will be wired in Task 7
+    let mut status = gpu::collect_gpu_status(&cfg);
+    status.inference_health = health::check_inference_health("127.0.0.1:8030").await;
 
     let mut cache = state.gpu_cache.lock().await;
     cache.last_result = status.clone();
