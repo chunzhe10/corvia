@@ -855,8 +855,16 @@ pub async fn ingest_workspace(
                                 })
                                 .collect();
 
+                        // Build a parallel vec of parent_session_id for edge creation.
+                        // Only turn-1 entries carry this (set by the adapter).
+                        let parent_ids: Vec<Option<String>> = source_files
+                            .iter()
+                            .map(|sf| sf.metadata.parent_session_id.clone())
+                            .collect();
+
                         let total = entries.len();
                         let mut stored = 0;
+                        let mut stored_ids: Vec<uuid::Uuid> = Vec::with_capacity(total);
                         for batch in
                             entries.chunks(corvia_kernel::introspect::EMBED_BATCH_SIZE)
                         {
@@ -867,9 +875,72 @@ pub async fn ingest_workspace(
                                 let mut entry = entry.clone();
                                 entry.embedding = Some(embedding);
                                 store.insert(&entry).await?;
+                                stored_ids.push(entry.id);
                                 stored += 1;
                             }
                             println!("  embedded and stored {}/{}", stored, total);
+                        }
+
+                        // Create spawned_by graph edges for subagent sessions.
+                        // For each entry with a parent_session_id, find the parent
+                        // session's first-turn entry (by file_path == parent session ID)
+                        // and create: subagent_turn1 --spawned_by--> parent_turn1.
+                        // Create spawned_by graph edges for subagent sessions.
+                        // Invariant: adapter emits exactly one entry per turn, so
+                        // source_files[i] maps to stored_ids[i] and parent_ids[i].
+                        debug_assert_eq!(
+                            source_files.len(),
+                            stored_ids.len(),
+                            "1:1 source-to-entry invariant violated in session ingest"
+                        );
+                        {
+                            // Build lookup: session_id → first stored entry UUID.
+                            // Relies on adapter emitting turns in order (turn 1 first),
+                            // so or_insert picks the turn-1 entry for each session.
+                            let mut session_first_entry: std::collections::HashMap<String, uuid::Uuid> =
+                                std::collections::HashMap::new();
+                            for (i, sf) in source_files.iter().enumerate() {
+                                session_first_entry
+                                    .entry(sf.metadata.file_path.clone())
+                                    .or_insert(stored_ids[i]);
+                            }
+
+                            let mut edges_created = 0u32;
+                            for (i, parent_id) in parent_ids.iter().enumerate() {
+                                if let Some(parent_sid) = parent_id {
+                                    let child_entry_id = stored_ids[i];
+                                    if let Some(&parent_entry_id) = session_first_entry.get(parent_sid) {
+                                        if let Err(e) = graph
+                                            .relate(
+                                                &child_entry_id,
+                                                "spawned_by",
+                                                &parent_entry_id,
+                                                None,
+                                            )
+                                            .await
+                                        {
+                                            eprintln!(
+                                                "  warning: failed to create spawned_by edge: {e}"
+                                            );
+                                        } else {
+                                            edges_created += 1;
+                                        }
+                                    } else {
+                                        // Parent was ingested in a prior run. Cross-batch
+                                        // edge resolution requires a source_version index
+                                        // (not yet implemented). Skip gracefully.
+                                        // TODO: implement cross-batch parent lookup via
+                                        // source_version index or metadata query.
+                                        eprintln!(
+                                            "  note: parent session {parent_sid} not in current batch — \
+                                             spawned_by edge skipped"
+                                        );
+                                    }
+                                }
+                            }
+                            if edges_created > 0 {
+                                println!("  {edges_created} spawned_by graph edges created");
+                            }
                         }
 
                         println!("  {} session turns stored", stored);

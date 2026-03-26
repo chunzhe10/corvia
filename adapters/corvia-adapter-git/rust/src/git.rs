@@ -131,6 +131,7 @@ impl IngestionAdapter for GitAdapter {
                     workstream: None,
                     content_role: None,
                     source_origin: None,
+                    parent_session_id: None,
                 },
             });
         }

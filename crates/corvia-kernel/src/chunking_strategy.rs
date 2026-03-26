@@ -38,6 +38,11 @@ pub struct SourceMetadata {
     /// Overrides path-based inference when set.
     #[serde(default)]
     pub source_origin: Option<String>,
+    /// Optional parent session ID for subagent sessions. When set, the ingest
+    /// pipeline creates a `spawned_by` graph edge from this session's first turn
+    /// to the parent session's first turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
 }
 
 /// A raw chunk produced by a [`ChunkingStrategy`] before pipeline processing.
@@ -220,6 +225,7 @@ mod tests {
             workstream: None,
             content_role: None,
             source_origin: None,
+                    parent_session_id: None,
         };
         assert_eq!(meta.file_path, "src/main.rs");
         assert_eq!(meta.extension, "rs");
@@ -319,6 +325,7 @@ mod tests {
             workstream: None,
             content_role: None,
             source_origin: None,
+                    parent_session_id: None,
         }
     }
 
@@ -370,6 +377,7 @@ mod tests {
                 workstream: None,
                 content_role: None,
                 source_origin: None,
+                    parent_session_id: None,
             },
         };
         let json = serde_json::to_string(&sf).unwrap();

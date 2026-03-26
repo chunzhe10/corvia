@@ -197,7 +197,8 @@ fn tool_definitions() -> Vec<Value> {
                     "query": { "type": "string", "description": "The search query" },
                     "scope_id": { "type": "string", "description": "Scope to search within (defaults to workspace scope if omitted)" },
                     "limit": { "type": "integer", "description": "Maximum sources (default 10)" },
-                    "expand_graph": { "type": "boolean", "description": "Follow graph edges (default true)" }
+                    "expand_graph": { "type": "boolean", "description": "Follow graph edges (default true)" },
+                    "workstream": { "type": "string", "description": "Filter by workstream (e.g. git branch name)" }
                 },
                 "required": ["query"]
             }
@@ -211,7 +212,8 @@ fn tool_definitions() -> Vec<Value> {
                     "query": { "type": "string", "description": "The question to answer" },
                     "scope_id": { "type": "string", "description": "Scope to search within (defaults to workspace scope if omitted)" },
                     "limit": { "type": "integer", "description": "Maximum sources (default 10)" },
-                    "expand_graph": { "type": "boolean", "description": "Follow graph edges (default true)" }
+                    "expand_graph": { "type": "boolean", "description": "Follow graph edges (default true)" },
+                    "workstream": { "type": "string", "description": "Filter by workstream (e.g. git branch name)" }
                 },
                 "required": ["query"]
             }
@@ -957,6 +959,7 @@ async fn tool_corvia_context(
     let scope_id = resolve_scope_id(args, state)?;
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
     let expand_graph = args.get("expand_graph").and_then(|v| v.as_bool()).unwrap_or(true);
+    let workstream = args.get("workstream").and_then(|v| v.as_str()).map(String::from);
 
     let rag = state.rag.as_ref()
         .ok_or((SERVICE_UNAVAILABLE, "RAG pipeline not configured".into()))?;
@@ -964,6 +967,7 @@ async fn tool_corvia_context(
     let opts = corvia_kernel::rag_types::RetrievalOpts {
         limit,
         expand_graph,
+        workstream,
         ..Default::default()
     };
 
@@ -1000,6 +1004,7 @@ async fn tool_corvia_ask(
     let scope_id = resolve_scope_id(args, state)?;
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
     let expand_graph = args.get("expand_graph").and_then(|v| v.as_bool()).unwrap_or(true);
+    let workstream = args.get("workstream").and_then(|v| v.as_str()).map(String::from);
 
     let rag = state.rag.as_ref()
         .ok_or((SERVICE_UNAVAILABLE, "RAG pipeline not configured".into()))?;
@@ -1007,6 +1012,7 @@ async fn tool_corvia_ask(
     let opts = corvia_kernel::rag_types::RetrievalOpts {
         limit,
         expand_graph,
+        workstream,
         ..Default::default()
     };
 
