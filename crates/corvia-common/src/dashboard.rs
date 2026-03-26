@@ -504,4 +504,72 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"gpus\":[]"));
     }
+
+    #[test]
+    fn test_gpu_status_response_without_inference_health() {
+        let resp = GpuStatusResponse {
+            gpus: vec![],
+            inference_backend: Default::default(),
+            inference_health: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("inference_health"), "inference_health should be absent when None");
+    }
+
+    #[test]
+    fn test_gpu_status_response_with_inference_health() {
+        let resp = GpuStatusResponse {
+            gpus: vec![],
+            inference_backend: Default::default(),
+            inference_health: Some(InferenceHealthStatus {
+                status: InferenceProbeStatus::Healthy,
+                ep_name: "cuda".to_string(),
+                ep_requested: "gpu".to_string(),
+                fallback_used: false,
+                baseline_us: 12000,
+                last_probe_us: 13000,
+                drift_pct: 8.3,
+                models_loaded: 1,
+                last_probe_at: Some("2026-03-26T12:00:00Z".to_string()),
+            }),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"inference_health\""));
+        assert!(json.contains("\"healthy\""));
+    }
+
+    #[test]
+    fn test_probe_status_serialization() {
+        assert_eq!(serde_json::to_string(&InferenceProbeStatus::Pending).unwrap(), "\"pending\"");
+        assert_eq!(serde_json::to_string(&InferenceProbeStatus::Healthy).unwrap(), "\"healthy\"");
+        assert_eq!(serde_json::to_string(&InferenceProbeStatus::Degraded).unwrap(), "\"degraded\"");
+        assert_eq!(serde_json::to_string(&InferenceProbeStatus::Failed).unwrap(), "\"failed\"");
+        assert_eq!(serde_json::to_string(&InferenceProbeStatus::Unreachable).unwrap(), "\"unreachable\"");
+    }
+
+    #[test]
+    fn test_gpu_info_new_fields_absent_when_none() {
+        let gpu = GpuInfo {
+            index: 0,
+            name: "Test GPU".to_string(),
+            vendor: "nvidia".to_string(),
+            utilization_pct: Some(50),
+            memory_used_mb: None,
+            memory_total_mb: None,
+            temperature_c: None,
+            power_draw_w: None,
+            power_limit_w: None,
+            processes: None,
+            render_busy_pct: None,
+            video_busy_pct: None,
+            frequency_mhz: None,
+            frequency_max_mhz: None,
+        };
+        let json = serde_json::to_string(&gpu).unwrap();
+        assert!(!json.contains("power_draw_w"));
+        assert!(!json.contains("processes"));
+        assert!(!json.contains("render_busy_pct"));
+        assert!(!json.contains("video_busy_pct"));
+        assert!(json.contains("utilization_pct")); // present because it's Some
+    }
 }
