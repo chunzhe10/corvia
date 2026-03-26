@@ -8,6 +8,9 @@ use std::time::Duration;
 /// Timeout for nvidia-smi commands.
 const NVIDIA_SMI_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Timeout for intel_gpu_top commands.
+const INTEL_GPU_TOP_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Run a command with a timeout. Returns None if the command fails or times out.
 fn run_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Option<String> {
     let mut child = std::process::Command::new(cmd)
@@ -174,6 +177,103 @@ pub fn detect_nvidia_processes() -> Vec<GpuProcess> {
     parse_nvidia_processes(&stdout)
 }
 
+/// Parse JSON output from `intel_gpu_top -J`.
+///
+/// `intel_gpu_top -J` outputs newline-delimited JSON objects (one per sample).
+/// Extracts `Render/3D/0` busy % and `Video/0` busy % from the first JSON frame.
+fn parse_intel_gpu_top(output: &str) -> (Option<u32>, Option<u32>) {
+    let first_line = output.lines().find(|l| l.starts_with('{')).unwrap_or("");
+    let obj: serde_json::Value = match serde_json::from_str(first_line) {
+        Ok(v) => v,
+        Err(_) => return (None, None),
+    };
+    let engines = match obj.get("engines") {
+        Some(e) => e,
+        None => return (None, None),
+    };
+    let render = engines
+        .get("Render/3D/0")
+        .and_then(|e| e.get("busy"))
+        .and_then(|v| v.as_f64())
+        .map(|v| v as u32);
+    let video = engines
+        .get("Video/0")
+        .and_then(|e| e.get("busy"))
+        .and_then(|v| v.as_f64())
+        .map(|v| v as u32);
+    (render, video)
+}
+
+/// Detect Intel GPU utilization by spawning `intel_gpu_top -J -s 500`.
+///
+/// This command runs forever, so we read the first JSON frame from stdout
+/// and then SIGKILL the child process. Returns `(render_busy_pct, video_busy_pct)`.
+/// Falls back to `(None, None)` on ENOENT, EPERM, timeout, or parse error.
+fn detect_intel_gpu_utilization() -> (Option<u32>, Option<u32>) {
+    // Check if intel_gpu_top is available
+    let which = std::process::Command::new("which")
+        .arg("intel_gpu_top")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match which {
+        Ok(s) if s.success() => {}
+        _ => return (None, None),
+    }
+
+    // Spawn intel_gpu_top — it runs forever, outputting JSON frames
+    let mut child = match std::process::Command::new("intel_gpu_top")
+        .args(["-J", "-s", "500"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!("failed to spawn intel_gpu_top: {e}");
+            return (None, None);
+        }
+    };
+
+    // Read stdout line-by-line until we get a JSON frame or timeout
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let reader = std::io::BufReader::new(stdout);
+    let start = std::time::Instant::now();
+    let mut collected = String::new();
+
+    use std::io::BufRead;
+    for line in reader.lines() {
+        if start.elapsed() >= INTEL_GPU_TOP_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            return (None, None);
+        }
+        match line {
+            Ok(l) => {
+                collected.push_str(&l);
+                collected.push('\n');
+                // Once we have a line starting with '{', we have our first frame
+                if l.starts_with('{') {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return parse_intel_gpu_top(&collected);
+                }
+            }
+            Err(e) => {
+                tracing::debug!("error reading intel_gpu_top stdout: {e}");
+                let _ = child.kill();
+                let _ = child.wait();
+                return (None, None);
+            }
+        }
+    }
+
+    // Shouldn't reach here (intel_gpu_top runs forever), but just in case
+    let _ = child.kill();
+    let _ = child.wait();
+    (None, None)
+}
+
 /// Detect Intel integrated GPUs via sysfs (`/sys/class/drm/card*/device/vendor`).
 ///
 /// Intel vendor ID is `0x8086`. Reads `gt_act_freq_mhz` and `gt_max_freq_mhz`
@@ -246,6 +346,13 @@ pub fn detect_intel_gpus() -> Vec<GpuInfo> {
         });
 
         intel_index += 1;
+    }
+
+    // Enrich the first Intel GPU with utilization data from intel_gpu_top
+    if !gpus.is_empty() {
+        let (render, video) = detect_intel_gpu_utilization();
+        gpus[0].render_busy_pct = render;
+        gpus[0].video_busy_pct = video;
     }
 
     gpus
@@ -493,6 +600,37 @@ mod tests {
     #[test]
     fn test_parse_nvidia_processes_empty() {
         assert!(parse_nvidia_processes("").is_empty());
+    }
+
+    #[test]
+    fn test_parse_intel_gpu_top_json() {
+        let json = r#"{"period":{"duration":0.500},"engines":{"Render/3D/0":{"busy":45.2},"Video/0":{"busy":12.8}}}"#;
+        let (render, video) = parse_intel_gpu_top(json);
+        assert_eq!(render, Some(45));
+        assert_eq!(video, Some(12));
+    }
+
+    #[test]
+    fn test_parse_intel_gpu_top_invalid_json() {
+        let (render, video) = parse_intel_gpu_top("not json");
+        assert_eq!(render, None);
+        assert_eq!(video, None);
+    }
+
+    #[test]
+    fn test_parse_intel_gpu_top_missing_engines() {
+        let json = r#"{"period":{"duration":0.500}}"#;
+        let (render, video) = parse_intel_gpu_top(json);
+        assert_eq!(render, None);
+        assert_eq!(video, None);
+    }
+
+    #[test]
+    fn test_parse_intel_gpu_top_multiline() {
+        let output = "some header\n{\"period\":{\"duration\":0.500},\"engines\":{\"Render/3D/0\":{\"busy\":30.0},\"Video/0\":{\"busy\":5.0}}}\n{\"period\":{\"duration\":0.500},\"engines\":{\"Render/3D/0\":{\"busy\":40.0}}}";
+        let (render, video) = parse_intel_gpu_top(output);
+        assert_eq!(render, Some(30)); // first JSON frame only
+        assert_eq!(video, Some(5));
     }
 
     #[test]
