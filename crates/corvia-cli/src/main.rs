@@ -643,6 +643,7 @@ async fn cmd_serve() -> Result<()> {
         coverage_cache,
         workspace_root,
         ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
+        gpu_cache: Arc::new(tokio::sync::Mutex::new(corvia_server::dashboard::gpu::GpuMetricsCache::new())),
     });
     // Initial coverage cache population + background refresh
     {

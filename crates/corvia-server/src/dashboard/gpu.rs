@@ -3,7 +3,40 @@
 use corvia_common::dashboard::{GpuInfo, GpuProcess, GpuStatusResponse, InferenceBackendInfo};
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+// ---------------------------------------------------------------------------
+// GPU metrics cache with stampede protection
+// ---------------------------------------------------------------------------
+
+/// Cached GPU status with a 5-second TTL and stampede protection.
+///
+/// Multiple concurrent dashboard requests will not each shell out to nvidia-smi;
+/// only the first request after the TTL expires will refresh while others return
+/// the stale cached result.
+pub struct GpuMetricsCache {
+    pub last_result: GpuStatusResponse,
+    pub last_fetched: Instant,
+    pub refreshing: bool,
+}
+
+impl GpuMetricsCache {
+    pub fn new() -> Self {
+        Self {
+            last_result: GpuStatusResponse {
+                gpus: vec![],
+                inference_backend: HashMap::new(),
+                inference_health: None,
+            },
+            last_fetched: Instant::now() - Duration::from_secs(60), // start stale
+            refreshing: false,
+        }
+    }
+
+    pub fn is_stale(&self) -> bool {
+        self.last_fetched.elapsed() > Duration::from_secs(5)
+    }
+}
 
 /// Timeout for nvidia-smi commands.
 const NVIDIA_SMI_TIMEOUT: Duration = Duration::from_secs(3);

@@ -65,6 +65,8 @@ pub struct AppState {
     pub workspace_root: std::path::PathBuf,
     /// Server-side ingestion status (for polling via GET /v1/ingest/status).
     pub ingest_status: Arc<std::sync::RwLock<corvia_kernel::ingest::IngestStatus>>,
+    /// Cached GPU metrics with 5s TTL and stampede protection.
+    pub gpu_cache: Arc<tokio::sync::Mutex<crate::dashboard::gpu::GpuMetricsCache>>,
 }
 
 // --- Existing memory types ---
@@ -1433,6 +1435,7 @@ mod tests {
             ),
             workspace_root: dir.to_path_buf(),
             ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
+            gpu_cache: Arc::new(tokio::sync::Mutex::new(crate::dashboard::gpu::GpuMetricsCache::new())),
         })
     }
 
@@ -1496,6 +1499,7 @@ mod tests {
             ),
             workspace_root: dir.to_path_buf(),
             ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
+            gpu_cache: Arc::new(tokio::sync::Mutex::new(crate::dashboard::gpu::GpuMetricsCache::new())),
         })
     }
 
