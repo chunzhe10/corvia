@@ -224,6 +224,8 @@ fn default_data_dir() -> String {
 fn default_device() -> String { "auto".into() }
 fn default_kv_quant() -> String { "q8".into() }
 fn default_flash_attention() -> bool { true }
+fn default_health_probe_interval_secs() -> u64 { 60 }
+fn default_health_probe_drift_threshold_pct() -> f64 { 100.0 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatModelDef {
@@ -283,6 +285,12 @@ pub struct InferenceConfig {
     /// Chat model registry: short name → HF repo + GGUF filename.
     #[serde(default = "default_chat_models")]
     pub chat_models: std::collections::HashMap<String, ChatModelDef>,
+    /// Interval in seconds between inference health probes.
+    #[serde(default = "default_health_probe_interval_secs")]
+    pub health_probe_interval_secs: u64,
+    /// Drift threshold percentage before marking inference as degraded.
+    #[serde(default = "default_health_probe_drift_threshold_pct")]
+    pub health_probe_drift_threshold_pct: f64,
 }
 
 impl Default for InferenceConfig {
@@ -294,6 +302,8 @@ impl Default for InferenceConfig {
             kv_quant: default_kv_quant(),
             flash_attention: default_flash_attention(),
             chat_models: default_chat_models(),
+            health_probe_interval_secs: default_health_probe_interval_secs(),
+            health_probe_drift_threshold_pct: default_health_probe_drift_threshold_pct(),
         }
     }
 }

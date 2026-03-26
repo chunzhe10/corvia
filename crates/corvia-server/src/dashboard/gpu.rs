@@ -46,6 +46,11 @@ pub fn detect_nvidia_gpus() -> Vec<GpuInfo> {
             memory_used_mb,
             memory_total_mb,
             temperature_c,
+            power_draw_w: None,
+            power_limit_w: None,
+            processes: None,
+            render_busy_pct: None,
+            video_busy_pct: None,
             frequency_mhz: None,
             frequency_max_mhz: None,
         });
@@ -116,6 +121,11 @@ pub fn detect_intel_gpus() -> Vec<GpuInfo> {
             memory_used_mb: None,
             memory_total_mb: None,
             temperature_c: None,
+            power_draw_w: None,
+            power_limit_w: None,
+            processes: None,
+            render_busy_pct: None,
+            video_busy_pct: None,
             frequency_mhz: freq_mhz,
             frequency_max_mhz: freq_max_mhz,
         });
@@ -220,6 +230,7 @@ pub fn collect_gpu_status(
     GpuStatusResponse {
         gpus,
         inference_backend,
+        inference_health: None,
     }
 }
 
