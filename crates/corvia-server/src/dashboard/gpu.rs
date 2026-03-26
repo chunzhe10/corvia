@@ -1,31 +1,56 @@
 //! GPU utilization detection — NVIDIA via `nvidia-smi`, Intel via sysfs.
 
-use corvia_common::dashboard::{GpuInfo, GpuStatusResponse, InferenceBackendInfo};
+use corvia_common::dashboard::{GpuInfo, GpuProcess, GpuStatusResponse, InferenceBackendInfo};
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
-/// Detect all NVIDIA GPUs by shelling out to `nvidia-smi`.
+/// Timeout for nvidia-smi commands.
+const NVIDIA_SMI_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Run a command with a timeout. Returns None if the command fails or times out.
+fn run_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    let mut child = std::process::Command::new(cmd)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    let output = child.wait_with_output().ok()?;
+                    return Some(String::from_utf8_lossy(&output.stdout).to_string());
+                }
+                return None;
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Parse nvidia-smi CSV output into `Vec<GpuInfo>`.
 ///
-/// Returns an empty vec if `nvidia-smi` is not available or fails.
-/// Uses synchronous `std::process::Command` to avoid complex async futures
-/// that conflict with the dual axum 0.7/0.8 dependency graph.
-pub fn detect_nvidia_gpus() -> Vec<GpuInfo> {
-    let output = std::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu",
-            "--format=csv,noheader,nounits",
-        ])
-        .output();
-
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
+/// Accepts 6-field rows (without power) or 8-field rows (with power.draw and power.limit).
+pub fn parse_nvidia_csv(output: &str) -> Vec<GpuInfo> {
     let mut gpus = Vec::new();
 
-    for line in stdout.lines() {
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
         let fields: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
         if fields.len() < 6 {
             continue;
@@ -38,6 +63,12 @@ pub fn detect_nvidia_gpus() -> Vec<GpuInfo> {
         let memory_total_mb = fields[4].parse::<u64>().ok();
         let temperature_c = fields[5].parse::<u32>().ok();
 
+        let (power_draw_w, power_limit_w) = if fields.len() >= 8 {
+            (fields[6].parse::<f64>().ok(), fields[7].parse::<f64>().ok())
+        } else {
+            (None, None)
+        };
+
         gpus.push(GpuInfo {
             index,
             name,
@@ -46,8 +77,8 @@ pub fn detect_nvidia_gpus() -> Vec<GpuInfo> {
             memory_used_mb,
             memory_total_mb,
             temperature_c,
-            power_draw_w: None,
-            power_limit_w: None,
+            power_draw_w,
+            power_limit_w,
             processes: None,
             render_busy_pct: None,
             video_busy_pct: None,
@@ -57,6 +88,90 @@ pub fn detect_nvidia_gpus() -> Vec<GpuInfo> {
     }
 
     gpus
+}
+
+/// Parse nvidia-smi compute-apps CSV output into `Vec<GpuProcess>`.
+pub fn parse_nvidia_processes(output: &str) -> Vec<GpuProcess> {
+    let mut procs = Vec::new();
+
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+        if fields.len() < 3 {
+            continue;
+        }
+
+        let pid = match fields[0].parse::<u32>() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let name = fields[1].to_string();
+        let memory_used_mb = fields[2].parse::<u64>().unwrap_or(0);
+
+        procs.push(GpuProcess {
+            pid,
+            name,
+            memory_used_mb,
+        });
+    }
+
+    procs
+}
+
+/// Detect all NVIDIA GPUs by shelling out to `nvidia-smi`.
+///
+/// Returns an empty vec if `nvidia-smi` is not available, fails, or times out (3s).
+/// Includes power draw/limit fields when available. Also queries running GPU
+/// processes and attaches them to the detected GPUs.
+///
+/// Uses synchronous `std::process::Command` to avoid complex async futures
+/// that conflict with the dual axum 0.7/0.8 dependency graph.
+pub fn detect_nvidia_gpus() -> Vec<GpuInfo> {
+    let stdout = match run_with_timeout(
+        "nvidia-smi",
+        &[
+            "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit",
+            "--format=csv,noheader,nounits",
+        ],
+        NVIDIA_SMI_TIMEOUT,
+    ) {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+
+    let mut gpus = parse_nvidia_csv(&stdout);
+
+    // Query GPU processes and attach to GPUs
+    let procs = detect_nvidia_processes();
+    if !procs.is_empty() && !gpus.is_empty() {
+        // Attach all processes to the first GPU for simplicity.
+        // A more precise mapping would use --query-compute-apps=gpu_uuid.
+        gpus[0].processes = Some(procs);
+    }
+
+    gpus
+}
+
+/// Query running GPU compute processes via `nvidia-smi`.
+///
+/// Returns an empty vec if the command fails or times out (3s).
+pub fn detect_nvidia_processes() -> Vec<GpuProcess> {
+    let stdout = match run_with_timeout(
+        "nvidia-smi",
+        &[
+            "--query-compute-apps=pid,name,used_memory",
+            "--format=csv,noheader,nounits",
+        ],
+        NVIDIA_SMI_TIMEOUT,
+    ) {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+
+    parse_nvidia_processes(&stdout)
 }
 
 /// Detect Intel integrated GPUs via sysfs (`/sys/class/drm/card*/device/vendor`).
@@ -345,5 +460,47 @@ mod tests {
     fn test_read_sysfs_helpers_missing_path() {
         assert!(read_sysfs_string(Path::new("/nonexistent/path")).is_none());
         assert!(read_sysfs_u64(Path::new("/nonexistent/path")).is_none());
+    }
+
+    #[test]
+    fn test_parse_nvidia_csv_with_power() {
+        let csv = "0, NVIDIA GeForce RTX 3090, 45, 2048, 24576, 65, 120.50, 350.00\n";
+        let gpus = parse_nvidia_csv(csv);
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].power_draw_w, Some(120.5));
+        assert_eq!(gpus[0].power_limit_w, Some(350.0));
+        assert_eq!(gpus[0].utilization_pct, Some(45));
+    }
+
+    #[test]
+    fn test_parse_nvidia_csv_missing_power() {
+        let csv = "0, NVIDIA GTX 1080, 30, 1024, 8192, 55\n";
+        let gpus = parse_nvidia_csv(csv);
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].power_draw_w, None);
+    }
+
+    #[test]
+    fn test_parse_nvidia_processes() {
+        let csv = "12345, python3, 1024\n67890, corvia-inference, 2048\n";
+        let procs = parse_nvidia_processes(csv);
+        assert_eq!(procs.len(), 2);
+        assert_eq!(procs[0].pid, 12345);
+        assert_eq!(procs[0].name, "python3");
+        assert_eq!(procs[0].memory_used_mb, 1024);
+    }
+
+    #[test]
+    fn test_parse_nvidia_processes_empty() {
+        assert!(parse_nvidia_processes("").is_empty());
+    }
+
+    #[test]
+    fn test_parse_nvidia_csv_multi_gpu() {
+        let csv = "0, GPU A, 45, 2048, 24576, 65, 120.50, 350.00\n1, GPU B, 80, 16384, 40960, 72, 250.00, 400.00\n";
+        let gpus = parse_nvidia_csv(csv);
+        assert_eq!(gpus.len(), 2);
+        assert_eq!(gpus[1].name, "GPU B");
+        assert_eq!(gpus[1].power_draw_w, Some(250.0));
     }
 }
