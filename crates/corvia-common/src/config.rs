@@ -105,6 +105,50 @@ impl HooksConfig {
     }
 }
 
+fn default_stale_threshold() -> f64 { 0.9 }
+fn default_coverage_ttl() -> u64 { 60 }
+const MIN_COVERAGE_TTL: u64 = 5;
+
+/// Dashboard configuration for index coverage monitoring.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DashboardSection {
+    /// Coverage below this ratio triggers `index_stale: true`. Range: 0.0..=1.0.
+    #[serde(default = "default_stale_threshold")]
+    pub stale_threshold: f64,
+    /// TTL in seconds for cached coverage computation. Minimum: 5.
+    #[serde(default = "default_coverage_ttl")]
+    pub coverage_ttl_secs: u64,
+}
+
+impl Default for DashboardSection {
+    fn default() -> Self {
+        Self {
+            stale_threshold: 0.9,
+            coverage_ttl_secs: 60,
+        }
+    }
+}
+
+impl DashboardSection {
+    /// Validate and clamp values. Call after deserialization.
+    pub fn validate(&mut self) -> Result<()> {
+        if !(0.0..=1.0).contains(&self.stale_threshold) {
+            return Err(CorviaError::Config(format!(
+                "dashboard.stale_threshold must be 0.0..=1.0, got {}",
+                self.stale_threshold
+            )));
+        }
+        if self.coverage_ttl_secs < MIN_COVERAGE_TTL {
+            eprintln!(
+                "Warning: dashboard.coverage_ttl_secs={} below minimum {}, clamping",
+                self.coverage_ttl_secs, MIN_COVERAGE_TTL
+            );
+            self.coverage_ttl_secs = MIN_COVERAGE_TTL;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkspaceConfig {
     #[serde(default = "default_repos_dir")]
@@ -154,6 +198,8 @@ pub struct CorviaConfig {
     pub scope: Option<Vec<ScopeConfig>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<HooksConfig>,
+    #[serde(default)]
+    pub dashboard: DashboardSection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -537,6 +583,7 @@ impl Default for CorviaConfig {
             sources: None,
             scope: None,
             hooks: None,
+            dashboard: DashboardSection::default(),
         }
     }
 }
@@ -1243,5 +1290,43 @@ port = 8020
         let toml_str = toml::to_string_pretty(&ws_config).unwrap();
         let loaded: CorviaConfig = toml::from_str(&toml_str).unwrap();
         assert!(loaded.workspace.unwrap().docs.is_none());
+    }
+
+    #[test]
+    fn test_dashboard_defaults() {
+        let config = CorviaConfig::default();
+        assert_eq!(config.dashboard.stale_threshold, 0.9);
+        assert_eq!(config.dashboard.coverage_ttl_secs, 60);
+    }
+
+    #[test]
+    fn test_dashboard_partial_override() {
+        // Serialize default, modify dashboard section, deserialize
+        let config = CorviaConfig::default();
+        let mut toml_str = toml::to_string_pretty(&config).unwrap();
+        // Replace the default threshold in the serialized TOML
+        toml_str = toml_str.replace("stale_threshold = 0.9", "stale_threshold = 0.5");
+        let loaded: CorviaConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(loaded.dashboard.stale_threshold, 0.5);
+        assert_eq!(loaded.dashboard.coverage_ttl_secs, 60);
+    }
+
+    #[test]
+    fn test_dashboard_threshold_out_of_range_high() {
+        let mut section = DashboardSection { stale_threshold: 1.5, coverage_ttl_secs: 60 };
+        assert!(section.validate().is_err());
+    }
+
+    #[test]
+    fn test_dashboard_threshold_out_of_range_negative() {
+        let mut section = DashboardSection { stale_threshold: -0.1, coverage_ttl_secs: 60 };
+        assert!(section.validate().is_err());
+    }
+
+    #[test]
+    fn test_dashboard_ttl_below_minimum() {
+        let mut section = DashboardSection { stale_threshold: 0.9, coverage_ttl_secs: 1 };
+        section.validate().unwrap();
+        assert_eq!(section.coverage_ttl_secs, 5);
     }
 }

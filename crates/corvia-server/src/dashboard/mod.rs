@@ -2,6 +2,7 @@
 
 pub mod activity;
 pub mod clustering;
+pub mod coverage;
 pub mod gpu;
 pub mod health;
 pub mod session_watcher;
@@ -82,6 +83,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/dashboard/sessions/hook/stream", get(hook_sessions_stream))
         .route("/api/dashboard/traces/recent", get(recent_traces_handler))
         .route("/api/dashboard/gpu", get(gpu_status_handler))
+        .route("/api/dashboard/status/refresh-coverage", post(refresh_coverage_handler))
         .with_state(state)
 }
 
@@ -153,6 +155,9 @@ async fn status_handler(
         Some(traces_data)
     };
 
+    // Index coverage (sync read from cache — refreshed at startup and via refresh endpoint)
+    let cov = state.coverage_cache.get_cached();
+
     Json(DashboardStatusResponse {
         services,
         entry_count,
@@ -161,7 +166,39 @@ async fn status_handler(
         session_count,
         config,
         traces,
+        index_coverage: cov.coverage,
+        index_stale: cov.stale,
+        index_disk_count: cov.disk_count,
+        index_store_count: cov.store_count,
+        index_hnsw_count: cov.hnsw_count,
+        index_stale_threshold: cov.threshold,
+        index_coverage_checked_at: cov.checked_at,
     })
+}
+
+/// POST /api/dashboard/status/refresh-coverage
+/// Force-recompute coverage and return fresh snapshot.
+async fn refresh_coverage_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let scope_id = state
+        .default_scope_id
+        .as_deref()
+        .unwrap_or(DEFAULT_SCOPE_ID);
+
+    let snapshot = state.coverage_cache
+        .refresh(&state.data_dir, scope_id, &*state.store)
+        .await;
+
+    Json(serde_json::json!({
+        "index_coverage": snapshot.coverage,
+        "index_stale": snapshot.stale,
+        "index_disk_count": snapshot.disk_count,
+        "index_store_count": snapshot.store_count,
+        "index_hnsw_count": snapshot.hnsw_count,
+        "index_stale_threshold": snapshot.threshold,
+        "index_coverage_checked_at": snapshot.checked_at,
+    }))
 }
 
 /// GET /api/dashboard/traces
@@ -1474,6 +1511,9 @@ mod tests {
             gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
             session_ingest_lock: tokio::sync::Mutex::new(()),
             hook_sessions: super::session_watcher::SessionWatcherState::new().0,
+            coverage_cache: Arc::new(
+                super::coverage::IndexCoverageCache::new(0.9, 60),
+            ),
         })
     }
 
@@ -1515,6 +1555,50 @@ mod tests {
         assert_eq!(json["entry_count"], 0);
         assert_eq!(json["agent_count"], 0);
         assert_eq!(json["merge_queue_depth"], 0);
+
+        // Verify coverage fields are present
+        assert!(json.get("index_coverage").is_some(), "missing index_coverage");
+        assert!(json.get("index_stale").is_some(), "missing index_stale");
+        assert!(json.get("index_disk_count").is_some(), "missing index_disk_count");
+        assert!(json.get("index_store_count").is_some(), "missing index_store_count");
+        assert!(json.get("index_hnsw_count").is_some(), "missing index_hnsw_count");
+        assert!(json.get("index_stale_threshold").is_some(), "missing index_stale_threshold");
+
+        // Fresh workspace: coverage is null, counts are 0
+        assert!(json["index_coverage"].is_null());
+        assert!(json["index_stale"].is_null());
+        assert_eq!(json["index_disk_count"], 0);
+        assert_eq!(json["index_store_count"], 0);
+        assert_eq!(json["index_hnsw_count"], 0);
+        assert_eq!(json["index_stale_threshold"], 0.9);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_coverage_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        let app = router(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/dashboard/status/refresh-coverage")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(json.get("index_coverage").is_some(), "refresh should return coverage");
+        assert!(json.get("index_coverage_checked_at").is_some(), "refresh should return checked_at");
+        // Fresh workspace: verify exact values
+        assert!(json["index_coverage"].is_null());
+        assert!(json["index_stale"].is_null());
+        assert_eq!(json["index_disk_count"], 0);
+        assert_eq!(json["index_store_count"], 0);
+        assert_eq!(json["index_hnsw_count"], 0);
+        assert_eq!(json["index_stale_threshold"], 0.9);
     }
 
     #[tokio::test]

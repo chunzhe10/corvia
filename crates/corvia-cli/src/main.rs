@@ -621,6 +621,12 @@ async fn cmd_serve() -> Result<()> {
     let config_path = CorviaConfig::config_path();
     let cluster_store = Arc::new(corvia_server::dashboard::clustering::ClusterStore::new());
     let (hook_sessions, _hook_rx) = corvia_server::dashboard::session_watcher::SessionWatcherState::new();
+    let coverage_cache = Arc::new(
+        corvia_server::dashboard::coverage::IndexCoverageCache::new(
+            config.dashboard.stale_threshold,
+            config.dashboard.coverage_ttl_secs,
+        ),
+    );
     let state = Arc::new(corvia_server::rest::AppState {
         store, engine, coordinator, graph, temporal, data_dir,
         rag: Some(rag), ready: ready.clone(), default_scope_id,
@@ -630,7 +636,26 @@ async fn cmd_serve() -> Result<()> {
         gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
         session_ingest_lock: tokio::sync::Mutex::new(()),
         hook_sessions: hook_sessions.clone(),
+        coverage_cache,
     });
+    // Initial coverage cache population + background refresh
+    {
+        let cache = state.coverage_cache.clone();
+        let store_bg = state.store.clone();
+        let data_dir_bg = state.data_dir.clone();
+        let scope_id_bg = config.project.scope_id.clone();
+        let ttl_secs = config.dashboard.coverage_ttl_secs;
+        tokio::spawn(async move {
+            // Initial population
+            cache.refresh(&data_dir_bg, &scope_id_bg, &*store_bg).await;
+            // Periodic refresh
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(ttl_secs)).await;
+                cache.refresh(&data_dir_bg, &scope_id_bg, &*store_bg).await;
+            }
+        });
+    }
+
     // Background cluster recompute every 60s
     {
         let cluster_store_bg = state.cluster_store.clone();
@@ -2131,7 +2156,9 @@ fn load_config() -> Result<CorviaConfig> {
     if !path.exists() {
         anyhow::bail!("No corvia.toml found. Run 'corvia init' first.");
     }
-    Ok(CorviaConfig::load(&path)?)
+    let mut config = CorviaConfig::load(&path)?;
+    config.dashboard.validate()?;
+    Ok(config)
 }
 
 fn connect_engine(config: &CorviaConfig) -> Arc<dyn InferenceEngine> {

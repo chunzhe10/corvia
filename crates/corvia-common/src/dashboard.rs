@@ -76,6 +76,21 @@ pub struct DashboardStatusResponse {
     pub config: DashboardConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub traces: Option<TracesData>,
+    /// Coverage ratio: HNSW entries / knowledge files on disk (0.0-1.0).
+    /// null when disk_count == 0 (fresh workspace).
+    pub index_coverage: Option<f64>,
+    /// true when coverage < threshold. null when coverage is null.
+    pub index_stale: Option<bool>,
+    /// Knowledge JSON files on disk for the default scope.
+    pub index_disk_count: u64,
+    /// Entries in Redb SCOPE_INDEX for the default scope.
+    pub index_store_count: u64,
+    /// Entries in Redb HNSW_TO_UUID table.
+    pub index_hnsw_count: u64,
+    /// Configured staleness threshold (0.0-1.0).
+    pub index_stale_threshold: f64,
+    /// ISO 8601 timestamp of last coverage computation.
+    pub index_coverage_checked_at: Option<String>,
 }
 
 /// A single structured log entry
@@ -353,9 +368,19 @@ mod tests {
                 workspace: "test".to_string(),
             },
             traces: None,
+            index_coverage: None,
+            index_stale: None,
+            index_disk_count: 0,
+            index_store_count: 0,
+            index_hnsw_count: 0,
+            index_stale_threshold: 0.9,
+            index_coverage_checked_at: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("traces"));
+        // Coverage fields should be present as null
+        assert!(json.contains("\"index_coverage\":null"));
+        assert!(json.contains("\"index_stale\":null"));
     }
 
     #[test]

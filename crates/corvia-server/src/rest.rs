@@ -59,6 +59,8 @@ pub struct AppState {
     pub session_ingest_lock: tokio::sync::Mutex<()>,
     /// Hook-observed Claude sessions (JSONL file watcher state).
     pub hook_sessions: std::sync::Arc<crate::dashboard::session_watcher::SessionWatcherState>,
+    /// Cached index coverage metrics (TTL-based, brief lock on cache read).
+    pub coverage_cache: Arc<crate::dashboard::coverage::IndexCoverageCache>,
 }
 
 // --- Existing memory types ---
@@ -1284,6 +1286,9 @@ mod tests {
             gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
             session_ingest_lock: tokio::sync::Mutex::new(()),
             hook_sessions: crate::dashboard::session_watcher::SessionWatcherState::new().0,
+            coverage_cache: Arc::new(
+                crate::dashboard::coverage::IndexCoverageCache::new(0.9, 60),
+            ),
         })
     }
 
@@ -1342,6 +1347,9 @@ mod tests {
             gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
             session_ingest_lock: tokio::sync::Mutex::new(()),
             hook_sessions: crate::dashboard::session_watcher::SessionWatcherState::new().0,
+            coverage_cache: Arc::new(
+                crate::dashboard::coverage::IndexCoverageCache::new(0.9, 60),
+            ),
         })
     }
 
