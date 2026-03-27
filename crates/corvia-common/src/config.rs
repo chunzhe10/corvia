@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use crate::errors::{CorviaError, Result};
+use crate::types::MemoryType;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -196,6 +198,8 @@ pub struct CorviaConfig {
     pub sources: Option<Vec<SourceConfig>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<Vec<ScopeConfig>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forgetting: Option<ForgettingConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<HooksConfig>,
     #[serde(default)]
@@ -549,6 +553,181 @@ pub struct SourceConfig {
     pub adapter_config: Option<toml::Value>,
 }
 
+// ── Forgetting policy configuration ─────────────────────────────────────────
+
+fn default_interval_minutes() -> u32 { 60 }
+fn default_max_inactive_days() -> u32 { 90 }
+fn default_budget_top_n() -> u32 { 10_000 }
+
+/// Global defaults for forgetting policies.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ForgettingPolicyConfig {
+    /// Force entry to Cold if inactive longer than this AND retention_score < 0.60.
+    /// Must be > 0.
+    #[serde(default = "default_max_inactive_days")]
+    pub max_inactive_days: u32,
+    /// Per-scope cap on active entries (Hot + Warm). 0 = no limit.
+    /// Pinned entries excluded from count.
+    #[serde(default = "default_budget_top_n")]
+    pub budget_top_n: u32,
+}
+
+impl Default for ForgettingPolicyConfig {
+    fn default() -> Self {
+        Self {
+            max_inactive_days: default_max_inactive_days(),
+            budget_top_n: default_budget_top_n(),
+        }
+    }
+}
+
+/// Per-memory-type override. All fields optional — `None` inherits from global defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PerTypeForgettingConfig {
+    /// Override enabled/disabled for this memory type. `None` = inherit global.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Override max inactive days. `None` = inherit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inactive_days: Option<u32>,
+    /// Override budget cap. `None` = inherit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_top_n: Option<u32>,
+}
+
+/// Per-scope forgetting override. Same shape as per-type — all fields optional.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ScopeForgettingOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inactive_days: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_top_n: Option<u32>,
+}
+
+/// Top-level `[forgetting]` section in corvia.toml.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ForgettingConfig {
+    /// Master switch. When false, all forgetting is disabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How often the GC worker runs (minutes). Must be > 0.
+    #[serde(default = "default_interval_minutes")]
+    pub interval_minutes: u32,
+    /// Global default policy values.
+    #[serde(default)]
+    pub defaults: ForgettingPolicyConfig,
+    /// Per-memory-type overrides. Keys are MemoryType variants (snake_case).
+    #[serde(default)]
+    pub by_type: HashMap<MemoryType, PerTypeForgettingConfig>,
+}
+
+impl Default for ForgettingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_minutes: default_interval_minutes(),
+            defaults: ForgettingPolicyConfig::default(),
+            by_type: HashMap::new(),
+        }
+    }
+}
+
+/// Fully resolved forgetting policy for a specific (scope, memory_type) pair.
+/// All values are concrete — no `Option`s.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedPolicy {
+    pub enabled: bool,
+    pub max_inactive_days: u32,
+    pub budget_top_n: u32,
+}
+
+impl ForgettingConfig {
+    /// Merge the 3-level hierarchy: global defaults → per-type → per-scope.
+    ///
+    /// Resolution order (most specific wins per field):
+    /// 1. Start with global `defaults`
+    /// 2. If global `enabled == false`, short-circuit to disabled
+    /// 3. Layer per-type override (non-None fields replace)
+    /// 4. If per-type `enabled == Some(false)`, short-circuit to disabled
+    /// 5. Layer per-scope override (non-None fields replace)
+    /// 6. Return merged `ResolvedPolicy`
+    pub fn resolve_policy(
+        &self,
+        memory_type: MemoryType,
+        scope_override: Option<&ScopeForgettingOverride>,
+    ) -> ResolvedPolicy {
+        // Global disabled → everything off
+        if !self.enabled {
+            return ResolvedPolicy {
+                enabled: false,
+                max_inactive_days: self.defaults.max_inactive_days,
+                budget_top_n: self.defaults.budget_top_n,
+            };
+        }
+
+        let mut enabled = true;
+        let mut max_inactive_days = self.defaults.max_inactive_days;
+        let mut budget_top_n = self.defaults.budget_top_n;
+
+        // Layer 2: per-type override
+        if let Some(type_cfg) = self.by_type.get(&memory_type) {
+            if let Some(e) = type_cfg.enabled {
+                enabled = e;
+            }
+            if !enabled {
+                return ResolvedPolicy { enabled, max_inactive_days, budget_top_n };
+            }
+            if let Some(d) = type_cfg.max_inactive_days {
+                max_inactive_days = d;
+            }
+            if let Some(b) = type_cfg.budget_top_n {
+                budget_top_n = b;
+            }
+        }
+
+        // Layer 3: per-scope override (most specific)
+        if let Some(scope_cfg) = scope_override {
+            if let Some(e) = scope_cfg.enabled {
+                enabled = e;
+            }
+            if let Some(d) = scope_cfg.max_inactive_days {
+                max_inactive_days = d;
+            }
+            if let Some(b) = scope_cfg.budget_top_n {
+                budget_top_n = b;
+            }
+        }
+
+        ResolvedPolicy { enabled, max_inactive_days, budget_top_n }
+    }
+
+    /// Validate configuration values. Call after deserialization.
+    pub fn validate(&self) -> Result<()> {
+        if self.interval_minutes == 0 {
+            return Err(CorviaError::Config(
+                "forgetting.interval_minutes must be > 0".into(),
+            ));
+        }
+        if self.defaults.max_inactive_days == 0 {
+            return Err(CorviaError::Config(
+                "forgetting.defaults.max_inactive_days must be > 0".into(),
+            ));
+        }
+        for (memory_type, cfg) in &self.by_type {
+            if let Some(d) = cfg.max_inactive_days {
+                if d == 0 {
+                    return Err(CorviaError::Config(format!(
+                        "forgetting.by_type.{memory_type}.max_inactive_days must be > 0"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Per-scope configuration (e.g. `[[scope]]` in corvia.toml).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScopeConfig {
@@ -557,6 +736,9 @@ pub struct ScopeConfig {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_days: Option<u32>,
+    /// Per-scope forgetting policy overrides. Most specific layer in the hierarchy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forgetting: Option<ScopeForgettingOverride>,
 }
 
 impl Default for CorviaConfig {
@@ -592,6 +774,7 @@ impl Default for CorviaConfig {
             adapters: None,
             sources: None,
             scope: None,
+            forgetting: None,
             hooks: None,
             dashboard: DashboardSection::default(),
         }
@@ -1338,5 +1521,299 @@ port = 8020
         let mut section = DashboardSection { stale_threshold: 0.9, coverage_ttl_secs: 1 };
         section.validate().unwrap();
         assert_eq!(section.coverage_ttl_secs, 5);
+    }
+
+    // ── Forgetting policy config tests ──────────────────────────────────
+
+    #[test]
+    fn test_forgetting_defaults() {
+        let cfg = ForgettingConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.interval_minutes, 60);
+        assert_eq!(cfg.defaults.max_inactive_days, 90);
+        assert_eq!(cfg.defaults.budget_top_n, 10_000);
+        assert!(cfg.by_type.is_empty());
+    }
+
+    #[test]
+    fn test_forgetting_global_defaults_apply() {
+        let cfg = ForgettingConfig {
+            enabled: true,
+            ..ForgettingConfig::default()
+        };
+        let resolved = cfg.resolve_policy(MemoryType::Episodic, None);
+        assert!(resolved.enabled);
+        assert_eq!(resolved.max_inactive_days, 90);
+        assert_eq!(resolved.budget_top_n, 10_000);
+    }
+
+    #[test]
+    fn test_forgetting_per_type_override_wins_over_global() {
+        let mut cfg = ForgettingConfig {
+            enabled: true,
+            ..ForgettingConfig::default()
+        };
+        cfg.by_type.insert(MemoryType::Episodic, PerTypeForgettingConfig {
+            enabled: None,
+            max_inactive_days: Some(14),
+            budget_top_n: None,
+        });
+        let resolved = cfg.resolve_policy(MemoryType::Episodic, None);
+        assert!(resolved.enabled);
+        assert_eq!(resolved.max_inactive_days, 14);
+        assert_eq!(resolved.budget_top_n, 10_000); // inherited from global
+    }
+
+    #[test]
+    fn test_forgetting_per_scope_override_wins_over_per_type() {
+        let mut cfg = ForgettingConfig {
+            enabled: true,
+            ..ForgettingConfig::default()
+        };
+        cfg.by_type.insert(MemoryType::Episodic, PerTypeForgettingConfig {
+            enabled: None,
+            max_inactive_days: Some(14),
+            budget_top_n: None,
+        });
+        let scope_override = ScopeForgettingOverride {
+            enabled: None,
+            max_inactive_days: Some(3650),
+            budget_top_n: Some(0),
+        };
+        let resolved = cfg.resolve_policy(MemoryType::Episodic, Some(&scope_override));
+        assert!(resolved.enabled);
+        assert_eq!(resolved.max_inactive_days, 3650);
+        assert_eq!(resolved.budget_top_n, 0);
+    }
+
+    #[test]
+    fn test_forgetting_global_disabled_overrides_all() {
+        let mut cfg = ForgettingConfig::default(); // enabled: false
+        cfg.by_type.insert(MemoryType::Episodic, PerTypeForgettingConfig {
+            enabled: Some(true),
+            max_inactive_days: Some(14),
+            budget_top_n: None,
+        });
+        let scope_override = ScopeForgettingOverride {
+            enabled: Some(true),
+            max_inactive_days: Some(7),
+            budget_top_n: None,
+        };
+        let resolved = cfg.resolve_policy(MemoryType::Episodic, Some(&scope_override));
+        assert!(!resolved.enabled);
+    }
+
+    #[test]
+    fn test_forgetting_per_type_disabled() {
+        let mut cfg = ForgettingConfig {
+            enabled: true,
+            ..ForgettingConfig::default()
+        };
+        cfg.by_type.insert(MemoryType::Structural, PerTypeForgettingConfig {
+            enabled: Some(false),
+            max_inactive_days: None,
+            budget_top_n: None,
+        });
+        let resolved = cfg.resolve_policy(MemoryType::Structural, None);
+        assert!(!resolved.enabled);
+    }
+
+    #[test]
+    fn test_forgetting_missing_config_backward_compat() {
+        let toml_str = r#"
+[project]
+name = "test"
+scope_id = "test"
+
+[storage]
+data_dir = ".corvia"
+
+[embedding]
+model = "nomic-embed-text"
+url = "http://127.0.0.1:11434"
+dimensions = 768
+
+[server]
+host = "127.0.0.1"
+port = 8020
+"#;
+        let config: CorviaConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.forgetting.is_none());
+    }
+
+    #[test]
+    fn test_forgetting_full_toml_parse() {
+        let toml_str = r#"
+[project]
+name = "test"
+scope_id = "test"
+
+[storage]
+data_dir = ".corvia"
+
+[embedding]
+model = "nomic-embed-text"
+url = "http://127.0.0.1:11434"
+dimensions = 768
+
+[server]
+host = "127.0.0.1"
+port = 8020
+
+[forgetting]
+enabled = true
+interval_minutes = 30
+
+[forgetting.defaults]
+max_inactive_days = 90
+budget_top_n = 10000
+
+[forgetting.by_type.episodic]
+max_inactive_days = 14
+
+[forgetting.by_type.structural]
+enabled = false
+
+[forgetting.by_type.decisional]
+max_inactive_days = 365
+
+[forgetting.by_type.procedural]
+max_inactive_days = 180
+
+[[scope]]
+id = "compliance"
+description = "Compliance data"
+[scope.forgetting]
+max_inactive_days = 3650
+budget_top_n = 0
+"#;
+        let config: CorviaConfig = toml::from_str(toml_str).unwrap();
+        let fg = config.forgetting.as_ref().unwrap();
+        assert!(fg.enabled);
+        assert_eq!(fg.interval_minutes, 30);
+        assert_eq!(fg.defaults.max_inactive_days, 90);
+        assert_eq!(fg.defaults.budget_top_n, 10_000);
+
+        // Per-type checks
+        assert_eq!(fg.by_type.len(), 4);
+        let episodic = fg.by_type.get(&MemoryType::Episodic).unwrap();
+        assert_eq!(episodic.max_inactive_days, Some(14));
+        let structural = fg.by_type.get(&MemoryType::Structural).unwrap();
+        assert_eq!(structural.enabled, Some(false));
+        let decisional = fg.by_type.get(&MemoryType::Decisional).unwrap();
+        assert_eq!(decisional.max_inactive_days, Some(365));
+
+        // Per-scope check
+        let scopes = config.scope.as_ref().unwrap();
+        assert_eq!(scopes.len(), 1);
+        let scope_fg = scopes[0].forgetting.as_ref().unwrap();
+        assert_eq!(scope_fg.max_inactive_days, Some(3650));
+        assert_eq!(scope_fg.budget_top_n, Some(0));
+    }
+
+    #[test]
+    fn test_forgetting_budget_zero_means_no_limit() {
+        let cfg = ForgettingConfig {
+            enabled: true,
+            defaults: ForgettingPolicyConfig {
+                max_inactive_days: 90,
+                budget_top_n: 0,
+            },
+            ..ForgettingConfig::default()
+        };
+        let resolved = cfg.resolve_policy(MemoryType::Episodic, None);
+        assert_eq!(resolved.budget_top_n, 0);
+    }
+
+    #[test]
+    fn test_forgetting_validation_ok() {
+        let cfg = ForgettingConfig {
+            enabled: true,
+            ..ForgettingConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_forgetting_validation_interval_zero() {
+        let cfg = ForgettingConfig {
+            enabled: true,
+            interval_minutes: 0,
+            ..ForgettingConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_forgetting_validation_max_inactive_days_zero() {
+        let cfg = ForgettingConfig {
+            enabled: true,
+            defaults: ForgettingPolicyConfig {
+                max_inactive_days: 0,
+                budget_top_n: 10_000,
+            },
+            ..ForgettingConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_forgetting_validation_per_type_max_inactive_zero() {
+        let mut cfg = ForgettingConfig {
+            enabled: true,
+            ..ForgettingConfig::default()
+        };
+        cfg.by_type.insert(MemoryType::Episodic, PerTypeForgettingConfig {
+            enabled: None,
+            max_inactive_days: Some(0),
+            budget_top_n: None,
+        });
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_forgetting_resolve_no_type_override_uses_defaults() {
+        let cfg = ForgettingConfig {
+            enabled: true,
+            ..ForgettingConfig::default()
+        };
+        // Analytical has no by_type entry → should get global defaults
+        let resolved = cfg.resolve_policy(MemoryType::Analytical, None);
+        assert!(resolved.enabled);
+        assert_eq!(resolved.max_inactive_days, 90);
+        assert_eq!(resolved.budget_top_n, 10_000);
+    }
+
+    #[test]
+    fn test_forgetting_scope_config_roundtrip() {
+        let mut config = CorviaConfig::default();
+        config.forgetting = Some(ForgettingConfig {
+            enabled: true,
+            interval_minutes: 30,
+            defaults: ForgettingPolicyConfig {
+                max_inactive_days: 90,
+                budget_top_n: 5000,
+            },
+            by_type: HashMap::new(),
+        });
+        config.scope = Some(vec![ScopeConfig {
+            id: "test-scope".into(),
+            description: Some("Test".into()),
+            ttl_days: None,
+            forgetting: Some(ScopeForgettingOverride {
+                enabled: None,
+                max_inactive_days: Some(365),
+                budget_top_n: None,
+            }),
+        }]);
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let loaded: CorviaConfig = toml::from_str(&toml_str).unwrap();
+        let fg = loaded.forgetting.unwrap();
+        assert!(fg.enabled);
+        assert_eq!(fg.interval_minutes, 30);
+        assert_eq!(fg.defaults.budget_top_n, 5000);
+        let scopes = loaded.scope.unwrap();
+        let scope_fg = scopes[0].forgetting.as_ref().unwrap();
+        assert_eq!(scope_fg.max_inactive_days, Some(365));
     }
 }
