@@ -793,15 +793,13 @@ async fn tool_corvia_history(
     let uuid = uuid::Uuid::parse_str(entry_id)
         .map_err(|e| (INVALID_PARAMS, format!("Invalid UUID: {e}")))?;
 
-    // Check if the entry is Forgotten — increment counter for observability
-    if let Ok(Some(entry)) = state.store.get(&uuid).await {
-        if entry.tier == corvia_common::types::Tier::Forgotten {
-            state.forgotten_access_counter.increment();
-        }
-    }
-
     let chain = state.temporal.history(&uuid).await
         .map_err(|e| (INTERNAL_ERROR, format!("History query failed: {e}")))?;
+
+    // Check if any entry in the chain is Forgotten — increment counter for observability
+    if chain.iter().any(|e| e.tier == corvia_common::types::Tier::Forgotten) {
+        state.forgotten_access_counter.increment();
+    }
 
     if chain.is_empty() {
         return Ok(json!({

@@ -662,7 +662,7 @@ fn apply_budget_policy(
     candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut demoted = 0;
-    for (entry_id, _score, current_tier) in &candidates {
+    for (entry_id, score, current_tier) in &candidates {
         if demoted >= excess {
             break;
         }
@@ -686,8 +686,17 @@ fn apply_budget_policy(
                 if *current_tier == Tier::Hot {
                     budget_transitions.push(TierTransition {
                         entry_id: *entry_id,
+                        scope_id: entry.scope_id.clone(),
+                        memory_type: entry.memory_type,
                         old_tier: *current_tier,
                         new_tier: Tier::Warm,
+                        retention_score: *score,
+                        d_score: 0.0,
+                        a_score: 0.0,
+                        g_score: 0.0,
+                        c_score: 0.0,
+                        superseded: entry.superseded_by.is_some(),
+                        reason: "budget_policy",
                     });
                     demoted += 1;
                 }
@@ -703,8 +712,17 @@ fn apply_budget_policy(
 
         budget_transitions.push(TierTransition {
             entry_id: *entry_id,
+            scope_id: entry_map.get(entry_id).map(|e| e.scope_id.clone()).unwrap_or_default(),
+            memory_type: entry_map.get(entry_id).map(|e| e.memory_type).unwrap_or_default(),
             old_tier: *current_tier,
             new_tier: target,
+            retention_score: *score,
+            d_score: 0.0,
+            a_score: 0.0,
+            g_score: 0.0,
+            c_score: 0.0,
+            superseded: entry_map.get(entry_id).map(|e| e.superseded_by.is_some()).unwrap_or(false),
+            reason: "budget_policy",
         });
         demoted += 1;
     }

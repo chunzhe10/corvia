@@ -210,6 +210,46 @@ impl LiteStore {
         Ok(entries)
     }
 
+    /// Lightweight tier counting — iterates Redb entries and extracts only
+    /// `scope_id` and `tier` fields without full deserialization (avoids loading embeddings).
+    pub fn count_tiers_by_scope(&self, scope_id: &str) -> Result<crate::ops::TierDistribution> {
+        use corvia_common::types::Tier;
+
+        // Minimal struct for partial deserialization (avoids embedding allocation)
+        #[derive(serde::Deserialize)]
+        struct TierOnly {
+            scope_id: String,
+            #[serde(default)]
+            tier: Tier,
+        }
+
+        let read_txn = self.db.begin_read()
+            .map_err(|e| CorviaError::Storage(format!("Failed to begin read txn: {e}")))?;
+        let entries_table = match read_txn.open_table(ENTRIES) {
+            Ok(t) => t,
+            Err(_) => return Ok(crate::ops::TierDistribution::default()),
+        };
+
+        let mut dist = crate::ops::TierDistribution::default();
+        for item in entries_table.iter()
+            .map_err(|e| CorviaError::Storage(format!("Failed to iterate ENTRIES: {e}")))?
+        {
+            let (_key, value) = item
+                .map_err(|e| CorviaError::Storage(format!("Failed to read entry: {e}")))?;
+            if let Ok(partial) = serde_json::from_slice::<TierOnly>(value.value()) {
+                if partial.scope_id == scope_id {
+                    match partial.tier {
+                        Tier::Hot => dist.hot += 1,
+                        Tier::Warm => dist.warm += 1,
+                        Tier::Cold => dist.cold += 1,
+                        Tier::Forgotten => dist.forgotten += 1,
+                    }
+                }
+            }
+        }
+        Ok(dist)
+    }
+
     /// Update an entry's metadata in Redb without touching the HNSW index.
     ///
     /// Used by the GC worker to update tier, retention_score, tier_changed_at,

@@ -49,22 +49,9 @@ pub async fn system_status(
     let open_sessions = coordinator.sessions.list_open()?.len();
     let merge_queue_depth = coordinator.merge_queue.depth()?;
 
-    // Compute tier distribution
+    // Compute tier distribution (lightweight — avoids full entry deserialization)
     let tier_distribution = if let Some(lite_store) = store.as_any().downcast_ref::<LiteStore>() {
-        let entries = lite_store.fetch_all_entries().unwrap_or_default();
-        let mut dist = TierDistribution::default();
-        for entry in &entries {
-            if entry.scope_id != scope_id {
-                continue;
-            }
-            match entry.tier {
-                corvia_common::types::Tier::Hot => dist.hot += 1,
-                corvia_common::types::Tier::Warm => dist.warm += 1,
-                corvia_common::types::Tier::Cold => dist.cold += 1,
-                corvia_common::types::Tier::Forgotten => dist.forgotten += 1,
-            }
-        }
-        dist
+        lite_store.count_tiers_by_scope(scope_id).unwrap_or_default()
     } else {
         TierDistribution::default()
     };
@@ -445,6 +432,48 @@ mod tests {
         assert_eq!(status.tier_distribution.hot, 0);
         assert_eq!(status.tier_distribution.warm, 0);
         assert_eq!(status.tier_distribution.cold, 0);
+        assert_eq!(status.tier_distribution.forgotten, 0);
+    }
+
+    #[tokio::test]
+    async fn test_system_status_tier_distribution_with_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, coord) = setup_coordinator(dir.path()).await;
+
+        // Insert entries with different tiers
+        let mut hot_entry = corvia_common::types::KnowledgeEntry::new(
+            "hot entry".into(), "test-scope".into(), "v1".into(),
+        );
+        hot_entry.embedding = Some(vec![1.0, 0.0, 0.0]);
+        hot_entry.tier = corvia_common::types::Tier::Hot;
+        store.insert(&hot_entry).await.unwrap();
+
+        let mut warm_entry = corvia_common::types::KnowledgeEntry::new(
+            "warm entry".into(), "test-scope".into(), "v1".into(),
+        );
+        warm_entry.embedding = Some(vec![0.0, 1.0, 0.0]);
+        warm_entry.tier = corvia_common::types::Tier::Warm;
+        store.insert(&warm_entry).await.unwrap();
+
+        let mut cold_entry = corvia_common::types::KnowledgeEntry::new(
+            "cold entry".into(), "test-scope".into(), "v1".into(),
+        );
+        cold_entry.embedding = Some(vec![0.0, 0.0, 1.0]);
+        cold_entry.tier = corvia_common::types::Tier::Cold;
+        store.insert(&cold_entry).await.unwrap();
+
+        // Different scope — should not be counted
+        let mut other_scope = corvia_common::types::KnowledgeEntry::new(
+            "other scope".into(), "other-scope".into(), "v1".into(),
+        );
+        other_scope.embedding = Some(vec![1.0, 1.0, 0.0]);
+        other_scope.tier = corvia_common::types::Tier::Hot;
+        store.insert(&other_scope).await.unwrap();
+
+        let status = system_status(store, &coord, "test-scope").await.unwrap();
+        assert_eq!(status.tier_distribution.hot, 1);
+        assert_eq!(status.tier_distribution.warm, 1);
+        assert_eq!(status.tier_distribution.cold, 1);
         assert_eq!(status.tier_distribution.forgotten, 0);
     }
 
