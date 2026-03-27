@@ -716,12 +716,10 @@ impl ForgettingConfig {
             ));
         }
         for (memory_type, cfg) in &self.by_type {
-            if let Some(d) = cfg.max_inactive_days {
-                if d == 0 {
-                    return Err(CorviaError::Config(format!(
-                        "forgetting.by_type.{memory_type}.max_inactive_days must be > 0"
-                    )));
-                }
+            if let Some(0) = cfg.max_inactive_days {
+                return Err(CorviaError::Config(format!(
+                    "forgetting.by_type.{memory_type}.max_inactive_days must be > 0"
+                )));
             }
         }
         Ok(())
@@ -816,15 +814,11 @@ impl CorviaConfig {
         // Validate scope-level forgetting overrides
         if let Some(ref scopes) = config.scope {
             for scope in scopes {
-                if let Some(ref override_cfg) = scope.forgetting {
-                    if let Some(d) = override_cfg.max_inactive_days {
-                        if d == 0 {
-                            return Err(CorviaError::Config(format!(
-                                "scope.{}.forgetting.max_inactive_days must be > 0",
-                                scope.id
-                            )));
-                        }
-                    }
+                if scope.forgetting.as_ref().and_then(|f| f.max_inactive_days) == Some(0) {
+                    return Err(CorviaError::Config(format!(
+                        "scope.{}.forgetting.max_inactive_days must be > 0",
+                        scope.id
+                    )));
                 }
             }
         }
