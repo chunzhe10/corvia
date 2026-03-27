@@ -28,7 +28,12 @@ use crate::traits::{GraphStore, InferenceEngine, QueryableStore};
 ///
 /// Applied after cosine similarity (or blended score) to deprioritize lower tiers.
 /// Forgotten entries get 0.0 and should be excluded from results entirely.
-pub const fn tier_weight(tier: &Tier) -> f32 {
+///
+/// Weights: Hot=1.0 (full), Warm=0.7 (deprioritized), Cold=0.3 (heavily penalized),
+/// Forgotten=0.0 (excluded). These values are tuned so that a high-similarity Cold
+/// entry can still outrank a low-similarity Warm entry (e.g., 0.95*0.3 > 0.4*0.7).
+#[inline]
+pub(crate) const fn tier_weight(tier: Tier) -> f32 {
     match tier {
         Tier::Hot => 1.0,
         Tier::Warm => 0.7,
@@ -238,7 +243,7 @@ impl Retriever for VectorRetriever {
                 .into_iter()
                 .filter(|sr| sr.entry.tier != Tier::Forgotten)
                 .map(|mut sr| {
-                    sr.score *= tier_weight(&sr.entry.tier);
+                    sr.score *= tier_weight(sr.entry.tier);
                     sr
                 })
                 .collect();
@@ -428,7 +433,7 @@ impl Retriever for GraphExpandRetriever {
             if sr.entry.tier == Tier::Forgotten {
                 continue;
             }
-            let blended = ((1.0 - self.alpha) * sr.score + self.alpha * 1.0) * tier_weight(&sr.entry.tier);
+            let blended = ((1.0 - self.alpha) * sr.score + self.alpha * 1.0) * tier_weight(sr.entry.tier);
             scored.push((blended, SearchResult { entry: sr.entry.clone(), score: blended }));
         }
 
@@ -488,7 +493,7 @@ impl Retriever for GraphExpandRetriever {
                             .as_ref()
                             .map(|emb| cosine_similarity(&embedding, emb))
                             .unwrap_or(0.0);
-                        let blended = ((1.0 - self.alpha) * cosine + self.alpha * 0.5) * tier_weight(&neighbor_entry.tier);
+                        let blended = ((1.0 - self.alpha) * cosine + self.alpha * 0.5) * tier_weight(neighbor_entry.tier);
                         scored.push((
                             blended,
                             SearchResult {
@@ -543,7 +548,7 @@ impl Retriever for GraphExpandRetriever {
                             .as_ref()
                             .map(|emb| cosine_similarity(&embedding, emb))
                             .unwrap_or(0.0);
-                        let blended = ((1.0 - self.alpha) * cosine + self.alpha * (1.0 / 3.0)) * tier_weight(&entry.tier);
+                        let blended = ((1.0 - self.alpha) * cosine + self.alpha * (1.0 / 3.0)) * tier_weight(entry.tier);
                         scored.push((
                             blended,
                             SearchResult {
@@ -571,7 +576,7 @@ impl Retriever for GraphExpandRetriever {
                                 if !seen.contains(&sr.entry.id) && sr.entry.tier != Tier::Forgotten {
                                     seen.insert(sr.entry.id);
                                     // Cold entries get pure cosine score (no graph proximity bonus), with tier_weight.
-                                    let blended = (1.0 - self.alpha) * sr.score * tier_weight(&sr.entry.tier);
+                                    let blended = (1.0 - self.alpha) * sr.score * tier_weight(sr.entry.tier);
                                     scored.push((blended, SearchResult { entry: sr.entry, score: blended }));
                                     added += 1;
                                 }
@@ -1484,10 +1489,10 @@ mod tests {
     #[test]
     fn test_tier_weight_values() {
         use corvia_common::types::Tier;
-        assert_eq!(super::tier_weight(&Tier::Hot), 1.0);
-        assert!((super::tier_weight(&Tier::Warm) - 0.7).abs() < f32::EPSILON);
-        assert!((super::tier_weight(&Tier::Cold) - 0.3).abs() < f32::EPSILON);
-        assert_eq!(super::tier_weight(&Tier::Forgotten), 0.0);
+        assert_eq!(super::tier_weight(Tier::Hot), 1.0);
+        assert_eq!(super::tier_weight(Tier::Warm), 0.7);
+        assert_eq!(super::tier_weight(Tier::Cold), 0.3);
+        assert_eq!(super::tier_weight(Tier::Forgotten), 0.0);
     }
 
     /// Hot entry ranks above Warm entry with same cosine similarity.
@@ -1606,6 +1611,97 @@ mod tests {
         assert!(!has_forgotten, "forgotten entries must never appear in results");
     }
 
+    /// Verify exact score ratio: warm score == hot score * 0.7 for identical cosine.
+    #[tokio::test]
+    async fn test_tier_weight_score_ratio() {
+        use corvia_common::types::Tier;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+        let engine: Arc<dyn InferenceEngine> = Arc::new(MockEngine);
+
+        // Insert fillers for HNSW connectivity.
+        for i in 0..8 {
+            let mut entry = KnowledgeEntry::new(
+                format!("filler {i}"),
+                "ratio-scope".to_string(),
+                "v1".to_string(),
+            );
+            entry.embedding = Some(vec![0.5, i as f32 * 0.01, 0.5]);
+            store.insert(&entry).await.unwrap();
+        }
+
+        // Hot and Warm entries with identical embeddings (same cosine similarity).
+        let mut hot = KnowledgeEntry::new(
+            "hot ratio".to_string(),
+            "ratio-scope".to_string(),
+            "v1".to_string(),
+        );
+        hot.embedding = Some(vec![1.0, 0.001, 0.0]);
+        hot.tier = Tier::Hot;
+        store.insert(&hot).await.unwrap();
+
+        let mut warm = KnowledgeEntry::new(
+            "warm ratio".to_string(),
+            "ratio-scope".to_string(),
+            "v1".to_string(),
+        );
+        warm.embedding = Some(vec![1.0, 0.002, 0.0]);
+        warm.tier = Tier::Warm;
+        store.insert(&warm).await.unwrap();
+
+        let retriever = VectorRetriever::new(store.clone() as Arc<dyn QueryableStore>, engine);
+        let opts = RetrievalOpts {
+            limit: 20,
+            visibility: VisibilityMode::All,
+            ..Default::default()
+        };
+        let result = retriever.retrieve("test", "ratio-scope", &opts).await.unwrap();
+
+        let hot_score = result.results.iter().find(|r| r.entry.content == "hot ratio").unwrap().score;
+        let warm_score = result.results.iter().find(|r| r.entry.content == "warm ratio").unwrap().score;
+
+        // warm_score should be ~0.7 * hot_score (embeddings nearly identical).
+        let ratio = warm_score / hot_score;
+        assert!(
+            (ratio - 0.7).abs() < 0.01,
+            "tier weight ratio should be ~0.7, got {ratio} (hot={hot_score}, warm={warm_score})"
+        );
+    }
+
+    /// When all entries are Forgotten, retriever returns empty results.
+    #[tokio::test]
+    async fn test_all_forgotten_returns_empty() {
+        use corvia_common::types::Tier;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+        let engine: Arc<dyn InferenceEngine> = Arc::new(MockEngine);
+
+        // Insert only Forgotten entries.
+        for i in 0..5 {
+            let mut entry = KnowledgeEntry::new(
+                format!("forgotten {i}"),
+                "all-forgotten".to_string(),
+                "v1".to_string(),
+            );
+            entry.embedding = Some(vec![1.0, i as f32 * 0.001, 0.0]);
+            entry.tier = Tier::Forgotten;
+            store.insert(&entry).await.unwrap();
+        }
+
+        let retriever = VectorRetriever::new(store.clone() as Arc<dyn QueryableStore>, engine);
+        let opts = RetrievalOpts {
+            limit: 10,
+            visibility: VisibilityMode::All,
+            ..Default::default()
+        };
+        let result = retriever.retrieve("test", "all-forgotten", &opts).await.unwrap();
+        assert!(result.results.is_empty(), "all-Forgotten scope should return empty results");
+    }
+
     /// Cold entry with high cosine can still rank above Warm entry with low cosine.
     /// 0.95 * 0.3 = 0.285 vs 0.4 * 0.7 = 0.28 — cold wins.
     #[tokio::test]
@@ -1661,13 +1757,11 @@ mod tests {
         let warm_pos = result.results.iter().position(|r| r.entry.content == "warm low cosine");
 
         assert!(cold_pos.is_some(), "cold entry should be in results");
-        // If warm entry appears, cold should rank higher.
-        if let Some(wp) = warm_pos {
-            assert!(
-                cold_pos.unwrap() < wp,
-                "cold entry (1.0*0.3=0.3) should rank above warm entry (~0*0.7≈0)"
-            );
-        }
+        assert!(warm_pos.is_some(), "warm entry must be in results for ranking comparison");
+        assert!(
+            cold_pos.unwrap() < warm_pos.unwrap(),
+            "cold entry (1.0*0.3=0.3) should rank above warm entry (~0*0.7≈0)"
+        );
     }
 
     /// GraphExpandRetriever also excludes Forgotten entries from results.
