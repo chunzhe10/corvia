@@ -581,10 +581,12 @@ impl Default for ForgettingPolicyConfig {
     }
 }
 
-/// Per-memory-type override. All fields optional — `None` inherits from global defaults.
+/// Override layer for forgetting policy. All fields optional — `None` inherits
+/// from the next-lower layer in the hierarchy. Used for both per-memory-type
+/// and per-scope overrides.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct PerTypeForgettingConfig {
-    /// Override enabled/disabled for this memory type. `None` = inherit global.
+pub struct ForgettingOverride {
+    /// Override enabled/disabled. `None` = inherit from parent layer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     /// Override max inactive days. `None` = inherit.
@@ -595,16 +597,11 @@ pub struct PerTypeForgettingConfig {
     pub budget_top_n: Option<u32>,
 }
 
-/// Per-scope forgetting override. Same shape as per-type — all fields optional.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct ScopeForgettingOverride {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_inactive_days: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub budget_top_n: Option<u32>,
-}
+/// Per-memory-type override alias (same fields, distinct name for clarity).
+pub type PerTypeForgettingConfig = ForgettingOverride;
+
+/// Per-scope forgetting override alias.
+pub type ScopeForgettingOverride = ForgettingOverride;
 
 /// Top-level `[forgetting]` section in corvia.toml.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -650,7 +647,10 @@ impl ForgettingConfig {
     /// 1. Start with global `defaults`
     /// 2. If global `enabled == false`, short-circuit to disabled
     /// 3. Layer per-type override (non-None fields replace)
-    /// 4. If per-type `enabled == Some(false)`, short-circuit to disabled
+    /// 4. If per-type `enabled == Some(false)`, short-circuit to disabled.
+    ///    **Note:** This is a hard disable — scope overrides cannot re-enable a
+    ///    type disabled at the per-type level. This allows admins to guarantee
+    ///    certain memory types are never subject to forgetting.
     /// 5. Layer per-scope override (non-None fields replace)
     /// 6. Return merged `ResolvedPolicy`
     pub fn resolve_policy(
@@ -808,8 +808,27 @@ impl CorviaConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| CorviaError::Config(format!("Failed to read {}: {}", path.display(), e)))?;
-        toml::from_str(&content)
-            .map_err(|e| CorviaError::Config(format!("Failed to parse config: {e}")))
+        let config: Self = toml::from_str(&content)
+            .map_err(|e| CorviaError::Config(format!("Failed to parse config: {e}")))?;
+        if let Some(ref fg) = config.forgetting {
+            fg.validate()?;
+        }
+        // Validate scope-level forgetting overrides
+        if let Some(ref scopes) = config.scope {
+            for scope in scopes {
+                if let Some(ref override_cfg) = scope.forgetting {
+                    if let Some(d) = override_cfg.max_inactive_days {
+                        if d == 0 {
+                            return Err(CorviaError::Config(format!(
+                                "scope.{}.forgetting.max_inactive_days must be > 0",
+                                scope.id
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(config)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -1616,6 +1635,60 @@ port = 8020
         });
         let resolved = cfg.resolve_policy(MemoryType::Structural, None);
         assert!(!resolved.enabled);
+    }
+
+    #[test]
+    fn test_forgetting_per_type_disabled_scope_cannot_reenable() {
+        // Per-type enabled=false is a hard disable — scope overrides cannot
+        // re-enable it. This allows admins to guarantee certain memory types
+        // are never subject to forgetting.
+        let mut cfg = ForgettingConfig {
+            enabled: true,
+            ..ForgettingConfig::default()
+        };
+        cfg.by_type.insert(MemoryType::Structural, PerTypeForgettingConfig {
+            enabled: Some(false),
+            max_inactive_days: None,
+            budget_top_n: None,
+        });
+        let scope_override = ScopeForgettingOverride {
+            enabled: Some(true), // attempt to re-enable
+            max_inactive_days: Some(365),
+            budget_top_n: None,
+        };
+        let resolved = cfg.resolve_policy(MemoryType::Structural, Some(&scope_override));
+        assert!(!resolved.enabled, "per-type disabled is a hard disable");
+    }
+
+    #[test]
+    fn test_forgetting_scope_max_inactive_days_zero_rejected() {
+        // Scope-level max_inactive_days = 0 should be caught by validation in load()
+        let toml_str = r#"
+[project]
+name = "test"
+scope_id = "test"
+
+[storage]
+data_dir = ".corvia"
+
+[embedding]
+model = "nomic-embed-text"
+url = "http://127.0.0.1:11434"
+dimensions = 768
+
+[server]
+host = "127.0.0.1"
+port = 8020
+
+[[scope]]
+id = "bad-scope"
+[scope.forgetting]
+max_inactive_days = 0
+"#;
+        let path = std::path::Path::new("/tmp/corvia-test-scope-forgetting-validate.toml");
+        std::fs::write(path, toml_str).unwrap();
+        let result = CorviaConfig::load(path);
+        assert!(result.is_err(), "scope forgetting max_inactive_days=0 should fail validation");
     }
 
     #[test]

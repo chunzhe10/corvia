@@ -37,7 +37,10 @@ max_inactive_days = 365
 max_inactive_days = 180
 
 # Per-scope overrides (most specific wins)
-[scopes.compliance.forgetting]
+[[scope]]
+id = "compliance"
+description = "Compliance data with extended retention"
+[scope.forgetting]
 max_inactive_days = 3650
 budget_top_n = 0
 ```
@@ -90,16 +93,21 @@ pub struct ResolvedPolicy {
 
 ## Resolution Algorithm
 
-`resolve_policy(scope_id, memory_type) -> ResolvedPolicy`:
+`ForgettingConfig::resolve_policy(&self, memory_type, scope_override: Option<&ScopeForgettingOverride>) -> ResolvedPolicy`:
+
+The caller looks up the `ScopeConfig` by scope ID and passes its optional
+`forgetting` field. This decouples resolution from scope lookup.
 
 1. Start with global `defaults`
 2. If `forgetting.enabled == false`, return `ResolvedPolicy { enabled: false, .. }`
 3. Layer per-type override: `by_type[memory_type]` fields replace non-None values
-4. If per-type `enabled == Some(false)`, return disabled
-5. Layer per-scope override: `scope[scope_id].forgetting` fields replace non-None values
+4. If per-type `enabled == Some(false)`, return disabled (hard disable — scope cannot re-enable)
+5. Layer per-scope override: `scope_override` fields replace non-None values
 6. Return merged `ResolvedPolicy`
 
-Most-specific wins at each field level. Missing fields inherit from the layer below.
+Most-specific wins at each field level, except per-type `enabled=false` which is
+a hard disable that scope overrides cannot reverse. This allows admins to guarantee
+certain memory types are never subject to forgetting.
 
 ## Validation Rules
 
