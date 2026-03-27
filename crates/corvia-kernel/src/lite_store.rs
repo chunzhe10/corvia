@@ -5,7 +5,8 @@ use hnsw_rs::prelude::*;
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use arc_swap::ArcSwap;
+use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::knowledge_files;
@@ -40,7 +41,7 @@ const MAX_ELEMENTS: usize = 100_000;
 pub struct LiteStore {
     data_dir: PathBuf,
     db: Arc<Database>,
-    hnsw: Arc<Mutex<Hnsw<'static, f32, DistCosine>>>,
+    hnsw: Arc<ArcSwap<Hnsw<'static, f32, DistCosine>>>,
     next_hnsw_id: AtomicU64,
     dimensions: usize,
     graph: crate::graph_store::LiteGraphStore,
@@ -137,7 +138,7 @@ impl LiteStore {
         let store = Self {
             data_dir: data_dir.to_path_buf(),
             db,
-            hnsw: Arc::new(Mutex::new(hnsw)),
+            hnsw: Arc::new(ArcSwap::from_pointee(hnsw)),
             next_hnsw_id: AtomicU64::new(next_id),
             dimensions,
             graph,
@@ -265,12 +266,9 @@ impl LiteStore {
         let uuid_str = entry.id.to_string();
         let hnsw_id = self.allocate_hnsw_id();
 
-        // Insert into HNSW
+        // Insert into HNSW (hnsw_rs uses internal RwLock — concurrent inserts are safe)
         {
-            let hnsw = self
-                .hnsw
-                .lock()
-                .map_err(|e| CorviaError::Storage(format!("HNSW lock poisoned: {e}")))?;
+            let hnsw = self.hnsw.load();
             hnsw.insert((embedding, hnsw_id as usize));
         }
 
@@ -343,10 +341,7 @@ impl LiteStore {
         let _ = std::fs::remove_file(hnsw_dir.join("litestore.hnsw.graph"));
         let _ = std::fs::remove_file(hnsw_dir.join("litestore.hnsw.data"));
 
-        let hnsw = self
-            .hnsw
-            .lock()
-            .map_err(|e| CorviaError::Storage(format!("HNSW lock poisoned: {e}")))?;
+        let hnsw = self.hnsw.load();
         hnsw.file_dump(&hnsw_dir, "litestore")
             .map_err(|e| CorviaError::Storage(format!("Failed to dump HNSW: {e}")))?;
 
@@ -436,23 +431,26 @@ impl LiteStore {
         let all_entries = knowledge_files::read_all(&self.data_dir)?;
         let count = all_entries.len();
 
-        // Reset HNSW to a fresh index
-        {
-            let mut hnsw = self
-                .hnsw
-                .lock()
-                .map_err(|e| CorviaError::Storage(format!("HNSW lock poisoned: {e}")))?;
-            *hnsw = Hnsw::<f32, DistCosine>::new(
-                MAX_NB_CONNECTION,
-                MAX_ELEMENTS,
-                MAX_LAYER,
-                EF_CONSTRUCTION,
-                DistCosine {},
-            );
-        }
+        // Blue-green rebuild: build a new HNSW index without blocking searches
+        let new_hnsw = Hnsw::<f32, DistCosine>::new(
+            MAX_NB_CONNECTION,
+            MAX_ELEMENTS,
+            MAX_LAYER,
+            EF_CONSTRUCTION,
+            DistCosine {},
+        );
 
         // Reset the counter
         self.next_hnsw_id.store(0, Ordering::SeqCst);
+
+        // Atomic swap: searches in flight continue using the old index until this point.
+        // After store(), new searches use the fresh (empty) index while we rebuild.
+        // For rebuild_from_files (startup path), this is acceptable — the index is
+        // being populated from scratch and searches shouldn't happen until rebuild completes.
+        let old_hnsw = self.hnsw.swap(Arc::new(new_hnsw));
+
+        // Defer old index deallocation off the async runtime
+        tokio::task::spawn_blocking(move || drop(old_hnsw));
 
         // Clear the temporal index and source_version index before rebuilding
         self.clear_temporal_index()?;
@@ -628,10 +626,7 @@ impl super::traits::QueryableStore for LiteStore {
         let fetch_count = (limit * 2).max(10);
 
         let neighbours = {
-            let hnsw = self
-                .hnsw
-                .lock()
-                .map_err(|e| CorviaError::Storage(format!("HNSW lock poisoned: {e}")))?;
+            let hnsw = self.hnsw.load();
             hnsw.search(embedding, fetch_count, EF_SEARCH)
         };
 
