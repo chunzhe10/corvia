@@ -707,6 +707,15 @@ async fn cmd_serve() -> Result<()> {
         });
     }
 
+    // Spawn GC knowledge worker (tiered knowledge lifecycle)
+    {
+        let gc_store = state.store.clone();
+        let gc_graph = state.graph.clone();
+        let gc_config = state.config.clone();
+        let gc_data_dir = state.data_dir.clone();
+        corvia_kernel::gc_worker::spawn_gc_worker(gc_store, gc_graph, gc_config, gc_data_dir);
+    }
+
     let mut app = corvia_server::rest::router(state.clone());
     app = app.merge(corvia_server::mcp::mcp_router(state.clone()));
     app = app.merge(corvia_server::dashboard::router(state));

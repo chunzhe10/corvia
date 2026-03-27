@@ -196,6 +196,107 @@ impl LiteStore {
         Ok(entries)
     }
 
+    /// Update an entry's metadata in Redb without touching the HNSW index.
+    ///
+    /// Used by the GC worker to update tier, retention_score, tier_changed_at,
+    /// and discard embeddings (Cold→Forgotten) without re-indexing.
+    /// Also writes the updated entry to the knowledge JSON file.
+    pub fn update_entry_metadata(&self, entry: &KnowledgeEntry) -> Result<()> {
+        let uuid_str = entry.id.to_string();
+        let entry_json = serde_json::to_vec(entry)
+            .map_err(|e| CorviaError::Storage(format!("Failed to serialize entry: {e}")))?;
+
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| CorviaError::Storage(format!("Failed to begin write txn: {e}")))?;
+        {
+            let mut table = write_txn
+                .open_table(ENTRIES)
+                .map_err(|e| CorviaError::Storage(format!("Failed to open ENTRIES: {e}")))?;
+            table
+                .insert(uuid_str.as_str(), entry_json.as_slice())
+                .map_err(|e| CorviaError::Storage(format!("Failed to update entry: {e}")))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| CorviaError::Storage(format!("Failed to commit entry update: {e}")))?;
+
+        // Also persist to knowledge JSON file
+        knowledge_files::write_entry(&self.data_dir, entry)?;
+
+        Ok(())
+    }
+
+    /// Batch-update entry metadata in Redb. Groups writes into transactions of
+    /// `batch_size` entries to avoid blocking concurrent access tracking writes.
+    pub fn update_entries_batch(&self, entries: &[&KnowledgeEntry], batch_size: usize) -> Result<()> {
+        for chunk in entries.chunks(batch_size) {
+            let write_txn = self
+                .db
+                .begin_write()
+                .map_err(|e| CorviaError::Storage(format!("Failed to begin write txn: {e}")))?;
+            {
+                let mut table = write_txn
+                    .open_table(ENTRIES)
+                    .map_err(|e| CorviaError::Storage(format!("Failed to open ENTRIES: {e}")))?;
+                for entry in chunk {
+                    let uuid_str = entry.id.to_string();
+                    let entry_json = serde_json::to_vec(entry)
+                        .map_err(|e| CorviaError::Storage(format!("Failed to serialize: {e}")))?;
+                    table
+                        .insert(uuid_str.as_str(), entry_json.as_slice())
+                        .map_err(|e| CorviaError::Storage(format!("Failed to update: {e}")))?;
+                }
+            }
+            write_txn
+                .commit()
+                .map_err(|e| CorviaError::Storage(format!("Failed to commit batch: {e}")))?;
+
+            // Write JSON files outside the Redb transaction
+            for entry in chunk {
+                knowledge_files::write_entry(&self.data_dir, entry)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete HNSW mappings for a set of entry UUIDs.
+    ///
+    /// Removes the UUID↔HNSW_ID bidirectional mapping from Redb. The actual HNSW
+    /// vectors become orphaned and are cleaned up on the next `rebuild_from_files()`.
+    pub fn remove_hnsw_mappings(&self, entry_ids: &[uuid::Uuid]) -> Result<()> {
+        if entry_ids.is_empty() {
+            return Ok(());
+        }
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| CorviaError::Storage(format!("Failed to begin write txn: {e}")))?;
+        {
+            let mut u2h_table = write_txn
+                .open_table(UUID_TO_HNSW)
+                .map_err(|e| CorviaError::Storage(format!("Failed to open UUID_TO_HNSW: {e}")))?;
+            let mut h2u_table = write_txn
+                .open_table(HNSW_TO_UUID)
+                .map_err(|e| CorviaError::Storage(format!("Failed to open HNSW_TO_UUID: {e}")))?;
+
+            for id in entry_ids {
+                let uuid_str = id.to_string();
+                // Look up the HNSW ID for this UUID
+                if let Ok(Some(hnsw_id_guard)) = u2h_table.get(uuid_str.as_str()) {
+                    let hnsw_id = hnsw_id_guard.value();
+                    let _ = h2u_table.remove(hnsw_id);
+                }
+                let _ = u2h_table.remove(uuid_str.as_str());
+            }
+        }
+        write_txn
+            .commit()
+            .map_err(|e| CorviaError::Storage(format!("Failed to commit HNSW mapping removal: {e}")))?;
+        Ok(())
+    }
+
     /// Access the underlying graph store (for migration export).
     pub fn graph(&self) -> &crate::graph_store::LiteGraphStore {
         &self.graph

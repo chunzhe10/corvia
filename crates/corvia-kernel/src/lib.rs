@@ -95,6 +95,7 @@ pub mod inference_provisioner;
 pub mod skill_registry;
 pub mod ingest;
 pub mod scoring;
+pub mod gc_worker;
 #[cfg(feature = "postgres")]
 pub mod postgres_store;
 
