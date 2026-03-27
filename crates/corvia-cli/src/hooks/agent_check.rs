@@ -14,7 +14,7 @@ pub fn agent_check() -> String {
         .build()
     {
         Ok(c) => c,
-        Err(_) => return format!("Agent auto-registration deferred (HTTP client init failed). Will register on first MCP write."),
+        Err(_) => return "Agent auto-registration deferred (HTTP client init failed). Will register on first MCP write.".to_string(),
     };
 
     let url = format!("{api}/api/dashboard/agents/{agent_id}/connect");
@@ -27,7 +27,7 @@ pub fn agent_check() -> String {
             format!("Connected as: {agent_id} (active sessions: {sessions})")
         }
         _ => {
-            format!("Agent auto-registration deferred (server not ready). Will register on first MCP write.")
+            "Agent auto-registration deferred (server not ready). Will register on first MCP write.".to_string()
         }
     }
 }

@@ -173,12 +173,10 @@ pub fn run_hook_from_args(event_str: &str, handler_str: Option<&str>) -> Result<
 
             // Event-specific built-in handlers
             match event {
-                HookEvent::SessionStart => {
-                    if hooks_config.agent_check {
-                        hook_debug!("agent-check: registering");
-                        let msg = agent_check::agent_check();
-                        println!("{msg}");
-                    }
+                HookEvent::SessionStart if hooks_config.agent_check => {
+                    hook_debug!("agent-check: registering");
+                    let msg = agent_check::agent_check();
+                    println!("{msg}");
                 }
                 HookEvent::SessionEnd => {
                     if hooks_config.orphan_cleanup {

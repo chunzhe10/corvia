@@ -318,6 +318,19 @@ fn resolve_repo_path(workspace_root: &Path, repos_dir: &str, repo: &corvia_commo
 // Core ingest orchestration
 // ---------------------------------------------------------------------------
 
+/// Parameters for [`run_workspace_ingest`], bundled to stay under clippy's
+/// `too_many_arguments` threshold.
+pub struct WorkspaceIngestCtx<'a> {
+    pub root: &'a Path,
+    pub config: &'a CorviaConfig,
+    pub store: Arc<dyn QueryableStore>,
+    pub graph: Arc<dyn GraphStore>,
+    pub engine: Arc<dyn InferenceEngine>,
+    pub repo_filter: Option<&'a str>,
+    pub session_lock: Option<&'a tokio::sync::Mutex<()>>,
+    pub progress: &'a dyn IngestProgress,
+}
+
 /// Run workspace ingestion using pre-existing store/graph/engine instances.
 ///
 /// This function contains **blocking I/O** (adapter process pipes, chunking).
@@ -325,16 +338,17 @@ fn resolve_repo_path(workspace_root: &Path, repos_dir: &str, repo: &corvia_commo
 ///
 /// If `session_lock` is provided, it will be acquired before the Claude session
 /// history phase to prevent races with concurrent session ingest endpoints.
-pub async fn run_workspace_ingest(
-    root: &Path,
-    config: &CorviaConfig,
-    store: Arc<dyn QueryableStore>,
-    graph: Arc<dyn GraphStore>,
-    engine: Arc<dyn InferenceEngine>,
-    repo_filter: Option<&str>,
-    session_lock: Option<&tokio::sync::Mutex<()>>,
-    progress: &dyn IngestProgress,
-) -> anyhow::Result<IngestReport> {
+pub async fn run_workspace_ingest(ctx: WorkspaceIngestCtx<'_>) -> anyhow::Result<IngestReport> {
+    let WorkspaceIngestCtx {
+        root,
+        config,
+        store,
+        graph,
+        engine,
+        repo_filter,
+        session_lock,
+        progress,
+    } = ctx;
     let ws = config
         .workspace
         .as_ref()
@@ -525,9 +539,10 @@ pub async fn run_workspace_ingest(
     }
 
     // --- Phase 2: Workspace docs (only on full ingest) ---
-    if repo_filter.is_none() {
-        if let Some(docs_config) = ws.docs.as_ref() {
-            if let Some(workspace_docs_dir) = &docs_config.workspace_docs {
+    if repo_filter.is_none()
+        && let Some(docs_config) = ws.docs.as_ref()
+        && let Some(workspace_docs_dir) = &docs_config.workspace_docs
+    {
                 let docs_path = root.join(workspace_docs_dir);
                 if docs_path.exists() && docs_path.is_dir() {
                     let docs_path_str = docs_path
@@ -666,8 +681,6 @@ pub async fn run_workspace_ingest(
                         );
                     }
                 }
-            }
-        }
     }
 
     // --- Phase 3: Claude Code session history (only on full ingest) ---

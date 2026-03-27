@@ -84,10 +84,8 @@ fn is_corvia_hook(entry: &serde_json::Value) -> bool {
     // Check the "hooks" array inside the entry
     if let Some(hooks_arr) = entry.get("hooks").and_then(|h| h.as_array()) {
         for hook in hooks_arr {
-            if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
-                if PURGE_PATTERNS.iter().any(|p| cmd.contains(p)) {
-                    return true;
-                }
+            if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) && PURGE_PATTERNS.iter().any(|p| cmd.contains(p)) {
+                return true;
             }
         }
     }

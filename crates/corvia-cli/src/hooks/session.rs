@@ -50,13 +50,11 @@ fn append_event(session_id: &str, event: &serde_json::Value) -> Result<()> {
     line.push('\n');
 
     // If line exceeds PIPE_BUF, strip the input field to bring it under
-    if line.len() > PIPE_BUF {
-        if let Some(mut obj) = event.as_object().cloned() {
-            obj.remove("input");
-            obj.remove("output");
-            line = serde_json::to_string(&serde_json::Value::Object(obj))?;
-            line.push('\n');
-        }
+    if line.len() > PIPE_BUF && let Some(mut obj) = event.as_object().cloned() {
+        obj.remove("input");
+        obj.remove("output");
+        line = serde_json::to_string(&serde_json::Value::Object(obj))?;
+        line.push('\n');
     }
 
     file.write_all(line.as_bytes())?;
@@ -84,15 +82,12 @@ fn current_turn(session_id: &str) -> u32 {
 
     let reader = BufReader::new(file);
     let mut last_turn = 0u32;
-    for line in reader.lines() {
-        if let Ok(line) = line {
-            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) {
-                if obj.get("type").and_then(|t| t.as_str()) == Some("user_prompt") {
-                    if let Some(t) = obj.get("turn").and_then(|t| t.as_u64()) {
-                        last_turn = t as u32;
-                    }
-                }
-            }
+    for line in reader.lines().map_while(Result::ok) {
+        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line)
+            && obj.get("type").and_then(|t| t.as_str()) == Some("user_prompt")
+            && let Some(t) = obj.get("turn").and_then(|t| t.as_u64())
+        {
+            last_turn = t as u32;
         }
     }
     last_turn
@@ -320,19 +315,16 @@ fn compute_duration_ms(path: &std::path::Path) -> u64 {
         Err(_) => return 0,
     };
     let reader = BufReader::new(file);
-    if let Some(Ok(first_line)) = reader.lines().next() {
-        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&first_line) {
-            if let Some(ts_str) = obj.get("timestamp").and_then(|t| t.as_str()) {
-                // Parse ISO timestamp to compute elapsed
-                if let Some(start_secs) = parse_iso_epoch_secs(ts_str) {
-                    let now_secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    return now_secs.saturating_sub(start_secs) * 1000;
-                }
-            }
-        }
+    if let Some(Ok(first_line)) = reader.lines().next()
+        && let Ok(obj) = serde_json::from_str::<serde_json::Value>(&first_line)
+        && let Some(ts_str) = obj.get("timestamp").and_then(|t| t.as_str())
+        && let Some(start_secs) = parse_iso_epoch_secs(ts_str)
+    {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        return now_secs.saturating_sub(start_secs) * 1000;
     }
     0
 }
@@ -387,17 +379,15 @@ pub fn sweep_stale_sessions(max_age_hours: u64) {
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        if let Ok(meta) = path.metadata() {
-            if let Ok(modified) = meta.modified() {
-                if let Ok(age) = now.duration_since(modified) {
-                    if age > max_age {
-                        if let Err(e) = gzip_session(&path) {
-                            eprintln!("Warning: failed to gzip stale session {:?}: {e}", path);
-                        } else {
-                            swept += 1;
-                        }
-                    }
-                }
+        if let Ok(meta) = path.metadata()
+            && let Ok(modified) = meta.modified()
+            && let Ok(age) = now.duration_since(modified)
+            && age > max_age
+        {
+            if let Err(e) = gzip_session(&path) {
+                eprintln!("Warning: failed to gzip stale session {:?}: {e}", path);
+            } else {
+                swept += 1;
             }
         }
     }

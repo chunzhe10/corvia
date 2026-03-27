@@ -81,7 +81,7 @@ impl IndexCoverageCache {
         debug!(
             disk = inner.snapshot.disk_count,
             hnsw = inner.snapshot.hnsw_count,
-            fresh = inner.last_computed.map_or(false, |t| t.elapsed() < self.ttl),
+            fresh = inner.last_computed.is_some_and(|t| t.elapsed() < self.ttl),
             "index coverage cache read"
         );
         inner.snapshot.clone()
@@ -93,7 +93,7 @@ impl IndexCoverageCache {
             warn!("coverage cache mutex poisoned, recovering");
             e.into_inner()
         });
-        inner.last_computed.map_or(true, |t| t.elapsed() >= self.ttl)
+        inner.last_computed.is_none_or(|t| t.elapsed() >= self.ttl)
     }
 
     /// Recompute coverage from disk, store, and HNSW. Async because it uses
@@ -206,8 +206,7 @@ fn count_json_files(dir: &Path) -> u64 {
             .filter(|e| {
                 e.path()
                     .extension()
-                    .and_then(|ext| ext.to_str())
-                    .map_or(false, |ext| ext == "json")
+                    .and_then(|ext| ext.to_str()) == Some("json")
             })
             .count() as u64,
         Err(e) => {
