@@ -135,7 +135,7 @@ impl From<SearchResult> for SearchResultDto {
             end_line: r.entry.metadata.end_line,
             content_role: r.entry.metadata.content_role,
             source_origin: r.entry.metadata.source_origin,
-            tier: r.tier.map(|t| format!("{t:?}")),
+            tier: Some(r.tier.to_string()),
             retention_score: r.retention_score,
         }
     }

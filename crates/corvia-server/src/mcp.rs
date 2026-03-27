@@ -658,9 +658,7 @@ async fn tool_corvia_search(
                 "content_role": r.entry.metadata.content_role,
                 "source_origin": r.entry.metadata.source_origin,
             });
-            if let Some(tier) = &r.tier {
-                item["tier"] = json!(format!("{tier:?}"));
-            }
+            item["tier"] = json!(r.tier.to_string());
             if let Some(rs) = r.retention_score {
                 item["retention_score"] = json!(rs);
             }
@@ -707,9 +705,7 @@ async fn tool_corvia_search(
             "content_role": r.entry.metadata.content_role,
             "source_origin": r.entry.metadata.source_origin,
         });
-        if let Some(tier) = &r.tier {
-            item["tier"] = json!(format!("{tier:?}"));
-        }
+        item["tier"] = json!(r.tier.to_string());
         if let Some(rs) = r.retention_score {
             item["retention_score"] = json!(rs);
         }
@@ -1118,6 +1114,12 @@ async fn tool_corvia_system_status(
                 "open_sessions": status.open_sessions,
                 "merge_queue_depth": status.merge_queue_depth,
                 "scope_id": status.scope_id,
+                "tier_distribution": {
+                    "hot": status.tier_distribution.hot,
+                    "warm": status.tier_distribution.warm,
+                    "cold": status.tier_distribution.cold,
+                    "forgotten": status.tier_distribution.forgotten,
+                },
             })).unwrap()
         }]
     }))

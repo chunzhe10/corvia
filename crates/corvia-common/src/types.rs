@@ -330,7 +330,7 @@ pub struct SearchResult {
     pub score: f32,
     /// Knowledge tier at retrieval time.
     #[serde(default)]
-    pub tier: Option<Tier>,
+    pub tier: Tier,
     /// Composite retention score at retrieval time (0.0–1.0).
     #[serde(default)]
     pub retention_score: Option<f32>,

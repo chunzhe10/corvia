@@ -160,25 +160,7 @@ pub fn compute_retention_score_breakdown(params: &RetentionParams) -> ScoreBreak
 #[inline]
 #[must_use]
 pub fn compute_retention_score(params: &RetentionParams) -> f32 {
-    let alpha = alpha_for_type(params.memory_type, params.is_superseded);
-
-    let d = decay_component(params.days_since_creation, alpha);
-    let a = access_component(params.access_count, params.days_since_access);
-    let g = graph_component(params.inbound_edges);
-    let c = confidence_component(params.confidence);
-
-    let mut score = W_DECAY * d + W_ACCESS * a + W_GRAPH * g + W_CONFIDENCE * c;
-
-    if params.is_superseded {
-        score *= SUPERSESSION_PENALTY;
-    }
-
-    // NaN guard: if any input was NaN, score is NaN; treat as 0.
-    let score = score as f32;
-    if score.is_nan() {
-        return 0.0;
-    }
-    score.clamp(0.0, 1.0)
+    compute_retention_score_breakdown(params).total
 }
 
 /// Determine whether the entry should transition to a different tier.

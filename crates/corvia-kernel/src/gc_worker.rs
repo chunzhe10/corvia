@@ -191,7 +191,6 @@ pub fn spawn_gc_worker(
 ///
 /// Public for direct invocation via `ops::gc_run` and testing.
 #[tracing::instrument(name = "corvia.gc.cycle", skip_all, fields(
-    scope_id = tracing::field::Empty,
     entries_scanned = 0u64,
     transitions_hot_warm = 0u64,
     transitions_warm_cold = 0u64,

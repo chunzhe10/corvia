@@ -434,7 +434,7 @@ impl Retriever for GraphExpandRetriever {
                 continue;
             }
             let blended = ((1.0 - self.alpha) * sr.score + self.alpha * 1.0) * tier_weight(sr.entry.tier);
-            scored.push((blended, SearchResult { entry: sr.entry.clone(), score: blended, tier: Some(sr.entry.tier), retention_score: sr.entry.retention_score }));
+            scored.push((blended, SearchResult { entry: sr.entry.clone(), score: blended, tier: sr.entry.tier, retention_score: sr.entry.retention_score }));
         }
 
         // Graph expansion (timed separately).
@@ -497,7 +497,7 @@ impl Retriever for GraphExpandRetriever {
                         scored.push((
                             blended,
                             SearchResult {
-                                tier: Some(neighbor_entry.tier),
+                                tier: neighbor_entry.tier,
                                 retention_score: neighbor_entry.retention_score,
                                 entry: neighbor_entry,
                                 score: blended,
@@ -554,7 +554,7 @@ impl Retriever for GraphExpandRetriever {
                         scored.push((
                             blended,
                             SearchResult {
-                                tier: Some(entry.tier),
+                                tier: entry.tier,
                                 retention_score: entry.retention_score,
                                 entry,
                                 score: blended,
@@ -581,7 +581,7 @@ impl Retriever for GraphExpandRetriever {
                                     seen.insert(sr.entry.id);
                                     // Cold entries get pure cosine score (no graph proximity bonus), with tier_weight.
                                     let blended = (1.0 - self.alpha) * sr.score * tier_weight(sr.entry.tier);
-                                    scored.push((blended, SearchResult { tier: Some(sr.entry.tier), retention_score: sr.entry.retention_score, entry: sr.entry, score: blended }));
+                                    scored.push((blended, SearchResult { tier: sr.entry.tier, retention_score: sr.entry.retention_score, entry: sr.entry, score: blended }));
                                     added += 1;
                                 }
                             }
@@ -705,13 +705,13 @@ pub fn post_filter_metadata(
 
 #[cfg(test)]
 mod filter_tests {
-    use corvia_common::types::{KnowledgeEntry, SearchResult};
+    use corvia_common::types::{KnowledgeEntry, SearchResult, Tier};
 
     fn make_result(content_role: Option<&str>, source_origin: Option<&str>, score: f32) -> SearchResult {
         let mut entry = KnowledgeEntry::new("test".into(), "scope".into(), "v1".into());
         entry.metadata.content_role = content_role.map(String::from);
         entry.metadata.source_origin = source_origin.map(String::from);
-        SearchResult { entry, score, tier: None, retention_score: None }
+        SearchResult { entry, score, tier: Tier::Hot, retention_score: None }
     }
 
     fn make_result_with_workstream(content_role: Option<&str>, source_origin: Option<&str>, workstream: &str, score: f32) -> SearchResult {
@@ -719,7 +719,7 @@ mod filter_tests {
         entry.metadata.content_role = content_role.map(String::from);
         entry.metadata.source_origin = source_origin.map(String::from);
         entry.workstream = workstream.to_string();
-        SearchResult { entry, score, tier: None, retention_score: None }
+        SearchResult { entry, score, tier: Tier::Hot, retention_score: None }
     }
 
     #[test]
@@ -1979,7 +1979,7 @@ mod tests {
         assert!(!results.is_empty());
 
         let result = &results[0];
-        assert_eq!(result.tier, Some(Tier::Warm), "SearchResult should carry tier from entry");
+        assert_eq!(result.tier, Tier::Warm, "SearchResult should carry tier from entry");
         assert_eq!(result.retention_score, Some(0.45), "SearchResult should carry retention_score from entry");
     }
 }
