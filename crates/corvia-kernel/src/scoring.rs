@@ -9,6 +9,9 @@
 //! retention_score = 0.35 * D(t, alpha) + 0.30 * A(count, recency) + 0.20 * G(edges) + 0.15 * C(conf)
 //! if superseded: retention_score *= 0.5
 //! ```
+//!
+//! Each component returns a value in `[0.0, 1.0]`. Weights sum to 1.0, so the
+//! un-penalized score is also in `[0.0, 1.0]`. The supersession penalty halves it.
 
 use corvia_common::types::{MemoryType, Tier};
 
@@ -23,7 +26,8 @@ const W_GRAPH: f64 = 0.20;
 /// Weight for confidence component.
 const W_CONFIDENCE: f64 = 0.15;
 
-/// Normalizer for access frequency: `log(101.0)`.
+/// Normalizer for access frequency: `ln(101.0)`.
+/// Caps the frequency component at ~1.0 when `access_count >= 100`.
 const FREQ_NORMALIZER: f64 = 4.615_120_516_934_844; // ln(101) precomputed
 
 /// Supersession penalty multiplier.
@@ -59,22 +63,45 @@ const THRESHOLD_WARM_TO_HOT: f32 = 0.60;
 /// Inputs for retention score computation.
 ///
 /// Decoupled from `KnowledgeEntry` to keep scoring pure and independently testable.
-#[derive(Debug, Clone)]
+/// All fields are `Copy` — the struct is cheap to pass by value or reference.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RetentionParams {
+    /// Classification of the knowledge entry (determines decay alpha).
     pub memory_type: MemoryType,
+    /// Days elapsed since the entry was created. Negative values are clamped to 0.
     pub days_since_creation: f64,
+    /// Number of times the entry has been accessed.
     pub access_count: u32,
-    /// `None` means the entry has never been accessed.
+    /// Days since last access. `None` means the entry has never been accessed.
     pub days_since_access: Option<f64>,
+    /// Number of inbound graph edges pointing to this entry.
     pub inbound_edges: u32,
+    /// Confidence score in `[0.0, 1.0]`. `None` defaults to 0.7.
     pub confidence: Option<f32>,
+    /// Whether this entry has been superseded by a newer entry.
     pub is_superseded: bool,
+}
+
+impl Default for RetentionParams {
+    fn default() -> Self {
+        Self {
+            memory_type: MemoryType::default(),
+            days_since_creation: 0.0,
+            access_count: 0,
+            days_since_access: None,
+            inbound_edges: 0,
+            confidence: None,
+            is_superseded: false,
+        }
+    }
 }
 
 /// Returns the decay exponent (alpha) for a memory type.
 ///
 /// Special case: Structural entries that are superseded use `alpha = 0.60` (Episodic rate)
 /// instead of `alpha = 0` so they actually decay.
+#[inline]
+#[must_use]
 pub fn alpha_for_type(memory_type: MemoryType, is_superseded: bool) -> f64 {
     match memory_type {
         MemoryType::Structural if is_superseded => ALPHA_EPISODIC,
@@ -89,7 +116,9 @@ pub fn alpha_for_type(memory_type: MemoryType, is_superseded: bool) -> f64 {
 /// Compute the composite retention score.
 ///
 /// Returns a value in `[0.0, 1.0]` (clamped). Higher means the entry is more
-/// likely to remain in its current tier.
+/// likely to remain in its current tier. NaN inputs are treated as 0.
+#[inline]
+#[must_use]
 pub fn compute_retention_score(params: &RetentionParams) -> f32 {
     let alpha = alpha_for_type(params.memory_type, params.is_superseded);
 
@@ -104,44 +133,28 @@ pub fn compute_retention_score(params: &RetentionParams) -> f32 {
         score *= SUPERSESSION_PENALTY;
     }
 
-    (score as f32).clamp(0.0, 1.0)
+    // NaN guard: if any input was NaN, score is NaN; treat as 0.
+    let score = score as f32;
+    if score.is_nan() {
+        return 0.0;
+    }
+    score.clamp(0.0, 1.0)
 }
 
 /// Determine whether the entry should transition to a different tier.
 ///
 /// Returns `Some(new_tier)` if a transition is warranted, `None` if the entry
 /// stays in its current tier. Hysteresis gaps prevent oscillation at boundaries.
+#[inline]
+#[must_use]
 pub fn determine_tier_transition(current_tier: Tier, score: f32) -> Option<Tier> {
     match current_tier {
-        Tier::Hot => {
-            if score < THRESHOLD_HOT_TO_WARM {
-                Some(Tier::Warm)
-            } else {
-                None
-            }
-        }
-        Tier::Warm => {
-            if score >= THRESHOLD_WARM_TO_HOT {
-                Some(Tier::Hot)
-            } else if score < THRESHOLD_WARM_TO_COLD {
-                Some(Tier::Cold)
-            } else {
-                None
-            }
-        }
-        Tier::Cold => {
-            if score >= THRESHOLD_COLD_TO_WARM {
-                Some(Tier::Warm)
-            } else if score < THRESHOLD_COLD_TO_FORGOTTEN {
-                Some(Tier::Forgotten)
-            } else {
-                None
-            }
-        }
-        Tier::Forgotten => {
-            // Forgotten is the terminal state — no promotion back.
-            None
-        }
+        Tier::Hot if score < THRESHOLD_HOT_TO_WARM => Some(Tier::Warm),
+        Tier::Warm if score >= THRESHOLD_WARM_TO_HOT => Some(Tier::Hot),
+        Tier::Warm if score < THRESHOLD_WARM_TO_COLD => Some(Tier::Cold),
+        Tier::Cold if score >= THRESHOLD_COLD_TO_WARM => Some(Tier::Warm),
+        Tier::Cold if score < THRESHOLD_COLD_TO_FORGOTTEN => Some(Tier::Forgotten),
+        _ => None, // includes Forgotten (terminal) and all in-range cases
     }
 }
 
@@ -149,36 +162,57 @@ pub fn determine_tier_transition(current_tier: Tier, score: f32) -> Option<Tier>
 
 /// Time decay: `D(t, alpha) = (1 + t_days)^(-alpha)`.
 ///
-/// `t_days` is clamped to >= 0.
+/// `t_days` is clamped to >= 0. Short-circuits to 1.0 when alpha is 0 (Structural).
+#[inline]
 fn decay_component(days_since_creation: f64, alpha: f64) -> f64 {
-    let t = days_since_creation.max(0.0);
+    if alpha == 0.0 {
+        return 1.0;
+    }
+    let t = sanitize_f64(days_since_creation);
     (1.0 + t).powf(-alpha)
 }
 
 /// Access signal: frequency weighted by recency.
 ///
-/// `A = (log(1 + count) / FREQ_NORMALIZER) * (1 + days_since_access)^(-0.3)`
+/// `A = (ln(1 + count) / FREQ_NORMALIZER) * (1 + days_since_access)^(-0.3)`
 ///
-/// Returns 0 for never-accessed entries.
+/// Returns 0 for never-accessed entries. Frequency is capped at 1.0.
+#[inline]
 fn access_component(access_count: u32, days_since_access: Option<f64>) -> f64 {
     match days_since_access {
         None => 0.0,
         Some(days) => {
-            let freq = (1.0 + access_count as f64).ln() / FREQ_NORMALIZER;
-            let recency = (1.0 + days.max(0.0)).powf(-ACCESS_RECENCY_ALPHA);
+            let freq = ((1.0 + access_count as f64).ln() / FREQ_NORMALIZER).min(1.0);
+            let recency = (1.0 + sanitize_f64(days)).powf(-ACCESS_RECENCY_ALPHA);
             freq * recency
         }
     }
 }
 
 /// Graph connectivity: `min(inbound_edges / 10, 1.0)`.
+#[inline]
 fn graph_component(inbound_edges: u32) -> f64 {
     (inbound_edges as f64 / GRAPH_EDGE_CAP).min(1.0)
 }
 
-/// Confidence: `confidence.unwrap_or(0.7)`.
+/// Confidence: `confidence.unwrap_or(0.7)`, clamped to `[0.0, 1.0]`.
+#[inline]
 fn confidence_component(confidence: Option<f32>) -> f64 {
-    confidence.map(|c| c as f64).unwrap_or(DEFAULT_CONFIDENCE)
+    match confidence {
+        Some(c) if c.is_nan() => DEFAULT_CONFIDENCE,
+        Some(c) => (c as f64).clamp(0.0, 1.0),
+        None => DEFAULT_CONFIDENCE,
+    }
+}
+
+/// Sanitize an f64 input: clamp to >= 0, replace NaN/infinity with 0.
+#[inline]
+fn sanitize_f64(v: f64) -> f64 {
+    if v.is_nan() || v.is_infinite() {
+        0.0
+    } else {
+        v.max(0.0)
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -190,6 +224,19 @@ mod tests {
     // Helper: approximately equal within tolerance
     fn approx_eq(a: f32, b: f32, tol: f32) -> bool {
         (a - b).abs() < tol
+    }
+
+    // ── Invariant tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_weights_sum_to_one() {
+        let sum = W_DECAY + W_ACCESS + W_GRAPH + W_CONFIDENCE;
+        assert!((sum - 1.0).abs() < 1e-10, "Weights sum to {sum}, expected 1.0");
+    }
+
+    #[test]
+    fn test_freq_normalizer_matches_ln_101() {
+        assert!((FREQ_NORMALIZER - 101.0_f64.ln()).abs() < 1e-10);
     }
 
     // ── Alpha values ────────────────────────────────────────────────────────
@@ -224,6 +271,15 @@ mod tests {
         assert_eq!(alpha_for_type(MemoryType::Structural, true), ALPHA_EPISODIC);
     }
 
+    #[test]
+    fn test_alpha_non_structural_superseded_unchanged() {
+        // Superseded flag only changes alpha for Structural
+        assert_eq!(alpha_for_type(MemoryType::Episodic, true), ALPHA_EPISODIC);
+        assert_eq!(alpha_for_type(MemoryType::Decisional, true), ALPHA_DECISIONAL);
+        assert_eq!(alpha_for_type(MemoryType::Procedural, true), ALPHA_PROCEDURAL);
+        assert_eq!(alpha_for_type(MemoryType::Analytical, true), ALPHA_ANALYTICAL);
+    }
+
     // ── Worked examples from RFC ────────────────────────────────────────────
 
     #[test]
@@ -235,16 +291,14 @@ mod tests {
             days_since_creation: 14.0,
             access_count: 2,
             days_since_access: Some(1.0),
-            inbound_edges: 0,
             confidence: Some(0.6),
-            is_superseded: false,
+            ..Default::default()
         };
         let score = compute_retention_score(&params);
         assert!(
             approx_eq(score, 0.217, 0.03),
             "Expected ~0.217, got {score}"
         );
-        // Should be Cold tier (below 0.25 warm threshold)
         assert_eq!(
             determine_tier_transition(Tier::Warm, score),
             Some(Tier::Cold)
@@ -262,14 +316,13 @@ mod tests {
             days_since_access: Some(2.0),
             inbound_edges: 6,
             confidence: Some(0.9),
-            is_superseded: false,
+            ..Default::default()
         };
         let score = compute_retention_score(&params);
         assert!(
             approx_eq(score, 0.576, 0.03),
             "Expected ~0.576, got {score}"
         );
-        // Hot stays Hot (score >= 0.50)
         assert_eq!(determine_tier_transition(Tier::Hot, score), None);
     }
 
@@ -279,11 +332,8 @@ mod tests {
         let params = RetentionParams {
             memory_type: MemoryType::Episodic,
             days_since_creation: 60.0,
-            access_count: 0,
-            days_since_access: None,
-            inbound_edges: 0,
             confidence: Some(0.5),
-            is_superseded: false,
+            ..Default::default()
         };
         let score = compute_retention_score(&params);
         assert!(
@@ -305,14 +355,11 @@ mod tests {
             confidence: Some(0.8),
             is_superseded: false,
         };
-        let mut superseded = base.clone();
-        superseded.is_superseded = true;
+        let superseded = RetentionParams { is_superseded: true, ..base };
 
         let base_score = compute_retention_score(&base);
         let super_score = compute_retention_score(&superseded);
 
-        // Superseded score should be roughly half of base (not exact because
-        // alpha changes for Structural, but for Decisional alpha is unchanged)
         assert!(
             approx_eq(super_score, base_score * 0.5, 0.01),
             "Expected {}, got {super_score}",
@@ -322,31 +369,20 @@ mod tests {
 
     #[test]
     fn test_structural_superseded_uses_episodic_alpha() {
-        // Structural + superseded should decay (alpha=0.60 instead of alpha=0)
         let fresh = RetentionParams {
             memory_type: MemoryType::Structural,
-            days_since_creation: 0.0,
-            access_count: 0,
-            days_since_access: None,
-            inbound_edges: 0,
-            confidence: None,
-            is_superseded: false,
+            ..Default::default()
         };
         let old_superseded = RetentionParams {
             memory_type: MemoryType::Structural,
             days_since_creation: 365.0,
-            access_count: 0,
-            days_since_access: None,
-            inbound_edges: 0,
-            confidence: None,
             is_superseded: true,
+            ..Default::default()
         };
 
         let fresh_score = compute_retention_score(&fresh);
         let old_score = compute_retention_score(&old_superseded);
 
-        // Fresh structural should have high decay component (alpha=0 means no decay)
-        // Old superseded structural should have much lower score
         assert!(
             old_score < fresh_score * 0.3,
             "Old superseded structural ({old_score}) should be much lower than fresh ({fresh_score})"
@@ -360,125 +396,179 @@ mod tests {
         let params = RetentionParams {
             memory_type: MemoryType::Episodic,
             days_since_creation: -5.0,
-            access_count: 0,
-            days_since_access: None,
-            inbound_edges: 0,
             confidence: Some(0.7),
-            is_superseded: false,
+            ..Default::default()
         };
         let score = compute_retention_score(&params);
-        // With t clamped to 0: D = (1+0)^(-0.6) = 1.0
-        // A = 0, G = 0, C = 0.7
+        // D = (1+0)^(-0.6) = 1.0, A = 0, G = 0, C = 0.7
         // score = 0.35*1.0 + 0 + 0 + 0.15*0.7 = 0.455
-        assert!(
-            approx_eq(score, 0.455, 0.01),
-            "Expected ~0.455, got {score}"
-        );
+        assert!(approx_eq(score, 0.455, 0.01), "Expected ~0.455, got {score}");
     }
 
     #[test]
     fn test_never_accessed_entry_access_is_zero() {
-        let params = RetentionParams {
+        assert_eq!(access_component(0, None), 0.0);
+        assert_eq!(access_component(100, None), 0.0);
+    }
+
+    #[test]
+    fn test_access_increases_score() {
+        let base = RetentionParams {
             memory_type: MemoryType::Episodic,
             days_since_creation: 10.0,
-            access_count: 0,
-            days_since_access: None,
-            inbound_edges: 0,
             confidence: Some(0.7),
-            is_superseded: false,
+            ..Default::default()
         };
-        let score = compute_retention_score(&params);
-        // Access component should be exactly 0
-        let params_with_access = RetentionParams {
+        let with_access = RetentionParams {
             access_count: 10,
             days_since_access: Some(1.0),
-            ..params.clone()
+            ..base
         };
-        let score_with_access = compute_retention_score(&params_with_access);
-        assert!(score_with_access > score, "Access should increase score");
+        assert!(compute_retention_score(&with_access) > compute_retention_score(&base));
+    }
+
+    #[test]
+    fn test_nan_days_since_creation_returns_zero() {
+        let params = RetentionParams {
+            days_since_creation: f64::NAN,
+            ..Default::default()
+        };
+        let score = compute_retention_score(&params);
+        assert!(!score.is_nan(), "NaN should not propagate");
+        assert!(score >= 0.0);
+    }
+
+    #[test]
+    fn test_nan_days_since_access_returns_valid() {
+        let params = RetentionParams {
+            access_count: 5,
+            days_since_access: Some(f64::NAN),
+            ..Default::default()
+        };
+        let score = compute_retention_score(&params);
+        assert!(!score.is_nan(), "NaN should not propagate");
+    }
+
+    #[test]
+    fn test_infinity_days_since_creation() {
+        let params = RetentionParams {
+            days_since_creation: f64::INFINITY,
+            ..Default::default()
+        };
+        let score = compute_retention_score(&params);
+        assert!(!score.is_nan());
+        assert!(score >= 0.0 && score <= 1.0);
+    }
+
+    #[test]
+    fn test_u32_max_access_count_stays_clamped() {
+        let params = RetentionParams {
+            access_count: u32::MAX,
+            days_since_access: Some(0.0),
+            ..Default::default()
+        };
+        let score = compute_retention_score(&params);
+        assert!(score <= 1.0, "Score {score} exceeds 1.0 with u32::MAX access_count");
+        assert!(score >= 0.0);
+    }
+
+    #[test]
+    fn test_negative_days_since_access_clamps() {
+        let a_neg = access_component(5, Some(-3.0));
+        let a_zero = access_component(5, Some(0.0));
+        assert_eq!(a_neg, a_zero, "Negative days_since_access should clamp to 0");
+    }
+
+    #[test]
+    fn test_confidence_zero() {
+        assert_eq!(confidence_component(Some(0.0)), 0.0);
+    }
+
+    #[test]
+    fn test_confidence_over_one_clamped() {
+        assert_eq!(confidence_component(Some(1.5)), 1.0);
+    }
+
+    #[test]
+    fn test_confidence_nan_uses_default() {
+        assert_eq!(confidence_component(Some(f32::NAN)), DEFAULT_CONFIDENCE);
     }
 
     // ── Hysteresis tests ────────────────────────────────────────────────────
 
     #[test]
     fn test_hysteresis_hot_stays_hot_at_051() {
-        // score=0.51 — above hot_to_warm threshold (0.50), Hot stays Hot
         assert_eq!(determine_tier_transition(Tier::Hot, 0.51), None);
     }
 
     #[test]
     fn test_hysteresis_warm_stays_warm_at_059() {
-        // score=0.59 — below warm_to_hot threshold (0.60), Warm stays Warm
         assert_eq!(determine_tier_transition(Tier::Warm, 0.59), None);
     }
 
     #[test]
     fn test_hysteresis_prevents_oscillation() {
-        // An entry at score=0.55 should stay in whatever tier it's in:
-        // - If Hot: 0.55 >= 0.50, stays Hot
-        // - If Warm: 0.55 < 0.60, stays Warm
+        // score=0.55 stays in whatever tier it's in
         assert_eq!(determine_tier_transition(Tier::Hot, 0.55), None);
         assert_eq!(determine_tier_transition(Tier::Warm, 0.55), None);
     }
 
     #[test]
     fn test_hot_demotes_to_warm_below_050() {
-        assert_eq!(
-            determine_tier_transition(Tier::Hot, 0.49),
-            Some(Tier::Warm)
-        );
+        assert_eq!(determine_tier_transition(Tier::Hot, 0.49), Some(Tier::Warm));
     }
 
     #[test]
     fn test_warm_promotes_to_hot_at_060() {
-        assert_eq!(
-            determine_tier_transition(Tier::Warm, 0.60),
-            Some(Tier::Hot)
-        );
+        assert_eq!(determine_tier_transition(Tier::Warm, 0.60), Some(Tier::Hot));
     }
 
     #[test]
     fn test_warm_demotes_to_cold_below_025() {
-        assert_eq!(
-            determine_tier_transition(Tier::Warm, 0.24),
-            Some(Tier::Cold)
-        );
+        assert_eq!(determine_tier_transition(Tier::Warm, 0.24), Some(Tier::Cold));
     }
 
     #[test]
     fn test_cold_promotes_to_warm_at_035() {
-        assert_eq!(
-            determine_tier_transition(Tier::Cold, 0.35),
-            Some(Tier::Warm)
-        );
+        assert_eq!(determine_tier_transition(Tier::Cold, 0.35), Some(Tier::Warm));
     }
 
     #[test]
     fn test_cold_demotes_to_forgotten_below_005() {
-        assert_eq!(
-            determine_tier_transition(Tier::Cold, 0.04),
-            Some(Tier::Forgotten)
-        );
+        assert_eq!(determine_tier_transition(Tier::Cold, 0.04), Some(Tier::Forgotten));
     }
 
     #[test]
     fn test_cold_stays_cold_at_010() {
-        // Between 0.05 and 0.35 — stays Cold
         assert_eq!(determine_tier_transition(Tier::Cold, 0.10), None);
     }
 
     #[test]
     fn test_forgotten_is_terminal() {
-        // Even high scores can't promote out of Forgotten
         assert_eq!(determine_tier_transition(Tier::Forgotten, 0.99), None);
         assert_eq!(determine_tier_transition(Tier::Forgotten, 0.0), None);
+    }
+
+    // Exact boundary tests
+    #[test]
+    fn test_exact_boundary_hot_at_050_stays() {
+        assert_eq!(determine_tier_transition(Tier::Hot, 0.50), None);
+    }
+
+    #[test]
+    fn test_exact_boundary_warm_at_025_stays() {
+        assert_eq!(determine_tier_transition(Tier::Warm, 0.25), None);
+    }
+
+    #[test]
+    fn test_exact_boundary_cold_at_005_stays() {
+        assert_eq!(determine_tier_transition(Tier::Cold, 0.05), None);
     }
 
     // ── Component unit tests ────────────────────────────────────────────────
 
     #[test]
     fn test_decay_structural_never_decays() {
-        // alpha=0 means (1+t)^0 = 1.0 always
         assert_eq!(decay_component(0.0, 0.0), 1.0);
         assert_eq!(decay_component(365.0, 0.0), 1.0);
         assert_eq!(decay_component(10000.0, 0.0), 1.0);
@@ -501,8 +591,14 @@ mod tests {
         let a100 = access_component(100, Some(0.0));
         assert!(a10 > a1);
         assert!(a100 > a10);
-        // Logarithmic: a100/a10 should be less than a10/a1
         assert!((a100 - a10) < (a10 - a1) * 2.0);
+    }
+
+    #[test]
+    fn test_access_component_max_at_100_accesses() {
+        // With 100 accesses and 0 days since access, frequency should be ~1.0
+        let a = access_component(100, Some(0.0));
+        assert!((a - 1.0).abs() < 0.01, "Expected ~1.0, got {a}");
     }
 
     #[test]
@@ -526,12 +622,11 @@ mod tests {
         // Maximum possible score
         let max_params = RetentionParams {
             memory_type: MemoryType::Structural,
-            days_since_creation: 0.0,
             access_count: 1000,
             days_since_access: Some(0.0),
             inbound_edges: 100,
             confidence: Some(1.0),
-            is_superseded: false,
+            ..Default::default()
         };
         let max_score = compute_retention_score(&max_params);
         assert!(max_score <= 1.0, "Max score {max_score} exceeds 1.0");
@@ -541,14 +636,26 @@ mod tests {
         let min_params = RetentionParams {
             memory_type: MemoryType::Episodic,
             days_since_creation: 100000.0,
-            access_count: 0,
-            days_since_access: None,
-            inbound_edges: 0,
             confidence: Some(0.0),
             is_superseded: true,
+            ..Default::default()
         };
         let min_score = compute_retention_score(&min_params);
         assert!(min_score >= 0.0, "Min score {min_score} is negative");
         assert!(min_score < 0.01, "Min score {min_score} should be near 0.0");
+    }
+
+    // ── Default ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_retention_params_default() {
+        let params = RetentionParams::default();
+        assert_eq!(params.memory_type, MemoryType::Episodic);
+        assert_eq!(params.days_since_creation, 0.0);
+        assert_eq!(params.access_count, 0);
+        assert!(params.days_since_access.is_none());
+        assert_eq!(params.inbound_edges, 0);
+        assert!(params.confidence.is_none());
+        assert!(!params.is_superseded);
     }
 }
