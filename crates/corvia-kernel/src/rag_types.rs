@@ -26,6 +26,8 @@ pub struct RetrievalOpts {
     pub source_origin: Option<String>,
     /// Filter results by workstream (e.g. git branch name).
     pub workstream: Option<String>,
+    /// Include Cold-tier entries via brute-force cosine scan (default false).
+    pub include_cold: bool,
 }
 
 impl Default for RetrievalOpts {
@@ -41,6 +43,7 @@ impl Default for RetrievalOpts {
             content_role: None,
             source_origin: None,
             workstream: None,
+            include_cold: false,
         }
     }
 }
@@ -55,6 +58,7 @@ mod tests {
         assert!(opts.content_role.is_none());
         assert!(opts.source_origin.is_none());
         assert!(opts.workstream.is_none());
+        assert!(!opts.include_cold);
     }
 }
 
@@ -116,7 +120,13 @@ pub struct RetrievalMetrics {
     /// Time spent on sort + filter (subset of search_latency_ms).
     #[serde(default)]
     pub filter_latency_ms: u64,
+    /// Time spent on brute-force cosine scan over Cold-tier entries.
+    #[serde(default)]
+    pub cold_scan_latency_ms: u64,
     pub vector_results: usize,
+    /// Number of Cold-tier entries returned from brute-force scan.
+    #[serde(default)]
+    pub cold_results: usize,
     pub graph_expanded: usize,
     #[serde(default)]
     pub graph_reinforced: usize,

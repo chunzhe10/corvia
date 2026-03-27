@@ -34,6 +34,7 @@ arc-swap = "1"
 hnsw_rs = "0.3"
 redb = "2"
 petgraph = "0.7"
+rayon = "1"
 chrono = { version = "0.4", features = ["serde"] }
 pdf-extract = "0.7"
 pulldown-cmark = "0.12"

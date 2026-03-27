@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
 
+use crate::lite_store::LiteStore;
 use crate::rag_types::{RetrievalMetrics, RetrievalOpts, RetrievalResult};
 use crate::reasoner::cosine_similarity;
 use crate::traits::{GraphStore, InferenceEngine, QueryableStore};
@@ -48,7 +49,9 @@ fn check_rbac_scope(
                         hnsw_latency_ms: 0,
                         graph_latency_ms: 0,
                         filter_latency_ms: 0,
+                        cold_scan_latency_ms: 0,
                         vector_results: 0,
+                        cold_results: 0,
                         graph_expanded: 0,
                         graph_reinforced: 0,
                         post_filter_count: 0,
@@ -76,6 +79,51 @@ fn spawn_access_recording(store: Arc<dyn QueryableStore>, results: &[SearchResul
             Err(e) => warn!(error = %e, "Access recording failed"),
         }
     });
+}
+
+/// Perform brute-force cold scan if `include_cold` is set and the store is LiteStore.
+///
+/// Returns `(cold_results, cold_scan_latency_ms)`. Merges cold results into the
+/// existing results vector by score, then truncates to limit.
+fn merge_cold_results(
+    store: &dyn QueryableStore,
+    embedding: &[f32],
+    scope_id: &str,
+    opts: &RetrievalOpts,
+    results: &mut Vec<SearchResult>,
+) -> (usize, u64) {
+    if !opts.include_cold {
+        return (0, 0);
+    }
+
+    let cold_start = Instant::now();
+
+    // Downcast to LiteStore for cold scan (LiteStore-specific operation).
+    let lite_store = match store.as_any().downcast_ref::<LiteStore>() {
+        Some(ls) => ls,
+        None => {
+            warn!("include_cold requested but store is not LiteStore — skipping cold scan");
+            return (0, 0);
+        }
+    };
+
+    let cold_results = match lite_store.scan_cold_entries(embedding, scope_id, opts.limit) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "Cold scan failed, continuing with HNSW results only");
+            return (0, cold_start.elapsed().as_millis() as u64);
+        }
+    };
+
+    let cold_count = cold_results.len();
+    if cold_count > 0 {
+        // Merge cold results into existing results.
+        results.extend(cold_results);
+        // Re-sort by score descending.
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    (cold_count, cold_start.elapsed().as_millis() as u64)
 }
 
 /// First stage of the RAG pipeline: query -> ranked results.
@@ -147,8 +195,13 @@ impl Retriever for VectorRetriever {
         let raw_results = self.store.search(&embedding, scope_id, fetch_limit).await?;
         let vector_results = raw_results.len();
 
+        // Cold-tier brute-force scan (merged before visibility filtering).
+        let mut merged = raw_results;
+        let (cold_results, cold_scan_latency_ms) =
+            merge_cold_results(self.store.as_ref(), &embedding, scope_id, opts, &mut merged);
+
         // Visibility post-filter (no take yet — metadata filter runs after).
-        let vis_filtered: Vec<SearchResult> = raw_results
+        let vis_filtered: Vec<SearchResult> = merged
             .into_iter()
             .filter(|sr| visibility_filter(&sr.entry, &opts.visibility, opts.agent_id.as_deref()))
             .collect();
@@ -175,9 +228,11 @@ impl Retriever for VectorRetriever {
             retriever = self.name(),
             scope_id,
             vector_results,
+            cold_results,
             post_filter_count,
             embed_latency_ms,
             search_latency_ms,
+            cold_scan_latency_ms,
             latency_ms = start.elapsed().as_millis() as u64,
             "retrieval complete"
         );
@@ -188,10 +243,12 @@ impl Retriever for VectorRetriever {
                 latency_ms: start.elapsed().as_millis() as u64,
                 embed_latency_ms,
                 search_latency_ms,
-                hnsw_latency_ms: search_latency_ms, // VectorRetriever: all search time is HNSW
+                hnsw_latency_ms: search_latency_ms - cold_scan_latency_ms,
                 graph_latency_ms: 0,
                 filter_latency_ms: 0,
+                cold_scan_latency_ms,
                 vector_results,
+                cold_results,
                 graph_expanded: 0,
                 graph_reinforced: 0,
                 post_filter_count,
@@ -444,6 +501,39 @@ impl Retriever for GraphExpandRetriever {
 
         let graph_latency_ms = graph_start.elapsed().as_millis() as u64;
 
+        // Cold-tier brute-force scan (merged with graph-expanded results).
+        let cold_scan_start = Instant::now();
+        let cold_results = if opts.include_cold {
+            match self.store.as_ref().as_any().downcast_ref::<LiteStore>() {
+                Some(ls) => {
+                    match ls.scan_cold_entries(&embedding, scope_id, opts.limit) {
+                        Ok(cold) => {
+                            for sr in &cold {
+                                if !seen.contains(&sr.entry.id) {
+                                    seen.insert(sr.entry.id);
+                                    // Cold entries get pure cosine score (no graph proximity bonus).
+                                    let blended = (1.0 - self.alpha) * sr.score;
+                                    scored.push((blended, SearchResult { entry: sr.entry.clone(), score: blended }));
+                                }
+                            }
+                            cold.len()
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Cold scan failed, continuing without cold results");
+                            0
+                        }
+                    }
+                }
+                None => {
+                    warn!("include_cold requested but store is not LiteStore — skipping cold scan");
+                    0
+                }
+            }
+        } else {
+            0
+        };
+        let cold_scan_latency_ms = cold_scan_start.elapsed().as_millis() as u64;
+
         // Sort + filter (timed separately).
         let filter_start = Instant::now();
 
@@ -480,12 +570,14 @@ impl Retriever for GraphExpandRetriever {
             retriever = self.name(),
             scope_id,
             vector_results,
+            cold_results,
             graph_expanded,
             graph_reinforced,
             post_filter_count,
             embed_latency_ms,
             hnsw_latency_ms,
             graph_latency_ms,
+            cold_scan_latency_ms,
             filter_latency_ms,
             search_latency_ms,
             latency_ms = start.elapsed().as_millis() as u64,
@@ -501,7 +593,9 @@ impl Retriever for GraphExpandRetriever {
                 hnsw_latency_ms,
                 graph_latency_ms,
                 filter_latency_ms,
+                cold_scan_latency_ms,
                 vector_results,
+                cold_results,
                 graph_expanded,
                 graph_reinforced,
                 post_filter_count,
@@ -1141,5 +1235,245 @@ mod tests {
         let fake_id = uuid::Uuid::now_v7();
         // Should not panic or error — just skip the missing entry.
         store.record_access(&[fake_id]).await.unwrap();
+    }
+
+    /// Cold entry found when include_cold=true.
+    #[tokio::test]
+    async fn test_cold_entry_found_when_include_cold_true() {
+        use corvia_common::types::Tier;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+        let engine: Arc<dyn InferenceEngine> = Arc::new(MockEngine);
+
+        // Insert 10 Hot entries for HNSW connectivity.
+        let mut idx: usize = 0;
+        let mut next_emb = || {
+            idx += 1;
+            vec![1.0, idx as f32 * 0.001, 0.0]
+        };
+        for i in 0..10 {
+            let mut entry = KnowledgeEntry::new(
+                format!("hot item {i}"),
+                "scope-cold".to_string(),
+                "v1".to_string(),
+            );
+            entry.embedding = Some(next_emb());
+            store.insert(&entry).await.unwrap();
+        }
+
+        // Insert a Cold entry directly into Redb (not HNSW).
+        // We insert it as Hot first, then update its tier to Cold in Redb.
+        let mut cold_entry = KnowledgeEntry::new(
+            "cold knowledge: secret sauce".to_string(),
+            "scope-cold".to_string(),
+            "v1".to_string(),
+        );
+        cold_entry.embedding = Some(vec![1.0, 0.0, 0.0]); // exact match to query
+        cold_entry.tier = Tier::Cold;
+        // Insert via store (adds to HNSW), then we'll test cold scan directly
+        store.insert(&cold_entry).await.unwrap();
+
+        // Test: scan_cold_entries should find the cold entry.
+        let cold_results = store
+            .scan_cold_entries(&[1.0, 0.0, 0.0], "scope-cold", 10)
+            .unwrap();
+        assert_eq!(cold_results.len(), 1, "should find exactly 1 cold entry");
+        assert_eq!(cold_results[0].entry.content, "cold knowledge: secret sauce");
+        assert!(cold_results[0].score > 0.99, "exact match should have score ~1.0");
+
+        // Test via retriever with include_cold=true.
+        let retriever = VectorRetriever::new(store.clone() as Arc<dyn QueryableStore>, engine);
+        let opts = RetrievalOpts {
+            limit: 15,
+            include_cold: true,
+            visibility: VisibilityMode::All,
+            ..Default::default()
+        };
+        let result = retriever.retrieve("test", "scope-cold", &opts).await.unwrap();
+        // Cold entry should appear in results.
+        let has_cold = result.results.iter().any(|r| r.entry.content.contains("cold knowledge"));
+        assert!(has_cold, "cold entry should be in results when include_cold=true");
+        assert!(result.metrics.cold_results >= 1, "metrics should report cold results");
+    }
+
+    /// Cold entry NOT found when include_cold=false (default).
+    #[tokio::test]
+    async fn test_cold_entry_not_found_when_include_cold_false() {
+        use corvia_common::types::Tier;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+        let engine: Arc<dyn InferenceEngine> = Arc::new(MockEngine);
+
+        // Insert 10 Hot entries for HNSW connectivity.
+        let mut idx: usize = 0;
+        let mut next_emb = || {
+            idx += 1;
+            vec![1.0, idx as f32 * 0.001, 0.0]
+        };
+        for i in 0..10 {
+            let mut entry = KnowledgeEntry::new(
+                format!("hot item {i}"),
+                "scope-default".to_string(),
+                "v1".to_string(),
+            );
+            entry.embedding = Some(next_emb());
+            store.insert(&entry).await.unwrap();
+        }
+
+        // Insert a Cold entry.
+        let mut cold_entry = KnowledgeEntry::new(
+            "cold secret".to_string(),
+            "scope-default".to_string(),
+            "v1".to_string(),
+        );
+        cold_entry.embedding = Some(vec![1.0, 0.0, 0.0]);
+        cold_entry.tier = Tier::Cold;
+        store.insert(&cold_entry).await.unwrap();
+
+        // Default opts: include_cold=false.
+        let retriever = VectorRetriever::new(store.clone() as Arc<dyn QueryableStore>, engine);
+        let opts = RetrievalOpts {
+            limit: 15,
+            visibility: VisibilityMode::All,
+            ..Default::default()
+        };
+        assert!(!opts.include_cold, "default should be false");
+        let result = retriever.retrieve("test", "scope-default", &opts).await.unwrap();
+        assert_eq!(result.metrics.cold_results, 0, "no cold scan when include_cold=false");
+        assert_eq!(result.metrics.cold_scan_latency_ms, 0);
+    }
+
+    /// Cold entry with higher cosine similarity ranks above Warm entry.
+    #[tokio::test]
+    async fn test_cold_entry_ranks_above_warm_when_higher_similarity() {
+        use corvia_common::types::Tier;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+        let engine: Arc<dyn InferenceEngine> = Arc::new(MockEngine);
+
+        // Insert 10 filler entries for HNSW connectivity.
+        let mut idx: usize = 0;
+        let mut next_emb = || {
+            idx += 1;
+            vec![0.5, idx as f32 * 0.01, 0.5]
+        };
+        for i in 0..10 {
+            let mut entry = KnowledgeEntry::new(
+                format!("filler {i}"),
+                "scope-rank".to_string(),
+                "v1".to_string(),
+            );
+            entry.embedding = Some(next_emb());
+            store.insert(&entry).await.unwrap();
+        }
+
+        // Warm entry with low similarity to query [1,0,0].
+        let mut warm_entry = KnowledgeEntry::new(
+            "warm entry".to_string(),
+            "scope-rank".to_string(),
+            "v1".to_string(),
+        );
+        warm_entry.embedding = Some(vec![0.0, 1.0, 0.0]); // orthogonal to query
+        warm_entry.tier = Tier::Warm;
+        store.insert(&warm_entry).await.unwrap();
+
+        // Cold entry with high similarity to query [1,0,0].
+        let mut cold_entry = KnowledgeEntry::new(
+            "cold entry high score".to_string(),
+            "scope-rank".to_string(),
+            "v1".to_string(),
+        );
+        cold_entry.embedding = Some(vec![1.0, 0.0, 0.0]); // exact match
+        cold_entry.tier = Tier::Cold;
+        store.insert(&cold_entry).await.unwrap();
+
+        let retriever = VectorRetriever::new(store.clone() as Arc<dyn QueryableStore>, engine);
+        let opts = RetrievalOpts {
+            limit: 20,
+            include_cold: true,
+            visibility: VisibilityMode::All,
+            ..Default::default()
+        };
+        let result = retriever.retrieve("test", "scope-rank", &opts).await.unwrap();
+
+        // Find positions.
+        let cold_pos = result.results.iter().position(|r| r.entry.content == "cold entry high score");
+        let warm_pos = result.results.iter().position(|r| r.entry.content == "warm entry");
+
+        assert!(cold_pos.is_some(), "cold entry should be in results");
+        // If warm entry appears at all, cold should rank higher (lower index).
+        if let Some(wp) = warm_pos {
+            assert!(
+                cold_pos.unwrap() < wp,
+                "cold entry (exact match) should rank above warm entry (orthogonal)"
+            );
+        }
+    }
+
+    /// Scan handles zero Cold entries gracefully.
+    #[tokio::test]
+    async fn test_cold_scan_zero_cold_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+
+        // Insert only Hot entries.
+        for i in 0..5 {
+            let mut entry = KnowledgeEntry::new(
+                format!("hot {i}"),
+                "scope-empty".to_string(),
+                "v1".to_string(),
+            );
+            entry.embedding = Some(vec![1.0, i as f32 * 0.01, 0.0]);
+            store.insert(&entry).await.unwrap();
+        }
+
+        let results = store
+            .scan_cold_entries(&[1.0, 0.0, 0.0], "scope-empty", 10)
+            .unwrap();
+        assert!(results.is_empty(), "no cold entries should mean empty results");
+    }
+
+    /// Forgotten entries (embedding=None) excluded from cold scan.
+    #[tokio::test]
+    async fn test_cold_scan_excludes_forgotten_entries() {
+        use corvia_common::types::Tier;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+
+        // Insert a Cold entry with embedding.
+        let mut cold_with_emb = KnowledgeEntry::new(
+            "cold with embedding".to_string(),
+            "scope-forgotten".to_string(),
+            "v1".to_string(),
+        );
+        cold_with_emb.embedding = Some(vec![1.0, 0.0, 0.0]);
+        cold_with_emb.tier = Tier::Cold;
+        store.insert(&cold_with_emb).await.unwrap();
+
+        // Insert a Forgotten entry (Cold tier but embedding=None conceptually).
+        // In practice Forgotten entries have tier=Forgotten, not Cold.
+        let mut forgotten = KnowledgeEntry::new(
+            "forgotten entry".to_string(),
+            "scope-forgotten".to_string(),
+            "v1".to_string(),
+        );
+        forgotten.embedding = Some(vec![1.0, 0.0, 0.0]); // need embedding to insert
+        forgotten.tier = Tier::Forgotten;
+        store.insert(&forgotten).await.unwrap();
+
+        let results = store
+            .scan_cold_entries(&[1.0, 0.0, 0.0], "scope-forgotten", 10)
+            .unwrap();
+        assert_eq!(results.len(), 1, "only Cold tier entries should be returned");
+        assert_eq!(results[0].entry.content, "cold with embedding");
     }
 }

@@ -372,6 +372,101 @@ impl LiteStore {
             .map_err(|e| CorviaError::Storage(format!("Failed to count HNSW_TO_UUID: {e}")))
     }
 
+    /// Brute-force cosine scan over Cold-tier entries in Redb.
+    ///
+    /// Iterates all entries in the scope, filters for `Tier::Cold` with preserved
+    /// embeddings, computes cosine similarity against the query embedding, and
+    /// returns the top-K results sorted by score descending.
+    ///
+    /// Uses `rayon::par_iter()` when cold entry count exceeds 1,000 for parallel
+    /// cosine computation.
+    #[tracing::instrument(name = "corvia.store.scan_cold", skip(self, query_embedding), fields(scope_id))]
+    pub fn scan_cold_entries(
+        &self,
+        query_embedding: &[f32],
+        scope_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        use corvia_common::types::Tier;
+        use crate::reasoner::cosine_similarity;
+
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let prefix_start = format!("{scope_id}:");
+        let prefix_end = format!("{scope_id};");
+
+        // Single read transaction: scope scan + entry reads.
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| CorviaError::Storage(format!("Failed to begin read txn: {e}")))?;
+        let scope_table = read_txn
+            .open_table(SCOPE_INDEX)
+            .map_err(|e| CorviaError::Storage(format!("Failed to open SCOPE_INDEX: {e}")))?;
+        let entries_table = read_txn
+            .open_table(ENTRIES)
+            .map_err(|e| CorviaError::Storage(format!("Failed to open ENTRIES: {e}")))?;
+
+        // Collect UUIDs in scope via prefix range scan.
+        let uuids: Vec<String> = scope_table
+            .range(prefix_start.as_str()..prefix_end.as_str())
+            .map_err(|e| CorviaError::Storage(format!("Failed to range scan: {e}")))?
+            .filter_map(|item| item.ok().map(|(_, v)| v.value().to_string()))
+            .collect();
+
+        // Batch-read all entries and filter to Cold tier with embeddings.
+        let cold_entries: Vec<(KnowledgeEntry, Vec<f32>)> = uuids
+            .iter()
+            .filter_map(|uuid_str| {
+                let bytes = entries_table.get(uuid_str.as_str()).ok()??;
+                let entry: KnowledgeEntry = serde_json::from_slice(bytes.value()).ok()?;
+                if entry.tier != Tier::Cold {
+                    return None;
+                }
+                let emb = entry.embedding.clone()?;
+                Some((entry, emb))
+            })
+            .collect();
+
+        if cold_entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let cold_count = cold_entries.len();
+        info!(cold_count, scope_id, "scanning cold entries");
+
+        // Compute cosine similarity — parallel when > 1,000 entries.
+        let mut scored: Vec<(f32, KnowledgeEntry)> = if cold_count > 1_000 {
+            use rayon::prelude::*;
+            cold_entries
+                .into_par_iter()
+                .map(|(entry, emb)| {
+                    let score = cosine_similarity(query_embedding, &emb);
+                    (score, entry)
+                })
+                .collect()
+        } else {
+            cold_entries
+                .into_iter()
+                .map(|(entry, emb)| {
+                    let score = cosine_similarity(query_embedding, &emb);
+                    (score, entry)
+                })
+                .collect()
+        };
+
+        // Sort by score descending, take top-K.
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+
+        Ok(scored
+            .into_iter()
+            .map(|(score, entry)| SearchResult { entry, score })
+            .collect())
+    }
+
     /// Clear the TEMPORAL_INDEX table in Redb by dropping and re-creating it.
     fn clear_source_version_index(&self) -> Result<()> {
         let write_txn = self

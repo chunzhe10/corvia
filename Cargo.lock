@@ -923,6 +923,7 @@ dependencies = [
  "petgraph",
  "pgvector",
  "pulldown-cmark",
+ "rayon",
  "redb",
  "reqwest",
  "serde",
