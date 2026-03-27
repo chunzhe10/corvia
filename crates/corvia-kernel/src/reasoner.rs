@@ -676,7 +676,7 @@ pub fn check_unmapped_content_role(entries: &[KnowledgeEntry], scope_id: &str) -
         .filter(|e| e.scope_id == scope_id)
         .filter(|e| {
             if let Some(ref role) = e.metadata.content_role {
-                !corvia_common::types::is_mapped_content_role(role)
+                !corvia_common::types::MemoryType::is_known_content_role(role)
             } else {
                 false
             }

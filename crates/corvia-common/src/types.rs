@@ -11,7 +11,7 @@ use uuid::Uuid;
 /// - Episodic (α=0.60): Session discoveries, agent activity — fast decay unless reinforced
 /// - Analytical (α=0.30): Synthesized findings, health checks — medium decay
 /// - Procedural (α=0.10): Instructions, workflows — slowest decay, reinforced by access
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryType {
     Structural,
@@ -34,20 +34,41 @@ impl fmt::Display for MemoryType {
     }
 }
 
+impl std::str::FromStr for MemoryType {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "structural" => Ok(Self::Structural),
+            "decisional" => Ok(Self::Decisional),
+            "episodic" => Ok(Self::Episodic),
+            "analytical" => Ok(Self::Analytical),
+            "procedural" => Ok(Self::Procedural),
+            _ => Err(format!(
+                "Unknown memory type: {s}. Valid: structural, decisional, episodic, analytical, procedural"
+            )),
+        }
+    }
+}
+
 /// Lifecycle tier for knowledge entries.
 ///
 /// - Hot: HNSW indexed, full retrieval participation
 /// - Warm: HNSW indexed, retrieval deprioritized
 /// - Cold: NOT in HNSW, embedding preserved, searchable via brute-force fallback
 /// - Forgotten: Compacted into summary entry, original archived
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
+    /// Compacted into summary entry, original archived. Only irreversible step.
+    Forgotten,
+    /// NOT in HNSW, embedding preserved, searchable via brute-force fallback.
+    Cold,
+    /// HNSW indexed, retrieval deprioritized.
+    Warm,
+    /// HNSW indexed, full retrieval participation.
     #[default]
     Hot,
-    Warm,
-    Cold,
-    Forgotten,
 }
 
 impl fmt::Display for Tier {
@@ -61,40 +82,62 @@ impl fmt::Display for Tier {
     }
 }
 
-/// Known content_role values and their MemoryType mappings.
-const CONTENT_ROLE_MAPPINGS: &[(&str, MemoryType)] = &[
-    ("code", MemoryType::Structural),
-    ("design", MemoryType::Decisional),
-    ("decision", MemoryType::Decisional),
-    ("plan", MemoryType::Decisional),
-    ("memory", MemoryType::Episodic),
-    ("learning", MemoryType::Episodic),
-    ("finding", MemoryType::Analytical),
-    ("instruction", MemoryType::Procedural),
-];
+impl std::str::FromStr for Tier {
+    type Err = String;
 
-/// Classify a content_role string into a MemoryType.
-///
-/// Returns the mapped MemoryType, or `Episodic` (default) for `None` or unrecognized values.
-/// Logs a warning for unrecognized non-None values.
-pub fn classify_memory_type(content_role: Option<&str>) -> MemoryType {
-    match content_role {
-        None => MemoryType::default(),
-        Some(role) => {
-            for &(key, memory_type) in CONTENT_ROLE_MAPPINGS {
-                if role == key {
-                    return memory_type;
-                }
-            }
-            tracing::warn!(content_role = role, "unmapped content_role, defaulting to Episodic");
-            MemoryType::default()
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "hot" => Ok(Self::Hot),
+            "warm" => Ok(Self::Warm),
+            "cold" => Ok(Self::Cold),
+            "forgotten" => Ok(Self::Forgotten),
+            _ => Err(format!(
+                "Unknown tier: {s}. Valid: hot, warm, cold, forgotten"
+            )),
         }
     }
 }
 
+impl MemoryType {
+    /// Classify a content_role string into a MemoryType.
+    ///
+    /// Returns the mapped MemoryType, or `Episodic` (default) for `None` or unrecognized values.
+    /// Logs a warning for unrecognized non-None values.
+    pub fn from_content_role(content_role: Option<&str>) -> Self {
+        match content_role {
+            None => Self::default(),
+            Some(role) => match role {
+                "code" => Self::Structural,
+                "design" | "decision" | "plan" => Self::Decisional,
+                "memory" | "learning" => Self::Episodic,
+                "finding" => Self::Analytical,
+                "instruction" => Self::Procedural,
+                _ => {
+                    tracing::warn!(content_role = role, "unmapped content_role, defaulting to Episodic");
+                    Self::default()
+                }
+            },
+        }
+    }
+
+    /// Returns true if the given content_role maps to a known MemoryType.
+    pub fn is_known_content_role(role: &str) -> bool {
+        matches!(role, "code" | "design" | "decision" | "plan" | "memory" | "learning" | "finding" | "instruction")
+    }
+}
+
+/// Classify a content_role string into a MemoryType.
+///
+/// Convenience wrapper for [`MemoryType::from_content_role`].
+pub fn classify_memory_type(content_role: Option<&str>) -> MemoryType {
+    MemoryType::from_content_role(content_role)
+}
+
 /// Returns true if the given content_role is in the known mapping table.
+///
+/// Convenience wrapper for [`MemoryType::is_known_content_role`].
 pub fn is_mapped_content_role(role: &str) -> bool {
-    CONTENT_ROLE_MAPPINGS.iter().any(|&(key, _)| key == role)
+    MemoryType::is_known_content_role(role)
 }
 
 /// A single unit of knowledge stored in Corvia.
@@ -122,6 +165,8 @@ pub struct KnowledgeEntry {
     // Tiered knowledge fields
     #[serde(default)]
     pub memory_type: MemoryType,
+    /// Confidence score for decisional/analytical entries. Value must be in `[0.0, 1.0]`.
+    /// Used in decay math: `effective_age = actual_age / confidence`.
     #[serde(default)]
     pub confidence: Option<f32>,
     #[serde(default)]
@@ -132,14 +177,14 @@ pub struct KnowledgeEntry {
     pub tier: Tier,
     #[serde(default)]
     pub tier_changed_at: Option<DateTime<Utc>>,
+    /// Composite retention score (0.0-1.0). Higher = more likely to stay in current tier.
+    /// Computed by GC workers: `0.35×decay + 0.30×access + 0.20×graph + 0.15×confidence`.
     #[serde(default)]
     pub retention_score: Option<f32>,
+    /// Pin state. `Some(info)` = pinned (exempt from GC demotion), `None` = not pinned.
+    /// Pinned entries cannot be demoted below their current tier.
     #[serde(default)]
-    pub pinned: bool,
-    #[serde(default)]
-    pub pinned_by: Option<String>,
-    #[serde(default)]
-    pub pinned_at: Option<DateTime<Utc>>,
+    pub pin: Option<PinInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -153,6 +198,15 @@ pub struct EntryMetadata {
     pub content_role: Option<String>,
     #[serde(default)]
     pub source_origin: Option<String>,
+}
+
+/// Information about a pinned entry. Presence indicates the entry is pinned.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PinInfo {
+    /// Agent or user identifier that pinned this entry.
+    pub by: String,
+    /// When the entry was pinned.
+    pub at: DateTime<Utc>,
 }
 
 impl KnowledgeEntry {
@@ -180,9 +234,7 @@ impl KnowledgeEntry {
             tier: Tier::default(),
             tier_changed_at: None,
             retention_score: None,
-            pinned: false,
-            pinned_by: None,
-            pinned_at: None,
+            pin: None,
         }
     }
 
@@ -201,9 +253,33 @@ impl KnowledgeEntry {
         self
     }
 
-    /// Auto-classify memory_type from the entry's content_role.
+    /// Auto-classify memory_type from the entry's content_role (mutates in place).
     pub fn auto_classify(&mut self) {
-        self.memory_type = classify_memory_type(self.metadata.content_role.as_deref());
+        self.memory_type = MemoryType::from_content_role(self.metadata.content_role.as_deref());
+    }
+
+    /// Auto-classify memory_type from the entry's content_role (builder chain).
+    pub fn with_auto_classify(mut self) -> Self {
+        self.auto_classify();
+        self
+    }
+
+    /// Pin this entry, exempting it from GC demotion.
+    pub fn pin(&mut self, by: impl Into<String>) {
+        self.pin = Some(PinInfo {
+            by: by.into(),
+            at: Utc::now(),
+        });
+    }
+
+    /// Unpin this entry, allowing GC demotion.
+    pub fn unpin(&mut self) {
+        self.pin = None;
+    }
+
+    /// Returns true if this entry is pinned.
+    pub fn is_pinned(&self) -> bool {
+        self.pin.is_some()
     }
 
     pub fn with_agent(mut self, agent_id: String, session_id: String) -> Self {
@@ -413,9 +489,8 @@ mod tests {
         assert!(entry.last_accessed.is_none());
         assert!(entry.tier_changed_at.is_none());
         assert!(entry.retention_score.is_none());
-        assert!(!entry.pinned);
-        assert!(entry.pinned_by.is_none());
-        assert!(entry.pinned_at.is_none());
+        assert!(!entry.is_pinned());
+        assert!(entry.pin.is_none());
     }
 
     #[test]
@@ -439,7 +514,7 @@ mod tests {
         assert_eq!(entry.memory_type, MemoryType::Episodic);
         assert_eq!(entry.tier, Tier::Hot);
         assert_eq!(entry.access_count, 0);
-        assert!(!entry.pinned);
+        assert!(!entry.is_pinned());
     }
 
     #[test]
@@ -455,5 +530,89 @@ mod tests {
         let entry = KnowledgeEntry::new("test".into(), "scope".into(), "v1".into())
             .with_memory_type(MemoryType::Procedural);
         assert_eq!(entry.memory_type, MemoryType::Procedural);
+    }
+
+    #[test]
+    fn test_memory_type_from_str() {
+        assert_eq!("structural".parse::<MemoryType>().unwrap(), MemoryType::Structural);
+        assert_eq!("decisional".parse::<MemoryType>().unwrap(), MemoryType::Decisional);
+        assert_eq!("episodic".parse::<MemoryType>().unwrap(), MemoryType::Episodic);
+        assert_eq!("analytical".parse::<MemoryType>().unwrap(), MemoryType::Analytical);
+        assert_eq!("procedural".parse::<MemoryType>().unwrap(), MemoryType::Procedural);
+        assert!("unknown".parse::<MemoryType>().is_err());
+    }
+
+    #[test]
+    fn test_tier_from_str() {
+        assert_eq!("hot".parse::<Tier>().unwrap(), Tier::Hot);
+        assert_eq!("warm".parse::<Tier>().unwrap(), Tier::Warm);
+        assert_eq!("cold".parse::<Tier>().unwrap(), Tier::Cold);
+        assert_eq!("forgotten".parse::<Tier>().unwrap(), Tier::Forgotten);
+        assert!("unknown".parse::<Tier>().is_err());
+    }
+
+    #[test]
+    fn test_tier_ordering() {
+        assert!(Tier::Hot > Tier::Warm);
+        assert!(Tier::Warm > Tier::Cold);
+        assert!(Tier::Cold > Tier::Forgotten);
+    }
+
+    #[test]
+    fn test_memory_type_from_content_role() {
+        assert_eq!(MemoryType::from_content_role(Some("code")), MemoryType::Structural);
+        assert_eq!(MemoryType::from_content_role(Some("design")), MemoryType::Decisional);
+        assert_eq!(MemoryType::from_content_role(None), MemoryType::Episodic);
+        assert!(MemoryType::is_known_content_role("code"));
+        assert!(!MemoryType::is_known_content_role("unknown"));
+    }
+
+    #[test]
+    fn test_knowledge_entry_pin_unpin() {
+        let mut entry = KnowledgeEntry::new("test".into(), "scope".into(), "v1".into());
+        assert!(!entry.is_pinned());
+
+        entry.pin("agent-1");
+        assert!(entry.is_pinned());
+        assert_eq!(entry.pin.as_ref().unwrap().by, "agent-1");
+
+        entry.unpin();
+        assert!(!entry.is_pinned());
+        assert!(entry.pin.is_none());
+    }
+
+    #[test]
+    fn test_knowledge_entry_with_auto_classify() {
+        let mut entry = KnowledgeEntry::new("test".into(), "scope".into(), "v1".into());
+        entry.metadata.content_role = Some("instruction".into());
+        let entry = entry.with_auto_classify();
+        assert_eq!(entry.memory_type, MemoryType::Procedural);
+    }
+
+    #[test]
+    fn test_pin_info_serde_roundtrip() {
+        let pin = PinInfo { by: "agent-1".into(), at: Utc::now() };
+        let json = serde_json::to_string(&pin).unwrap();
+        let back: PinInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.by, "agent-1");
+    }
+
+    #[test]
+    fn test_memory_type_display_fromstr_roundtrip() {
+        for mt in &[MemoryType::Structural, MemoryType::Decisional, MemoryType::Episodic,
+                     MemoryType::Analytical, MemoryType::Procedural] {
+            let s = mt.to_string();
+            let back: MemoryType = s.parse().unwrap();
+            assert_eq!(*mt, back);
+        }
+    }
+
+    #[test]
+    fn test_tier_display_fromstr_roundtrip() {
+        for t in &[Tier::Hot, Tier::Warm, Tier::Cold, Tier::Forgotten] {
+            let s = t.to_string();
+            let back: Tier = s.parse().unwrap();
+            assert_eq!(*t, back);
+        }
     }
 }
