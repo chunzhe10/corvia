@@ -11,13 +11,14 @@ LiteStore's HNSW index uses `Arc<Mutex<Hnsw>>`. At 100K entries, rebuild takes
 
 ## Solution
 
-Replace `Arc<Mutex<Hnsw>>` with `Arc<ArcSwap<Arc<Hnsw>>>` using the `arc-swap` crate.
+Replace `Arc<Mutex<Hnsw>>` with `Arc<ArcSwap<Hnsw>>` using the `arc-swap` crate.
+(`ArcSwap<T>` stores `Arc<T>` internally via `from_pointee`.)
 
 - **Search**: `load()` — wait-free pointer read, zero contention
 - **Insert**: `load()` + `insert()` — hnsw_rs uses internal RwLock, thread-safe
-- **Rebuild**: Build new Hnsw in background, `store(Arc::new(new_hnsw))` for atomic swap
-- **Flush**: `load()` + `file_dump()` — snapshot current index for persistence
-- **Drop**: Old index deallocated via `tokio::task::spawn_blocking(move || drop(old))`
+- **Rebuild**: Build new Hnsw fully, then `swap(Arc::new(new_hnsw))` for atomic swap
+- **Flush**: `load_full()` + `file_dump()` — snapshot current index for persistence
+- **Drop**: Old index deallocated via `std::thread::spawn(move || drop(old))`
 
 ## Type Change
 
@@ -26,45 +27,49 @@ Replace `Arc<Mutex<Hnsw>>` with `Arc<ArcSwap<Arc<Hnsw>>>` using the `arc-swap` c
 hnsw: Arc<Mutex<Hnsw<'static, f32, DistCosine>>>
 
 // After
-hnsw: Arc<ArcSwap<Arc<Hnsw<'static, f32, DistCosine>>>>
+hnsw: Arc<ArcSwap<Hnsw<'static, f32, DistCosine>>>
+// ArcSwap<T> stores Arc<T> internally — no double-Arc needed
 ```
 
 The outer `Arc` enables sharing across `&self` methods. `ArcSwap` enables atomic
-pointer swap. The inner `Arc` enables the old index to be moved to `spawn_blocking`
-for deferred deallocation.
+pointer swap. `swap()` returns the old `Arc<T>` for deferred deallocation.
 
-## Lock Site Migration (4 sites)
+## Lock Site Migration (4 sites + rebuild refactor)
 
 | Site | Before | After |
 |------|--------|-------|
-| `index_entry()` L272 | `.lock().unwrap(); hnsw.insert()` | `.load(); hnsw.insert()` |
-| `search()` L633 | `.lock().unwrap(); hnsw.search()` | `.load(); hnsw.search()` |
-| `flush_hnsw()` L348 | `.lock().unwrap(); hnsw.file_dump()` | `.load(); hnsw.file_dump()` |
-| `rebuild_from_files()` L443 | `.lock().unwrap(); *hnsw = new` | Build new, `.store(Arc::new(new))` |
+| `index_entry()` | `.lock().unwrap(); hnsw.insert()` | `.load(); hnsw.insert()` |
+| `search()` | `.lock().unwrap(); hnsw.search()` | `.load(); hnsw.search()` |
+| `flush_hnsw()` | `.lock().unwrap(); hnsw.file_dump()` | `.load_full(); hnsw.file_dump()` |
+| `rebuild_from_files()` | `.lock().unwrap(); *hnsw = new` | Build full → `.swap(Arc::new(new))` |
+
+`flush_hnsw` uses `load_full()` (clones Arc, releases slot) instead of `load()`
+to avoid pinning the ArcSwap slot during potentially long I/O.
 
 ## Unsafe Transmute
 
 The existing `unsafe { std::mem::transmute(loaded) }` for lifetime erasure in
 `open()` is preserved identically. The transmute happens on the bare `Hnsw` value
-before wrapping in `Arc<ArcSwap<Arc<...>>>`.
+before wrapping in `ArcSwap`. Safety argument is unchanged: without mmap, all
+HNSW data is owned `Vec<T>`, making the lifetime a phantom artifact.
 
 ## Blue-Green Rebuild
 
 ```
 1. Build new Hnsw (MAX_NB_CONNECTION, MAX_ELEMENTS, etc.)
-2. Insert all entries into new index (from knowledge files)
-3. old = self.hnsw.swap(Arc::new(new_hnsw))
-4. tokio::task::spawn_blocking(move || drop(old))
+2. Insert all entries into new_hnsw directly (via index_entry_into)
+3. old = self.hnsw.swap(Arc::new(new_hnsw))  // atomic pointer swap
+4. std::thread::spawn(move || drop(old))      // deferred deallocation
 ```
 
-During step 1-2, searches continue using the old index via `load()`.
+During steps 1-2, searches continue using the old index via `load()`.
 Step 3 is an atomic pointer swap — searches after this use the new index.
-Step 4 deallocates the old index off the async runtime.
+Step 4 deallocates the old index on a background thread.
 
 ## Files Modified
 
 - `crates/corvia-kernel/Cargo.toml` — add `arc-swap = "1"`
-- `crates/corvia-kernel/src/lite_store.rs` — all HNSW access (4 sites + struct def + open)
+- `crates/corvia-kernel/src/lite_store.rs` — all HNSW access (4 sites + struct def + open + rebuild refactor)
 
 ## Acceptance Criteria
 

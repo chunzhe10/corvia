@@ -263,14 +263,23 @@ impl LiteStore {
 
     /// Index an entry into HNSW + Redb (does NOT write the knowledge JSON file).
     fn index_entry(&self, entry: &KnowledgeEntry, embedding: &[f32]) -> Result<()> {
+        let hnsw = self.hnsw.load();
+        self.index_entry_into(entry, embedding, &hnsw)
+    }
+
+    /// Index an entry into a specific HNSW instance + Redb.
+    /// Used by `index_entry` (live path) and `rebuild_from_files` (blue-green path).
+    fn index_entry_into(
+        &self,
+        entry: &KnowledgeEntry,
+        embedding: &[f32],
+        target_hnsw: &Hnsw<'static, f32, DistCosine>,
+    ) -> Result<()> {
         let uuid_str = entry.id.to_string();
         let hnsw_id = self.allocate_hnsw_id();
 
         // Insert into HNSW (hnsw_rs uses internal RwLock — concurrent inserts are safe)
-        {
-            let hnsw = self.hnsw.load();
-            hnsw.insert((embedding, hnsw_id as usize));
-        }
+        target_hnsw.insert((embedding, hnsw_id as usize));
 
         // Write metadata to Redb
         let entry_json = serde_json::to_vec(entry)
@@ -341,7 +350,9 @@ impl LiteStore {
         let _ = std::fs::remove_file(hnsw_dir.join("litestore.hnsw.graph"));
         let _ = std::fs::remove_file(hnsw_dir.join("litestore.hnsw.data"));
 
-        let hnsw = self.hnsw.load();
+        // load_full() clones the Arc and releases the ArcSwap slot immediately,
+        // so a concurrent swap() is not blocked during the potentially long file_dump.
+        let hnsw = self.hnsw.load_full();
         hnsw.file_dump(&hnsw_dir, "litestore")
             .map_err(|e| CorviaError::Storage(format!("Failed to dump HNSW: {e}")))?;
 
@@ -425,13 +436,15 @@ impl LiteStore {
 
     /// Rebuild the HNSW index, Redb metadata, and temporal index from knowledge JSON files.
     /// Graph edges in Redb are preserved — petgraph is rebuilt from Redb during open().
-    /// This is used to restore state after opening a fresh LiteStore.
+    /// Safe to call while the server is handling queries — uses blue-green swap so
+    /// searches continue against the old index until the new one is fully populated.
     /// Returns the number of entries re-indexed.
     pub fn rebuild_from_files(&self) -> Result<usize> {
         let all_entries = knowledge_files::read_all(&self.data_dir)?;
         let count = all_entries.len();
 
-        // Blue-green rebuild: build a new HNSW index without blocking searches
+        // Blue-green rebuild: build the new index fully before swapping.
+        // Searches continue using the old index throughout this phase.
         let new_hnsw = Hnsw::<f32, DistCosine>::new(
             MAX_NB_CONNECTION,
             MAX_ELEMENTS,
@@ -440,25 +453,18 @@ impl LiteStore {
             DistCosine {},
         );
 
-        // Reset the counter
+        // Reset the counter before populating the new index
         self.next_hnsw_id.store(0, Ordering::SeqCst);
-
-        // Atomic swap: searches in flight continue using the old index until this point.
-        // After store(), new searches use the fresh (empty) index while we rebuild.
-        // For rebuild_from_files (startup path), this is acceptable — the index is
-        // being populated from scratch and searches shouldn't happen until rebuild completes.
-        let old_hnsw = self.hnsw.swap(Arc::new(new_hnsw));
-
-        // Defer old index deallocation off the async runtime
-        tokio::task::spawn_blocking(move || drop(old_hnsw));
 
         // Clear the temporal index and source_version index before rebuilding
         self.clear_temporal_index()?;
         self.clear_source_version_index()?;
 
+        // Populate the new HNSW index and Redb metadata.
+        // Inserts go into new_hnsw (not self.hnsw), so searches are unaffected.
         for entry in &all_entries {
             if let Some(ref embedding) = entry.embedding {
-                self.index_entry(entry, embedding)?;
+                self.index_entry_into(entry, embedding, &new_hnsw)?;
             } else {
                 // For entries without embeddings, still populate source_version index
                 self.write_source_version_index(entry)?;
@@ -468,6 +474,15 @@ impl LiteStore {
         }
 
         self.persist_next_id()?;
+
+        // Atomic swap: searches instantly switch from old to fully-populated new index.
+        let old_hnsw = self.hnsw.swap(Arc::new(new_hnsw));
+        info!("HNSW blue-green swap complete: old index replaced with {} entries", count);
+
+        // Defer old index deallocation off the async runtime.
+        // The JoinHandle is intentionally dropped — if the blocking task panics,
+        // the old index is simply leaked (acceptable for deallocation-only work).
+        std::thread::spawn(move || drop(old_hnsw));
 
         info!(
             "Rebuilt LiteStore from {} entries (HNSW + metadata + temporal index; graph edges preserved in Redb)",
@@ -1689,5 +1704,134 @@ mod tests {
 
         store.delete_scope("scope").await.unwrap();
         assert_eq!(store.hnsw_entry_count().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_search_empty_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LiteStore::open(dir.path(), 3).unwrap();
+        store.init_schema().await.unwrap();
+
+        // Search on a completely empty HNSW index should return empty, not panic
+        let results = store.search(&[0.1, 0.2, 0.3], "scope", 5).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_rebuild_produces_identical_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LiteStore::open(dir.path(), 3).unwrap();
+        store.init_schema().await.unwrap();
+
+        // Insert entries with distinguishable embeddings
+        let embeddings: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+            vec![0.7, 0.7, 0.0],
+            vec![0.0, 0.7, 0.7],
+        ];
+        for (i, emb) in embeddings.iter().enumerate() {
+            let entry = KnowledgeEntry::new(
+                format!("entry {i}"), "scope".into(), format!("v{i}"),
+            ).with_embedding(emb.clone());
+            store.insert(&entry).await.unwrap();
+        }
+
+        // Search before rebuild
+        let query = vec![0.9, 0.1, 0.0];
+        let before = store.search(&query, "scope", 3).await.unwrap();
+        assert!(!before.is_empty(), "should have results before rebuild");
+
+        // Rebuild from files
+        let rebuilt = store.rebuild_from_files().unwrap();
+        assert_eq!(rebuilt, 5);
+
+        // Search after rebuild — should return same top result
+        let after = store.search(&query, "scope", 3).await.unwrap();
+        assert!(!after.is_empty(), "should have results after rebuild");
+        assert_eq!(
+            before[0].entry.id, after[0].entry.id,
+            "top result should be the same before and after rebuild"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_search_during_rebuild() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+
+        // Insert enough entries for meaningful search
+        for i in 0..20 {
+            let angle = (i as f32) * std::f32::consts::PI / 10.0;
+            let entry = KnowledgeEntry::new(
+                format!("concurrent entry {i}"), "scope".into(), format!("v{i}"),
+            ).with_embedding(vec![angle.cos(), angle.sin(), 0.5]);
+            store.insert(&entry).await.unwrap();
+        }
+
+        // Spawn concurrent searches while triggering rebuild
+        let store_search = Arc::clone(&store);
+        let search_handle = tokio::spawn(async move {
+            let mut successes = 0;
+            for _ in 0..10 {
+                let results = store_search.search(&[1.0, 0.0, 0.5], "scope", 5).await;
+                match results {
+                    Ok(r) => {
+                        // Results should be valid (not panic, not error)
+                        // During blue-green rebuild, searches use old index until swap
+                        successes += 1;
+                        // After swap, results come from new index — either way, valid
+                        assert!(r.len() <= 5, "should respect limit");
+                    }
+                    Err(e) => panic!("search should not error during rebuild: {e}"),
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            successes
+        });
+
+        // Trigger rebuild on another task
+        let store_rebuild = Arc::clone(&store);
+        let rebuild_handle = tokio::task::spawn_blocking(move || {
+            store_rebuild.rebuild_from_files().unwrap()
+        });
+
+        let (search_result, rebuild_result) = tokio::join!(search_handle, rebuild_handle);
+        let successes = search_result.unwrap();
+        let rebuilt = rebuild_result.unwrap();
+
+        assert!(successes > 0, "at least some searches should succeed");
+        assert_eq!(rebuilt, 20, "all entries should be rebuilt");
+    }
+
+    #[tokio::test]
+    async fn test_hnsw_roundtrip_after_arcswap() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Phase 1: create store, insert, flush
+        {
+            let store = LiteStore::open(dir.path(), 3).unwrap();
+            store.init_schema().await.unwrap();
+
+            let entry = KnowledgeEntry::new(
+                "roundtrip test".into(), "scope".into(), "v1".into(),
+            ).with_embedding(vec![0.5, 0.5, 0.5]);
+            store.insert(&entry).await.unwrap();
+            store.flush_hnsw().unwrap();
+        }
+
+        // Phase 2: reopen store (loads HNSW from disk via ArcSwap path)
+        {
+            let store = LiteStore::open(dir.path(), 3).unwrap();
+            store.init_schema().await.unwrap();
+
+            let results = store.search(&[0.5, 0.5, 0.5], "scope", 1).await.unwrap();
+            assert_eq!(results.len(), 1, "should find the entry after reopen");
+            assert_eq!(results[0].entry.content, "roundtrip test");
+        }
     }
 }
