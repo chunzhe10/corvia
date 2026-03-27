@@ -1547,7 +1547,7 @@ mod tests {
             ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
             gpu_cache: std::sync::Arc::new(tokio::sync::Mutex::new(super::gpu::GpuMetricsCache::new())),
             forgotten_access_counter: std::sync::Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
-            gc_knowledge_history: None,
+            gc_knowledge_history: std::sync::Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
         })
     }
 

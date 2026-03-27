@@ -70,7 +70,7 @@ pub struct AppState {
     /// Counter for Forgotten entry access attempts (read by GC cycle span).
     pub forgotten_access_counter: Arc<corvia_kernel::gc_worker::ForgottenAccessCounter>,
     /// In-memory ring buffer of recent knowledge GC cycle reports.
-    pub gc_knowledge_history: Option<Arc<corvia_kernel::ops::GcKnowledgeHistory>>,
+    pub gc_knowledge_history: Arc<corvia_kernel::ops::GcKnowledgeHistory>,
 }
 
 // --- Existing memory types ---
@@ -615,7 +615,9 @@ async fn pin_entry_handler(
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid UUID: {e}")))?;
     let result = corvia_kernel::ops::pin_entry(&state.store, &uuid, &req.agent_id).await
         .map_err(|e| map_corvia_err("Pin failed", e))?;
-    Ok(Json(serde_json::to_value(result).unwrap()))
+    let json = serde_json::to_value(result)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Serialization failed: {e}")))?;
+    Ok(Json(json))
 }
 
 async fn unpin_entry_handler(
@@ -626,7 +628,9 @@ async fn unpin_entry_handler(
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid UUID: {e}")))?;
     let result = corvia_kernel::ops::unpin_entry(&state.store, &uuid).await
         .map_err(|e| map_corvia_err("Unpin failed", e))?;
-    Ok(Json(serde_json::to_value(result).unwrap()))
+    let json = serde_json::to_value(result)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Serialization failed: {e}")))?;
+    Ok(Json(json))
 }
 
 async fn inspect_entry_handler(
@@ -637,7 +641,9 @@ async fn inspect_entry_handler(
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid UUID: {e}")))?;
     let result = corvia_kernel::ops::inspect_entry(&state.store, &state.graph, &uuid).await
         .map_err(|e| map_corvia_err("Inspect failed", e))?;
-    Ok(Json(serde_json::to_value(result).unwrap()))
+    let json = serde_json::to_value(result)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Serialization failed: {e}")))?;
+    Ok(Json(json))
 }
 
 async fn gc_status_handler(
@@ -685,20 +691,20 @@ async fn gc_run_handler(
         &config,
     ).await.map_err(|e| map_corvia_err("GC run failed", e))?;
 
-    // Store report in knowledge GC history
-    if let Some(ref kh) = state.gc_knowledge_history {
-        kh.push(report.clone());
-    }
+    // Serialize before push to avoid unnecessary clone
+    let json = serde_json::to_value(&report)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Serialization failed: {e}")))?;
 
-    Ok(Json(serde_json::to_value(report).unwrap()))
+    // Store report in knowledge GC history
+    state.gc_knowledge_history.push(report);
+
+    Ok(Json(json))
 }
 
 async fn gc_history_handler(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let reports = state.gc_knowledge_history.as_ref()
-        .map(|h| h.all())
-        .unwrap_or_default();
+    let reports = state.gc_knowledge_history.all();
 
     Ok(Json(serde_json::json!({
         "cycles": serde_json::to_value(&reports).unwrap_or_default(),
@@ -1565,7 +1571,7 @@ mod tests {
             ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
             gpu_cache: Arc::new(tokio::sync::Mutex::new(crate::dashboard::gpu::GpuMetricsCache::new())),
             forgotten_access_counter: Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
-            gc_knowledge_history: None,
+            gc_knowledge_history: Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
         })
     }
 
@@ -1631,7 +1637,7 @@ mod tests {
             ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
             gpu_cache: Arc::new(tokio::sync::Mutex::new(crate::dashboard::gpu::GpuMetricsCache::new())),
             forgotten_access_counter: Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
-            gc_knowledge_history: None,
+            gc_knowledge_history: Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
         })
     }
 

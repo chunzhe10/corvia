@@ -273,12 +273,23 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "corvia_pin",
-            "description": "Pin a knowledge entry to prevent it from being demoted or forgotten by GC. Requires agent identity for audit trail.",
+            "description": "Pin a knowledge entry to prevent it from being demoted or forgotten by GC. Pinned entries remain in their current tier indefinitely, exempt from all GC scoring and forgetting policies. Requires agent identity via agent_id parameter or _meta.agent_id.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "entry_id": { "type": "string", "description": "The entry UUID to pin" },
-                    "agent_id": { "type": "string", "description": "Agent identity for audit trail (e.g. 'claude-code')" }
+                    "agent_id": { "type": "string", "description": "Agent identity for audit trail (e.g. 'claude-code'). Falls back to _meta.agent_id if omitted." }
+                },
+                "required": ["entry_id"]
+            }
+        }),
+        json!({
+            "name": "corvia_inspect",
+            "description": "Inspect a knowledge entry's full lifecycle metadata: tier, retention score, memory type, access history, pin state, and graph connectivity.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "entry_id": { "type": "string", "description": "The entry UUID to inspect" }
                 },
                 "required": ["entry_id"]
             }
@@ -620,6 +631,7 @@ async fn handle_tools_call(
         "corvia_agents_list" => tool_corvia_agents_list(state),
         "corvia_merge_queue" => tool_corvia_merge_queue(state, &arguments),
         "corvia_pin" => tool_corvia_pin(state, &arguments, agent_id).await,
+        "corvia_inspect" => tool_corvia_inspect(state, &arguments).await,
         // Tier 2 (LowRisk) — require _meta.confirmed
         "corvia_unpin" => tool_corvia_unpin(state, &arguments, meta).await,
         "corvia_config_set" => tool_corvia_config_set(state, &arguments, meta).await,
@@ -1279,6 +1291,28 @@ async fn tool_corvia_pin(
     }))
 }
 
+async fn tool_corvia_inspect(
+    state: &AppState,
+    args: &Value,
+) -> Result<Value, (i32, String)> {
+    let entry_id_str = args.get("entry_id").and_then(|v| v.as_str())
+        .ok_or((INVALID_PARAMS, "Missing 'entry_id' parameter".into()))?;
+    let entry_id = uuid::Uuid::parse_str(entry_id_str)
+        .map_err(|e| (INVALID_PARAMS, format!("Invalid UUID: {e}")))?;
+
+    let inspection = corvia_kernel::ops::inspect_entry(&state.store, &state.graph, &entry_id).await
+        .map_err(|e| (INTERNAL_ERROR, format!("Inspect failed: {e}")))?;
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(
+                &serde_json::to_value(&inspection).map_err(|e| (INTERNAL_ERROR, format!("Serialize failed: {e}")))?
+            ).unwrap()
+        }]
+    }))
+}
+
 // --- Tier 2 (LowRisk) control-plane tool implementations ---
 
 async fn tool_corvia_unpin(
@@ -1571,7 +1605,7 @@ mod tests {
             ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
             gpu_cache: std::sync::Arc::new(tokio::sync::Mutex::new(crate::dashboard::gpu::GpuMetricsCache::new())),
             forgotten_access_counter: std::sync::Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
-            gc_knowledge_history: None,
+            gc_knowledge_history: std::sync::Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
         })
     }
 
@@ -1607,7 +1641,7 @@ mod tests {
     async fn test_tools_list() {
         let result = handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 20);
+        assert_eq!(tools.len(), 21);
 
         let names: Vec<&str> = tools.iter()
             .map(|t| t["name"].as_str().unwrap())
@@ -1626,6 +1660,7 @@ mod tests {
         assert!(names.contains(&"corvia_agents_list"));
         assert!(names.contains(&"corvia_merge_queue"));
         assert!(names.contains(&"corvia_pin"));
+        assert!(names.contains(&"corvia_inspect"));
         // Tier 2
         assert!(names.contains(&"corvia_unpin"));
         assert!(names.contains(&"corvia_config_set"));
@@ -1888,7 +1923,7 @@ mod tests {
             ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
             gpu_cache: std::sync::Arc::new(tokio::sync::Mutex::new(crate::dashboard::gpu::GpuMetricsCache::new())),
             forgotten_access_counter: std::sync::Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
-            gc_knowledge_history: None,
+            gc_knowledge_history: std::sync::Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
         });
 
         let args = json!({ "query": "rag-routed", "scope_id": "rag-scope", "limit": 5 });

@@ -265,11 +265,12 @@ impl ServerClient {
 
     /// Get GC status (tier distribution).
     pub async fn gc_status(&self, scope_id: Option<&str>) -> Result<serde_json::Value> {
-        let mut url = format!("{}/v1/gc/status", self.base_url);
+        let url = format!("{}/v1/gc/status", self.base_url);
+        let mut req = self.client.get(&url);
         if let Some(scope) = scope_id {
-            url = format!("{url}?scope_id={scope}");
+            req = req.query(&[("scope_id", scope)]);
         }
-        let resp = self.client.get(&url).send().await?.error_for_status()?;
+        let resp = req.send().await?.error_for_status()?;
         Ok(resp.json().await?)
     }
 

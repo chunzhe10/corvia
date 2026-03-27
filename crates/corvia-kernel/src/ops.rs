@@ -458,8 +458,9 @@ pub async fn inspect_entry(
         .unwrap_or_default()
         .len();
 
-    let content_preview: String = entry.content.chars().take(200).collect();
-    let ellipsis = if entry.content.chars().nth(200).is_some() { "..." } else { "" };
+    let mut chars = entry.content.chars();
+    let content_preview: String = (&mut chars).take(200).collect();
+    let ellipsis = if chars.next().is_some() { "..." } else { "" };
 
     Ok(EntryInspection {
         id: entry.id.to_string(),
@@ -807,7 +808,13 @@ mod tests {
         // Verify entry is now pinned
         let updated = store.get(&entry_id).await.unwrap().unwrap();
         assert!(updated.pin.is_some());
-        assert_eq!(updated.pin.unwrap().by, "claude-code");
+        assert_eq!(updated.pin.as_ref().unwrap().by, "claude-code");
+
+        // Re-pin with different agent (idempotent, overwrites)
+        let result2 = pin_entry(&store, &entry_id, "other-agent").await.unwrap();
+        assert_eq!(result2.pinned_by, "other-agent");
+        let updated2 = store.get(&entry_id).await.unwrap().unwrap();
+        assert_eq!(updated2.pin.as_ref().unwrap().by, "other-agent");
     }
 
     #[tokio::test]

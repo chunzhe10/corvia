@@ -225,6 +225,9 @@ enum Commands {
     Unpin {
         /// Entry UUID to unpin
         entry_id: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Inspect a knowledge entry's full lifecycle metadata
@@ -489,7 +492,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             GcCommands::History => cmd_gc_history().await?,
         },
         Commands::Pin { entry_id, agent_id } => cmd_pin(&entry_id, &agent_id).await?,
-        Commands::Unpin { entry_id } => cmd_unpin(&entry_id).await?,
+        Commands::Unpin { entry_id, yes } => cmd_unpin(&entry_id, yes).await?,
         Commands::Inspect { entry_id } => cmd_inspect(&entry_id).await?,
         Commands::Hooks { command } => match command {
             HooksCommands::Run { .. } => unreachable!("handled in fast path above"),
@@ -696,7 +699,7 @@ async fn cmd_serve() -> Result<()> {
         ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
         gpu_cache: Arc::new(tokio::sync::Mutex::new(corvia_server::dashboard::gpu::GpuMetricsCache::new())),
         forgotten_access_counter: Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
-        gc_knowledge_history: Some(Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(50))),
+        gc_knowledge_history: Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(50)),
     });
     // Initial coverage cache population + background refresh.
     // NOTE: ttl_secs is captured once at startup. While `dashboard` is in
@@ -2164,7 +2167,7 @@ async fn cmd_gc_status(scope: Option<&str>) -> Result<()> {
 
     println!("GC Status for scope '{scope_id}':");
     if !forgetting {
-        println!("  ⚠  Forgetting is DISABLED — all entries treated as Hot for retrieval");
+        println!("  WARNING: Forgetting is DISABLED — all entries treated as Hot for retrieval");
     }
     println!("  Total entries: {total}");
     println!("  Tier distribution:");
@@ -2233,7 +2236,13 @@ async fn cmd_pin(entry_id: &str, agent_id: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_unpin(entry_id: &str) -> Result<()> {
+async fn cmd_unpin(entry_id: &str, yes: bool) -> Result<()> {
+    if !yes {
+        eprintln!("WARNING: Unpinning makes entry {entry_id} eligible for GC demotion and forgetting.");
+        eprintln!("Use --yes to confirm.");
+        std::process::exit(1);
+    }
+
     let config = load_config()?;
     let client = server_client::ServerClient::detect(&config).await
         .ok_or_else(|| anyhow::anyhow!("No running corvia server found. Start with `corvia serve`."))?;
