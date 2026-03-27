@@ -1,6 +1,101 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use uuid::Uuid;
+
+/// Classification of knowledge by cognitive function.
+///
+/// Each type has a distinct decay profile (alpha values for power-law decay):
+/// - Structural (α=0): Code signatures, API shapes — no decay, refreshed on re-ingestion
+/// - Decisional (α=0.15): Design decisions, architectural choices — very slow decay
+/// - Episodic (α=0.60): Session discoveries, agent activity — fast decay unless reinforced
+/// - Analytical (α=0.30): Synthesized findings, health checks — medium decay
+/// - Procedural (α=0.10): Instructions, workflows — slowest decay, reinforced by access
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryType {
+    Structural,
+    Decisional,
+    #[default]
+    Episodic,
+    Analytical,
+    Procedural,
+}
+
+impl fmt::Display for MemoryType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Structural => write!(f, "structural"),
+            Self::Decisional => write!(f, "decisional"),
+            Self::Episodic => write!(f, "episodic"),
+            Self::Analytical => write!(f, "analytical"),
+            Self::Procedural => write!(f, "procedural"),
+        }
+    }
+}
+
+/// Lifecycle tier for knowledge entries.
+///
+/// - Hot: HNSW indexed, full retrieval participation
+/// - Warm: HNSW indexed, retrieval deprioritized
+/// - Cold: NOT in HNSW, embedding preserved, searchable via brute-force fallback
+/// - Forgotten: Compacted into summary entry, original archived
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tier {
+    #[default]
+    Hot,
+    Warm,
+    Cold,
+    Forgotten,
+}
+
+impl fmt::Display for Tier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Hot => write!(f, "hot"),
+            Self::Warm => write!(f, "warm"),
+            Self::Cold => write!(f, "cold"),
+            Self::Forgotten => write!(f, "forgotten"),
+        }
+    }
+}
+
+/// Known content_role values and their MemoryType mappings.
+const CONTENT_ROLE_MAPPINGS: &[(&str, MemoryType)] = &[
+    ("code", MemoryType::Structural),
+    ("design", MemoryType::Decisional),
+    ("decision", MemoryType::Decisional),
+    ("plan", MemoryType::Decisional),
+    ("memory", MemoryType::Episodic),
+    ("learning", MemoryType::Episodic),
+    ("finding", MemoryType::Analytical),
+    ("instruction", MemoryType::Procedural),
+];
+
+/// Classify a content_role string into a MemoryType.
+///
+/// Returns the mapped MemoryType, or `Episodic` (default) for `None` or unrecognized values.
+/// Logs a warning for unrecognized non-None values.
+pub fn classify_memory_type(content_role: Option<&str>) -> MemoryType {
+    match content_role {
+        None => MemoryType::default(),
+        Some(role) => {
+            for &(key, memory_type) in CONTENT_ROLE_MAPPINGS {
+                if role == key {
+                    return memory_type;
+                }
+            }
+            tracing::warn!(content_role = role, "unmapped content_role, defaulting to Episodic");
+            MemoryType::default()
+        }
+    }
+}
+
+/// Returns true if the given content_role is in the known mapping table.
+pub fn is_mapped_content_role(role: &str) -> bool {
+    CONTENT_ROLE_MAPPINGS.iter().any(|&(key, _)| key == role)
+}
 
 /// A single unit of knowledge stored in Corvia.
 /// Bi-temporal: tracks both when the knowledge was true (valid_from/valid_to)
@@ -24,6 +119,27 @@ pub struct KnowledgeEntry {
     pub session_id: Option<String>,
     #[serde(default)]
     pub entry_status: crate::agent_types::EntryStatus,
+    // Tiered knowledge fields
+    #[serde(default)]
+    pub memory_type: MemoryType,
+    #[serde(default)]
+    pub confidence: Option<f32>,
+    #[serde(default)]
+    pub last_accessed: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub access_count: u32,
+    #[serde(default)]
+    pub tier: Tier,
+    #[serde(default)]
+    pub tier_changed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub retention_score: Option<f32>,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub pinned_by: Option<String>,
+    #[serde(default)]
+    pub pinned_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -57,6 +173,16 @@ impl KnowledgeEntry {
             agent_id: None,
             session_id: None,
             entry_status: crate::agent_types::EntryStatus::default(),
+            memory_type: MemoryType::default(),
+            confidence: None,
+            last_accessed: None,
+            access_count: 0,
+            tier: Tier::default(),
+            tier_changed_at: None,
+            retention_score: None,
+            pinned: false,
+            pinned_by: None,
+            pinned_at: None,
         }
     }
 
@@ -68,6 +194,16 @@ impl KnowledgeEntry {
     pub fn with_embedding(mut self, embedding: Vec<f32>) -> Self {
         self.embedding = Some(embedding);
         self
+    }
+
+    pub fn with_memory_type(mut self, memory_type: MemoryType) -> Self {
+        self.memory_type = memory_type;
+        self
+    }
+
+    /// Auto-classify memory_type from the entry's content_role.
+    pub fn auto_classify(&mut self) {
+        self.memory_type = classify_memory_type(self.metadata.content_role.as_deref());
     }
 
     pub fn with_agent(mut self, agent_id: String, session_id: String) -> Self {
@@ -194,5 +330,130 @@ mod tests {
         let roundtrip: EntryMetadata = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtrip.content_role, Some("design".into()));
         assert_eq!(roundtrip.source_origin, Some("repo:corvia".into()));
+    }
+
+    #[test]
+    fn test_memory_type_default() {
+        assert_eq!(MemoryType::default(), MemoryType::Episodic);
+    }
+
+    #[test]
+    fn test_tier_default() {
+        assert_eq!(Tier::default(), Tier::Hot);
+    }
+
+    #[test]
+    fn test_memory_type_display() {
+        assert_eq!(MemoryType::Structural.to_string(), "structural");
+        assert_eq!(MemoryType::Decisional.to_string(), "decisional");
+        assert_eq!(MemoryType::Episodic.to_string(), "episodic");
+        assert_eq!(MemoryType::Analytical.to_string(), "analytical");
+        assert_eq!(MemoryType::Procedural.to_string(), "procedural");
+    }
+
+    #[test]
+    fn test_tier_display() {
+        assert_eq!(Tier::Hot.to_string(), "hot");
+        assert_eq!(Tier::Warm.to_string(), "warm");
+        assert_eq!(Tier::Cold.to_string(), "cold");
+        assert_eq!(Tier::Forgotten.to_string(), "forgotten");
+    }
+
+    #[test]
+    fn test_memory_type_serde_roundtrip() {
+        let mt = MemoryType::Decisional;
+        let json = serde_json::to_string(&mt).unwrap();
+        assert_eq!(json, "\"decisional\"");
+        let back: MemoryType = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, MemoryType::Decisional);
+    }
+
+    #[test]
+    fn test_tier_serde_roundtrip() {
+        let t = Tier::Cold;
+        let json = serde_json::to_string(&t).unwrap();
+        assert_eq!(json, "\"cold\"");
+        let back: Tier = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, Tier::Cold);
+    }
+
+    #[test]
+    fn test_classify_memory_type_mappings() {
+        assert_eq!(classify_memory_type(Some("code")), MemoryType::Structural);
+        assert_eq!(classify_memory_type(Some("design")), MemoryType::Decisional);
+        assert_eq!(classify_memory_type(Some("decision")), MemoryType::Decisional);
+        assert_eq!(classify_memory_type(Some("plan")), MemoryType::Decisional);
+        assert_eq!(classify_memory_type(Some("memory")), MemoryType::Episodic);
+        assert_eq!(classify_memory_type(Some("learning")), MemoryType::Episodic);
+        assert_eq!(classify_memory_type(Some("finding")), MemoryType::Analytical);
+        assert_eq!(classify_memory_type(Some("instruction")), MemoryType::Procedural);
+    }
+
+    #[test]
+    fn test_classify_memory_type_defaults() {
+        assert_eq!(classify_memory_type(None), MemoryType::Episodic);
+        assert_eq!(classify_memory_type(Some("unknown_role")), MemoryType::Episodic);
+    }
+
+    #[test]
+    fn test_is_mapped_content_role() {
+        assert!(is_mapped_content_role("code"));
+        assert!(is_mapped_content_role("design"));
+        assert!(!is_mapped_content_role("unknown"));
+        assert!(!is_mapped_content_role(""));
+    }
+
+    #[test]
+    fn test_knowledge_entry_new_tiered_defaults() {
+        let entry = KnowledgeEntry::new("test".into(), "scope".into(), "v1".into());
+        assert_eq!(entry.memory_type, MemoryType::Episodic);
+        assert_eq!(entry.tier, Tier::Hot);
+        assert_eq!(entry.access_count, 0);
+        assert!(entry.confidence.is_none());
+        assert!(entry.last_accessed.is_none());
+        assert!(entry.tier_changed_at.is_none());
+        assert!(entry.retention_score.is_none());
+        assert!(!entry.pinned);
+        assert!(entry.pinned_by.is_none());
+        assert!(entry.pinned_at.is_none());
+    }
+
+    #[test]
+    fn test_knowledge_entry_backward_compat_deserialization() {
+        // JSON from before tiered knowledge fields existed — must deserialize without error
+        let json = r#"{
+            "id": "01960000-0000-7000-8000-000000000001",
+            "content": "old entry",
+            "source_version": "v1",
+            "scope_id": "test",
+            "workstream": "main",
+            "recorded_at": "2026-01-01T00:00:00Z",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_to": null,
+            "superseded_by": null,
+            "embedding": null,
+            "metadata": {}
+        }"#;
+        let entry: KnowledgeEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.content, "old entry");
+        assert_eq!(entry.memory_type, MemoryType::Episodic);
+        assert_eq!(entry.tier, Tier::Hot);
+        assert_eq!(entry.access_count, 0);
+        assert!(!entry.pinned);
+    }
+
+    #[test]
+    fn test_knowledge_entry_auto_classify() {
+        let mut entry = KnowledgeEntry::new("test".into(), "scope".into(), "v1".into());
+        entry.metadata.content_role = Some("design".into());
+        entry.auto_classify();
+        assert_eq!(entry.memory_type, MemoryType::Decisional);
+    }
+
+    #[test]
+    fn test_knowledge_entry_with_memory_type() {
+        let entry = KnowledgeEntry::new("test".into(), "scope".into(), "v1".into())
+            .with_memory_type(MemoryType::Procedural);
+        assert_eq!(entry.memory_type, MemoryType::Procedural);
     }
 }

@@ -30,6 +30,13 @@ pub mod spans {
     pub const INFERENCE_RELOAD: &str = "corvia.inference.reload";
     pub const INFERENCE_CONFIG_RELOAD: &str = "corvia.inference.config_reload";
 
+    // Tiered knowledge lifecycle spans
+    pub const GC_CYCLE: &str = "corvia.gc.cycle";
+    pub const GC_SCORE: &str = "corvia.gc.score";
+    pub const GC_TRANSITION: &str = "corvia.gc.transition";
+    pub const GC_REBUILD: &str = "corvia.gc.rebuild";
+    pub const ACCESS_RECORD: &str = "corvia.access.record";
+
     // Hook lifecycle spans (embedded in JSONL events, reconstructed during ingestion)
     pub const HOOK_DISPATCH: &str = "corvia.hook.dispatch";
     pub const HOOK_SESSION_RECORD: &str = "corvia.hook.session_record";
@@ -209,6 +216,11 @@ mod tests {
             spans::INFERENCE_LOAD,
             spans::INFERENCE_RELOAD,
             spans::INFERENCE_CONFIG_RELOAD,
+            spans::GC_CYCLE,
+            spans::GC_SCORE,
+            spans::GC_TRANSITION,
+            spans::GC_REBUILD,
+            spans::ACCESS_RECORD,
         ];
         for name in &all {
             assert!(

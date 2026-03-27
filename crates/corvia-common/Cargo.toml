@@ -18,4 +18,5 @@ uuid.workspace = true
 thiserror.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 toml = "0.8"
+tracing.workspace = true
 anyhow.workspace = true
