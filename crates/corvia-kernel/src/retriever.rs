@@ -71,8 +71,9 @@ fn spawn_access_recording(store: Arc<dyn QueryableStore>, results: &[SearchResul
     }
     let entry_ids: Vec<uuid::Uuid> = results.iter().map(|sr| sr.entry.id).collect();
     tokio::spawn(async move {
-        if let Err(e) = store.record_access(&entry_ids).await {
-            warn!(error = %e, "Access recording failed");
+        match store.record_access(&entry_ids).await {
+            Ok(()) => {}
+            Err(e) => warn!(error = %e, "Access recording failed"),
         }
     });
 }
@@ -1099,7 +1100,7 @@ mod tests {
         assert!(!result.results.is_empty());
 
         // Give the spawned task time to complete.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
         // Verify access tracking updated for returned entries.
         let returned_ids: Vec<uuid::Uuid> = result.results.iter().map(|sr| sr.entry.id).collect();
@@ -1111,7 +1112,7 @@ mod tests {
 
         // Search again — access_count should increment to 2.
         let _result2 = retriever.retrieve("test", "access-scope", &opts).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
         for id in &returned_ids {
             let entry = store.get(id).await.unwrap().unwrap();

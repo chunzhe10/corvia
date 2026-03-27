@@ -194,6 +194,21 @@ impl crate::traits::QueryableStore for PostgresStore {
             .await
             .map_err(|e| CorviaError::Storage(format!("Failed to create HNSW index: {e}")))?;
 
+        // Add tiered-knowledge columns to existing tables (idempotent migration).
+        sqlx::query(
+            "ALTER TABLE knowledge ADD COLUMN IF NOT EXISTS last_accessed TIMESTAMPTZ"
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CorviaError::Storage(format!("Failed to add last_accessed column: {e}")))?;
+
+        sqlx::query(
+            "ALTER TABLE knowledge ADD COLUMN IF NOT EXISTS access_count INTEGER NOT NULL DEFAULT 0"
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CorviaError::Storage(format!("Failed to add access_count column: {e}")))?;
+
         info!("PostgreSQL schema initialized (embedding dim={dim})");
         Ok(())
     }
@@ -335,19 +350,21 @@ impl crate::traits::QueryableStore for PostgresStore {
         Ok(row.as_ref().and_then(row_to_entry))
     }
 
+    #[tracing::instrument(name = "corvia.access.record", skip(self), fields(count = entry_ids.len()))]
     async fn record_access(&self, entry_ids: &[uuid::Uuid]) -> Result<()> {
         if entry_ids.is_empty() {
             return Ok(());
         }
 
-        let ids: Vec<Uuid> = entry_ids.to_vec();
+        // SQL integer addition is safe here: access_count is INTEGER (max 2^31-1).
+        // Overflow is unreachable in practice (would require billions of accesses per entry).
         if let Err(e) = sqlx::query(
             r#"UPDATE knowledge
                SET last_accessed = NOW(),
                    access_count = access_count + 1
                WHERE id = ANY($1)"#,
         )
-        .bind(&ids)
+        .bind(entry_ids)
         .execute(&self.pool)
         .await
         {

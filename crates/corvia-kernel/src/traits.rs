@@ -36,6 +36,10 @@ pub trait QueryableStore: Send + Sync {
     /// Record access for a batch of entries (updates last_accessed and access_count).
     /// All updates are batched into a single write transaction.
     /// Failures are non-fatal — implementations should log warnings, not propagate errors.
+    ///
+    /// Access metadata is ephemeral: LiteStore persists to Redb only (not knowledge
+    /// JSON files), so access counts are reset on `rebuild_from_files`. This is
+    /// intentional — access tracking is operational telemetry, not source-of-truth data.
     async fn record_access(&self, entry_ids: &[uuid::Uuid]) -> Result<()>;
 
     /// Downcast support for store-specific operations (e.g., LiteStore::rebuild_from_files).

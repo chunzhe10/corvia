@@ -687,6 +687,9 @@ impl super::traits::QueryableStore for LiteStore {
         Ok(results)
     }
 
+    /// Access metadata is Redb-only — not persisted to knowledge JSON files.
+    /// This is intentional: access counts are ephemeral operational data and
+    /// will be reset on `rebuild_from_files`. See trait doc for rationale.
     #[tracing::instrument(name = "corvia.access.record", skip(self), fields(count = entry_ids.len()))]
     async fn record_access(&self, entry_ids: &[uuid::Uuid]) -> Result<()> {
         if entry_ids.is_empty() {
