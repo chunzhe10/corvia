@@ -4,7 +4,7 @@ use corvia_common::types::{EdgeDirection, EntryMetadata, GraphEdge, KnowledgeEnt
 use pgvector::Vector;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 pub struct PostgresStore {
@@ -101,6 +101,9 @@ fn row_to_entry(row: &sqlx::postgres::PgRow) -> Option<KnowledgeEntry> {
     let entry_status: corvia_common::agent_types::EntryStatus =
         serde_json::from_value(serde_json::Value::String(entry_status_str))
             .unwrap_or_default();
+    let last_accessed: Option<chrono::DateTime<chrono::Utc>> =
+        row.try_get("last_accessed").ok().flatten();
+    let access_count: i32 = row.try_get("access_count").unwrap_or(0);
 
     Some(KnowledgeEntry {
         id,
@@ -117,6 +120,14 @@ fn row_to_entry(row: &sqlx::postgres::PgRow) -> Option<KnowledgeEntry> {
         agent_id,
         session_id,
         entry_status,
+        memory_type: corvia_common::types::MemoryType::default(),
+        confidence: None,
+        last_accessed,
+        access_count: access_count as u32,
+        tier: corvia_common::types::Tier::default(),
+        tier_changed_at: None,
+        retention_score: None,
+        pin: None,
     })
 }
 
@@ -145,7 +156,9 @@ impl crate::traits::QueryableStore for PostgresStore {
                 metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
                 agent_id TEXT,
                 session_id TEXT,
-                entry_status TEXT NOT NULL DEFAULT 'merged'
+                entry_status TEXT NOT NULL DEFAULT 'merged',
+                last_accessed TIMESTAMPTZ,
+                access_count INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_knowledge_scope ON knowledge(scope_id);
@@ -180,6 +193,21 @@ impl crate::traits::QueryableStore for PostgresStore {
             .execute(&self.pool)
             .await
             .map_err(|e| CorviaError::Storage(format!("Failed to create HNSW index: {e}")))?;
+
+        // Add tiered-knowledge columns to existing tables (idempotent migration).
+        sqlx::query(
+            "ALTER TABLE knowledge ADD COLUMN IF NOT EXISTS last_accessed TIMESTAMPTZ"
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CorviaError::Storage(format!("Failed to add last_accessed column: {e}")))?;
+
+        sqlx::query(
+            "ALTER TABLE knowledge ADD COLUMN IF NOT EXISTS access_count INTEGER NOT NULL DEFAULT 0"
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CorviaError::Storage(format!("Failed to add access_count column: {e}")))?;
 
         info!("PostgreSQL schema initialized (embedding dim={dim})");
         Ok(())
@@ -320,6 +348,30 @@ impl crate::traits::QueryableStore for PostgresStore {
         .map_err(|e| CorviaError::Storage(format!("Failed to get by source_version: {e}")))?;
 
         Ok(row.as_ref().and_then(row_to_entry))
+    }
+
+    #[tracing::instrument(name = "corvia.access.record", skip(self), fields(count = entry_ids.len()))]
+    async fn record_access(&self, entry_ids: &[uuid::Uuid]) -> Result<()> {
+        if entry_ids.is_empty() {
+            return Ok(());
+        }
+
+        // SQL integer addition is safe here: access_count is INTEGER (max 2^31-1).
+        // Overflow is unreachable in practice (would require billions of accesses per entry).
+        if let Err(e) = sqlx::query(
+            r#"UPDATE knowledge
+               SET last_accessed = NOW(),
+                   access_count = access_count + 1
+               WHERE id = ANY($1)"#,
+        )
+        .bind(entry_ids)
+        .execute(&self.pool)
+        .await
+        {
+            warn!(error = %e, "Failed to record access in PostgresStore");
+        }
+
+        Ok(())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

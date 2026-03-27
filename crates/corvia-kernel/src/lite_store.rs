@@ -697,6 +697,74 @@ impl super::traits::QueryableStore for LiteStore {
         Ok(results)
     }
 
+    /// Access metadata is Redb-only — not persisted to knowledge JSON files.
+    /// This is intentional: access counts are ephemeral operational data and
+    /// will be reset on `rebuild_from_files`. See trait doc for rationale.
+    #[tracing::instrument(name = "corvia.access.record", skip(self), fields(count = entry_ids.len()))]
+    async fn record_access(&self, entry_ids: &[uuid::Uuid]) -> Result<()> {
+        if entry_ids.is_empty() {
+            return Ok(());
+        }
+
+        let write_txn = match self.db.begin_write() {
+            Ok(txn) => txn,
+            Err(e) => {
+                warn!(error = %e, "Failed to begin write txn for access recording");
+                return Ok(());
+            }
+        };
+
+        {
+            let mut entries_table = match write_txn.open_table(ENTRIES) {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(error = %e, "Failed to open ENTRIES for access recording");
+                    return Ok(());
+                }
+            };
+
+            for id in entry_ids {
+                let uuid_str = id.to_string();
+                let entry_bytes = match entries_table.get(uuid_str.as_str()) {
+                    Ok(Some(val)) => val.value().to_vec(),
+                    Ok(None) => continue,
+                    Err(e) => {
+                        warn!(entry_id = %id, error = %e, "Failed to read entry for access recording");
+                        continue;
+                    }
+                };
+
+                let mut entry: KnowledgeEntry = match serde_json::from_slice(&entry_bytes) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        warn!(entry_id = %id, error = %e, "Failed to deserialize entry for access recording");
+                        continue;
+                    }
+                };
+
+                entry.record_access();
+
+                let updated_bytes = match serde_json::to_vec(&entry) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(entry_id = %id, error = %e, "Failed to serialize entry for access recording");
+                        continue;
+                    }
+                };
+
+                if let Err(e) = entries_table.insert(uuid_str.as_str(), updated_bytes.as_slice()) {
+                    warn!(entry_id = %id, error = %e, "Failed to write entry for access recording");
+                }
+            }
+        }
+
+        if let Err(e) = write_txn.commit() {
+            warn!(error = %e, "Failed to commit access recording transaction");
+        }
+
+        Ok(())
+    }
+
     #[tracing::instrument(name = "corvia.store.get", skip(self))]
     async fn get(&self, id: &uuid::Uuid) -> Result<Option<KnowledgeEntry>> {
         let uuid_str = id.to_string();
@@ -1833,5 +1901,72 @@ mod tests {
             assert_eq!(results.len(), 1, "should find the entry after reopen");
             assert_eq!(results[0].entry.content, "roundtrip test");
         }
+    }
+
+    #[tokio::test]
+    async fn test_record_access_updates_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LiteStore::open(dir.path(), 3).unwrap();
+        store.init_schema().await.unwrap();
+
+        let entry = KnowledgeEntry::new("test content".into(), "scope".into(), "v1".into())
+            .with_embedding(vec![0.1, 0.2, 0.3]);
+        let entry_id = entry.id;
+        store.insert(&entry).await.unwrap();
+
+        // Initial state.
+        let before = store.get(&entry_id).await.unwrap().unwrap();
+        assert_eq!(before.access_count, 0);
+        assert!(before.last_accessed.is_none());
+
+        // Record access.
+        store.record_access(&[entry_id]).await.unwrap();
+
+        let after = store.get(&entry_id).await.unwrap().unwrap();
+        assert_eq!(after.access_count, 1);
+        assert!(after.last_accessed.is_some());
+
+        // Record access again — should increment.
+        store.record_access(&[entry_id]).await.unwrap();
+
+        let after2 = store.get(&entry_id).await.unwrap().unwrap();
+        assert_eq!(after2.access_count, 2);
+        assert!(after2.last_accessed.unwrap() >= after.last_accessed.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_record_access_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LiteStore::open(dir.path(), 3).unwrap();
+        store.init_schema().await.unwrap();
+
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let entry = KnowledgeEntry::new(
+                format!("item {i}"), "scope".into(), format!("v{i}"),
+            ).with_embedding(vec![0.1, 0.2, i as f32 * 0.1]);
+            ids.push(entry.id);
+            store.insert(&entry).await.unwrap();
+        }
+
+        // Batch record access for all three.
+        store.record_access(&ids).await.unwrap();
+
+        for id in &ids {
+            let entry = store.get(id).await.unwrap().unwrap();
+            assert_eq!(entry.access_count, 1);
+            assert!(entry.last_accessed.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_record_access_nonexistent_entry_graceful() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LiteStore::open(dir.path(), 3).unwrap();
+        store.init_schema().await.unwrap();
+
+        let fake_id = uuid::Uuid::now_v7();
+        // Should not panic or error.
+        store.record_access(&[fake_id]).await.unwrap();
     }
 }
