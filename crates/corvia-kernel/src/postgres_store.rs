@@ -34,7 +34,9 @@ impl PostgresStore {
         Ok(rows.iter().filter_map(row_to_entry).collect())
     }
 
-    /// Search including cold-tier entries (may fall back to sequential scan).
+    /// Search including cold-tier entries (excludes forgotten).
+    /// This query cannot use the partial HNSW index and may fall back to
+    /// sequential scan. Intended for opt-in use when cold entries are needed.
     pub async fn search_with_cold(
         &self,
         embedding: &[f32],
@@ -47,7 +49,7 @@ impl PostgresStore {
             r#"SELECT *, embedding <=> $1 AS distance
                FROM knowledge
                WHERE scope_id = $2 AND embedding IS NOT NULL
-                 AND tier IN ('hot', 'warm', 'cold')
+                 AND tier != 'forgotten'
                ORDER BY embedding <=> $1
                LIMIT $3"#,
         )
@@ -74,9 +76,10 @@ impl PostgresStore {
     }
 
     /// Transition an entry to a new tier, updating tier_changed_at.
+    /// Returns an error if the entry does not exist.
     pub async fn update_tier(&self, entry_id: &Uuid, new_tier: corvia_common::types::Tier) -> Result<()> {
         let tier_str = new_tier.to_string();
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE knowledge SET tier = $1, tier_changed_at = NOW() WHERE id = $2",
         )
         .bind(&tier_str)
@@ -85,13 +88,17 @@ impl PostgresStore {
         .await
         .map_err(|e| CorviaError::Storage(format!("Failed to update tier: {e}")))?;
 
+        if result.rows_affected() == 0 {
+            return Err(CorviaError::Storage(format!("Entry {entry_id} not found for tier update")));
+        }
+
         Ok(())
     }
 
-    /// Query pinned entries in a scope.
+    /// Query pinned entries in a scope, ordered by pin time (most recent first).
     pub async fn get_pinned(&self, scope_id: &str) -> Result<Vec<KnowledgeEntry>> {
         let rows = sqlx::query(
-            "SELECT * FROM knowledge WHERE scope_id = $1 AND pinned = true",
+            "SELECT * FROM knowledge WHERE scope_id = $1 AND pinned = true ORDER BY pinned_at DESC",
         )
         .bind(scope_id)
         .fetch_all(&self.pool)
@@ -196,14 +203,15 @@ fn row_to_entry(row: &sqlx::postgres::PgRow) -> Option<KnowledgeEntry> {
     let retention_score_f64: Option<f64> = row.try_get("retention_score").ok().flatten();
     let pinned: bool = row.try_get("pinned").unwrap_or(false);
     let pin = if pinned {
-        let pinned_by: String = row.try_get("pinned_by").unwrap_or_else(|_| String::new());
-        let pinned_at: chrono::DateTime<chrono::Utc> = row
-            .try_get("pinned_at")
-            .unwrap_or_else(|_| chrono::Utc::now());
-        Some(corvia_common::types::PinInfo {
-            by: pinned_by,
-            at: pinned_at,
-        })
+        let pinned_by: Option<String> = row.try_get("pinned_by").ok().flatten();
+        let pinned_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("pinned_at").ok().flatten();
+        match (pinned_by, pinned_at) {
+            (Some(by), Some(at)) => Some(corvia_common::types::PinInfo { by, at }),
+            _ => {
+                warn!("Entry has pinned=true but missing pin metadata, treating as unpinned");
+                None
+            }
+        }
     } else {
         None
     };
@@ -287,11 +295,11 @@ impl crate::traits::QueryableStore for PostgresStore {
             .map_err(|e| CorviaError::Storage(format!("Failed to init schema: {e}")))?;
 
         // Idempotent tiered-knowledge column migrations.
+        // last_accessed and access_count are already in the CREATE TABLE above;
+        // the remaining columns are added here for existing databases.
         let tiered_columns = [
             "ALTER TABLE knowledge ADD COLUMN IF NOT EXISTS memory_type TEXT NOT NULL DEFAULT 'episodic'",
             "ALTER TABLE knowledge ADD COLUMN IF NOT EXISTS confidence FLOAT",
-            "ALTER TABLE knowledge ADD COLUMN IF NOT EXISTS last_accessed TIMESTAMPTZ",
-            "ALTER TABLE knowledge ADD COLUMN IF NOT EXISTS access_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE knowledge ADD COLUMN IF NOT EXISTS tier TEXT NOT NULL DEFAULT 'hot'",
             "ALTER TABLE knowledge ADD COLUMN IF NOT EXISTS tier_changed_at TIMESTAMPTZ",
             "ALTER TABLE knowledge ADD COLUMN IF NOT EXISTS retention_score FLOAT",
@@ -330,6 +338,14 @@ impl crate::traits::QueryableStore for PostgresStore {
         .execute(&self.pool)
         .await
         .map_err(|e| CorviaError::Storage(format!("Failed to create tier index: {e}")))?;
+
+        // Partial index for pinned entry queries (only indexes pinned rows).
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_knowledge_pinned ON knowledge(scope_id) WHERE pinned = true"
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CorviaError::Storage(format!("Failed to create pinned index: {e}")))?;
 
         info!("PostgreSQL schema initialized (embedding dim={dim})");
         Ok(())
@@ -1581,5 +1597,79 @@ mod tests {
 
         store.delete_scope("test-tiered").await.unwrap();
         cleanup_test_db("warm_search").await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_batch_record_access() {
+        let store = match connect_test_store("batch_access").await {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("Skipping: PostgreSQL not available");
+                return;
+            }
+        };
+
+        let e1 = KnowledgeEntry::new("entry 1".into(), "test-tiered".into(), "v1".into())
+            .with_embedding(test_embedding(1.0, 0.0, 0.0));
+        let e2 = KnowledgeEntry::new("entry 2".into(), "test-tiered".into(), "v2".into())
+            .with_embedding(test_embedding(0.0, 1.0, 0.0));
+        let e3 = KnowledgeEntry::new("entry 3".into(), "test-tiered".into(), "v3".into())
+            .with_embedding(test_embedding(0.0, 0.0, 1.0));
+        let ids = [e1.id, e2.id, e3.id];
+        store.insert(&e1).await.unwrap();
+        store.insert(&e2).await.unwrap();
+        store.insert(&e3).await.unwrap();
+
+        // Batch access — all three in one call
+        store.record_access(&ids).await.unwrap();
+
+        for id in &ids {
+            let got = store.get(id).await.unwrap().unwrap();
+            assert_eq!(got.access_count, 1);
+            assert!(got.last_accessed.is_some());
+        }
+
+        // Empty slice is a no-op
+        store.record_access(&[]).await.unwrap();
+
+        store.delete_scope("test-tiered").await.unwrap();
+        cleanup_test_db("batch_access").await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_forgotten_tier_excluded() {
+        let store = match connect_test_store("forgotten_tier").await {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("Skipping: PostgreSQL not available");
+                return;
+            }
+        };
+
+        let mut forgotten_entry = KnowledgeEntry::new(
+            "forgotten content".into(),
+            "test-tiered".into(),
+            "v1".into(),
+        )
+        .with_embedding(test_embedding(1.0, 0.0, 0.0));
+        forgotten_entry.tier = corvia_common::types::Tier::Forgotten;
+        store.insert(&forgotten_entry).await.unwrap();
+
+        // Forgotten entries excluded from default search
+        let results = store
+            .search(&test_embedding(1.0, 0.0, 0.0), "test-tiered", 10)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+
+        // Forgotten entries also excluded from cold search
+        let results = store
+            .search_with_cold(&test_embedding(1.0, 0.0, 0.0), "test-tiered", 10)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+
+        store.delete_scope("test-tiered").await.unwrap();
+        cleanup_test_db("forgotten_tier").await;
     }
 }
