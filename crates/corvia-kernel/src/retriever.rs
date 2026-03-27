@@ -28,7 +28,7 @@ use crate::traits::{GraphStore, InferenceEngine, QueryableStore};
 ///
 /// Applied after cosine similarity (or blended score) to deprioritize lower tiers.
 /// Forgotten entries get 0.0 and should be excluded from results entirely.
-pub fn tier_weight(tier: &Tier) -> f32 {
+pub const fn tier_weight(tier: &Tier) -> f32 {
     match tier {
         Tier::Hot => 1.0,
         Tier::Warm => 0.7,
@@ -138,21 +138,17 @@ fn merge_cold_results(
     }
 
     // Deduplicate: skip cold entries already present in HNSW results.
-    // Also exclude Forgotten entries and apply tier_weight to cold results.
+    // Tier weighting is NOT applied here — the caller applies it uniformly to all results.
     let existing_ids: HashSet<uuid::Uuid> = results.iter().map(|sr| sr.entry.id).collect();
     let new_cold: Vec<SearchResult> = cold_results
         .into_iter()
-        .filter(|sr| !existing_ids.contains(&sr.entry.id) && sr.entry.tier != Tier::Forgotten)
-        .map(|mut sr| {
-            sr.score *= tier_weight(&sr.entry.tier);
-            sr
-        })
+        .filter(|sr| !existing_ids.contains(&sr.entry.id))
         .collect();
     let cold_count = new_cold.len();
 
     if cold_count > 0 {
         results.extend(new_cold);
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        // Skip sorting — caller re-sorts after tier weighting.
     }
 
     (cold_count, cold_start.elapsed().as_millis() as u64)
@@ -235,21 +231,25 @@ impl Retriever for VectorRetriever {
             merge_cold_results(self.store.as_ref(), &embedding, scope_id, opts, &mut merged);
 
         // Apply tier_weight multiplier: deprioritize Warm/Cold, exclude Forgotten.
-        let tier_weighted: Vec<SearchResult> = merged
-            .into_iter()
-            .filter(|sr| sr.entry.tier != Tier::Forgotten)
-            .map(|mut sr| {
-                sr.score *= tier_weight(&sr.entry.tier);
-                sr
-            })
-            .collect();
-
-        // Re-sort after tier weighting (order may have changed).
-        let mut tier_sorted = tier_weighted;
-        tier_sorted.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        // Fast path: skip filter/map/re-sort when all entries are Hot (common case).
+        let any_non_hot = merged.iter().any(|sr| sr.entry.tier != Tier::Hot);
+        let mut tier_weighted = if any_non_hot {
+            let mut weighted: Vec<SearchResult> = merged
+                .into_iter()
+                .filter(|sr| sr.entry.tier != Tier::Forgotten)
+                .map(|mut sr| {
+                    sr.score *= tier_weight(&sr.entry.tier);
+                    sr
+                })
+                .collect();
+            weighted.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            weighted
+        } else {
+            merged
+        };
 
         // Visibility post-filter (no take yet — metadata filter runs after).
-        let vis_filtered: Vec<SearchResult> = tier_sorted
+        let vis_filtered: Vec<SearchResult> = tier_weighted
             .into_iter()
             .filter(|sr| visibility_filter(&sr.entry, &opts.visibility, opts.agent_id.as_deref()))
             .collect();
@@ -597,8 +597,8 @@ impl Retriever for GraphExpandRetriever {
         // Sort + filter (timed separately).
         let filter_start = Instant::now();
 
-        // Sort by blended score descending.
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort by blended score descending (unstable sort — no stability requirement).
+        scored.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
         // Visibility post-filter (no take yet — metadata filter runs after).
         let vis_filtered: Vec<SearchResult> = scored
