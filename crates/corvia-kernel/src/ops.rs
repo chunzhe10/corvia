@@ -248,7 +248,7 @@ fn json_to_toml(json: &serde_json::Value) -> Result<toml::Value> {
 // GC
 // ---------------------------------------------------------------------------
 
-/// Run garbage collection sweep with timing.
+/// Run garbage collection sweep with timing (session-level GC).
 pub async fn gc_run(coordinator: &AgentCoordinator) -> Result<GcReport> {
     let start = std::time::Instant::now();
     let mut report = coordinator.gc().await?;
@@ -257,6 +257,32 @@ pub async fn gc_run(coordinator: &AgentCoordinator) -> Result<GcReport> {
         report.started_at = chrono::Utc::now().to_rfc3339();
     }
     Ok(report)
+}
+
+/// Run knowledge-level GC: retention scoring + tier transitions.
+///
+/// Triggers a single GC cycle immediately (outside the periodic worker loop).
+/// Used by the MCP `corvia_gc_run` tool for on-demand GC.
+pub async fn gc_knowledge_run(
+    store: &std::sync::Arc<dyn QueryableStore>,
+    graph: &std::sync::Arc<dyn crate::traits::GraphStore>,
+    data_dir: &std::path::Path,
+    config: &corvia_common::config::CorviaConfig,
+) -> Result<crate::gc_worker::GcCycleReport> {
+    let forgetting = config.forgetting.as_ref();
+    let scope_configs: std::collections::HashMap<String, Option<corvia_common::config::ScopeForgettingOverride>> =
+        config
+            .scope
+            .as_ref()
+            .map(|scopes| {
+                scopes
+                    .iter()
+                    .map(|s| (s.id.clone(), s.forgetting.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+    crate::gc_worker::run_gc_cycle(store, graph, data_dir, forgetting, &scope_configs).await
 }
 
 /// In-memory ring buffer of recent GC reports.
