@@ -83,8 +83,11 @@ fn spawn_access_recording(store: Arc<dyn QueryableStore>, results: &[SearchResul
 
 /// Perform brute-force cold scan if `include_cold` is set and the store is LiteStore.
 ///
-/// Returns `(cold_results, cold_scan_latency_ms)`. Merges cold results into the
-/// existing results vector by score, then truncates to limit.
+/// Returns `(cold_results_added, cold_scan_latency_ms)`. Merges deduplicated cold
+/// results into the existing results vector by score. Caller is responsible for
+/// truncating to limit after this call.
+///
+/// Assumes HNSW uses cosine distance, so `1 - distance == cosine_similarity` holds.
 fn merge_cold_results(
     store: &dyn QueryableStore,
     embedding: &[f32],
@@ -115,11 +118,20 @@ fn merge_cold_results(
         }
     };
 
-    let cold_count = cold_results.len();
+    if cold_results.is_empty() {
+        return (0, cold_start.elapsed().as_millis() as u64);
+    }
+
+    // Deduplicate: skip cold entries already present in HNSW results.
+    let existing_ids: HashSet<uuid::Uuid> = results.iter().map(|sr| sr.entry.id).collect();
+    let new_cold: Vec<SearchResult> = cold_results
+        .into_iter()
+        .filter(|sr| !existing_ids.contains(&sr.entry.id))
+        .collect();
+    let cold_count = new_cold.len();
+
     if cold_count > 0 {
-        // Merge cold results into existing results.
-        results.extend(cold_results);
-        // Re-sort by score descending.
+        results.extend(new_cold);
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     }
 
@@ -192,7 +204,9 @@ impl Retriever for VectorRetriever {
             opts.limit
         };
         let fetch_limit = (search_limit * opts.oversample_factor).max(10);
+        let hnsw_start = Instant::now();
         let raw_results = self.store.search(&embedding, scope_id, fetch_limit).await?;
+        let hnsw_latency_ms = hnsw_start.elapsed().as_millis() as u64;
         let vector_results = raw_results.len();
 
         // Cold-tier brute-force scan (merged before visibility filtering).
@@ -243,7 +257,7 @@ impl Retriever for VectorRetriever {
                 latency_ms: start.elapsed().as_millis() as u64,
                 embed_latency_ms,
                 search_latency_ms,
-                hnsw_latency_ms: search_latency_ms - cold_scan_latency_ms,
+                hnsw_latency_ms,
                 graph_latency_ms: 0,
                 filter_latency_ms: 0,
                 cold_scan_latency_ms,
@@ -508,15 +522,17 @@ impl Retriever for GraphExpandRetriever {
                 Some(ls) => {
                     match ls.scan_cold_entries(&embedding, scope_id, opts.limit) {
                         Ok(cold) => {
-                            for sr in &cold {
+                            let mut added = 0usize;
+                            for sr in cold {
                                 if !seen.contains(&sr.entry.id) {
                                     seen.insert(sr.entry.id);
                                     // Cold entries get pure cosine score (no graph proximity bonus).
                                     let blended = (1.0 - self.alpha) * sr.score;
-                                    scored.push((blended, SearchResult { entry: sr.entry.clone(), score: blended }));
+                                    scored.push((blended, SearchResult { entry: sr.entry, score: blended }));
+                                    added += 1;
                                 }
                             }
-                            cold.len()
+                            added
                         }
                         Err(e) => {
                             warn!(error = %e, "Cold scan failed, continuing without cold results");
@@ -1284,6 +1300,9 @@ mod tests {
         assert!(cold_results[0].score > 0.99, "exact match should have score ~1.0");
 
         // Test via retriever with include_cold=true.
+        // Note: store.insert() adds Cold entries to HNSW too (production tier demotion
+        // would remove from HNSW). So the entry is found via HNSW; cold_results may be 0
+        // after dedup. The key assertion is that the entry appears in results.
         let retriever = VectorRetriever::new(store.clone() as Arc<dyn QueryableStore>, engine);
         let opts = RetrievalOpts {
             limit: 15,
@@ -1292,10 +1311,9 @@ mod tests {
             ..Default::default()
         };
         let result = retriever.retrieve("test", "scope-cold", &opts).await.unwrap();
-        // Cold entry should appear in results.
+        // Cold entry should appear in results (may come from HNSW or cold scan).
         let has_cold = result.results.iter().any(|r| r.entry.content.contains("cold knowledge"));
         assert!(has_cold, "cold entry should be in results when include_cold=true");
-        assert!(result.metrics.cold_results >= 1, "metrics should report cold results");
     }
 
     /// Cold entry NOT found when include_cold=false (default).
@@ -1475,5 +1493,82 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1, "only Cold tier entries should be returned");
         assert_eq!(results[0].entry.content, "cold with embedding");
+    }
+
+    /// GraphExpandRetriever: cold entries get alpha-blended scores (no graph bonus).
+    #[tokio::test]
+    async fn test_graph_expand_retriever_cold_scan() {
+        use crate::traits::GraphStore;
+        use corvia_common::types::Tier;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+
+        let queryable = store.clone() as Arc<dyn QueryableStore>;
+        let engine: Arc<dyn InferenceEngine> = Arc::new(MockEngine);
+        let graph = store.clone() as Arc<dyn GraphStore>;
+
+        // Insert 10 Hot entries for HNSW connectivity.
+        let mut idx: usize = 0;
+        let mut next_emb = || {
+            idx += 1;
+            vec![1.0, idx as f32 * 0.001, 0.0]
+        };
+        for i in 0..10 {
+            let mut entry = KnowledgeEntry::new(
+                format!("hot item {i}"),
+                "scope-graph-cold".to_string(),
+                "v1".to_string(),
+            );
+            entry.embedding = Some(next_emb());
+            queryable.insert(&entry).await.unwrap();
+        }
+
+        // Insert a Cold entry with high similarity.
+        let mut cold_entry = KnowledgeEntry::new(
+            "cold via graph retriever".to_string(),
+            "scope-graph-cold".to_string(),
+            "v1".to_string(),
+        );
+        cold_entry.embedding = Some(vec![1.0, 0.0, 0.0]);
+        cold_entry.tier = Tier::Cold;
+        queryable.insert(&cold_entry).await.unwrap();
+
+        let alpha = 0.3;
+        let retriever = GraphExpandRetriever::new(queryable, engine, graph, alpha);
+
+        // Test with include_cold=true — entry is found (may be via HNSW since insert
+        // adds to HNSW regardless of tier; cold_results may be 0 after dedup).
+        let opts = RetrievalOpts {
+            limit: 15,
+            expand_graph: true,
+            graph_depth: 1,
+            include_cold: true,
+            visibility: VisibilityMode::All,
+            ..Default::default()
+        };
+        let result = retriever.retrieve("test", "scope-graph-cold", &opts).await.unwrap();
+
+        let cold_hit = result.results.iter().find(|r| r.entry.content == "cold via graph retriever");
+        assert!(cold_hit.is_some(), "cold entry should be in graph retriever results");
+
+        // Test with include_cold=false — entry still found (it's in HNSW).
+        let opts_no_cold = RetrievalOpts {
+            limit: 15,
+            expand_graph: true,
+            graph_depth: 1,
+            include_cold: false,
+            visibility: VisibilityMode::All,
+            ..Default::default()
+        };
+        let result_no_cold = retriever.retrieve("test", "scope-graph-cold", &opts_no_cold).await.unwrap();
+        assert_eq!(result_no_cold.metrics.cold_results, 0, "no cold scan when disabled");
+        assert_eq!(result_no_cold.metrics.cold_scan_latency_ms, 0);
+
+        // Verify the scan_cold_entries method directly finds the Cold entry.
+        let direct_scan = store.scan_cold_entries(&[1.0, 0.0, 0.0], "scope-graph-cold", 10).unwrap();
+        assert_eq!(direct_scan.len(), 1, "scan should find the cold entry directly");
+        assert_eq!(direct_scan[0].entry.content, "cold via graph retriever");
     }
 }

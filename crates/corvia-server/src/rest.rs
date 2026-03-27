@@ -93,6 +93,9 @@ pub struct SearchRequest {
     pub content_role: Option<String>,
     pub source_origin: Option<String>,
     pub workstream: Option<String>,
+    /// Include Cold-tier entries via brute-force cosine scan (default false).
+    #[serde(default)]
+    pub include_cold: bool,
 }
 
 #[derive(Serialize)]
@@ -633,6 +636,7 @@ async fn search_memories(
             content_role,
             source_origin,
             workstream,
+            include_cold: req.include_cold,
             ..Default::default()
         };
         let response = rag.context(&req.query, &req.scope_id, Some(opts)).await

@@ -124,7 +124,8 @@ fn tool_definitions() -> Vec<Value> {
                     "limit": { "type": "integer", "description": "Maximum results (default 10)" },
                     "content_role": { "type": "string", "description": "Filter by content role: design, decision, plan, code, memory, finding, instruction, learning" },
                     "source_origin": { "type": "string", "description": "Filter by source origin: repo:<name>, workspace, memory" },
-                    "workstream": { "type": "string", "description": "Filter by workstream (e.g. git branch name)" }
+                    "workstream": { "type": "string", "description": "Filter by workstream (e.g. git branch name)" },
+                    "include_cold": { "type": "boolean", "description": "Include Cold-tier entries via brute-force cosine scan (default false)" }
                 },
                 "required": ["query"]
             }
@@ -200,7 +201,8 @@ fn tool_definitions() -> Vec<Value> {
                     "expand_graph": { "type": "boolean", "description": "Follow graph edges (default true)" },
                     "content_role": { "type": "string", "description": "Filter by content role: design, decision, plan, code, memory, finding, instruction, learning" },
                     "source_origin": { "type": "string", "description": "Filter by source origin: repo:<name>, workspace, memory" },
-                    "workstream": { "type": "string", "description": "Filter by workstream (e.g. git branch name)" }
+                    "workstream": { "type": "string", "description": "Filter by workstream (e.g. git branch name)" },
+                    "include_cold": { "type": "boolean", "description": "Include Cold-tier entries via brute-force cosine scan (default false)" }
                 },
                 "required": ["query"]
             }
@@ -217,7 +219,8 @@ fn tool_definitions() -> Vec<Value> {
                     "expand_graph": { "type": "boolean", "description": "Follow graph edges (default true)" },
                     "content_role": { "type": "string", "description": "Filter by content role: design, decision, plan, code, memory, finding, instruction, learning" },
                     "source_origin": { "type": "string", "description": "Filter by source origin: repo:<name>, workspace, memory" },
-                    "workstream": { "type": "string", "description": "Filter by workstream (e.g. git branch name)" }
+                    "workstream": { "type": "string", "description": "Filter by workstream (e.g. git branch name)" },
+                    "include_cold": { "type": "boolean", "description": "Include Cold-tier entries via brute-force cosine scan (default false)" }
                 },
                 "required": ["query"]
             }
@@ -630,6 +633,7 @@ async fn tool_corvia_search(
     let content_role = args.get("content_role").and_then(|v| v.as_str()).map(String::from);
     let source_origin = args.get("source_origin").and_then(|v| v.as_str()).map(String::from);
     let workstream = args.get("workstream").and_then(|v| v.as_str()).map(String::from);
+    let include_cold = args.get("include_cold").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // Route through RAG pipeline if available (fixes ContextBuilder bypass)
     if let Some(rag) = &state.rag {
@@ -639,6 +643,7 @@ async fn tool_corvia_search(
             content_role: content_role.clone(),
             source_origin: source_origin.clone(),
             workstream: workstream.clone(),
+            include_cold,
             ..Default::default()
         };
         let response = rag.context(query, scope_id, Some(opts)).await
@@ -966,6 +971,7 @@ async fn tool_corvia_context(
     let content_role = args.get("content_role").and_then(|v| v.as_str()).map(String::from);
     let source_origin = args.get("source_origin").and_then(|v| v.as_str()).map(String::from);
     let workstream = args.get("workstream").and_then(|v| v.as_str()).map(String::from);
+    let include_cold = args.get("include_cold").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let rag = state.rag.as_ref()
         .ok_or((SERVICE_UNAVAILABLE, "RAG pipeline not configured".into()))?;
@@ -976,6 +982,7 @@ async fn tool_corvia_context(
         content_role,
         source_origin,
         workstream,
+        include_cold,
         ..Default::default()
     };
 
@@ -1015,6 +1022,7 @@ async fn tool_corvia_ask(
     let content_role = args.get("content_role").and_then(|v| v.as_str()).map(String::from);
     let source_origin = args.get("source_origin").and_then(|v| v.as_str()).map(String::from);
     let workstream = args.get("workstream").and_then(|v| v.as_str()).map(String::from);
+    let include_cold = args.get("include_cold").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let rag = state.rag.as_ref()
         .ok_or((SERVICE_UNAVAILABLE, "RAG pipeline not configured".into()))?;
@@ -1025,6 +1033,7 @@ async fn tool_corvia_ask(
         content_role,
         source_origin,
         workstream,
+        include_cold,
         ..Default::default()
     };
 

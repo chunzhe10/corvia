@@ -416,16 +416,22 @@ impl LiteStore {
             .filter_map(|item| item.ok().map(|(_, v)| v.value().to_string()))
             .collect();
 
+        let query_dims = query_embedding.len();
+
         // Batch-read all entries and filter to Cold tier with embeddings.
         let cold_entries: Vec<(KnowledgeEntry, Vec<f32>)> = uuids
             .iter()
             .filter_map(|uuid_str| {
                 let bytes = entries_table.get(uuid_str.as_str()).ok()??;
-                let entry: KnowledgeEntry = serde_json::from_slice(bytes.value()).ok()?;
+                let mut entry: KnowledgeEntry = serde_json::from_slice(bytes.value()).ok()?;
                 if entry.tier != Tier::Cold {
                     return None;
                 }
-                let emb = entry.embedding.clone()?;
+                let emb = entry.embedding.take()?;
+                // Skip entries with mismatched embedding dimensions (e.g., model change).
+                if emb.len() != query_dims {
+                    return None;
+                }
                 Some((entry, emb))
             })
             .collect();
