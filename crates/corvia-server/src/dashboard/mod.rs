@@ -1546,6 +1546,7 @@ mod tests {
             workspace_root: dir.to_path_buf(),
             ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
             gpu_cache: std::sync::Arc::new(tokio::sync::Mutex::new(super::gpu::GpuMetricsCache::new())),
+            forgotten_access_counter: std::sync::Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
         })
     }
 

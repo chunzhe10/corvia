@@ -260,7 +260,7 @@ fn estimate_tokens(text: &str) -> usize {
 mod tests {
     use super::*;
     use corvia_common::agent_types::EntryStatus;
-    use corvia_common::types::{EntryMetadata, KnowledgeEntry};
+    use corvia_common::types::{EntryMetadata, KnowledgeEntry, Tier};
 
     /// Helper: create a SearchResult with given content, score, and optional source file.
     fn mock_result(content: &str, score: f32, source_file: Option<&str>) -> SearchResult {
@@ -272,7 +272,7 @@ mod tests {
             chunk_type: Some("function".into()),
             ..Default::default()
         };
-        SearchResult { entry, score }
+        SearchResult { entry, score, tier: Tier::Hot, retention_score: None }
     }
 
     #[test]

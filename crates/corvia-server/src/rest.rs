@@ -67,6 +67,8 @@ pub struct AppState {
     pub ingest_status: Arc<std::sync::RwLock<corvia_kernel::ingest::IngestStatus>>,
     /// Cached GPU metrics with 5s TTL and stampede protection.
     pub gpu_cache: Arc<tokio::sync::Mutex<crate::dashboard::gpu::GpuMetricsCache>>,
+    /// Counter for Forgotten entry access attempts (read by GC cycle span).
+    pub forgotten_access_counter: Arc<corvia_kernel::gc_worker::ForgottenAccessCounter>,
 }
 
 // --- Existing memory types ---
@@ -115,6 +117,10 @@ pub struct SearchResultDto {
     pub end_line: Option<u32>,
     pub content_role: Option<String>,
     pub source_origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention_score: Option<f32>,
 }
 
 impl From<SearchResult> for SearchResultDto {
@@ -129,6 +135,8 @@ impl From<SearchResult> for SearchResultDto {
             end_line: r.entry.metadata.end_line,
             content_role: r.entry.metadata.content_role,
             source_origin: r.entry.metadata.source_origin,
+            tier: Some(r.tier.to_string()),
+            retention_score: r.retention_score,
         }
     }
 }
@@ -1440,6 +1448,7 @@ mod tests {
             workspace_root: dir.to_path_buf(),
             ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
             gpu_cache: Arc::new(tokio::sync::Mutex::new(crate::dashboard::gpu::GpuMetricsCache::new())),
+            forgotten_access_counter: Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
         })
     }
 
@@ -1504,6 +1513,7 @@ mod tests {
             workspace_root: dir.to_path_buf(),
             ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
             gpu_cache: Arc::new(tokio::sync::Mutex::new(crate::dashboard::gpu::GpuMetricsCache::new())),
+            forgotten_access_counter: Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
         })
     }
 

@@ -650,14 +650,19 @@ async fn tool_corvia_search(
             .map_err(|e| (INTERNAL_ERROR, format!("Search failed: {e}")))?;
 
         let items: Vec<Value> = response.context.sources.iter().map(|r| {
-            json!({
+            let mut item = json!({
                 "content": r.entry.content,
                 "score": r.score,
                 "source_file": r.entry.metadata.source_file,
                 "language": r.entry.metadata.language,
                 "content_role": r.entry.metadata.content_role,
                 "source_origin": r.entry.metadata.source_origin,
-            })
+            });
+            item["tier"] = json!(r.tier.to_string());
+            if let Some(rs) = r.retention_score {
+                item["retention_score"] = json!(rs);
+            }
+            item
         }).collect();
 
         return Ok(json!({
@@ -692,14 +697,19 @@ async fn tool_corvia_search(
     let results: Vec<_> = results.into_iter().take(limit).collect();
 
     let items: Vec<Value> = results.iter().map(|r| {
-        json!({
+        let mut item = json!({
             "content": r.entry.content,
             "score": r.score,
             "source_file": r.entry.metadata.source_file,
             "language": r.entry.metadata.language,
             "content_role": r.entry.metadata.content_role,
             "source_origin": r.entry.metadata.source_origin,
-        })
+        });
+        item["tier"] = json!(r.tier.to_string());
+        if let Some(rs) = r.retention_score {
+            item["retention_score"] = json!(rs);
+        }
+        item
     }).collect();
 
     Ok(json!({
@@ -786,6 +796,11 @@ async fn tool_corvia_history(
     let chain = state.temporal.history(&uuid).await
         .map_err(|e| (INTERNAL_ERROR, format!("History query failed: {e}")))?;
 
+    // Check if any entry in the chain is Forgotten — increment counter for observability
+    if chain.iter().any(|e| e.tier == corvia_common::types::Tier::Forgotten) {
+        state.forgotten_access_counter.increment();
+    }
+
     if chain.is_empty() {
         return Ok(json!({
             "content": [{
@@ -832,6 +847,13 @@ async fn tool_corvia_graph(
 
     let uuid = uuid::Uuid::parse_str(entry_id)
         .map_err(|e| (INVALID_PARAMS, format!("Invalid UUID: {e}")))?;
+
+    // Check if the entry is Forgotten — increment counter for observability
+    if let Ok(Some(entry)) = state.store.get(&uuid).await {
+        if entry.tier == corvia_common::types::Tier::Forgotten {
+            state.forgotten_access_counter.increment();
+        }
+    }
 
     let edges = state.graph.edges(&uuid, EdgeDirection::Both).await
         .map_err(|e| (INTERNAL_ERROR, format!("Graph query failed: {e}")))?;
@@ -1090,6 +1112,12 @@ async fn tool_corvia_system_status(
                 "open_sessions": status.open_sessions,
                 "merge_queue_depth": status.merge_queue_depth,
                 "scope_id": status.scope_id,
+                "tier_distribution": {
+                    "hot": status.tier_distribution.hot,
+                    "warm": status.tier_distribution.warm,
+                    "cold": status.tier_distribution.cold,
+                    "forgotten": status.tier_distribution.forgotten,
+                },
             })).unwrap()
         }]
     }))
@@ -1455,6 +1483,7 @@ mod tests {
             workspace_root: dir.to_path_buf(),
             ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
             gpu_cache: std::sync::Arc::new(tokio::sync::Mutex::new(crate::dashboard::gpu::GpuMetricsCache::new())),
+            forgotten_access_counter: std::sync::Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
         })
     }
 
@@ -1768,6 +1797,7 @@ mod tests {
             workspace_root: dir.path().to_path_buf(),
             ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
             gpu_cache: std::sync::Arc::new(tokio::sync::Mutex::new(crate::dashboard::gpu::GpuMetricsCache::new())),
+            forgotten_access_counter: std::sync::Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
         });
 
         let args = json!({ "query": "rag-routed", "scope_id": "rag-scope", "limit": 5 });

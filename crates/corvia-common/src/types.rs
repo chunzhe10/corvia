@@ -328,6 +328,12 @@ impl KnowledgeEntry {
 pub struct SearchResult {
     pub entry: KnowledgeEntry,
     pub score: f32,
+    /// Knowledge tier at retrieval time.
+    #[serde(default)]
+    pub tier: Tier,
+    /// Composite retention score at retrieval time (0.0–1.0).
+    #[serde(default)]
+    pub retention_score: Option<f32>,
 }
 
 /// A directed edge in the knowledge graph (D37).

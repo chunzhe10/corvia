@@ -113,6 +113,46 @@ pub fn alpha_for_type(memory_type: MemoryType, is_superseded: bool) -> f64 {
     }
 }
 
+/// Individual component scores for observability/logging.
+#[derive(Debug, Clone, Copy)]
+pub struct ScoreBreakdown {
+    /// Time-decay component (weighted).
+    pub d_score: f32,
+    /// Access-signal component (weighted).
+    pub a_score: f32,
+    /// Graph-connectivity component (weighted).
+    pub g_score: f32,
+    /// Confidence component (weighted).
+    pub c_score: f32,
+    /// Final composite score (after supersession penalty, clamped to 0.0-1.0).
+    pub total: f32,
+}
+
+/// Compute the retention score with individual component breakdown.
+///
+/// Returns the composite score and each weighted component for structured logging.
+#[inline]
+#[must_use]
+pub fn compute_retention_score_breakdown(params: &RetentionParams) -> ScoreBreakdown {
+    let alpha = alpha_for_type(params.memory_type, params.is_superseded);
+
+    let d = (W_DECAY * decay_component(params.days_since_creation, alpha)) as f32;
+    let a = (W_ACCESS * access_component(params.access_count, params.days_since_access)) as f32;
+    let g = (W_GRAPH * graph_component(params.inbound_edges)) as f32;
+    let c = (W_CONFIDENCE * confidence_component(params.confidence)) as f32;
+
+    let mut total = d + a + g + c;
+    if params.is_superseded {
+        total *= SUPERSESSION_PENALTY as f32;
+    }
+    if total.is_nan() {
+        total = 0.0;
+    }
+    total = total.clamp(0.0, 1.0);
+
+    ScoreBreakdown { d_score: d, a_score: a, g_score: g, c_score: c, total }
+}
+
 /// Compute the composite retention score.
 ///
 /// Returns a value in `[0.0, 1.0]` (clamped). Higher means the entry is more
@@ -120,25 +160,7 @@ pub fn alpha_for_type(memory_type: MemoryType, is_superseded: bool) -> f64 {
 #[inline]
 #[must_use]
 pub fn compute_retention_score(params: &RetentionParams) -> f32 {
-    let alpha = alpha_for_type(params.memory_type, params.is_superseded);
-
-    let d = decay_component(params.days_since_creation, alpha);
-    let a = access_component(params.access_count, params.days_since_access);
-    let g = graph_component(params.inbound_edges);
-    let c = confidence_component(params.confidence);
-
-    let mut score = W_DECAY * d + W_ACCESS * a + W_GRAPH * g + W_CONFIDENCE * c;
-
-    if params.is_superseded {
-        score *= SUPERSESSION_PENALTY;
-    }
-
-    // NaN guard: if any input was NaN, score is NaN; treat as 0.
-    let score = score as f32;
-    if score.is_nan() {
-        return 0.0;
-    }
-    score.clamp(0.0, 1.0)
+    compute_retention_score_breakdown(params).total
 }
 
 /// Determine whether the entry should transition to a different tier.
@@ -804,5 +826,70 @@ mod tests {
             ..base_auto_protect_params()
         };
         assert!(!is_auto_protected(&params));
+    }
+
+    // ── ScoreBreakdown tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_breakdown_components_sum_to_total() {
+        let params = RetentionParams {
+            memory_type: MemoryType::Episodic,
+            days_since_creation: 30.0,
+            access_count: 10,
+            days_since_access: Some(5.0),
+            inbound_edges: 3,
+            confidence: Some(0.8),
+            is_superseded: false,
+        };
+
+        let breakdown = compute_retention_score_breakdown(&params);
+        let sum = breakdown.d_score + breakdown.a_score + breakdown.g_score + breakdown.c_score;
+        assert!(approx_eq(breakdown.total, sum, 0.01),
+            "total ({}) should equal sum of components ({})", breakdown.total, sum);
+    }
+
+    #[test]
+    fn test_breakdown_superseded_penalty() {
+        let base = RetentionParams {
+            memory_type: MemoryType::Episodic,
+            days_since_creation: 10.0,
+            access_count: 5,
+            days_since_access: Some(2.0),
+            inbound_edges: 2,
+            confidence: Some(0.8),
+            is_superseded: false,
+        };
+
+        let superseded = RetentionParams {
+            is_superseded: true,
+            ..base
+        };
+
+        let base_bd = compute_retention_score_breakdown(&base);
+        let sup_bd = compute_retention_score_breakdown(&superseded);
+
+        // Superseded total should be roughly half of base total
+        // (components may differ due to alpha change for Structural)
+        assert!(sup_bd.total < base_bd.total,
+            "superseded ({}) should be lower than base ({})", sup_bd.total, base_bd.total);
+    }
+
+    #[test]
+    fn test_breakdown_matches_compute_retention_score() {
+        let params = RetentionParams {
+            memory_type: MemoryType::Decisional,
+            days_since_creation: 45.0,
+            access_count: 20,
+            days_since_access: Some(3.0),
+            inbound_edges: 5,
+            confidence: Some(0.9),
+            is_superseded: false,
+        };
+
+        let score = compute_retention_score(&params);
+        let breakdown = compute_retention_score_breakdown(&params);
+
+        assert!(approx_eq(score, breakdown.total, 0.001),
+            "compute_retention_score ({}) should match breakdown.total ({})", score, breakdown.total);
     }
 }

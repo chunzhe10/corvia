@@ -646,6 +646,7 @@ async fn cmd_serve() -> Result<()> {
         workspace_root,
         ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
         gpu_cache: Arc::new(tokio::sync::Mutex::new(corvia_server::dashboard::gpu::GpuMetricsCache::new())),
+        forgotten_access_counter: Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
     });
     // Initial coverage cache population + background refresh.
     // NOTE: ttl_secs is captured once at startup. While `dashboard` is in
@@ -713,7 +714,8 @@ async fn cmd_serve() -> Result<()> {
         let gc_graph = state.graph.clone();
         let gc_config = state.config.clone();
         let gc_data_dir = state.data_dir.clone();
-        corvia_kernel::gc_worker::spawn_gc_worker(gc_store, gc_graph, gc_config, gc_data_dir);
+        let gc_counter = Some(state.forgotten_access_counter.clone());
+        corvia_kernel::gc_worker::spawn_gc_worker(gc_store, gc_graph, gc_config, gc_data_dir, gc_counter);
     }
 
     let mut app = corvia_server::rest::router(state.clone());
