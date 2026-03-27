@@ -227,7 +227,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "corvia_system_status",
-            "description": "Get a point-in-time system status snapshot (entry count, active agents, open sessions, merge queue depth)",
+            "description": "Get a point-in-time system status snapshot (entry count, active agents, open sessions, merge queue depth, tier distribution)",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -271,7 +271,31 @@ fn tool_definitions() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "name": "corvia_pin",
+            "description": "Pin a knowledge entry to prevent it from being demoted or forgotten by GC. Requires agent identity for audit trail.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "entry_id": { "type": "string", "description": "The entry UUID to pin" },
+                    "agent_id": { "type": "string", "description": "Agent identity for audit trail (e.g. 'claude-code')" }
+                },
+                "required": ["entry_id"]
+            }
+        }),
         // --- Tier 2 (LowRisk) tools — require _meta.confirmed ---
+        json!({
+            "name": "corvia_unpin",
+            "description": "Unpin a knowledge entry, making it eligible for GC demotion again. Requires confirmation via _meta.confirmed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "entry_id": { "type": "string", "description": "The entry UUID to unpin" }
+                },
+                "required": ["entry_id"]
+            },
+            "annotations": { "tier": "LowRisk" }
+        }),
         json!({
             "name": "corvia_config_set",
             "description": "Update a configuration value. Requires confirmation via _meta.confirmed.",
@@ -595,7 +619,9 @@ async fn handle_tools_call(
         "corvia_adapters_list" => tool_corvia_adapters_list(state),
         "corvia_agents_list" => tool_corvia_agents_list(state),
         "corvia_merge_queue" => tool_corvia_merge_queue(state, &arguments),
+        "corvia_pin" => tool_corvia_pin(state, &arguments, agent_id).await,
         // Tier 2 (LowRisk) — require _meta.confirmed
+        "corvia_unpin" => tool_corvia_unpin(state, &arguments, meta).await,
         "corvia_config_set" => tool_corvia_config_set(state, &arguments, meta).await,
         "corvia_gc_run" => tool_corvia_gc_run(state, meta).await,
         "corvia_rebuild_index" => tool_corvia_rebuild_index(state, &arguments, meta).await,
@@ -1224,7 +1250,68 @@ fn tool_corvia_merge_queue(
     }))
 }
 
+async fn tool_corvia_pin(
+    state: &AppState,
+    args: &Value,
+    agent_id: Option<&str>,
+) -> Result<Value, (i32, String)> {
+    let entry_id_str = args.get("entry_id").and_then(|v| v.as_str())
+        .ok_or((INVALID_PARAMS, "Missing 'entry_id' parameter".into()))?;
+    let entry_id = uuid::Uuid::parse_str(entry_id_str)
+        .map_err(|e| (INVALID_PARAMS, format!("Invalid UUID: {e}")))?;
+
+    let agent = agent_id
+        .ok_or((INVALID_PARAMS, "Pin requires agent identity (_meta.agent_id or agent_id param)".into()))?;
+
+    let result = corvia_kernel::ops::pin_entry(&state.store, &entry_id, agent).await
+        .map_err(|e| (INTERNAL_ERROR, format!("Pin failed: {e}")))?;
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string(&json!({
+                "status": "pinned",
+                "entry_id": result.entry_id,
+                "pinned_by": result.pinned_by,
+                "pinned_at": result.pinned_at,
+            })).unwrap()
+        }]
+    }))
+}
+
 // --- Tier 2 (LowRisk) control-plane tool implementations ---
+
+async fn tool_corvia_unpin(
+    state: &AppState,
+    args: &Value,
+    meta: Option<&Value>,
+) -> Result<Value, (i32, String)> {
+    let entry_id_str = args.get("entry_id").and_then(|v| v.as_str())
+        .ok_or((INVALID_PARAMS, "Missing 'entry_id' parameter".into()))?;
+    let entry_id = uuid::Uuid::parse_str(entry_id_str)
+        .map_err(|e| (INVALID_PARAMS, format!("Invalid UUID: {e}")))?;
+
+    if !is_confirmed(meta) {
+        return Ok(confirmation_response(
+            json!({ "entry_id": entry_id_str }),
+            &format!("Unpin entry {entry_id_str}? This makes it eligible for GC demotion."),
+        ));
+    }
+
+    let result = corvia_kernel::ops::unpin_entry(&state.store, &entry_id).await
+        .map_err(|e| (INTERNAL_ERROR, format!("Unpin failed: {e}")))?;
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string(&json!({
+                "status": "unpinned",
+                "entry_id": result.entry_id,
+                "was_pinned": result.was_pinned,
+            })).unwrap()
+        }]
+    }))
+}
 
 async fn tool_corvia_config_set(
     state: &AppState,
@@ -1484,6 +1571,7 @@ mod tests {
             ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
             gpu_cache: std::sync::Arc::new(tokio::sync::Mutex::new(crate::dashboard::gpu::GpuMetricsCache::new())),
             forgotten_access_counter: std::sync::Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
+            gc_knowledge_history: None,
         })
     }
 
@@ -1519,7 +1607,7 @@ mod tests {
     async fn test_tools_list() {
         let result = handle_tools_list();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 18);
+        assert_eq!(tools.len(), 20);
 
         let names: Vec<&str> = tools.iter()
             .map(|t| t["name"].as_str().unwrap())
@@ -1537,7 +1625,9 @@ mod tests {
         assert!(names.contains(&"corvia_adapters_list"));
         assert!(names.contains(&"corvia_agents_list"));
         assert!(names.contains(&"corvia_merge_queue"));
+        assert!(names.contains(&"corvia_pin"));
         // Tier 2
+        assert!(names.contains(&"corvia_unpin"));
         assert!(names.contains(&"corvia_config_set"));
         assert!(names.contains(&"corvia_gc_run"));
         assert!(names.contains(&"corvia_rebuild_index"));
@@ -1798,6 +1888,7 @@ mod tests {
             ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
             gpu_cache: std::sync::Arc::new(tokio::sync::Mutex::new(crate::dashboard::gpu::GpuMetricsCache::new())),
             forgotten_access_counter: std::sync::Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
+            gc_knowledge_history: None,
         });
 
         let args = json!({ "query": "rag-routed", "scope_id": "rag-scope", "limit": 5 });
@@ -2065,6 +2156,121 @@ mod tests {
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["dry_run"], true);
         assert_eq!(parsed["would_retry"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_corvia_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+
+        // Insert a test entry
+        let entry = corvia_common::types::KnowledgeEntry::new(
+            "pin me".into(), "test-scope".into(), "v1".into(),
+        ).with_embedding(vec![1.0, 0.0, 0.0]);
+        let entry_id = entry.id.to_string();
+        state.store.insert(&entry).await.unwrap();
+
+        let args = json!({ "entry_id": entry_id, "agent_id": "test-agent" });
+        let result = tool_corvia_pin(&state, &args, Some("test-agent")).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["status"], "pinned");
+        assert_eq!(parsed["pinned_by"], "test-agent");
+
+        // Verify entry is pinned in store
+        let updated = state.store.get(&entry.id).await.unwrap().unwrap();
+        assert!(updated.pin.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_corvia_pin_requires_agent_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+
+        let args = json!({ "entry_id": uuid::Uuid::now_v7().to_string() });
+        let result = tool_corvia_pin(&state, &args, None).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_corvia_unpin_requires_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+
+        let entry = corvia_common::types::KnowledgeEntry::new(
+            "unpin me".into(), "test-scope".into(), "v1".into(),
+        ).with_embedding(vec![1.0, 0.0, 0.0]);
+        let entry_id = entry.id.to_string();
+        state.store.insert(&entry).await.unwrap();
+
+        // Without confirmation — should return confirmation_required
+        let args = json!({ "entry_id": entry_id });
+        let result = tool_corvia_unpin(&state, &args, None).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["confirmation_required"], true);
+    }
+
+    #[tokio::test]
+    async fn test_corvia_unpin_with_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+
+        // Insert a pinned entry
+        let mut entry = corvia_common::types::KnowledgeEntry::new(
+            "unpin me".into(), "test-scope".into(), "v1".into(),
+        );
+        entry.embedding = Some(vec![1.0, 0.0, 0.0]);
+        entry.pin = Some(corvia_common::types::PinInfo {
+            by: "agent".into(),
+            at: chrono::Utc::now(),
+        });
+        let entry_id = entry.id.to_string();
+        state.store.insert(&entry).await.unwrap();
+
+        // With confirmation — should unpin
+        let args = json!({ "entry_id": entry_id });
+        let meta = json!({ "confirmed": true });
+        let result = tool_corvia_unpin(&state, &args, Some(&meta)).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["status"], "unpinned");
+        assert_eq!(parsed["was_pinned"], true);
+
+        // Verify unpinned in store
+        let updated = state.store.get(&entry.id).await.unwrap().unwrap();
+        assert!(updated.pin.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_system_status_includes_tier_distribution() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+
+        // Insert entries with different tiers
+        let mut hot_entry = corvia_common::types::KnowledgeEntry::new(
+            "hot".into(), "test-scope".into(), "v1".into(),
+        );
+        hot_entry.embedding = Some(vec![1.0, 0.0, 0.0]);
+        hot_entry.tier = corvia_common::types::Tier::Hot;
+        state.store.insert(&hot_entry).await.unwrap();
+
+        let mut cold_entry = corvia_common::types::KnowledgeEntry::new(
+            "cold".into(), "test-scope".into(), "v1".into(),
+        );
+        cold_entry.embedding = Some(vec![0.0, 1.0, 0.0]);
+        cold_entry.tier = corvia_common::types::Tier::Cold;
+        state.store.insert(&cold_entry).await.unwrap();
+
+        let args = json!({ "scope_id": "test-scope" });
+        let result = tool_corvia_system_status(&state, &args).await.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+
+        assert!(parsed.get("tier_distribution").is_some());
+        let dist = &parsed["tier_distribution"];
+        assert!(dist["hot"].as_u64().unwrap() >= 1);
+        assert!(dist["cold"].as_u64().unwrap() >= 1);
     }
 
 }

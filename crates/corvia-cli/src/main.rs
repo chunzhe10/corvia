@@ -206,11 +206,52 @@ enum Commands {
         command: BenchCommands,
     },
 
+    /// Knowledge lifecycle: garbage collection status, manual runs, history
+    Gc {
+        #[command(subcommand)]
+        command: GcCommands,
+    },
+
+    /// Pin a knowledge entry (prevents GC demotion)
+    Pin {
+        /// Entry UUID to pin
+        entry_id: String,
+        /// Agent identity for audit trail
+        #[arg(long, default_value = "cli")]
+        agent_id: String,
+    },
+
+    /// Unpin a knowledge entry (re-enables GC demotion)
+    Unpin {
+        /// Entry UUID to unpin
+        entry_id: String,
+    },
+
+    /// Inspect a knowledge entry's full lifecycle metadata
+    Inspect {
+        /// Entry UUID to inspect
+        entry_id: String,
+    },
+
     /// Manage Claude Code lifecycle hooks
     Hooks {
         #[command(subcommand)]
         command: HooksCommands,
     },
+}
+
+#[derive(Subcommand)]
+enum GcCommands {
+    /// Show tier distribution per scope
+    Status {
+        /// Scope to check (uses config scope_id if not specified)
+        #[arg(long)]
+        scope: Option<String>,
+    },
+    /// Trigger a manual knowledge GC cycle (retention scoring + tier transitions)
+    Run,
+    /// Show recent knowledge GC cycle metrics
+    History,
 }
 
 #[derive(Subcommand)]
@@ -442,6 +483,14 @@ async fn async_main(cli: Cli) -> Result<()> {
             BenchCommands::Report => cmd_bench_report()?,
             BenchCommands::Compare { server, limit } => cmd_bench_compare(&server, limit).await?,
         },
+        Commands::Gc { command } => match command {
+            GcCommands::Status { scope } => cmd_gc_status(scope.as_deref()).await?,
+            GcCommands::Run => cmd_gc_run().await?,
+            GcCommands::History => cmd_gc_history().await?,
+        },
+        Commands::Pin { entry_id, agent_id } => cmd_pin(&entry_id, &agent_id).await?,
+        Commands::Unpin { entry_id } => cmd_unpin(&entry_id).await?,
+        Commands::Inspect { entry_id } => cmd_inspect(&entry_id).await?,
         Commands::Hooks { command } => match command {
             HooksCommands::Run { .. } => unreachable!("handled in fast path above"),
             HooksCommands::Init => {
@@ -647,6 +696,7 @@ async fn cmd_serve() -> Result<()> {
         ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
         gpu_cache: Arc::new(tokio::sync::Mutex::new(corvia_server::dashboard::gpu::GpuMetricsCache::new())),
         forgotten_access_counter: Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
+        gc_knowledge_history: Some(Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(50))),
     });
     // Initial coverage cache population + background refresh.
     // NOTE: ttl_secs is captured once at startup. While `dashboard` is in
@@ -2094,6 +2144,150 @@ fn parse_duration(s: &str) -> Result<chrono::Duration> {
     } else {
         anyhow::bail!("Invalid duration format: {s}. Use '7d' for days or '1h' for hours.")
     }
+}
+
+// ---------------------------------------------------------------------------
+// GC / Pin / Unpin / Inspect commands
+// ---------------------------------------------------------------------------
+
+async fn cmd_gc_status(scope: Option<&str>) -> Result<()> {
+    let config = load_config()?;
+    let client = server_client::ServerClient::detect(&config).await
+        .ok_or_else(|| anyhow::anyhow!("No running corvia server found. Start with `corvia serve`."))?;
+
+    let scope_id = scope.unwrap_or(&config.project.scope_id);
+    let result = client.gc_status(Some(scope_id)).await?;
+
+    let dist = result.get("tier_distribution").unwrap_or(&serde_json::Value::Null);
+    let forgetting = result.get("forgetting_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+    let total = result.get("total_entries").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    println!("GC Status for scope '{scope_id}':");
+    if !forgetting {
+        println!("  ⚠  Forgetting is DISABLED — all entries treated as Hot for retrieval");
+    }
+    println!("  Total entries: {total}");
+    println!("  Tier distribution:");
+    println!("    Hot:       {}", dist.get("hot").and_then(|v| v.as_u64()).unwrap_or(0));
+    println!("    Warm:      {}", dist.get("warm").and_then(|v| v.as_u64()).unwrap_or(0));
+    println!("    Cold:      {}", dist.get("cold").and_then(|v| v.as_u64()).unwrap_or(0));
+    println!("    Forgotten: {}", dist.get("forgotten").and_then(|v| v.as_u64()).unwrap_or(0));
+
+    Ok(())
+}
+
+async fn cmd_gc_run() -> Result<()> {
+    let config = load_config()?;
+    let client = server_client::ServerClient::detect(&config).await
+        .ok_or_else(|| anyhow::anyhow!("No running corvia server found. Start with `corvia serve`."))?;
+
+    println!("Triggering knowledge GC cycle...");
+    let result = client.gc_run().await?;
+    println!("GC cycle complete:");
+    println!("{}", serde_json::to_string_pretty(&result)?);
+
+    Ok(())
+}
+
+async fn cmd_gc_history() -> Result<()> {
+    let config = load_config()?;
+    let client = server_client::ServerClient::detect(&config).await
+        .ok_or_else(|| anyhow::anyhow!("No running corvia server found. Start with `corvia serve`."))?;
+
+    let result = client.gc_history().await?;
+    let count = result.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    if count == 0 {
+        println!("No GC knowledge cycles recorded yet.");
+        return Ok(());
+    }
+
+    println!("Recent GC knowledge cycles ({count}):");
+    if let Some(cycles) = result.get("cycles").and_then(|v| v.as_array()) {
+        for (i, cycle) in cycles.iter().enumerate() {
+            println!("\n--- Cycle {} ---", i + 1);
+            println!("  Entries scanned:  {}", cycle.get("entries_scanned").and_then(|v| v.as_u64()).unwrap_or(0));
+            println!("  Hot → Warm:       {}", cycle.get("hot_to_warm").and_then(|v| v.as_u64()).unwrap_or(0));
+            println!("  Warm → Cold:      {}", cycle.get("warm_to_cold").and_then(|v| v.as_u64()).unwrap_or(0));
+            println!("  Cold → Forgotten: {}", cycle.get("cold_to_forgotten").and_then(|v| v.as_u64()).unwrap_or(0));
+            println!("  Cold → Warm:      {}", cycle.get("cold_to_warm").and_then(|v| v.as_u64()).unwrap_or(0));
+            println!("  Warm → Hot:       {}", cycle.get("warm_to_hot").and_then(|v| v.as_u64()).unwrap_or(0));
+            println!("  HNSW rebuild:     {}", cycle.get("hnsw_rebuild_triggered").and_then(|v| v.as_bool()).unwrap_or(false));
+            println!("  Duration:         {}ms", cycle.get("cycle_duration_ms").and_then(|v| v.as_u64()).unwrap_or(0));
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_pin(entry_id: &str, agent_id: &str) -> Result<()> {
+    let config = load_config()?;
+    let client = server_client::ServerClient::detect(&config).await
+        .ok_or_else(|| anyhow::anyhow!("No running corvia server found. Start with `corvia serve`."))?;
+
+    let result = client.pin_entry(entry_id, agent_id).await?;
+    println!("Pinned entry {}:", entry_id);
+    println!("  pinned_by: {}", result.get("pinned_by").and_then(|v| v.as_str()).unwrap_or("?"));
+    println!("  pinned_at: {}", result.get("pinned_at").and_then(|v| v.as_str()).unwrap_or("?"));
+
+    Ok(())
+}
+
+async fn cmd_unpin(entry_id: &str) -> Result<()> {
+    let config = load_config()?;
+    let client = server_client::ServerClient::detect(&config).await
+        .ok_or_else(|| anyhow::anyhow!("No running corvia server found. Start with `corvia serve`."))?;
+
+    let result = client.unpin_entry(entry_id).await?;
+    let was_pinned = result.get("was_pinned").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if was_pinned {
+        println!("Unpinned entry {entry_id}.");
+    } else {
+        println!("Entry {entry_id} was not pinned.");
+    }
+
+    Ok(())
+}
+
+async fn cmd_inspect(entry_id: &str) -> Result<()> {
+    let config = load_config()?;
+    let client = server_client::ServerClient::detect(&config).await
+        .ok_or_else(|| anyhow::anyhow!("No running corvia server found. Start with `corvia serve`."))?;
+
+    let result = client.inspect_entry(entry_id).await?;
+
+    println!("Entry: {}", result.get("id").and_then(|v| v.as_str()).unwrap_or("?"));
+    println!("  Scope:           {}", result.get("scope_id").and_then(|v| v.as_str()).unwrap_or("?"));
+    println!("  Tier:            {}", result.get("tier").and_then(|v| v.as_str()).unwrap_or("?"));
+    println!("  Retention score: {}", result.get("retention_score").and_then(|v| v.as_f64()).map(|s| format!("{s:.3}")).unwrap_or_else(|| "not computed".into()));
+    println!("  Memory type:     {}", result.get("memory_type").and_then(|v| v.as_str()).unwrap_or("?"));
+    println!("  Confidence:      {}", result.get("confidence").and_then(|v| v.as_f64()).map(|s| format!("{s:.2}")).unwrap_or_else(|| "default (0.7)".into()));
+    println!("  Access count:    {}", result.get("access_count").and_then(|v| v.as_u64()).unwrap_or(0));
+    println!("  Last accessed:   {}", result.get("last_accessed").and_then(|v| v.as_str()).unwrap_or("never"));
+    println!("  Tier changed:    {}", result.get("tier_changed_at").and_then(|v| v.as_str()).unwrap_or("never"));
+    println!("  Inbound edges:   {}", result.get("inbound_edges").and_then(|v| v.as_u64()).unwrap_or(0));
+    println!("  Recorded at:     {}", result.get("recorded_at").and_then(|v| v.as_str()).unwrap_or("?"));
+    println!("  Content role:    {}", result.get("content_role").and_then(|v| v.as_str()).unwrap_or("none"));
+    println!("  Source origin:   {}", result.get("source_origin").and_then(|v| v.as_str()).unwrap_or("none"));
+    println!("  Source file:     {}", result.get("source_file").and_then(|v| v.as_str()).unwrap_or("none"));
+
+    if let Some(pin) = result.get("pin") {
+        println!("  Pin status:      PINNED");
+        println!("    by:            {}", pin.get("by").and_then(|v| v.as_str()).unwrap_or("?"));
+        println!("    at:            {}", pin.get("at").and_then(|v| v.as_str()).unwrap_or("?"));
+    } else {
+        println!("  Pin status:      not pinned");
+    }
+
+    if let Some(superseded) = result.get("superseded_by").and_then(|v| v.as_str()) {
+        println!("  Superseded by:   {superseded}");
+    }
+
+    let preview = result.get("content_preview").and_then(|v| v.as_str()).unwrap_or("");
+    println!("\n  Content preview:\n    {preview}");
+
+    Ok(())
 }
 
 async fn cmd_inference_reload(

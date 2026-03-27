@@ -228,4 +228,70 @@ impl ServerClient {
 
         Ok(resp.json().await?)
     }
+
+    /// Pin an entry by ID.
+    pub async fn pin_entry(&self, entry_id: &str, agent_id: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .post(format!("{}/v1/entries/{}/pin", self.base_url, entry_id))
+            .json(&serde_json::json!({ "agent_id": agent_id }))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(resp.json().await?)
+    }
+
+    /// Unpin an entry by ID.
+    pub async fn unpin_entry(&self, entry_id: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .post(format!("{}/v1/entries/{}/unpin", self.base_url, entry_id))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(resp.json().await?)
+    }
+
+    /// Inspect an entry's lifecycle metadata.
+    pub async fn inspect_entry(&self, entry_id: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .get(format!("{}/v1/entries/{}/inspect", self.base_url, entry_id))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(resp.json().await?)
+    }
+
+    /// Get GC status (tier distribution).
+    pub async fn gc_status(&self, scope_id: Option<&str>) -> Result<serde_json::Value> {
+        let mut url = format!("{}/v1/gc/status", self.base_url);
+        if let Some(scope) = scope_id {
+            url = format!("{url}?scope_id={scope}");
+        }
+        let resp = self.client.get(&url).send().await?.error_for_status()?;
+        Ok(resp.json().await?)
+    }
+
+    /// Trigger a manual GC knowledge cycle.
+    pub async fn gc_run(&self) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .post(format!("{}/v1/gc/run", self.base_url))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(resp.json().await?)
+    }
+
+    /// Get recent GC knowledge cycle history.
+    pub async fn gc_history(&self) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .get(format!("{}/v1/gc/history", self.base_url))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(resp.json().await?)
+    }
 }

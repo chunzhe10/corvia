@@ -336,6 +336,185 @@ impl GcHistory {
 }
 
 // ---------------------------------------------------------------------------
+// Pin / Unpin / Inspect
+// ---------------------------------------------------------------------------
+
+/// Pin result returned to callers.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PinResult {
+    pub entry_id: String,
+    pub pinned_by: String,
+    pub pinned_at: String,
+}
+
+/// Pin an entry by ID, making it exempt from GC demotion.
+pub async fn pin_entry(
+    store: &Arc<dyn QueryableStore>,
+    entry_id: &uuid::Uuid,
+    agent_id: &str,
+) -> Result<PinResult> {
+    let lite_store = store
+        .as_any()
+        .downcast_ref::<LiteStore>()
+        .ok_or_else(|| CorviaError::Storage("Pin is only supported for LiteStore".into()))?;
+
+    let mut entry = lite_store
+        .get(entry_id)
+        .await?
+        .ok_or_else(|| CorviaError::Storage(format!("Entry {entry_id} not found")))?;
+
+    let now = chrono::Utc::now();
+    entry.pin = Some(corvia_common::types::PinInfo {
+        by: agent_id.to_string(),
+        at: now,
+    });
+
+    lite_store.update_entry_metadata(&entry)?;
+
+    Ok(PinResult {
+        entry_id: entry_id.to_string(),
+        pinned_by: agent_id.to_string(),
+        pinned_at: now.to_rfc3339(),
+    })
+}
+
+/// Unpin result returned to callers.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UnpinResult {
+    pub entry_id: String,
+    pub was_pinned: bool,
+}
+
+/// Unpin an entry by ID, making it eligible for GC demotion again.
+pub async fn unpin_entry(
+    store: &Arc<dyn QueryableStore>,
+    entry_id: &uuid::Uuid,
+) -> Result<UnpinResult> {
+    let lite_store = store
+        .as_any()
+        .downcast_ref::<LiteStore>()
+        .ok_or_else(|| CorviaError::Storage("Unpin is only supported for LiteStore".into()))?;
+
+    let mut entry = lite_store
+        .get(entry_id)
+        .await?
+        .ok_or_else(|| CorviaError::Storage(format!("Entry {entry_id} not found")))?;
+
+    let was_pinned = entry.pin.is_some();
+    entry.pin = None;
+
+    lite_store.update_entry_metadata(&entry)?;
+
+    Ok(UnpinResult {
+        entry_id: entry_id.to_string(),
+        was_pinned,
+    })
+}
+
+/// Full lifecycle metadata for an entry, used by the `inspect` command.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EntryInspection {
+    pub id: String,
+    pub scope_id: String,
+    pub content_preview: String,
+    pub tier: String,
+    pub tier_changed_at: Option<String>,
+    pub retention_score: Option<f32>,
+    pub memory_type: String,
+    pub confidence: Option<f32>,
+    pub access_count: u32,
+    pub last_accessed: Option<String>,
+    pub pin: Option<PinInspection>,
+    pub recorded_at: String,
+    pub valid_from: String,
+    pub valid_to: Option<String>,
+    pub superseded_by: Option<String>,
+    pub content_role: Option<String>,
+    pub source_origin: Option<String>,
+    pub source_file: Option<String>,
+    pub inbound_edges: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PinInspection {
+    pub by: String,
+    pub at: String,
+}
+
+/// Inspect an entry: return full lifecycle metadata with score breakdown.
+pub async fn inspect_entry(
+    store: &Arc<dyn QueryableStore>,
+    graph: &Arc<dyn crate::traits::GraphStore>,
+    entry_id: &uuid::Uuid,
+) -> Result<EntryInspection> {
+    let entry = store
+        .get(entry_id)
+        .await?
+        .ok_or_else(|| CorviaError::Storage(format!("Entry {entry_id} not found")))?;
+
+    let inbound_edges = graph
+        .edges(entry_id, corvia_common::types::EdgeDirection::Incoming)
+        .await
+        .unwrap_or_default()
+        .len();
+
+    let content_preview: String = entry.content.chars().take(200).collect();
+    let ellipsis = if entry.content.chars().nth(200).is_some() { "..." } else { "" };
+
+    Ok(EntryInspection {
+        id: entry.id.to_string(),
+        scope_id: entry.scope_id.clone(),
+        content_preview: format!("{content_preview}{ellipsis}"),
+        tier: entry.tier.to_string(),
+        tier_changed_at: entry.tier_changed_at.map(|t| t.to_rfc3339()),
+        retention_score: entry.retention_score,
+        memory_type: entry.memory_type.to_string(),
+        confidence: entry.confidence,
+        access_count: entry.access_count,
+        last_accessed: entry.last_accessed.map(|t| t.to_rfc3339()),
+        pin: entry.pin.as_ref().map(|p| PinInspection {
+            by: p.by.clone(),
+            at: p.at.to_rfc3339(),
+        }),
+        recorded_at: entry.recorded_at.to_rfc3339(),
+        valid_from: entry.valid_from.to_rfc3339(),
+        valid_to: entry.valid_to.map(|t| t.to_rfc3339()),
+        superseded_by: entry.superseded_by.map(|u| u.to_string()),
+        content_role: entry.metadata.content_role.clone(),
+        source_origin: entry.metadata.source_origin.clone(),
+        source_file: entry.metadata.source_file.clone(),
+        inbound_edges,
+    })
+}
+
+/// GC knowledge cycle history: wraps the in-memory GcCycleReport ring buffer.
+pub struct GcKnowledgeHistory {
+    reports: std::sync::Mutex<std::collections::VecDeque<crate::gc_worker::GcCycleReport>>,
+    max_size: usize,
+}
+
+impl GcKnowledgeHistory {
+    pub fn new(max_size: usize) -> Self {
+        Self {
+            reports: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(max_size)),
+            max_size,
+        }
+    }
+
+    pub fn push(&self, report: crate::gc_worker::GcCycleReport) {
+        let mut reports = self.reports.lock().unwrap();
+        if reports.len() >= self.max_size {
+            reports.pop_front();
+        }
+        reports.push_back(report);
+    }
+
+    pub fn all(&self) -> Vec<crate::gc_worker::GcCycleReport> {
+        self.reports.lock().unwrap().iter().cloned().collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Index rebuild
 // ---------------------------------------------------------------------------
 
@@ -608,6 +787,125 @@ mod tests {
         // duration_ms may be 0 for sub-millisecond GC on empty coordinator,
         // but it must not be absurdly large
         assert!(report.duration_ms < 10_000, "gc_run duration should be reasonable");
+    }
+
+    #[tokio::test]
+    async fn test_pin_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _coord) = setup_coordinator(dir.path()).await;
+
+        let mut entry = corvia_common::types::KnowledgeEntry::new(
+            "test pin".into(), "test-scope".into(), "v1".into(),
+        );
+        entry.embedding = Some(vec![1.0, 0.0, 0.0]);
+        let entry_id = entry.id;
+        store.insert(&entry).await.unwrap();
+
+        let result = pin_entry(&store, &entry_id, "claude-code").await.unwrap();
+        assert_eq!(result.pinned_by, "claude-code");
+
+        // Verify entry is now pinned
+        let updated = store.get(&entry_id).await.unwrap().unwrap();
+        assert!(updated.pin.is_some());
+        assert_eq!(updated.pin.unwrap().by, "claude-code");
+    }
+
+    #[tokio::test]
+    async fn test_unpin_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _coord) = setup_coordinator(dir.path()).await;
+
+        let mut entry = corvia_common::types::KnowledgeEntry::new(
+            "test unpin".into(), "test-scope".into(), "v1".into(),
+        );
+        entry.embedding = Some(vec![1.0, 0.0, 0.0]);
+        entry.pin = Some(corvia_common::types::PinInfo {
+            by: "agent".into(),
+            at: chrono::Utc::now(),
+        });
+        let entry_id = entry.id;
+        store.insert(&entry).await.unwrap();
+
+        let result = unpin_entry(&store, &entry_id).await.unwrap();
+        assert!(result.was_pinned);
+
+        // Verify entry is unpinned
+        let updated = store.get(&entry_id).await.unwrap().unwrap();
+        assert!(updated.pin.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_unpin_entry_not_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _coord) = setup_coordinator(dir.path()).await;
+
+        let mut entry = corvia_common::types::KnowledgeEntry::new(
+            "not pinned".into(), "test-scope".into(), "v1".into(),
+        );
+        entry.embedding = Some(vec![1.0, 0.0, 0.0]);
+        let entry_id = entry.id;
+        store.insert(&entry).await.unwrap();
+
+        let result = unpin_entry(&store, &entry_id).await.unwrap();
+        assert!(!result.was_pinned);
+    }
+
+    struct MockGraphStore;
+    #[async_trait::async_trait]
+    impl crate::traits::GraphStore for MockGraphStore {
+        async fn relate(&self, _from: &uuid::Uuid, _relation: &str, _to: &uuid::Uuid, _metadata: Option<serde_json::Value>) -> Result<()> { Ok(()) }
+        async fn edges(&self, _id: &uuid::Uuid, _direction: corvia_common::types::EdgeDirection) -> Result<Vec<corvia_common::types::GraphEdge>> { Ok(vec![]) }
+        async fn traverse(&self, _start: &uuid::Uuid, _relation: Option<&str>, _direction: corvia_common::types::EdgeDirection, _max_depth: usize) -> Result<Vec<corvia_common::types::KnowledgeEntry>> { Ok(vec![]) }
+        async fn shortest_path(&self, _from: &uuid::Uuid, _to: &uuid::Uuid) -> Result<Option<Vec<corvia_common::types::KnowledgeEntry>>> { Ok(None) }
+        async fn remove_edges(&self, _id: &uuid::Uuid) -> Result<()> { Ok(()) }
+    }
+
+    #[tokio::test]
+    async fn test_inspect_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap()) as Arc<dyn QueryableStore>;
+        store.init_schema().await.unwrap();
+        let graph = Arc::new(MockGraphStore) as Arc<dyn crate::traits::GraphStore>;
+
+        let mut entry = corvia_common::types::KnowledgeEntry::new(
+            "test inspect content".into(), "test-scope".into(), "v1".into(),
+        );
+        entry.embedding = Some(vec![1.0, 0.0, 0.0]);
+        entry.tier = corvia_common::types::Tier::Warm;
+        entry.retention_score = Some(0.42);
+        entry.access_count = 5;
+        let entry_id = entry.id;
+        store.insert(&entry).await.unwrap();
+
+        let inspection = inspect_entry(&store, &graph, &entry_id).await.unwrap();
+        assert_eq!(inspection.tier, "warm");
+        assert_eq!(inspection.retention_score, Some(0.42));
+        assert_eq!(inspection.access_count, 5);
+        assert_eq!(inspection.memory_type, "episodic"); // default
+        assert!(inspection.content_preview.starts_with("test inspect content"));
+        assert!(inspection.pin.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pin_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _coord) = setup_coordinator(dir.path()).await;
+
+        let fake_id = uuid::Uuid::now_v7();
+        let result = pin_entry(&store, &fake_id, "agent").await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_gc_knowledge_history_ring_buffer() {
+        let history = GcKnowledgeHistory::new(3);
+        assert!(history.all().is_empty());
+
+        for _ in 0..5 {
+            history.push(crate::gc_worker::GcCycleReport::default());
+        }
+
+        assert_eq!(history.all().len(), 3);
     }
 
     #[test]
