@@ -281,7 +281,9 @@ impl crate::traits::QueryableStore for PostgresStore {
                 let distance: f64 = row.try_get("distance").ok()?;
                 let score = 1.0 - distance as f32;
                 let entry = row_to_entry(row)?;
-                Some(SearchResult { entry, score })
+                let tier = Some(entry.tier);
+                let retention_score = entry.retention_score;
+                Some(SearchResult { entry, score, tier, retention_score })
             })
             .collect();
 

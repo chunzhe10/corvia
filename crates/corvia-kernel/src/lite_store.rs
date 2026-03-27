@@ -642,7 +642,11 @@ impl LiteStore {
 
         Ok(scored
             .into_iter()
-            .map(|(score, entry)| SearchResult { entry, score })
+            .map(|(score, entry)| {
+                let tier = Some(entry.tier);
+                let retention_score = entry.retention_score;
+                SearchResult { entry, score, tier, retention_score }
+            })
             .collect())
     }
 
@@ -961,7 +965,9 @@ impl super::traits::QueryableStore for LiteStore {
             // Convert cosine distance to similarity score
             let score = 1.0 - distance;
 
-            results.push(SearchResult { entry, score });
+            let tier = Some(entry.tier);
+            let rs = entry.retention_score;
+            results.push(SearchResult { entry, score, tier, retention_score: rs });
 
             if results.len() >= limit {
                 break;

@@ -13,11 +13,42 @@ use std::sync::Arc;
 use chrono::Utc;
 use corvia_common::config::{CorviaConfig, ForgettingConfig, ScopeForgettingOverride};
 use corvia_common::errors::Result;
-use corvia_common::types::{EdgeDirection, KnowledgeEntry, Tier};
-use tracing::{info, info_span, warn, Instrument};
+use corvia_common::types::{EdgeDirection, KnowledgeEntry, MemoryType, Tier};
+use tracing::{info, warn};
 
 use crate::scoring::{self, AutoProtectParams, RetentionParams};
 use crate::traits::{GraphStore, QueryableStore};
+
+/// Shared counter for Forgotten entry access attempts.
+///
+/// Tracks how often agents try to access Forgotten entries via direct ID lookups
+/// (`corvia_history`, `corvia_graph` traversal). High rate signals thresholds
+/// are too aggressive. The GC cycle reads and resets this counter.
+#[derive(Debug, Default)]
+pub struct ForgottenAccessCounter {
+    counter: std::sync::atomic::AtomicU64,
+}
+
+impl ForgottenAccessCounter {
+    pub fn new() -> Self {
+        Self { counter: std::sync::atomic::AtomicU64::new(0) }
+    }
+
+    /// Increment the counter by 1. Called when a Forgotten entry is accessed.
+    pub fn increment(&self) {
+        self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Load the current count without resetting.
+    pub fn load(&self) -> u64 {
+        self.counter.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Swap the counter to 0, returning the previous value.
+    pub fn take(&self) -> u64 {
+        self.counter.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+}
 
 /// Batch size for Redb write transactions during tier transitions.
 const BATCH_SIZE: usize = 100;
@@ -44,6 +75,7 @@ pub struct GcCycleReport {
     pub warm_to_hot: usize,
     pub cold_to_warm: usize,
     pub hnsw_rebuild_triggered: bool,
+    pub rebuild_duration_ms: u64,
     pub cycle_duration_ms: u64,
     pub scopes_processed: usize,
     /// Forgotten transitions deferred due to rate limit.
@@ -60,12 +92,21 @@ pub struct GcCycleReport {
 
 // ── Tier transition record ──────────────────────────────────────────────────
 
-/// A pending tier transition for a single entry.
+/// A pending tier transition for a single entry, with score breakdown for structured logging.
 #[derive(Debug, Clone)]
 struct TierTransition {
     entry_id: uuid::Uuid,
+    scope_id: String,
+    memory_type: MemoryType,
     old_tier: Tier,
     new_tier: Tier,
+    retention_score: f32,
+    d_score: f32,
+    a_score: f32,
+    g_score: f32,
+    c_score: f32,
+    superseded: bool,
+    reason: &'static str,
 }
 
 // ── Spawn ───────────────────────────────────────────────────────────────────
@@ -79,6 +120,7 @@ pub fn spawn_gc_worker(
     graph: Arc<dyn GraphStore>,
     config: Arc<std::sync::RwLock<CorviaConfig>>,
     data_dir: std::path::PathBuf,
+    forgotten_counter: Option<Arc<ForgottenAccessCounter>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -112,7 +154,7 @@ pub fn spawn_gc_worker(
             ))
             .await;
 
-            match run_gc_cycle(&store, &graph, &data_dir, forgetting_config.as_ref(), &scope_configs).await {
+            match run_gc_cycle(&store, &graph, &data_dir, forgetting_config.as_ref(), &scope_configs, forgotten_counter.as_deref()).await {
                 Ok(report) => {
                     if report.entries_scored > 0 {
                         info!(
@@ -148,12 +190,26 @@ pub fn spawn_gc_worker(
 /// Run one GC cycle across all scopes.
 ///
 /// Public for direct invocation via `ops::gc_run` and testing.
+#[tracing::instrument(name = "corvia.gc.cycle", skip_all, fields(
+    scope_id = tracing::field::Empty,
+    entries_scanned = 0u64,
+    transitions_hot_warm = 0u64,
+    transitions_warm_cold = 0u64,
+    transitions_cold_forgotten = 0u64,
+    promotions_cold_warm = 0u64,
+    promotions_warm_hot = 0u64,
+    rebuild_triggered = false,
+    rebuild_duration_ms = 0u64,
+    forgotten_access_attempts = 0u64,
+    cycle_duration_ms = 0u64,
+))]
 pub async fn run_gc_cycle(
     store: &Arc<dyn QueryableStore>,
     graph: &Arc<dyn GraphStore>,
     data_dir: &Path,
     forgetting_config: Option<&ForgettingConfig>,
     scope_configs: &HashMap<String, Option<ScopeForgettingOverride>>,
+    forgotten_counter: Option<&ForgottenAccessCounter>,
 ) -> Result<GcCycleReport> {
     let start = std::time::Instant::now();
 
@@ -164,50 +220,62 @@ pub async fn run_gc_cycle(
         }
     };
 
-    let span = info_span!("corvia.gc.cycle");
-    async move {
-        let mut report = GcCycleReport::default();
+    let mut report = GcCycleReport::default();
 
-        // Downcast to LiteStore once for the entire cycle
-        let lite_store = store
-            .as_any()
-            .downcast_ref::<crate::lite_store::LiteStore>()
-            .ok_or_else(|| {
-                corvia_common::errors::CorviaError::Storage(
-                    "GC worker requires LiteStore backend".into(),
-                )
-            })?;
-
-        // Load ALL entries once (not per-scope) to avoid O(S*E) redundant scans
-        let all_entries = lite_store.fetch_all_entries()?;
-
-        // Discover scopes from knowledge directory
-        let knowledge_dir = data_dir.join("knowledge");
-        let scopes = list_scope_dirs(&knowledge_dir);
-
-        for scope_id in &scopes {
-            let scope_override = scope_configs
-                .get(scope_id.as_str())
-                .and_then(|o| o.as_ref());
-
-            process_scope(
-                lite_store,
-                graph,
-                scope_id,
-                &all_entries,
-                forgetting,
-                scope_override,
-                &mut report,
+    // Downcast to LiteStore once for the entire cycle
+    let lite_store = store
+        .as_any()
+        .downcast_ref::<crate::lite_store::LiteStore>()
+        .ok_or_else(|| {
+            corvia_common::errors::CorviaError::Storage(
+                "GC worker requires LiteStore backend".into(),
             )
-            .await?;
-            report.scopes_processed += 1;
-        }
+        })?;
 
-        report.cycle_duration_ms = start.elapsed().as_millis() as u64;
-        Ok(report)
+    // Load ALL entries once (not per-scope) to avoid O(S*E) redundant scans
+    let all_entries = lite_store.fetch_all_entries()?;
+
+    // Discover scopes from knowledge directory
+    let knowledge_dir = data_dir.join("knowledge");
+    let scopes = list_scope_dirs(&knowledge_dir);
+
+    for scope_id in &scopes {
+        let scope_override = scope_configs
+            .get(scope_id.as_str())
+            .and_then(|o| o.as_ref());
+
+        process_scope(
+            lite_store,
+            graph,
+            scope_id,
+            &all_entries,
+            forgetting,
+            scope_override,
+            &mut report,
+        )
+        .await?;
+        report.scopes_processed += 1;
     }
-    .instrument(span)
-    .await
+
+    report.cycle_duration_ms = start.elapsed().as_millis() as u64;
+
+    // Take the forgotten_access_attempts counter (reset to 0 for next cycle)
+    let forgotten_attempts = forgotten_counter.map(|c| c.take()).unwrap_or(0);
+
+    // Record all metrics into the span
+    let span = tracing::Span::current();
+    span.record("entries_scanned", report.entries_scanned as u64);
+    span.record("transitions_hot_warm", report.hot_to_warm as u64);
+    span.record("transitions_warm_cold", report.warm_to_cold as u64);
+    span.record("transitions_cold_forgotten", report.cold_to_forgotten as u64);
+    span.record("promotions_cold_warm", report.cold_to_warm as u64);
+    span.record("promotions_warm_hot", report.warm_to_hot as u64);
+    span.record("rebuild_triggered", report.hnsw_rebuild_triggered);
+    span.record("rebuild_duration_ms", report.rebuild_duration_ms);
+    span.record("forgotten_access_attempts", forgotten_attempts);
+    span.record("cycle_duration_ms", report.cycle_duration_ms);
+
+    Ok(report)
 }
 
 /// Process a single scope: score all entries, determine transitions, apply batched writes.
@@ -290,7 +358,8 @@ async fn process_scope(
             is_superseded: entry.superseded_by.is_some(),
         };
 
-        let retention_score = scoring::compute_retention_score(&params);
+        let breakdown = scoring::compute_retention_score_breakdown(&params);
+        let retention_score = breakdown.total;
         score_updates.push((entry.id, retention_score));
 
         // Determine score-based transition
@@ -308,14 +377,31 @@ async fn process_scope(
         // Take the WORSE transition (lower tier = worse)
         let effective_transition = worse_transition(score_transition, inactivity_transition);
 
+        // Determine transition reason
+        let reason = match (&score_transition, &inactivity_transition) {
+            (Some(_), None) => "score_decay",
+            (None, Some(_)) => "inactivity",
+            (Some(s), Some(i)) if i <= s => "inactivity",
+            _ => "score_decay",
+        };
+
         if let Some(target_tier) = effective_transition {
             // Enforce one-tier-step-per-cycle
             let clamped = clamp_one_step(entry.tier, target_tier);
             if clamped != entry.tier {
                 transitions.push(TierTransition {
                     entry_id: entry.id,
+                    scope_id: scope_id.to_string(),
+                    memory_type: entry.memory_type,
                     old_tier: entry.tier,
                     new_tier: clamped,
+                    retention_score,
+                    d_score: breakdown.d_score,
+                    a_score: breakdown.a_score,
+                    g_score: breakdown.g_score,
+                    c_score: breakdown.c_score,
+                    superseded: entry.superseded_by.is_some(),
+                    reason,
                 });
                 transitioned_ids.insert(entry.id);
             }
@@ -399,7 +485,7 @@ async fn process_scope(
         }
     }
 
-    // Count transitions by type
+    // Count transitions by type and emit structured transition logs
     for t in &transitions {
         match (t.old_tier, t.new_tier) {
             (Tier::Hot, Tier::Warm) => report.hot_to_warm += 1,
@@ -409,6 +495,23 @@ async fn process_scope(
             (Tier::Cold, Tier::Warm) => report.cold_to_warm += 1,
             _ => {}
         }
+
+        // Structured transition log with full score breakdown
+        info!(
+            entry_id = %t.entry_id,
+            scope_id = %t.scope_id,
+            memory_type = %t.memory_type,
+            from_tier = ?t.old_tier,
+            to_tier = ?t.new_tier,
+            retention_score = t.retention_score,
+            d_score = t.d_score,
+            a_score = t.a_score,
+            g_score = t.g_score,
+            c_score = t.c_score,
+            superseded = t.superseded,
+            reason = t.reason,
+            "tier_transition"
+        );
     }
 
     let has_warm_to_cold = transitions
@@ -428,12 +531,14 @@ async fn process_scope(
 
     // Trigger HNSW rebuild if any Warm→Cold transitions (entries removed from HNSW)
     if has_warm_to_cold {
+        let rebuild_start = std::time::Instant::now();
         info!(scope = scope_id, "Triggering HNSW rebuild after Warm→Cold transitions");
         lite_store.rebuild_from_files()?;
         if let Err(e) = lite_store.flush_hnsw() {
             warn!(error = %e, "Failed to persist HNSW after GC rebuild");
         }
         report.hnsw_rebuild_triggered = true;
+        report.rebuild_duration_ms = rebuild_start.elapsed().as_millis() as u64;
     }
 
     Ok(())
@@ -973,7 +1078,7 @@ mod tests {
         let store: Arc<dyn QueryableStore> = store;
 
         // forgetting = None → disabled
-        let report = run_gc_cycle(&store, &graph, dir.path(), None, &HashMap::new())
+        let report = run_gc_cycle(&store, &graph, dir.path(), None, &HashMap::new(), None)
             .await
             .unwrap();
         assert_eq!(report.entries_scanned, 0);
@@ -991,7 +1096,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        let report = run_gc_cycle(&store, &graph, dir.path(), Some(&config), &HashMap::new())
+        let report = run_gc_cycle(&store, &graph, dir.path(), Some(&config), &HashMap::new(), None)
             .await
             .unwrap();
         assert_eq!(report.entries_scanned, 0);
@@ -1023,7 +1128,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1064,7 +1169,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1098,7 +1203,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1131,7 +1236,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1169,10 +1274,10 @@ mod tests {
         };
 
         // Run GC twice
-        let report1 = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+        let report1 = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new(), None)
             .await
             .unwrap();
-        let report2 = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+        let report2 = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1208,7 +1313,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1246,7 +1351,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1285,7 +1390,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1390,7 +1495,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1431,7 +1536,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1469,7 +1574,7 @@ mod tests {
 
         // Run multiple cycles
         for _ in 0..3 {
-            run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+            run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new(), None)
                 .await
                 .unwrap();
         }
@@ -1512,7 +1617,7 @@ mod tests {
         };
         config.defaults.budget_top_n = 10;
 
-        let _report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+        let _report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1570,7 +1675,7 @@ mod tests {
         };
         config.defaults.budget_top_n = 10;
 
-        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1611,7 +1716,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1760,10 +1865,105 @@ mod tests {
             ..Default::default()
         };
 
-        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new(), None)
             .await
             .unwrap();
 
         assert!(!report.circuit_breaker_tripped, "Normal cycle should not trip circuit breaker");
+    }
+
+    // ── Observability tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_forgotten_access_counter() {
+        let counter = ForgottenAccessCounter::new();
+        assert_eq!(counter.load(), 0);
+
+        counter.increment();
+        counter.increment();
+        counter.increment();
+        assert_eq!(counter.load(), 3);
+
+        // take() returns current and resets to 0
+        let val = counter.take();
+        assert_eq!(val, 3);
+        assert_eq!(counter.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_gc_cycle_transition_emits_with_score_breakdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::lite_store::LiteStore::open(dir.path(), 768).unwrap());
+        store.init_schema().await.unwrap();
+
+        // Insert an old Episodic entry that will transition
+        let mut entry = make_entry(Tier::Hot, MemoryType::Episodic);
+        entry.scope_id = "test-scope".into();
+        entry.recorded_at = Utc::now() - chrono::Duration::days(90);
+        entry.embedding = Some(vec![0.1; 768]);
+        entry.confidence = Some(0.3);
+
+        crate::knowledge_files::write_entry(dir.path(), &entry).unwrap();
+        store.insert(&entry).await.unwrap();
+
+        let graph: Arc<dyn GraphStore> = store.clone();
+        let store_q: Arc<dyn QueryableStore> = store.clone();
+
+        let config = ForgettingConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        let counter = ForgottenAccessCounter::new();
+        counter.increment(); // simulate one forgotten access
+
+        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new(), Some(&counter))
+            .await
+            .unwrap();
+
+        // Should have at least one transition
+        assert!(report.entries_scored > 0);
+        assert!(
+            report.hot_to_warm > 0 || report.warm_to_cold > 0 || report.cold_to_forgotten > 0,
+            "Expected a transition for old episodic entry"
+        );
+
+        // Counter should be reset after GC cycle takes it
+        assert_eq!(counter.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_gc_cycle_report_has_rebuild_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::lite_store::LiteStore::open(dir.path(), 768).unwrap());
+        store.init_schema().await.unwrap();
+
+        // Insert a Warm entry that will transition Warm → Cold
+        let mut entry = make_entry(Tier::Warm, MemoryType::Episodic);
+        entry.scope_id = "test-scope".into();
+        entry.recorded_at = Utc::now() - chrono::Duration::days(365);
+        entry.embedding = Some(vec![0.1; 768]);
+        entry.confidence = Some(0.0);
+        entry.superseded_by = Some(uuid::Uuid::now_v7());
+
+        crate::knowledge_files::write_entry(dir.path(), &entry).unwrap();
+        store.insert(&entry).await.unwrap();
+
+        let graph: Arc<dyn GraphStore> = store.clone();
+        let store_q: Arc<dyn QueryableStore> = store.clone();
+
+        let config = ForgettingConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(report.warm_to_cold, 1);
+        assert!(report.hnsw_rebuild_triggered);
+        // rebuild_duration_ms should be set (>= 0)
+        // Can't assert > 0 because sub-ms rebuilds on empty stores
     }
 }

@@ -33,6 +33,10 @@ pub struct SearchResultDto {
     pub chunk_type: Option<String>,
     pub start_line: Option<u32>,
     pub end_line: Option<u32>,
+    #[serde(default)]
+    pub tier: Option<String>,
+    #[serde(default)]
+    pub retention_score: Option<f32>,
 }
 
 #[derive(Deserialize)]

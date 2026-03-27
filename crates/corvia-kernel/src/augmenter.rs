@@ -272,7 +272,7 @@ mod tests {
             chunk_type: Some("function".into()),
             ..Default::default()
         };
-        SearchResult { entry, score }
+        SearchResult { entry, score, tier: None, retention_score: None }
     }
 
     #[test]

@@ -434,7 +434,7 @@ impl Retriever for GraphExpandRetriever {
                 continue;
             }
             let blended = ((1.0 - self.alpha) * sr.score + self.alpha * 1.0) * tier_weight(sr.entry.tier);
-            scored.push((blended, SearchResult { entry: sr.entry.clone(), score: blended }));
+            scored.push((blended, SearchResult { entry: sr.entry.clone(), score: blended, tier: Some(sr.entry.tier), retention_score: sr.entry.retention_score }));
         }
 
         // Graph expansion (timed separately).
@@ -497,6 +497,8 @@ impl Retriever for GraphExpandRetriever {
                         scored.push((
                             blended,
                             SearchResult {
+                                tier: Some(neighbor_entry.tier),
+                                retention_score: neighbor_entry.retention_score,
                                 entry: neighbor_entry,
                                 score: blended,
                             },
@@ -552,6 +554,8 @@ impl Retriever for GraphExpandRetriever {
                         scored.push((
                             blended,
                             SearchResult {
+                                tier: Some(entry.tier),
+                                retention_score: entry.retention_score,
                                 entry,
                                 score: blended,
                             },
@@ -577,7 +581,7 @@ impl Retriever for GraphExpandRetriever {
                                     seen.insert(sr.entry.id);
                                     // Cold entries get pure cosine score (no graph proximity bonus), with tier_weight.
                                     let blended = (1.0 - self.alpha) * sr.score * tier_weight(sr.entry.tier);
-                                    scored.push((blended, SearchResult { entry: sr.entry, score: blended }));
+                                    scored.push((blended, SearchResult { tier: Some(sr.entry.tier), retention_score: sr.entry.retention_score, entry: sr.entry, score: blended }));
                                     added += 1;
                                 }
                             }
@@ -707,7 +711,7 @@ mod filter_tests {
         let mut entry = KnowledgeEntry::new("test".into(), "scope".into(), "v1".into());
         entry.metadata.content_role = content_role.map(String::from);
         entry.metadata.source_origin = source_origin.map(String::from);
-        SearchResult { entry, score }
+        SearchResult { entry, score, tier: None, retention_score: None }
     }
 
     fn make_result_with_workstream(content_role: Option<&str>, source_origin: Option<&str>, workstream: &str, score: f32) -> SearchResult {
@@ -715,7 +719,7 @@ mod filter_tests {
         entry.metadata.content_role = content_role.map(String::from);
         entry.metadata.source_origin = source_origin.map(String::from);
         entry.workstream = workstream.to_string();
-        SearchResult { entry, score }
+        SearchResult { entry, score, tier: None, retention_score: None }
     }
 
     #[test]
@@ -1956,5 +1960,26 @@ mod tests {
         let direct_scan = store.scan_cold_entries(&[1.0, 0.0, 0.0], "scope-graph-cold", 10).unwrap();
         assert_eq!(direct_scan.len(), 1, "scan should find the cold entry directly");
         assert_eq!(direct_scan[0].entry.content, "cold via graph retriever");
+    }
+
+    #[tokio::test]
+    async fn test_search_result_contains_tier_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::lite_store::LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+
+        let mut entry = KnowledgeEntry::new("test tier field".into(), "scope-tier".into(), "v1".into());
+        entry.embedding = Some(vec![1.0, 0.0, 0.0]);
+        entry.tier = Tier::Warm;
+        entry.retention_score = Some(0.45);
+        entry.entry_status = EntryStatus::Merged;
+        store.insert(&entry).await.unwrap();
+
+        let results = store.search(&[1.0, 0.0, 0.0], "scope-tier", 10).await.unwrap();
+        assert!(!results.is_empty());
+
+        let result = &results[0];
+        assert_eq!(result.tier, Some(Tier::Warm), "SearchResult should carry tier from entry");
+        assert_eq!(result.retention_score, Some(0.45), "SearchResult should carry retention_score from entry");
     }
 }

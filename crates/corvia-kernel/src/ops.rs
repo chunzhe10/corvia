@@ -17,6 +17,15 @@ use std::sync::Arc;
 // System status
 // ---------------------------------------------------------------------------
 
+/// Per-scope tier distribution counts.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct TierDistribution {
+    pub hot: u64,
+    pub warm: u64,
+    pub cold: u64,
+    pub forgotten: u64,
+}
+
 /// System status snapshot.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SystemStatus {
@@ -25,6 +34,8 @@ pub struct SystemStatus {
     pub open_sessions: usize,
     pub merge_queue_depth: u64,
     pub scope_id: String,
+    /// Tier distribution for the scope.
+    pub tier_distribution: TierDistribution,
 }
 
 /// Gather a point-in-time system status snapshot.
@@ -38,12 +49,33 @@ pub async fn system_status(
     let open_sessions = coordinator.sessions.list_open()?.len();
     let merge_queue_depth = coordinator.merge_queue.depth()?;
 
+    // Compute tier distribution
+    let tier_distribution = if let Some(lite_store) = store.as_any().downcast_ref::<LiteStore>() {
+        let entries = lite_store.fetch_all_entries().unwrap_or_default();
+        let mut dist = TierDistribution::default();
+        for entry in &entries {
+            if entry.scope_id != scope_id {
+                continue;
+            }
+            match entry.tier {
+                corvia_common::types::Tier::Hot => dist.hot += 1,
+                corvia_common::types::Tier::Warm => dist.warm += 1,
+                corvia_common::types::Tier::Cold => dist.cold += 1,
+                corvia_common::types::Tier::Forgotten => dist.forgotten += 1,
+            }
+        }
+        dist
+    } else {
+        TierDistribution::default()
+    };
+
     Ok(SystemStatus {
         entry_count,
         active_agents,
         open_sessions,
         merge_queue_depth,
         scope_id: scope_id.to_string(),
+        tier_distribution,
     })
 }
 
@@ -282,7 +314,7 @@ pub async fn gc_knowledge_run(
             })
             .unwrap_or_default();
 
-    crate::gc_worker::run_gc_cycle(store, graph, data_dir, forgetting, &scope_configs).await
+    crate::gc_worker::run_gc_cycle(store, graph, data_dir, forgetting, &scope_configs, None).await
 }
 
 /// In-memory ring buffer of recent GC reports.
@@ -410,6 +442,10 @@ mod tests {
         assert_eq!(status.open_sessions, 0);
         assert_eq!(status.merge_queue_depth, 0);
         assert_eq!(status.scope_id, "test");
+        assert_eq!(status.tier_distribution.hot, 0);
+        assert_eq!(status.tier_distribution.warm, 0);
+        assert_eq!(status.tier_distribution.cold, 0);
+        assert_eq!(status.tier_distribution.forgotten, 0);
     }
 
     #[tokio::test]
