@@ -69,6 +69,8 @@ pub struct AppState {
     pub gpu_cache: Arc<tokio::sync::Mutex<crate::dashboard::gpu::GpuMetricsCache>>,
     /// Counter for Forgotten entry access attempts (read by GC cycle span).
     pub forgotten_access_counter: Arc<corvia_kernel::gc_worker::ForgottenAccessCounter>,
+    /// In-memory ring buffer of recent knowledge GC cycle reports.
+    pub gc_knowledge_history: Arc<corvia_kernel::ops::GcKnowledgeHistory>,
 }
 
 // --- Existing memory types ---
@@ -365,6 +367,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Workspace ingestion endpoints
         .route("/v1/ingest", post(ingest_workspace_handler))
         .route("/v1/ingest/status", get(ingest_status_handler))
+        // Tiered knowledge control endpoints
+        .route("/v1/entries/{id}/pin", post(pin_entry_handler))
+        .route("/v1/entries/{id}/unpin", post(unpin_entry_handler))
+        .route("/v1/entries/{id}/inspect", get(inspect_entry_handler))
+        .route("/v1/gc/status", get(gc_status_handler))
+        .route("/v1/gc/run", post(gc_run_handler))
+        .route("/v1/gc/history", get(gc_history_handler))
         .route("/health", get(health))
         // Embedded dashboard: serves static assets at root path.
         // API routes take priority over the fallback.
@@ -588,6 +597,119 @@ async fn ingest_status_handler(
 ) -> impl IntoResponse {
     let status = state.ingest_status.read().unwrap_or_else(|e| e.into_inner()).clone();
     (StatusCode::OK, Json(status))
+}
+
+// --- Tiered knowledge control handlers ---
+
+#[derive(Deserialize)]
+struct PinRequest {
+    agent_id: String,
+}
+
+async fn pin_entry_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<PinRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let uuid = uuid::Uuid::parse_str(&id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid UUID: {e}")))?;
+    let result = corvia_kernel::ops::pin_entry(&state.store, &uuid, &req.agent_id).await
+        .map_err(|e| map_corvia_err("Pin failed", e))?;
+    let json = serde_json::to_value(result)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Serialization failed: {e}")))?;
+    Ok(Json(json))
+}
+
+async fn unpin_entry_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let uuid = uuid::Uuid::parse_str(&id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid UUID: {e}")))?;
+    let result = corvia_kernel::ops::unpin_entry(&state.store, &uuid).await
+        .map_err(|e| map_corvia_err("Unpin failed", e))?;
+    let json = serde_json::to_value(result)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Serialization failed: {e}")))?;
+    Ok(Json(json))
+}
+
+async fn inspect_entry_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let uuid = uuid::Uuid::parse_str(&id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid UUID: {e}")))?;
+    let result = corvia_kernel::ops::inspect_entry(&state.store, &state.graph, &uuid).await
+        .map_err(|e| map_corvia_err("Inspect failed", e))?;
+    let json = serde_json::to_value(result)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Serialization failed: {e}")))?;
+    Ok(Json(json))
+}
+
+async fn gc_status_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let default_scope = state.default_scope_id.as_deref().unwrap_or("default");
+    let scope_id = params.get("scope_id").map(|s| s.as_str()).unwrap_or(default_scope);
+
+    let status = corvia_kernel::ops::system_status(
+        state.store.clone(),
+        &state.coordinator,
+        scope_id,
+    ).await.map_err(|e| map_corvia_err("GC status failed", e))?;
+
+    // Check if forgetting is enabled
+    let config = state.config.read()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Config lock: {e}")))?;
+    let forgetting_enabled = config.forgetting.as_ref().map(|f| f.enabled).unwrap_or(false);
+
+    Ok(Json(serde_json::json!({
+        "scope_id": scope_id,
+        "forgetting_enabled": forgetting_enabled,
+        "tier_distribution": {
+            "hot": status.tier_distribution.hot,
+            "warm": status.tier_distribution.warm,
+            "cold": status.tier_distribution.cold,
+            "forgotten": status.tier_distribution.forgotten,
+        },
+        "total_entries": status.entry_count,
+    })))
+}
+
+async fn gc_run_handler(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let config = state.config.read()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Config lock: {e}")))?
+        .clone();
+
+    let report = corvia_kernel::ops::gc_knowledge_run(
+        &state.store,
+        &state.graph,
+        &state.data_dir,
+        &config,
+    ).await.map_err(|e| map_corvia_err("GC run failed", e))?;
+
+    // Serialize before push to avoid unnecessary clone
+    let json = serde_json::to_value(&report)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Serialization failed: {e}")))?;
+
+    // Store report in knowledge GC history
+    state.gc_knowledge_history.push(report);
+
+    Ok(Json(json))
+}
+
+async fn gc_history_handler(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let reports = state.gc_knowledge_history.all();
+
+    Ok(Json(serde_json::json!({
+        "cycles": serde_json::to_value(&reports).unwrap_or_default(),
+        "count": reports.len(),
+    })))
 }
 
 // --- Existing handlers ---
@@ -1449,6 +1571,7 @@ mod tests {
             ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
             gpu_cache: Arc::new(tokio::sync::Mutex::new(crate::dashboard::gpu::GpuMetricsCache::new())),
             forgotten_access_counter: Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
+            gc_knowledge_history: Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
         })
     }
 
@@ -1514,6 +1637,7 @@ mod tests {
             ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
             gpu_cache: Arc::new(tokio::sync::Mutex::new(crate::dashboard::gpu::GpuMetricsCache::new())),
             forgotten_access_counter: Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
+            gc_knowledge_history: Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
         })
     }
 

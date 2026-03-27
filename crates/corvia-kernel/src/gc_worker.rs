@@ -65,7 +65,7 @@ const CIRCUIT_BREAKER_THRESHOLD: f64 = 0.50;
 // ── Report ──────────────────────────────────────────────────────────────────
 
 /// Metrics from a single GC cycle.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct GcCycleReport {
     pub entries_scanned: usize,
     pub entries_scored: usize,
