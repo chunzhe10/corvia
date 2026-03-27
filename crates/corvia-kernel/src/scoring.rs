@@ -215,6 +215,61 @@ fn sanitize_f64(v: f64) -> f64 {
     }
 }
 
+// ── Auto-protection ─────────────────────────────────────────────────────────
+
+/// Parameters for auto-protection evaluation.
+///
+/// Decoupled from `KnowledgeEntry` to keep scoring pure and independently testable.
+/// Uses borrowed `content_role` to avoid per-entry heap allocation in hot loops.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutoProtectParams<'a> {
+    pub memory_type: MemoryType,
+    /// Whether this entry is the HEAD of a supersession chain (not superseded by anything).
+    pub is_chain_head: bool,
+    pub inbound_edges: u32,
+    pub content_role: Option<&'a str>,
+    pub confidence: Option<f32>,
+}
+
+/// Check whether an entry is auto-protected from Cold → Forgotten transitions.
+///
+/// Auto-protected entries can still be demoted to Warm or Cold by scoring/budget,
+/// but they cannot reach Forgotten tier.
+///
+/// Rules (any one is sufficient):
+/// 1. `memory_type == Structural` (refreshed by ingestion)
+/// 2. HEAD of supersession chain (not superseded by anything)
+/// 3. `inbound_edges >= 5`
+/// 4. `content_role == "decision"` AND `confidence >= 0.9`
+#[must_use]
+pub fn is_auto_protected(params: &AutoProtectParams<'_>) -> bool {
+    // Rule 1: Structural entries
+    if params.memory_type == MemoryType::Structural {
+        return true;
+    }
+
+    // Rule 2: HEAD of supersession chain
+    if params.is_chain_head {
+        return true;
+    }
+
+    // Rule 3: Highly connected entries
+    if params.inbound_edges >= 5 {
+        return true;
+    }
+
+    // Rule 4: High-confidence decisions
+    if let Some(role) = params.content_role
+        && role == "decision"
+        && let Some(conf) = params.confidence
+        && conf >= 0.9
+    {
+        return true;
+    }
+
+    false
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -657,5 +712,97 @@ mod tests {
         assert_eq!(params.inbound_edges, 0);
         assert!(params.confidence.is_none());
         assert!(!params.is_superseded);
+    }
+
+    // ── Auto-protection tests ──────────────────────────────────────────────
+
+    fn base_auto_protect_params() -> AutoProtectParams<'static> {
+        AutoProtectParams {
+            memory_type: MemoryType::Episodic,
+            is_chain_head: false,
+            inbound_edges: 0,
+            content_role: None,
+            confidence: None,
+        }
+    }
+
+    #[test]
+    fn test_auto_protect_structural() {
+        let params = AutoProtectParams {
+            memory_type: MemoryType::Structural,
+            ..base_auto_protect_params()
+        };
+        assert!(is_auto_protected(&params));
+    }
+
+    #[test]
+    fn test_auto_protect_chain_head() {
+        let params = AutoProtectParams {
+            is_chain_head: true,
+            ..base_auto_protect_params()
+        };
+        assert!(is_auto_protected(&params));
+    }
+
+    #[test]
+    fn test_auto_protect_high_inbound_edges() {
+        let params = AutoProtectParams {
+            inbound_edges: 5,
+            ..base_auto_protect_params()
+        };
+        assert!(is_auto_protected(&params));
+
+        // 4 edges: not protected
+        let params4 = AutoProtectParams {
+            inbound_edges: 4,
+            ..base_auto_protect_params()
+        };
+        assert!(!is_auto_protected(&params4));
+    }
+
+    #[test]
+    fn test_auto_protect_decision_high_confidence() {
+        let params = AutoProtectParams {
+            content_role: Some("decision"),
+            confidence: Some(0.9),
+            ..base_auto_protect_params()
+        };
+        assert!(is_auto_protected(&params));
+    }
+
+    #[test]
+    fn test_auto_protect_decision_low_confidence() {
+        let params = AutoProtectParams {
+            content_role: Some("decision"),
+            confidence: Some(0.89),
+            ..base_auto_protect_params()
+        };
+        assert!(!is_auto_protected(&params));
+    }
+
+    #[test]
+    fn test_auto_protect_non_decision_high_confidence() {
+        let params = AutoProtectParams {
+            content_role: Some("design"),
+            confidence: Some(0.95),
+            ..base_auto_protect_params()
+        };
+        assert!(!is_auto_protected(&params));
+    }
+
+    #[test]
+    fn test_auto_protect_none_matches_nothing() {
+        let params = base_auto_protect_params();
+        assert!(!is_auto_protected(&params));
+    }
+
+    #[test]
+    fn test_auto_protect_decision_no_confidence() {
+        let params = AutoProtectParams {
+            content_role: Some("decision"),
+            confidence: None,
+            ..base_auto_protect_params()
+        };
+        assert!(!is_auto_protected(&params));
     }
 }

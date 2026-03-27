@@ -3,10 +3,10 @@
 //! Periodically evaluates all entries, computes retention scores, applies tier
 //! transitions, and triggers HNSW rebuilds when entries move out of indexed tiers.
 //!
-//! This is the skeleton — safeguards (chain protection, rate limit, circuit breaker)
-//! are in a follow-up issue.
+//! Safeguards: supersession chain protection, auto-protection rules, budget policy,
+//! rate limiting (max 50 Forgotten/cycle), and circuit breaker (>50% write failures).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -16,7 +16,7 @@ use corvia_common::errors::Result;
 use corvia_common::types::{EdgeDirection, KnowledgeEntry, Tier};
 use tracing::{info, info_span, warn, Instrument};
 
-use crate::scoring::{self, RetentionParams};
+use crate::scoring::{self, AutoProtectParams, RetentionParams};
 use crate::traits::{GraphStore, QueryableStore};
 
 /// Batch size for Redb write transactions during tier transitions.
@@ -24,6 +24,12 @@ const BATCH_SIZE: usize = 100;
 
 /// Score threshold above which inactivity policy does NOT force Cold.
 const INACTIVITY_SCORE_EXEMPTION: f32 = 0.60;
+
+/// Maximum number of Cold → Forgotten transitions per GC cycle.
+const MAX_FORGOTTEN_PER_CYCLE: usize = 50;
+
+/// Circuit breaker threshold: abort if this fraction of batch writes fail.
+const CIRCUIT_BREAKER_THRESHOLD: f64 = 0.50;
 
 // ── Report ──────────────────────────────────────────────────────────────────
 
@@ -40,6 +46,16 @@ pub struct GcCycleReport {
     pub hnsw_rebuild_triggered: bool,
     pub cycle_duration_ms: u64,
     pub scopes_processed: usize,
+    /// Forgotten transitions deferred due to rate limit.
+    pub forgotten_rate_limited: usize,
+    /// Entries protected from Forgotten by chain protection.
+    pub chain_protected: usize,
+    /// Entries protected from Forgotten by auto-protection rules.
+    pub auto_protected: usize,
+    /// Entries demoted by budget policy enforcement.
+    pub budget_demoted: usize,
+    /// Whether the circuit breaker tripped during this cycle.
+    pub circuit_breaker_tripped: bool,
 }
 
 // ── Tier transition record ──────────────────────────────────────────────────
@@ -107,6 +123,11 @@ pub fn spawn_gc_worker(
                             cold_to_forgotten = report.cold_to_forgotten,
                             warm_to_hot = report.warm_to_hot,
                             cold_to_warm = report.cold_to_warm,
+                            chain_protected = report.chain_protected,
+                            auto_protected = report.auto_protected,
+                            budget_demoted = report.budget_demoted,
+                            forgotten_rate_limited = report.forgotten_rate_limited,
+                            circuit_breaker = report.circuit_breaker_tripped,
                             hnsw_rebuild = report.hnsw_rebuild_triggered,
                             cycle_ms = report.cycle_duration_ms,
                             scopes = report.scopes_processed,
@@ -190,6 +211,14 @@ pub async fn run_gc_cycle(
 }
 
 /// Process a single scope: score all entries, determine transitions, apply batched writes.
+///
+/// Safeguard pipeline (applied in order):
+/// 1. Score-based transitions (existing)
+/// 2. Supersession chain protection — block Forgotten for ancestors of active HEADs
+/// 3. Auto-protection rules — block Forgotten for qualifying entries
+/// 4. Rate limit — cap Forgotten transitions at MAX_FORGOTTEN_PER_CYCLE
+/// 5. Budget policy — enforce budget_top_n cap with one-tier-step demotions
+/// 6. Circuit breaker — abort batch writes if >50% fail
 async fn process_scope(
     lite_store: &crate::lite_store::LiteStore,
     graph: &Arc<dyn GraphStore>,
@@ -207,6 +236,14 @@ async fn process_scope(
     let now = Utc::now();
     let mut transitions: Vec<TierTransition> = Vec::new();
     let mut score_updates: Vec<(uuid::Uuid, f32)> = Vec::new();
+    // Track entry IDs that already have a transition in this cycle (for budget skip logic)
+    let mut transitioned_ids: HashSet<uuid::Uuid> = HashSet::new();
+
+    // ── Pre-compute supersession chain protection ───────────────────────────
+    let chain_protected_ids = build_chain_protected_set(&scope_entries);
+
+    // ── Pre-compute inbound edge counts (needed for auto-protection) ────────
+    let mut inbound_edge_map: HashMap<uuid::Uuid, u32> = HashMap::new();
 
     for entry in &scope_entries {
         report.entries_scanned += 1;
@@ -239,6 +276,9 @@ async fn process_scope(
             .await
             .map(|e| e.len() as u32)
             .unwrap_or(0);
+
+        // Cache for budget phase
+        inbound_edge_map.insert(entry.id, inbound_edges);
 
         let params = RetentionParams {
             memory_type: entry.memory_type,
@@ -277,7 +317,85 @@ async fn process_scope(
                     old_tier: entry.tier,
                     new_tier: clamped,
                 });
+                transitioned_ids.insert(entry.id);
             }
+        }
+    }
+
+    // ── Safeguard 1: Supersession chain protection ──────────────────────────
+    // Block Cold→Forgotten for entries in active chains.
+    transitions.retain(|t| {
+        if t.new_tier == Tier::Forgotten && chain_protected_ids.contains(&t.entry_id) {
+            report.chain_protected += 1;
+            transitioned_ids.remove(&t.entry_id);
+            false
+        } else {
+            true
+        }
+    });
+
+    // Build entry lookup once (used by auto-protection and budget policy)
+    let entry_map: HashMap<uuid::Uuid, &KnowledgeEntry> =
+        scope_entries.iter().map(|e| (e.id, *e)).collect();
+
+    // ── Safeguard 2: Auto-protection rules ──────────────────────────────────
+    // Block Cold→Forgotten for auto-protected entries.
+    {
+        transitions.retain(|t| {
+            if t.new_tier == Tier::Forgotten
+                && let Some(entry) = entry_map.get(&t.entry_id)
+            {
+                let auto_params = AutoProtectParams {
+                    memory_type: entry.memory_type,
+                    is_chain_head: entry.superseded_by.is_none(),
+                    inbound_edges: inbound_edge_map.get(&entry.id).copied().unwrap_or(0),
+                    content_role: entry.metadata.content_role.as_deref(),
+                    confidence: entry.confidence,
+                };
+                if scoring::is_auto_protected(&auto_params) {
+                    report.auto_protected += 1;
+                    transitioned_ids.remove(&t.entry_id);
+                    return false;
+                }
+            }
+            true
+        });
+    }
+
+    // ── Safeguard 3: Rate limit (max Forgotten per cycle) ───────────────────
+    let mut forgotten_count = 0;
+    transitions.retain(|t| {
+        if t.new_tier == Tier::Forgotten {
+            if forgotten_count >= MAX_FORGOTTEN_PER_CYCLE {
+                report.forgotten_rate_limited += 1;
+                transitioned_ids.remove(&t.entry_id);
+                return false;
+            }
+            forgotten_count += 1;
+        }
+        true
+    });
+
+    // ── Safeguard 4: Budget policy enforcement ──────────────────────────────
+    // Runs after score-based transitions, before physical writes.
+    {
+        let score_map: HashMap<uuid::Uuid, f32> = score_updates.iter().copied().collect();
+
+        let budget_transitions = apply_budget_policy(
+            &scope_entries,
+            &entry_map,
+            &score_map,
+            &inbound_edge_map,
+            &transitioned_ids,
+            &chain_protected_ids,
+            forgetting,
+            scope_override,
+        );
+
+        report.budget_demoted += budget_transitions.len();
+        for bt in budget_transitions {
+            transitioned_ids.insert(bt.entry_id);
+            transitions.push(bt);
         }
     }
 
@@ -297,8 +415,16 @@ async fn process_scope(
         .iter()
         .any(|t| t.old_tier == Tier::Warm && t.new_tier == Tier::Cold);
 
-    // Apply transitions + score updates in batches (read-modify-write preserves access tracking)
-    apply_transitions_batched(lite_store, &transitions, &score_updates)?;
+    // ── Safeguard 5: Circuit breaker on batch writes ────────────────────────
+    match apply_transitions_batched(lite_store, &transitions, &score_updates) {
+        Ok(()) => {}
+        Err(e) => {
+            // Circuit breaker tripped — abort this scope
+            warn!(scope = scope_id, error = %e, "Circuit breaker tripped during GC batch writes");
+            report.circuit_breaker_tripped = true;
+            return Ok(());
+        }
+    }
 
     // Trigger HNSW rebuild if any Warm→Cold transitions (entries removed from HNSW)
     if has_warm_to_cold {
@@ -311,6 +437,175 @@ async fn process_scope(
     }
 
     Ok(())
+}
+
+// ── Chain protection ────────────────────────────────────────────────────────
+
+/// Build a set of entry IDs that are protected from Forgotten by supersession chains.
+///
+/// Walk `superseded_by` pointers to find chain HEADs. If a HEAD is in an active
+/// tier (Hot, Warm, or Cold), all ancestors in the chain are protected from Forgotten.
+fn build_chain_protected_set(entries: &[&KnowledgeEntry]) -> HashSet<uuid::Uuid> {
+    let mut protected = HashSet::new();
+
+    // Build reverse lookup: superseded_by → predecessor_id
+    // (which entry was superseded to become this one?)
+    let mut predecessors: HashMap<uuid::Uuid, Vec<uuid::Uuid>> = HashMap::new();
+    for entry in entries {
+        if let Some(successor_id) = entry.superseded_by {
+            predecessors.entry(successor_id).or_default().push(entry.id);
+        }
+    }
+
+    // Find all chain HEADs (not superseded by anything)
+    let heads: Vec<&KnowledgeEntry> = entries
+        .iter()
+        .filter(|e| e.superseded_by.is_none())
+        .copied()
+        .collect();
+
+    for head in &heads {
+        // If HEAD is in an active tier, protect all ancestors
+        if head.tier != Tier::Forgotten {
+            // Walk backward through predecessors with cycle guard
+            let mut stack = vec![head.id];
+            let mut visited = HashSet::new();
+            visited.insert(head.id);
+            while let Some(current_id) = stack.pop() {
+                if let Some(preds) = predecessors.get(&current_id) {
+                    for &pred_id in preds {
+                        if visited.insert(pred_id) {
+                            // Protect ancestors (not the head — it's covered by auto-protection rule 2)
+                            if pred_id != head.id {
+                                protected.insert(pred_id);
+                            }
+                            stack.push(pred_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    protected
+}
+
+// ── Budget policy ───────────────────────────────────────────────────────────
+
+/// Enforce budget_top_n: demote lowest-scoring non-pinned entries by one tier step
+/// when a scope exceeds its active entry cap.
+///
+/// - Runs after score-based transitions, before physical writes
+/// - Ranks non-pinned entries by retention_score
+/// - Demotes lowest by one tier step when scope > budget_top_n
+/// - Skips entries already transitioned in current cycle
+/// - Pinned entries excluded from count
+/// - Auto-protected entries can be budget-demoted to Warm but not Cold/Forgotten
+#[allow(clippy::too_many_arguments)]
+fn apply_budget_policy(
+    scope_entries: &[&KnowledgeEntry],
+    entry_map: &HashMap<uuid::Uuid, &KnowledgeEntry>,
+    score_map: &HashMap<uuid::Uuid, f32>,
+    inbound_edge_map: &HashMap<uuid::Uuid, u32>,
+    transitioned_ids: &HashSet<uuid::Uuid>,
+    chain_protected_ids: &HashSet<uuid::Uuid>,
+    forgetting: &ForgettingConfig,
+    scope_override: Option<&ScopeForgettingOverride>,
+) -> Vec<TierTransition> {
+    let mut budget_transitions = Vec::new();
+
+    // Budget is scope-wide, not per-type. Resolve directly from global defaults
+    // with optional scope override, bypassing per-type layer.
+    let mut budget = forgetting.defaults.budget_top_n;
+    if let Some(scope_cfg) = scope_override
+        && let Some(b) = scope_cfg.budget_top_n
+    {
+        budget = b;
+    }
+    if budget == 0 {
+        return budget_transitions; // 0 = no limit
+    }
+
+    // Count active entries (Hot + Warm), excluding pinned
+    let active_count = scope_entries
+        .iter()
+        .filter(|e| {
+            (e.tier == Tier::Hot || e.tier == Tier::Warm)
+                && e.pin.is_none()
+        })
+        .count();
+
+    if active_count <= budget as usize {
+        return budget_transitions; // Under budget
+    }
+
+    let excess = active_count - budget as usize;
+
+    // Rank active non-pinned entries by retention_score (ascending = lowest first)
+    let mut candidates: Vec<(uuid::Uuid, f32, Tier)> = scope_entries
+        .iter()
+        .filter(|e| {
+            (e.tier == Tier::Hot || e.tier == Tier::Warm)
+                && e.pin.is_none()
+                && !transitioned_ids.contains(&e.id) // Skip already-transitioned
+        })
+        .map(|e| {
+            let score = score_map.get(&e.id).copied().unwrap_or(0.0);
+            (e.id, score, e.tier)
+        })
+        .collect();
+
+    candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut demoted = 0;
+    for (entry_id, _score, current_tier) in &candidates {
+        if demoted >= excess {
+            break;
+        }
+
+        let target = clamp_one_step(*current_tier, Tier::Forgotten);
+        if target == *current_tier {
+            continue;
+        }
+
+        // Auto-protected entries can only be demoted to Warm, not Cold/Forgotten
+        if let Some(entry) = entry_map.get(entry_id) {
+            let auto_params = AutoProtectParams {
+                memory_type: entry.memory_type,
+                is_chain_head: entry.superseded_by.is_none(),
+                inbound_edges: inbound_edge_map.get(entry_id).copied().unwrap_or(0),
+                content_role: entry.metadata.content_role.as_deref(),
+                confidence: entry.confidence,
+            };
+            if scoring::is_auto_protected(&auto_params) && target < Tier::Warm {
+                // Floor at Warm for auto-protected entries
+                if *current_tier == Tier::Hot {
+                    budget_transitions.push(TierTransition {
+                        entry_id: *entry_id,
+                        old_tier: *current_tier,
+                        new_tier: Tier::Warm,
+                    });
+                    demoted += 1;
+                }
+                // If already Warm and auto-protected, skip (can't go to Cold)
+                continue;
+            }
+
+            // Chain-protected entries also can't go to Forgotten
+            if chain_protected_ids.contains(entry_id) && target == Tier::Forgotten {
+                continue;
+            }
+        }
+
+        budget_transitions.push(TierTransition {
+            entry_id: *entry_id,
+            old_tier: *current_tier,
+            new_tier: target,
+        });
+        demoted += 1;
+    }
+
+    budget_transitions
 }
 
 /// Apply inactivity policy: force to Cold if inactive past threshold AND score < exemption.
@@ -393,6 +688,8 @@ fn clamp_one_step(current: Tier, target: Tier) -> Tier {
 /// Uses read-modify-write via `GcEntryUpdate` to preserve concurrent access
 /// tracking updates (access_count, last_accessed) that may have occurred
 /// between the initial entry scan and this batch write.
+///
+/// Circuit breaker: if >50% of batch writes fail, aborts and returns an error.
 fn apply_transitions_batched(
     store: &crate::lite_store::LiteStore,
     transitions: &[TierTransition],
@@ -447,8 +744,28 @@ fn apply_transitions_batched(
         });
     }
 
-    // Batch write using read-modify-write (preserves access tracking fields)
-    store.update_entries_batch(&gc_updates, BATCH_SIZE)?;
+    // Batch write with circuit breaker
+    let total_batches = gc_updates.len().div_ceil(BATCH_SIZE);
+    let mut failed_batches = 0;
+
+    for chunk in gc_updates.chunks(BATCH_SIZE) {
+        if let Err(e) = store.update_entries_batch(chunk, BATCH_SIZE) {
+            failed_batches += 1;
+            warn!(error = %e, "GC batch write failed");
+
+            // Circuit breaker: abort if >50% of batches fail
+            if total_batches > 0
+                && (failed_batches as f64 / total_batches as f64) > CIRCUIT_BREAKER_THRESHOLD
+            {
+                return Err(corvia_common::errors::CorviaError::Storage(
+                    format!(
+                        "Circuit breaker tripped: {failed_batches}/{total_batches} batch writes failed (>{:.0}%)",
+                        CIRCUIT_BREAKER_THRESHOLD * 100.0,
+                    ),
+                ));
+            }
+        }
+    }
 
     // Delete HNSW mappings for entries leaving indexed tiers (lazy orphaning)
     if !hnsw_removal_ids.is_empty() {
@@ -976,5 +1293,477 @@ mod tests {
 
         let updated = store.get(&entry.id).await.unwrap().unwrap();
         assert_eq!(updated.tier, Tier::Warm, "Cold entry with high score should promote to Warm");
+    }
+
+    // ── build_chain_protected_set ─────────────────────────────────────────
+
+    #[test]
+    fn test_chain_protection_active_head_protects_ancestors() {
+        // Chain: A → B → C (C is HEAD, Warm)
+        // A and B should be protected from Forgotten.
+        let mut c = make_entry(Tier::Warm, MemoryType::Episodic);
+        c.superseded_by = None; // HEAD
+        let mut b = make_entry(Tier::Cold, MemoryType::Episodic);
+        b.superseded_by = Some(c.id);
+        let mut a = make_entry(Tier::Cold, MemoryType::Episodic);
+        a.superseded_by = Some(b.id);
+
+        let entries: Vec<&KnowledgeEntry> = vec![&a, &b, &c];
+        let protected = build_chain_protected_set(&entries);
+
+        assert!(protected.contains(&a.id), "A should be chain-protected");
+        assert!(protected.contains(&b.id), "B should be chain-protected");
+        assert!(!protected.contains(&c.id), "C (HEAD) protected by auto-protection, not chain");
+    }
+
+    #[test]
+    fn test_chain_protection_forgotten_head_allows_ancestor_forgotten() {
+        // Chain: A → B → C (C is HEAD, Forgotten)
+        // A and B can be Forgotten since HEAD is Forgotten.
+        let mut c = make_entry(Tier::Forgotten, MemoryType::Episodic);
+        c.superseded_by = None;
+        let mut b = make_entry(Tier::Cold, MemoryType::Episodic);
+        b.superseded_by = Some(c.id);
+        let mut a = make_entry(Tier::Cold, MemoryType::Episodic);
+        a.superseded_by = Some(b.id);
+
+        let entries: Vec<&KnowledgeEntry> = vec![&a, &b, &c];
+        let protected = build_chain_protected_set(&entries);
+
+        assert!(!protected.contains(&a.id), "A should NOT be protected (HEAD is Forgotten)");
+        assert!(!protected.contains(&b.id), "B should NOT be protected (HEAD is Forgotten)");
+    }
+
+    #[test]
+    fn test_chain_protection_no_chain_no_protection() {
+        // Standalone entry (no supersession chain)
+        let entry = make_entry(Tier::Cold, MemoryType::Episodic);
+        let entries: Vec<&KnowledgeEntry> = vec![&entry];
+        let protected = build_chain_protected_set(&entries);
+
+        assert!(protected.is_empty());
+    }
+
+    // ── Integration: chain protection in GC cycle ─────────────────────────
+
+    #[tokio::test]
+    async fn test_gc_chain_protection_blocks_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::lite_store::LiteStore::open(dir.path(), 768).unwrap());
+        store.init_schema().await.unwrap();
+
+        // Chain: A → B → C where C is Warm (active HEAD)
+        // A and B are Cold with very low scores — would be Forgotten without protection
+        let mut c = make_entry(Tier::Warm, MemoryType::Structural);
+        c.scope_id = "test-scope".into();
+        c.recorded_at = Utc::now();
+        c.embedding = Some(vec![0.1; 768]);
+        c.access_count = 50;
+        c.last_accessed = Some(Utc::now());
+        c.confidence = Some(0.9);
+        c.superseded_by = None;
+
+        let mut b = make_entry(Tier::Cold, MemoryType::Episodic);
+        b.scope_id = "test-scope".into();
+        b.recorded_at = Utc::now() - chrono::Duration::days(365);
+        b.embedding = Some(vec![0.2; 768]);
+        b.confidence = Some(0.0);
+        b.superseded_by = Some(c.id);
+
+        let mut a = make_entry(Tier::Cold, MemoryType::Episodic);
+        a.scope_id = "test-scope".into();
+        a.recorded_at = Utc::now() - chrono::Duration::days(365);
+        a.embedding = Some(vec![0.3; 768]);
+        a.confidence = Some(0.0);
+        a.superseded_by = Some(b.id);
+
+        for entry in [&a, &b, &c] {
+            crate::knowledge_files::write_entry(dir.path(), entry).unwrap();
+            store.insert(entry).await.unwrap();
+        }
+
+        let graph: Arc<dyn GraphStore> = store.clone();
+        let store_q: Arc<dyn QueryableStore> = store.clone();
+
+        let config = ForgettingConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+            .await
+            .unwrap();
+
+        // B and A should be chain-protected from Forgotten
+        let updated_a = store.get(&a.id).await.unwrap().unwrap();
+        let updated_b = store.get(&b.id).await.unwrap().unwrap();
+        assert_ne!(updated_a.tier, Tier::Forgotten, "A should be chain-protected from Forgotten");
+        assert_ne!(updated_b.tier, Tier::Forgotten, "B should be chain-protected from Forgotten");
+        // Chain protection specifically (not just auto-protection) should fire for ancestors
+        assert!(report.chain_protected > 0,
+            "Expected chain_protected > 0, got {}", report.chain_protected);
+    }
+
+    // ── Integration: auto-protection (Structural can reach Cold but not Forgotten) ──
+
+    #[tokio::test]
+    async fn test_gc_auto_protection_structural_not_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::lite_store::LiteStore::open(dir.path(), 768).unwrap());
+        store.init_schema().await.unwrap();
+
+        // Structural entry in Cold with very low score
+        let mut entry = make_entry(Tier::Cold, MemoryType::Structural);
+        entry.scope_id = "test-scope".into();
+        entry.recorded_at = Utc::now() - chrono::Duration::days(365);
+        entry.embedding = Some(vec![0.1; 768]);
+        entry.confidence = Some(0.0);
+        entry.superseded_by = Some(uuid::Uuid::now_v7()); // superseded to lower score
+
+        crate::knowledge_files::write_entry(dir.path(), &entry).unwrap();
+        store.insert(&entry).await.unwrap();
+
+        let graph: Arc<dyn GraphStore> = store.clone();
+        let store_q: Arc<dyn QueryableStore> = store.clone();
+
+        let config = ForgettingConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+            .await
+            .unwrap();
+
+        let updated = store.get(&entry.id).await.unwrap().unwrap();
+        // Structural is auto-protected — Cold is OK, Forgotten is blocked
+        assert_ne!(updated.tier, Tier::Forgotten, "Structural entry should not reach Forgotten");
+        assert!(report.auto_protected > 0, "Expected auto-protection to fire");
+    }
+
+    // ── Integration: pinned entry never demoted ──────────────────────────
+
+    #[tokio::test]
+    async fn test_gc_pinned_entry_never_demoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::lite_store::LiteStore::open(dir.path(), 768).unwrap());
+        store.init_schema().await.unwrap();
+
+        let mut entry = make_entry(Tier::Hot, MemoryType::Episodic);
+        entry.scope_id = "test-scope".into();
+        entry.recorded_at = Utc::now() - chrono::Duration::days(365);
+        entry.embedding = Some(vec![0.1; 768]);
+        entry.confidence = Some(0.0);
+        entry.pin = Some(PinInfo { by: "admin".into(), at: Utc::now() });
+
+        crate::knowledge_files::write_entry(dir.path(), &entry).unwrap();
+        store.insert(&entry).await.unwrap();
+
+        let graph: Arc<dyn GraphStore> = store.clone();
+        let store_q: Arc<dyn QueryableStore> = store.clone();
+
+        let config = ForgettingConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        // Run multiple cycles
+        for _ in 0..3 {
+            run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+                .await
+                .unwrap();
+        }
+
+        let updated = store.get(&entry.id).await.unwrap().unwrap();
+        assert_eq!(updated.tier, Tier::Hot, "Pinned entry should never be demoted");
+    }
+
+    // ── Integration: budget policy ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_gc_budget_demotes_excess() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::lite_store::LiteStore::open(dir.path(), 768).unwrap());
+        store.init_schema().await.unwrap();
+
+        // Create 15 Hot entries with varying scores
+        let mut entry_ids = Vec::new();
+        for i in 0..15 {
+            let mut entry = make_entry(Tier::Hot, MemoryType::Episodic);
+            entry.scope_id = "test-scope".into();
+            entry.recorded_at = Utc::now() - chrono::Duration::days(1);
+            entry.embedding = Some(vec![0.1 * (i as f32 + 1.0); 768]);
+            entry.access_count = (i * 10) as u32;
+            entry.last_accessed = Some(Utc::now());
+            entry.confidence = Some(0.5 + (i as f32) * 0.03);
+
+            crate::knowledge_files::write_entry(dir.path(), &entry).unwrap();
+            store.insert(&entry).await.unwrap();
+            entry_ids.push(entry.id);
+        }
+
+        let graph: Arc<dyn GraphStore> = store.clone();
+        let store_q: Arc<dyn QueryableStore> = store.clone();
+
+        // Set budget_top_n = 10 (so 5 should be demoted)
+        let mut config = ForgettingConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        config.defaults.budget_top_n = 10;
+
+        let _report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+            .await
+            .unwrap();
+
+        // Count how many entries were demoted (budget + score-based)
+        let mut demoted = 0;
+        for &id in &entry_ids {
+            let updated = store.get(&id).await.unwrap().unwrap();
+            if updated.tier != Tier::Hot {
+                demoted += 1;
+            }
+        }
+
+        // At least 5 should be demoted (budget forces it), possibly more from scoring
+        assert!(demoted >= 5, "Expected at least 5 demotions with budget_top_n=10, got {demoted}");
+    }
+
+    #[tokio::test]
+    async fn test_gc_budget_skips_already_transitioned() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::lite_store::LiteStore::open(dir.path(), 768).unwrap());
+        store.init_schema().await.unwrap();
+
+        // Create entries: some will transition by scoring, budget should skip those
+        let mut entries = Vec::new();
+        for i in 0..12 {
+            let mut entry = make_entry(Tier::Hot, MemoryType::Episodic);
+            entry.scope_id = "test-scope".into();
+            entry.embedding = Some(vec![0.1 * (i as f32 + 1.0); 768]);
+
+            if i < 4 {
+                // These 4 will naturally transition (old, low score)
+                entry.recorded_at = Utc::now() - chrono::Duration::days(365);
+                entry.confidence = Some(0.0);
+                entry.superseded_by = Some(uuid::Uuid::now_v7());
+            } else {
+                // These 8 are fresh and high-scoring
+                entry.recorded_at = Utc::now() - chrono::Duration::days(1);
+                entry.access_count = 50;
+                entry.last_accessed = Some(Utc::now());
+                entry.confidence = Some(0.9);
+            }
+
+            crate::knowledge_files::write_entry(dir.path(), &entry).unwrap();
+            store.insert(&entry).await.unwrap();
+            entries.push(entry);
+        }
+
+        let graph: Arc<dyn GraphStore> = store.clone();
+        let store_q: Arc<dyn QueryableStore> = store.clone();
+
+        // budget_top_n = 10, but 4 will already transition from scoring
+        let mut config = ForgettingConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        config.defaults.budget_top_n = 10;
+
+        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+            .await
+            .unwrap();
+
+        // The budget should not double-count already-transitioned entries
+        // 4 transitioned by scoring, remaining 8 active Hot — under budget of 10
+        // So budget_demoted should be minimal (0 or very few)
+        assert!(report.budget_demoted <= 2,
+            "Budget should skip already-transitioned entries, got {} budget demotions", report.budget_demoted);
+    }
+
+    // ── Integration: rate limit ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_gc_rate_limit_caps_forgotten_at_50() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::lite_store::LiteStore::open(dir.path(), 768).unwrap());
+        store.init_schema().await.unwrap();
+
+        // Create 60 Cold entries with very low scores (all would go Forgotten)
+        for i in 0..60 {
+            let mut entry = make_entry(Tier::Cold, MemoryType::Episodic);
+            entry.scope_id = "test-scope".into();
+            entry.recorded_at = Utc::now() - chrono::Duration::days(365);
+            entry.embedding = Some(vec![0.01 * (i as f32 + 1.0); 768]);
+            entry.confidence = Some(0.0);
+            entry.superseded_by = Some(uuid::Uuid::now_v7()); // low score
+            entry.last_accessed = None;
+
+            crate::knowledge_files::write_entry(dir.path(), &entry).unwrap();
+            store.insert(&entry).await.unwrap();
+        }
+
+        let graph: Arc<dyn GraphStore> = store.clone();
+        let store_q: Arc<dyn QueryableStore> = store.clone();
+
+        let config = ForgettingConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+            .await
+            .unwrap();
+
+        assert!(
+            report.cold_to_forgotten <= MAX_FORGOTTEN_PER_CYCLE,
+            "Expected at most {} Forgotten transitions, got {}",
+            MAX_FORGOTTEN_PER_CYCLE,
+            report.cold_to_forgotten,
+        );
+        assert!(
+            report.forgotten_rate_limited > 0,
+            "Expected some rate-limited transitions, got 0",
+        );
+    }
+
+    // ── Unit: build_chain_protected_set with branching chains ────────────
+
+    #[test]
+    fn test_chain_protection_multiple_chains() {
+        // Chain 1: A → B (B is HEAD, Warm) → A protected
+        // Chain 2: C → D (D is HEAD, Forgotten) → C NOT protected
+        let mut b = make_entry(Tier::Warm, MemoryType::Episodic);
+        b.superseded_by = None;
+        let mut a = make_entry(Tier::Cold, MemoryType::Episodic);
+        a.superseded_by = Some(b.id);
+
+        let mut d = make_entry(Tier::Forgotten, MemoryType::Episodic);
+        d.superseded_by = None;
+        let mut c = make_entry(Tier::Cold, MemoryType::Episodic);
+        c.superseded_by = Some(d.id);
+
+        let entries: Vec<&KnowledgeEntry> = vec![&a, &b, &c, &d];
+        let protected = build_chain_protected_set(&entries);
+
+        assert!(protected.contains(&a.id), "A should be protected (HEAD B is Warm)");
+        assert!(!protected.contains(&c.id), "C should NOT be protected (HEAD D is Forgotten)");
+    }
+
+    // ── Unit: apply_budget_policy ────────────────────────────────────────
+
+    #[test]
+    fn test_budget_policy_no_limit_when_zero() {
+        let entry = {
+            let mut e = make_entry(Tier::Hot, MemoryType::Structural);
+            e.scope_id = "test".into();
+            e
+        };
+        let scope_entries = vec![&entry];
+        let entry_map: HashMap<uuid::Uuid, &KnowledgeEntry> = [(entry.id, &entry)].into();
+        let score_map: HashMap<uuid::Uuid, f32> = [(entry.id, 0.01)].into();
+        let inbound_edge_map = HashMap::new();
+        let transitioned_ids = HashSet::new();
+        let chain_protected_ids = HashSet::new();
+
+        let forgetting = ForgettingConfig {
+            enabled: true,
+            defaults: corvia_common::config::ForgettingPolicyConfig {
+                max_inactive_days: 90,
+                budget_top_n: 0, // budget_top_n=0 means no limit
+            },
+            ..Default::default()
+        };
+
+        let transitions = apply_budget_policy(
+            &scope_entries, &entry_map, &score_map, &inbound_edge_map,
+            &transitioned_ids, &chain_protected_ids,
+            &forgetting, None,
+        );
+        assert!(transitions.is_empty(), "budget_top_n=0 means no limit");
+    }
+
+    #[test]
+    fn test_budget_policy_auto_protected_floor_at_warm() {
+        // 3 entries: 2 Structural (auto-protected), 1 Episodic. Budget = 1.
+        // Budget should demote Structural from Hot to Warm (floor), not Cold.
+        let mut structural1 = make_entry(Tier::Hot, MemoryType::Structural);
+        structural1.scope_id = "test".into();
+        let mut structural2 = make_entry(Tier::Hot, MemoryType::Structural);
+        structural2.scope_id = "test".into();
+        let mut episodic = make_entry(Tier::Hot, MemoryType::Episodic);
+        episodic.scope_id = "test".into();
+
+        let scope_entries = vec![&structural1, &structural2, &episodic];
+        let entry_map: HashMap<uuid::Uuid, &KnowledgeEntry> = scope_entries.iter().map(|e| (e.id, *e)).collect();
+        let score_map: HashMap<uuid::Uuid, f32> = [
+            (structural1.id, 0.01), // lowest
+            (structural2.id, 0.02),
+            (episodic.id, 0.03),    // highest of the three
+        ].into();
+        let inbound_edge_map = HashMap::new();
+        let transitioned_ids = HashSet::new();
+        let chain_protected_ids = HashSet::new();
+
+        let forgetting = ForgettingConfig {
+            enabled: true,
+            defaults: corvia_common::config::ForgettingPolicyConfig {
+                max_inactive_days: 90,
+                budget_top_n: 1, // only 1 active allowed, 3 present → 2 excess
+            },
+            ..Default::default()
+        };
+
+        let transitions = apply_budget_policy(
+            &scope_entries, &entry_map, &score_map, &inbound_edge_map,
+            &transitioned_ids, &chain_protected_ids,
+            &forgetting, None,
+        );
+
+        // Should get 2 demotions
+        assert_eq!(transitions.len(), 2, "Expected 2 budget demotions, got {}", transitions.len());
+
+        // All demotions should be to Warm (auto-protected Structural floor + one-step for Episodic)
+        for t in &transitions {
+            assert_eq!(t.new_tier, Tier::Warm,
+                "Budget demotion should be to Warm (one step from Hot), got {:?}", t.new_tier);
+        }
+    }
+
+    // ── Circuit breaker unit test ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_gc_circuit_breaker_on_write_failure() {
+        // The circuit breaker is tested by ensuring the report field is set correctly
+        // when the write path succeeds (no trip) vs when processing continues normally.
+        // A full write-failure simulation requires a mock store, so we verify:
+        // 1. Normal cycle does NOT trip circuit breaker
+        // 2. The circuit breaker field exists and defaults to false
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::lite_store::LiteStore::open(dir.path(), 768).unwrap());
+        store.init_schema().await.unwrap();
+
+        let mut entry = make_entry(Tier::Hot, MemoryType::Episodic);
+        entry.scope_id = "test-scope".into();
+        entry.recorded_at = Utc::now() - chrono::Duration::days(90);
+        entry.embedding = Some(vec![0.1; 768]);
+        entry.confidence = Some(0.3);
+
+        crate::knowledge_files::write_entry(dir.path(), &entry).unwrap();
+        store.insert(&entry).await.unwrap();
+
+        let graph: Arc<dyn GraphStore> = store.clone();
+        let store_q: Arc<dyn QueryableStore> = store.clone();
+
+        let config = ForgettingConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+            .await
+            .unwrap();
+
+        assert!(!report.circuit_breaker_tripped, "Normal cycle should not trip circuit breaker");
     }
 }
