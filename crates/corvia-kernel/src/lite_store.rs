@@ -236,14 +236,14 @@ impl LiteStore {
         {
             let (_key, value) = item
                 .map_err(|e| CorviaError::Storage(format!("Failed to read entry: {e}")))?;
-            if let Ok(partial) = serde_json::from_slice::<TierOnly>(value.value()) {
-                if partial.scope_id == scope_id {
-                    match partial.tier {
-                        Tier::Hot => dist.hot += 1,
-                        Tier::Warm => dist.warm += 1,
-                        Tier::Cold => dist.cold += 1,
-                        Tier::Forgotten => dist.forgotten += 1,
-                    }
+            if let Ok(partial) = serde_json::from_slice::<TierOnly>(value.value())
+                && partial.scope_id == scope_id
+            {
+                match partial.tier {
+                    Tier::Hot => dist.hot += 1,
+                    Tier::Warm => dist.warm += 1,
+                    Tier::Cold => dist.cold += 1,
+                    Tier::Forgotten => dist.forgotten += 1,
                 }
             }
         }

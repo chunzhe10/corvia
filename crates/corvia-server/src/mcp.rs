@@ -849,10 +849,10 @@ async fn tool_corvia_graph(
         .map_err(|e| (INVALID_PARAMS, format!("Invalid UUID: {e}")))?;
 
     // Check if the entry is Forgotten — increment counter for observability
-    if let Ok(Some(entry)) = state.store.get(&uuid).await {
-        if entry.tier == corvia_common::types::Tier::Forgotten {
-            state.forgotten_access_counter.increment();
-        }
+    if let Ok(Some(entry)) = state.store.get(&uuid).await
+        && entry.tier == corvia_common::types::Tier::Forgotten
+    {
+        state.forgotten_access_counter.increment();
     }
 
     let edges = state.graph.edges(&uuid, EdgeDirection::Both).await
