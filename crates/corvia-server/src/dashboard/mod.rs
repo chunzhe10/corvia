@@ -101,33 +101,6 @@ fn config_summary(cfg: &corvia_common::config::CorviaConfig) -> DashboardConfig 
     }
 }
 
-/// Count JSON knowledge files on disk and compute index coverage ratio.
-fn compute_index_coverage(
-    data_dir: &std::path::Path,
-    scope_id: &str,
-    entry_count: u64,
-) -> (Option<f64>, bool) {
-    let dir = data_dir.join("knowledge").join(scope_id);
-    if !dir.exists() {
-        return (None, false);
-    }
-    let file_count = std::fs::read_dir(&dir)
-        .map(|rd| {
-            rd.filter(|e| {
-                e.as_ref()
-                    .map(|e| e.path().extension().is_some_and(|ext| ext == "json"))
-                    .unwrap_or(false)
-            })
-            .count() as u64
-        })
-        .unwrap_or(0);
-    if file_count == 0 {
-        return (None, false);
-    }
-    let coverage = (entry_count as f64 / file_count as f64).min(1.0);
-    (Some(coverage), coverage < 0.9)
-}
-
 /// GET /api/dashboard/status
 /// Returns service health, store metrics, config summary, and optional traces.
 async fn status_handler(
@@ -207,7 +180,7 @@ async fn status_handler(
 /// Force-recompute coverage and return fresh snapshot.
 async fn refresh_coverage_handler(
     State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+) -> Json<corvia_common::dashboard::CoverageResponse> {
     let scope_id = state
         .default_scope_id
         .as_deref()
@@ -217,15 +190,7 @@ async fn refresh_coverage_handler(
         .refresh(&state.data_dir, scope_id, &*state.store)
         .await;
 
-    Json(serde_json::json!({
-        "index_coverage": snapshot.coverage,
-        "index_stale": snapshot.stale,
-        "index_disk_count": snapshot.disk_count,
-        "index_store_count": snapshot.store_count,
-        "index_hnsw_count": snapshot.hnsw_count,
-        "index_stale_threshold": snapshot.threshold,
-        "index_coverage_checked_at": snapshot.checked_at,
-    }))
+    Json(snapshot.into())
 }
 
 /// GET /api/dashboard/traces
@@ -1828,79 +1793,72 @@ mod tests {
         assert!(json.is_object(), "response should be a JSON object");
     }
 
-    // ── compute_index_coverage unit tests ──
-
-    #[test]
-    fn coverage_dir_not_exist() {
+    #[tokio::test]
+    async fn test_status_coverage_with_data() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(compute_index_coverage(tmp.path(), "no-scope", 0), (None, false));
-    }
+        let state = test_state(tmp.path()).await;
 
-    #[test]
-    fn coverage_empty_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join("knowledge/test")).unwrap();
-        assert_eq!(compute_index_coverage(tmp.path(), "test", 0), (None, false));
-    }
-
-    #[test]
-    fn coverage_fully_indexed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("knowledge/test");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.json"), "{}").unwrap();
-        std::fs::write(dir.join("b.json"), "{}").unwrap();
-        assert_eq!(compute_index_coverage(tmp.path(), "test", 2), (Some(1.0), false));
-    }
-
-    #[test]
-    fn coverage_boundary_exactly_90_pct() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("knowledge/test");
-        std::fs::create_dir_all(&dir).unwrap();
-        for i in 0..10 {
-            std::fs::write(dir.join(format!("{i}.json")), "{}").unwrap();
+        // Insert 7 entries (creates knowledge JSON files on disk + store + HNSW)
+        let scope_id = corvia_common::constants::DEFAULT_SCOPE_ID;
+        for _ in 0..7 {
+            let mut entry = corvia_common::types::KnowledgeEntry::new(
+                "test content".into(), scope_id.into(), "test.rs".into(),
+            );
+            entry.embedding = Some(vec![0.1, 0.2, 0.3]);
+            state.store.insert(&entry).await.unwrap();
         }
-        let (cov, stale) = compute_index_coverage(tmp.path(), "test", 9);
-        assert!((cov.unwrap() - 0.9).abs() < f64::EPSILON);
-        assert!(!stale, "90% should NOT be stale (threshold is < 0.9)");
-    }
-
-    #[test]
-    fn coverage_below_90_pct_is_stale() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("knowledge/test");
-        std::fs::create_dir_all(&dir).unwrap();
-        for i in 0..10 {
-            std::fs::write(dir.join(format!("{i}.json")), "{}").unwrap();
+        // Add 3 extra JSON files to simulate partial ingest
+        let knowledge_dir = tmp.path().join("knowledge").join(scope_id);
+        for i in 0..3 {
+            std::fs::write(
+                knowledge_dir.join(format!("extra-{i}.json")),
+                format!(r#"{{"extra":{i}}}"#),
+            ).unwrap();
         }
-        let (cov, stale) = compute_index_coverage(tmp.path(), "test", 8);
-        assert!((cov.unwrap() - 0.8).abs() < f64::EPSILON);
-        assert!(stale, "80% should be stale");
+
+        // Refresh coverage cache so status has data
+        state.coverage_cache
+            .refresh(&state.data_dir, scope_id, &*state.store)
+            .await;
+
+        let (status, json) = get_json(state, "/api/dashboard/status").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json["index_disk_count"], 10);
+        assert_eq!(json["index_store_count"], 7);
+        assert_eq!(json["index_hnsw_count"], 7);
+        assert_eq!(json["index_coverage"], 0.7);
+        assert_eq!(json["index_stale"], true);
+        assert_eq!(json["index_stale_threshold"], 0.9);
+        assert!(json["index_coverage_checked_at"].is_string(), "checked_at should be a string");
     }
 
-    #[test]
-    fn coverage_entry_count_exceeds_file_count_clamped() {
+    #[tokio::test]
+    async fn test_refresh_populates_cache_for_status() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("knowledge/test");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.json"), "{}").unwrap();
-        let (cov, stale) = compute_index_coverage(tmp.path(), "test", 5);
-        assert_eq!(cov, Some(1.0));
-        assert!(!stale);
+        let state = test_state(tmp.path()).await;
+
+        // Status before any refresh — cache has defaults
+        let (_, json_before) = get_json(state.clone(), "/api/dashboard/status").await;
+        assert!(json_before["index_coverage"].is_null());
+        assert!(json_before["index_coverage_checked_at"].is_null());
+
+        // POST refresh-coverage to populate the cache
+        let app = router(state.clone());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/dashboard/status/refresh-coverage")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        // Status after refresh — checked_at should now be set
+        let (_, json_after) = get_json(state, "/api/dashboard/status").await;
+        assert!(
+            json_after["index_coverage_checked_at"].is_string(),
+            "after refresh, checked_at should be set"
+        );
     }
 
-    #[test]
-    fn coverage_non_json_files_ignored() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("knowledge/test");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.json"), "{}").unwrap();
-        std::fs::write(dir.join("b.txt"), "not json").unwrap();
-        std::fs::write(dir.join("c.bak"), "backup").unwrap();
-        // 1 json file, entry_count=1 → fully indexed
-        let (cov, stale) = compute_index_coverage(tmp.path(), "test", 1);
-        assert_eq!(cov, Some(1.0));
-        assert!(!stale);
-    }
 }

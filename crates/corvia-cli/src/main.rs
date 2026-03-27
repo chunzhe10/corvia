@@ -647,7 +647,11 @@ async fn cmd_serve() -> Result<()> {
         ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
         gpu_cache: Arc::new(tokio::sync::Mutex::new(corvia_server::dashboard::gpu::GpuMetricsCache::new())),
     });
-    // Initial coverage cache population + background refresh
+    // Initial coverage cache population + background refresh.
+    // NOTE: ttl_secs is captured once at startup. While `dashboard` is in
+    // HOT_RELOADABLE_SECTIONS, `coverage_ttl_secs` changes require a server
+    // restart to take effect on the background loop. `stale_threshold` is read
+    // from the cache at construction time and also requires restart.
     {
         let cache = state.coverage_cache.clone();
         let store_bg = state.store.clone();

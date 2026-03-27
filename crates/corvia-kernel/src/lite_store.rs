@@ -1676,4 +1676,23 @@ mod tests {
 
         assert_eq!(store.hnsw_entry_count().unwrap(), 5);
     }
+
+    #[tokio::test]
+    async fn test_hnsw_entry_count_after_delete_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LiteStore::open(dir.path(), 3).unwrap();
+        store.init_schema().await.unwrap();
+
+        for _ in 0..5 {
+            let mut entry = corvia_common::types::KnowledgeEntry::new(
+                "test".into(), "scope".into(), "file.rs".into(),
+            );
+            entry.embedding = Some(vec![0.1, 0.2, 0.3]);
+            store.insert(&entry).await.unwrap();
+        }
+        assert_eq!(store.hnsw_entry_count().unwrap(), 5);
+
+        store.delete_scope("scope").await.unwrap();
+        assert_eq!(store.hnsw_entry_count().unwrap(), 0);
+    }
 }

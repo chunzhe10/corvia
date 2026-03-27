@@ -19,6 +19,20 @@ pub struct CoverageSnapshot {
     pub checked_at: Option<String>,
 }
 
+impl From<CoverageSnapshot> for corvia_common::dashboard::CoverageResponse {
+    fn from(s: CoverageSnapshot) -> Self {
+        Self {
+            index_coverage: s.coverage,
+            index_stale: s.stale,
+            index_disk_count: s.disk_count,
+            index_store_count: s.store_count,
+            index_hnsw_count: s.hnsw_count,
+            index_stale_threshold: s.threshold,
+            index_coverage_checked_at: s.checked_at,
+        }
+    }
+}
+
 /// Cached index coverage metrics with TTL-based refresh.
 ///
 /// Uses `std::sync::Mutex` with brief lock holds (never across `.await`).
@@ -478,5 +492,41 @@ mod tests {
         cache.refresh(tmp.path(), "test", &store).await;
         // Immediately after refresh with 0s TTL, needs_refresh is true
         assert!(cache.needs_refresh());
+    }
+
+    #[test]
+    fn test_count_json_files_ignores_subdirectories() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("scope");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 2 json files at top level
+        std::fs::write(dir.join("a.json"), "{}").unwrap();
+        std::fs::write(dir.join("b.json"), "{}").unwrap();
+        // 3 json files in a subdirectory (should NOT be counted)
+        let sub = dir.join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("c.json"), "{}").unwrap();
+        std::fs::write(sub.join("d.json"), "{}").unwrap();
+        std::fs::write(sub.join("e.json"), "{}").unwrap();
+        assert_eq!(count_json_files(&dir), 2);
+    }
+
+    #[test]
+    fn test_checked_at_is_valid_rfc3339() {
+        // Verify CoverageSnapshot.checked_at is valid RFC 3339 after refresh
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let tmp = tempdir().unwrap();
+            let store = make_store(tmp.path());
+            store.init_schema().await.unwrap();
+
+            let cache = IndexCoverageCache::new(0.9, 60);
+            let snap = cache.refresh(tmp.path(), "test", &store).await;
+            let ts = snap.checked_at.expect("checked_at should be set after refresh");
+            assert!(
+                chrono::DateTime::parse_from_rfc3339(&ts).is_ok(),
+                "checked_at should be valid RFC 3339: {ts}"
+            );
+        });
     }
 }

@@ -140,7 +140,7 @@ impl DashboardSection {
         }
         if self.coverage_ttl_secs < MIN_COVERAGE_TTL {
             eprintln!(
-                "Warning: dashboard.coverage_ttl_secs={} below minimum {}, clamping",
+                "warning: dashboard.coverage_ttl_secs={} below minimum {}, clamping",
                 self.coverage_ttl_secs, MIN_COVERAGE_TTL
             );
             self.coverage_ttl_secs = MIN_COVERAGE_TTL;
