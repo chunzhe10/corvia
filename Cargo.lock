@@ -863,6 +863,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "toml",
+ "tracing",
  "uuid",
 ]
 
@@ -947,6 +948,7 @@ dependencies = [
  "chrono",
  "corvia-common",
  "corvia-kernel",
+ "corvia-proto",
  "corvia-telemetry",
  "futures-core",
  "http-body-util",
@@ -960,6 +962,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "toml",
+ "tonic",
  "tower 0.5.3",
  "tower-http",
  "tracing",

@@ -32,6 +32,8 @@ pub enum CheckType {
     TemporalContradiction,
     /// Topic cluster has only memory-role entries, no formal design doc.
     CoverageGap,
+    /// Entry has a content_role value not in the MemoryType mapping table.
+    UnmappedContentRole,
 }
 
 impl CheckType {
@@ -48,6 +50,7 @@ impl CheckType {
             CheckType::MisplacedDoc => "misplaced_doc",
             CheckType::TemporalContradiction => "temporal_contradiction",
             CheckType::CoverageGap => "coverage_gap",
+            CheckType::UnmappedContentRole => "unmapped_content_role",
         }
     }
 }
@@ -67,8 +70,9 @@ impl std::str::FromStr for CheckType {
             "misplaced" | "misplaced_doc" => Ok(CheckType::MisplacedDoc),
             "temporal" | "temporal_contradiction" => Ok(CheckType::TemporalContradiction),
             "coverage" | "coverage_gap" => Ok(CheckType::CoverageGap),
+            "unmapped" | "unmapped_content_role" => Ok(CheckType::UnmappedContentRole),
             _ => Err(format!(
-                "Unknown check type: {s}. Valid: stale, broken, orphan, dangling, cycle, gap, contradiction, misplaced, temporal, coverage"
+                "Unknown check type: {s}. Valid: stale, broken, orphan, dangling, cycle, gap, contradiction, misplaced, temporal, coverage, unmapped"
             )),
         }
     }
@@ -174,6 +178,7 @@ impl<'a> Reasoner<'a> {
         }
         findings.extend(check_coverage_gap(entries, scope_id));
         findings.extend(check_temporal_contradiction(entries, 0.85));
+        findings.extend(check_unmapped_content_role(entries, scope_id));
         Ok(findings)
     }
 
@@ -207,7 +212,7 @@ impl<'a> Reasoner<'a> {
             CheckType::TemporalContradiction => {
                 Ok(check_temporal_contradiction(entries, 0.85))
             }
-
+            CheckType::UnmappedContentRole => Ok(check_unmapped_content_role(entries, scope_id)),
         }
     }
 
@@ -658,6 +663,46 @@ pub fn check_coverage_gap(entries: &[KnowledgeEntry], scope_id: &str) -> Vec<Fin
     } else {
         Vec::new()
     }
+}
+
+/// Check for entries with content_role values not in the MemoryType mapping table.
+///
+/// Warns about entries that have a content_role set but it doesn't map to any known
+/// MemoryType. These entries will fall back to Episodic classification, which may not
+/// be correct.
+pub fn check_unmapped_content_role(entries: &[KnowledgeEntry], scope_id: &str) -> Vec<Finding> {
+    let unmapped: Vec<&KnowledgeEntry> = entries
+        .iter()
+        .filter(|e| e.scope_id == scope_id)
+        .filter(|e| {
+            if let Some(ref role) = e.metadata.content_role {
+                !corvia_common::types::MemoryType::is_known_content_role(role)
+            } else {
+                false
+            }
+        })
+        .collect();
+
+    if unmapped.is_empty() {
+        return Vec::new();
+    }
+
+    let roles: std::collections::BTreeSet<&str> = unmapped
+        .iter()
+        .filter_map(|e| e.metadata.content_role.as_deref())
+        .collect();
+
+    vec![Finding::new(
+        CheckType::UnmappedContentRole,
+        scope_id,
+        unmapped.iter().map(|e| e.id).collect(),
+        0.6,
+        format!(
+            "{} entries have unmapped content_role values: {} — these default to Episodic memory type",
+            unmapped.len(),
+            roles.into_iter().collect::<Vec<_>>().join(", ")
+        ),
+    )]
 }
 
 /// Check for potential contradictions between current entries from different source origins.
@@ -1514,5 +1559,62 @@ mod tests {
         let findings = reasoner.run_check(&[e1, e2], "test", CheckType::CoverageGap).await.unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].check_type, CheckType::CoverageGap);
+    }
+
+    // ---- UnmappedContentRole check ----
+
+    #[test]
+    fn test_unmapped_content_role_detects_unknown() {
+        let mut e = entry("some entry", "test");
+        e.metadata.content_role = Some("exotic_role".into());
+        let findings = check_unmapped_content_role(&[e], "test");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].check_type, CheckType::UnmappedContentRole);
+        assert!(findings[0].rationale.contains("exotic_role"));
+    }
+
+    #[test]
+    fn test_unmapped_content_role_ignores_known() {
+        let mut e = entry("some entry", "test");
+        e.metadata.content_role = Some("design".into());
+        let findings = check_unmapped_content_role(&[e], "test");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn test_unmapped_content_role_ignores_none() {
+        let e = entry("some entry", "test");
+        let findings = check_unmapped_content_role(&[e], "test");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn test_unmapped_content_role_detects_empty_string() {
+        let mut e = entry("some entry", "test");
+        e.metadata.content_role = Some("".into());
+        let findings = check_unmapped_content_role(&[e], "test");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].check_type, CheckType::UnmappedContentRole);
+    }
+
+    #[test]
+    fn test_unmapped_content_role_parse_and_str() {
+        assert_eq!(CheckType::UnmappedContentRole.as_str(), "unmapped_content_role");
+        assert_eq!("unmapped_content_role".parse::<CheckType>().unwrap(), CheckType::UnmappedContentRole);
+        assert_eq!("unmapped".parse::<CheckType>().unwrap(), CheckType::UnmappedContentRole);
+    }
+
+    #[tokio::test]
+    async fn test_reasoner_unmapped_content_role_via_run_check() {
+        let (_dir, store) = test_store().await;
+
+        let mut e = entry("exotic entry", "test");
+        e.metadata.content_role = Some("banana".into());
+        store.insert(&e).await.unwrap();
+
+        let reasoner = Reasoner::new(&store, &store);
+        let findings = reasoner.run_check(&[e], "test", CheckType::UnmappedContentRole).await.unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].check_type, CheckType::UnmappedContentRole);
     }
 }
