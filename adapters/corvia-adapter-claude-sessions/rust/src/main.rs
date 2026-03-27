@@ -330,14 +330,12 @@ fn ingest_sessions_from<W: Write>(scope_id: &str, dir: &Path, out: &mut W) {
                 return true;
             }
             // Include raw .jsonl files only if they are stale (no recent writes)
-            if path_str.ends_with(".jsonl") {
-                if let Ok(meta) = e.metadata() {
-                    if let Ok(modified) = meta.modified() {
-                        if let Ok(age) = now.duration_since(modified) {
-                            return age > stale_threshold;
-                        }
-                    }
-                }
+            if path_str.ends_with(".jsonl")
+                && let Ok(meta) = e.metadata()
+                && let Ok(modified) = meta.modified()
+                && let Ok(age) = now.duration_since(modified)
+            {
+                return age > stale_threshold;
             }
             false
         })

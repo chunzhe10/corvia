@@ -347,16 +347,16 @@ pub async fn ingest_workspace(
     let engine = corvia_kernel::create_engine(&config);
 
     let progress = corvia_kernel::ingest::PrintProgress;
-    corvia_kernel::ingest::run_workspace_ingest(
+    corvia_kernel::ingest::run_workspace_ingest(corvia_kernel::ingest::WorkspaceIngestCtx {
         root,
-        &config,
+        config: &config,
         store,
         graph,
         engine,
         repo_filter,
-        None, // no session lock in CLI mode
-        &progress,
-    ).await?;
+        session_lock: None, // no session lock in CLI mode
+        progress: &progress,
+    }).await?;
 
     Ok(())
 }

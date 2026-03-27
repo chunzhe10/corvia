@@ -318,6 +318,19 @@ fn resolve_repo_path(workspace_root: &Path, repos_dir: &str, repo: &corvia_commo
 // Core ingest orchestration
 // ---------------------------------------------------------------------------
 
+/// Parameters for [`run_workspace_ingest`], bundled to stay under clippy's
+/// `too_many_arguments` threshold.
+pub struct WorkspaceIngestCtx<'a> {
+    pub root: &'a Path,
+    pub config: &'a CorviaConfig,
+    pub store: Arc<dyn QueryableStore>,
+    pub graph: Arc<dyn GraphStore>,
+    pub engine: Arc<dyn InferenceEngine>,
+    pub repo_filter: Option<&'a str>,
+    pub session_lock: Option<&'a tokio::sync::Mutex<()>>,
+    pub progress: &'a dyn IngestProgress,
+}
+
 /// Run workspace ingestion using pre-existing store/graph/engine instances.
 ///
 /// This function contains **blocking I/O** (adapter process pipes, chunking).
@@ -325,16 +338,17 @@ fn resolve_repo_path(workspace_root: &Path, repos_dir: &str, repo: &corvia_commo
 ///
 /// If `session_lock` is provided, it will be acquired before the Claude session
 /// history phase to prevent races with concurrent session ingest endpoints.
-pub async fn run_workspace_ingest(
-    root: &Path,
-    config: &CorviaConfig,
-    store: Arc<dyn QueryableStore>,
-    graph: Arc<dyn GraphStore>,
-    engine: Arc<dyn InferenceEngine>,
-    repo_filter: Option<&str>,
-    session_lock: Option<&tokio::sync::Mutex<()>>,
-    progress: &dyn IngestProgress,
-) -> anyhow::Result<IngestReport> {
+pub async fn run_workspace_ingest(ctx: WorkspaceIngestCtx<'_>) -> anyhow::Result<IngestReport> {
+    let WorkspaceIngestCtx {
+        root,
+        config,
+        store,
+        graph,
+        engine,
+        repo_filter,
+        session_lock,
+        progress,
+    } = ctx;
     let ws = config
         .workspace
         .as_ref()
@@ -525,147 +539,146 @@ pub async fn run_workspace_ingest(
     }
 
     // --- Phase 2: Workspace docs (only on full ingest) ---
-    if repo_filter.is_none() {
-        if let Some(docs_config) = ws.docs.as_ref() {
-            if let Some(workspace_docs_dir) = &docs_config.workspace_docs {
-                let docs_path = root.join(workspace_docs_dir);
-                if docs_path.exists() && docs_path.is_dir() {
-                    let docs_path_str = docs_path
-                        .to_str()
-                        .ok_or_else(|| anyhow::anyhow!("Invalid workspace docs path"))?;
+    if repo_filter.is_none()
+        && let Some(docs_config) = ws.docs.as_ref()
+        && let Some(workspace_docs_dir) = &docs_config.workspace_docs
+    {
+        let docs_path = root.join(workspace_docs_dir);
+        if docs_path.exists() && docs_path.is_dir() {
+            let docs_path_str = docs_path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("Invalid workspace docs path"))?;
 
-                    let blocked = docs_config
-                        .rules
-                        .as_ref()
-                        .map(|r| r.blocked_paths.clone())
-                        .unwrap_or_default();
+            let blocked = docs_config
+                .rules
+                .as_ref()
+                .map(|r| r.blocked_paths.clone())
+                .unwrap_or_default();
 
-                    let adapter_info = adapter_discovery::resolve_adapter(
-                        docs_path_str,
-                        &discovered,
-                        None,
-                        default_name,
-                    );
+            let adapter_info = adapter_discovery::resolve_adapter(
+                docs_path_str,
+                &discovered,
+                None,
+                default_name,
+            );
 
-                    if let Some(adapter_info) = adapter_info {
-                        progress.log(&format!(
-                            "\nIngesting workspace docs ({})...",
-                            workspace_docs_dir
-                        ));
+            if let Some(adapter_info) = adapter_info {
+                progress.log(&format!(
+                    "\nIngesting workspace docs ({})...",
+                    workspace_docs_dir
+                ));
 
-                        let mut process = ProcessAdapter::new(
-                            adapter_info.binary_path.clone(),
-                            adapter_info.metadata.clone(),
-                        );
-                        process.spawn().map_err(|e| anyhow::anyhow!(e))?;
+                let mut process = ProcessAdapter::new(
+                    adapter_info.binary_path.clone(),
+                    adapter_info.metadata.clone(),
+                );
+                process.spawn().map_err(|e| anyhow::anyhow!(e))?;
 
-                        let source_files = process
-                            .ingest(docs_path_str, &config.project.scope_id)
-                            .map_err(|e| anyhow::anyhow!(e))?;
+                let source_files = process
+                    .ingest(docs_path_str, &config.project.scope_id)
+                    .map_err(|e| anyhow::anyhow!(e))?;
 
-                        // Filter: only allowed subdirs, exclude blocked paths
-                        let allowed = &docs_config.allowed_workspace_subdirs;
-                        let source_files: Vec<_> = source_files
-                            .into_iter()
-                            .filter(|sf| {
-                                let path = &sf.metadata.file_path;
-                                let in_allowed = allowed.is_empty()
-                                    || allowed.iter().any(|sub| {
-                                        path.starts_with(&format!("{sub}/"))
-                                            || path.starts_with(sub.as_str())
-                                    });
-                                let is_blocked = blocked
-                                    .iter()
-                                    .any(|bp| blocked_path_match(bp, path));
-                                in_allowed && !is_blocked
-                            })
-                            .collect();
+                // Filter: only allowed subdirs, exclude blocked paths
+                let allowed = &docs_config.allowed_workspace_subdirs;
+                let source_files: Vec<_> = source_files
+                    .into_iter()
+                    .filter(|sf| {
+                        let path = &sf.metadata.file_path;
+                        let in_allowed = allowed.is_empty()
+                            || allowed.iter().any(|sub| {
+                                path.starts_with(&format!("{sub}/"))
+                                    || path.starts_with(sub.as_str())
+                            });
+                        let is_blocked = blocked
+                            .iter()
+                            .any(|bp| blocked_path_match(bp, path));
+                        in_allowed && !is_blocked
+                    })
+                    .collect();
 
-                        if source_files.is_empty() {
-                            progress.log("  No docs files to ingest.");
-                        } else {
-                            let pipeline = crate::create_chunking_pipeline(config);
-                            let (processed, pipeline_relations, pipeline_report) =
-                                pipeline.process_batch(&source_files)?;
+                if source_files.is_empty() {
+                    progress.log("  No docs files to ingest.");
+                } else {
+                    let pipeline = crate::create_chunking_pipeline(config);
+                    let (processed, pipeline_relations, pipeline_report) =
+                        pipeline.process_batch(&source_files)?;
 
-                            progress.log(&format!(
-                                "  {} files → {} chunks ({} merged, {} split)",
-                                pipeline_report.files_processed,
-                                pipeline_report.total_chunks,
-                                pipeline_report.chunks_merged,
-                                pipeline_report.chunks_split
-                            ));
+                    progress.log(&format!(
+                        "  {} files → {} chunks ({} merged, {} split)",
+                        pipeline_report.files_processed,
+                        pipeline_report.total_chunks,
+                        pipeline_report.chunks_merged,
+                        pipeline_report.chunks_split
+                    ));
 
-                            let docs_meta_lookup: HashMap<&str, &SourceMetadata> =
-                                source_files.iter().map(|sf| (sf.metadata.file_path.as_str(), &sf.metadata)).collect();
+                    let docs_meta_lookup: HashMap<&str, &SourceMetadata> =
+                        source_files.iter().map(|sf| (sf.metadata.file_path.as_str(), &sf.metadata)).collect();
 
-                            let entries: Vec<KnowledgeEntry> = processed
-                                .iter()
-                                .map(|pc| {
-                                    let src_meta = docs_meta_lookup.get(pc.metadata.source_file.as_str());
-                                    let mut entry = KnowledgeEntry::new(
-                                        pc.content.clone(),
-                                        config.project.scope_id.clone(),
-                                        pc.metadata.source_file.clone(),
-                                    );
-                                    entry.workstream = src_meta
-                                        .and_then(|m| m.workstream.clone())
-                                        .unwrap_or_else(|| "docs".to_string());
-                                    entry.metadata = corvia_common::types::EntryMetadata {
-                                        source_file: Some(pc.metadata.source_file.clone()),
-                                        language: pc.metadata.language.clone(),
-                                        chunk_type: Some(pc.chunk_type.clone()),
-                                        start_line: Some(pc.start_line),
-                                        end_line: Some(pc.end_line),
-                                        content_role: src_meta
-                                            .and_then(|m| m.content_role.clone())
-                                            .or_else(|| infer_content_role(&pc.metadata.source_file)),
-                                        source_origin: src_meta
-                                            .and_then(|m| m.source_origin.clone())
-                                            .or_else(|| infer_source_origin(None, &pc.metadata.source_file)),
-                                    };
-                                    entry
-                                })
-                                .collect();
+                    let entries: Vec<KnowledgeEntry> = processed
+                        .iter()
+                        .map(|pc| {
+                            let src_meta = docs_meta_lookup.get(pc.metadata.source_file.as_str());
+                            let mut entry = KnowledgeEntry::new(
+                                pc.content.clone(),
+                                config.project.scope_id.clone(),
+                                pc.metadata.source_file.clone(),
+                            );
+                            entry.workstream = src_meta
+                                .and_then(|m| m.workstream.clone())
+                                .unwrap_or_else(|| "docs".to_string());
+                            entry.metadata = corvia_common::types::EntryMetadata {
+                                source_file: Some(pc.metadata.source_file.clone()),
+                                language: pc.metadata.language.clone(),
+                                chunk_type: Some(pc.chunk_type.clone()),
+                                start_line: Some(pc.start_line),
+                                end_line: Some(pc.end_line),
+                                content_role: src_meta
+                                    .and_then(|m| m.content_role.clone())
+                                    .or_else(|| infer_content_role(&pc.metadata.source_file)),
+                                source_origin: src_meta
+                                    .and_then(|m| m.source_origin.clone())
+                                    .or_else(|| infer_source_origin(None, &pc.metadata.source_file)),
+                            };
+                            entry
+                        })
+                        .collect();
 
-                            let total = entries.len();
-                            let mut stored_ids: Vec<uuid::Uuid> = Vec::with_capacity(total);
-                            let mut stored = 0;
-                            for batch in entries.chunks(EMBED_BATCH_SIZE) {
-                                let texts: Vec<String> = batch.iter().map(|e| e.content.clone()).collect();
-                                let embeddings = engine.embed_batch(&texts).await?;
-                                for (entry, embedding) in batch.iter().zip(embeddings) {
-                                    let mut entry = entry.clone();
-                                    entry.embedding = Some(embedding);
-                                    store.insert(&entry).await?;
-                                    stored_ids.push(entry.id);
-                                    stored += 1;
-                                }
-                                progress.log(&format!("  embedded and stored {}/{}", stored, total));
-                            }
-
-                            if !pipeline_relations.is_empty() {
-                                let relations_stored = wire_pipeline_relations(
-                                    &pipeline_relations, &processed, &stored_ids, &*graph,
-                                ).await;
-                                if relations_stored > 0 {
-                                    progress.log(&format!("  {relations_stored} graph relations stored"));
-                                }
-                            }
-
-                            progress.log(&format!("  {} chunks stored for workspace docs", stored));
-                            report.docs_chunks = stored;
-                            report.total_chunks += stored;
+                    let total = entries.len();
+                    let mut stored_ids: Vec<uuid::Uuid> = Vec::with_capacity(total);
+                    let mut stored = 0;
+                    for batch in entries.chunks(EMBED_BATCH_SIZE) {
+                        let texts: Vec<String> = batch.iter().map(|e| e.content.clone()).collect();
+                        let embeddings = engine.embed_batch(&texts).await?;
+                        for (entry, embedding) in batch.iter().zip(embeddings) {
+                            let mut entry = entry.clone();
+                            entry.embedding = Some(embedding);
+                            store.insert(&entry).await?;
+                            stored_ids.push(entry.id);
+                            stored += 1;
                         }
-
-                        process.shutdown().map_err(|e| anyhow::anyhow!(e))?;
-                    } else {
-                        progress.log(
-                            "\n  Skipping workspace docs — no suitable adapter found \
-                             (install corvia-adapter-basic)"
-                        );
+                        progress.log(&format!("  embedded and stored {}/{}", stored, total));
                     }
+
+                    if !pipeline_relations.is_empty() {
+                        let relations_stored = wire_pipeline_relations(
+                            &pipeline_relations, &processed, &stored_ids, &*graph,
+                        ).await;
+                        if relations_stored > 0 {
+                            progress.log(&format!("  {relations_stored} graph relations stored"));
+                        }
+                    }
+
+                    progress.log(&format!("  {} chunks stored for workspace docs", stored));
+                    report.docs_chunks = stored;
+                    report.total_chunks += stored;
                 }
+
+                process.shutdown().map_err(|e| anyhow::anyhow!(e))?;
+            } else {
+                progress.log(
+                    "\n  Skipping workspace docs — no suitable adapter found \
+                     (install corvia-adapter-basic)"
+                );
             }
         }
     }

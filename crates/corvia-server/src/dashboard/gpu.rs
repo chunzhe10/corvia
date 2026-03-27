@@ -21,6 +21,12 @@ pub struct GpuMetricsCache {
     pub refresh_started: Instant,
 }
 
+impl Default for GpuMetricsCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GpuMetricsCache {
     pub fn new() -> Self {
         Self {

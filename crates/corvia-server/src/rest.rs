@@ -521,16 +521,16 @@ async fn ingest_workspace_handler(
         let result = rt.block_on(async {
             tokio::time::timeout(
                 std::time::Duration::from_secs(600),
-                corvia_kernel::ingest::run_workspace_ingest(
-                    &state_bg.workspace_root,
-                    &config,
-                    state_bg.store.clone(),
-                    state_bg.graph.clone(),
-                    state_bg.engine.clone(),
-                    repo_filter_ref,
-                    Some(&state_bg.session_ingest_lock),
-                    &progress,
-                ),
+                corvia_kernel::ingest::run_workspace_ingest(corvia_kernel::ingest::WorkspaceIngestCtx {
+                    root: &state_bg.workspace_root,
+                    config: &config,
+                    store: state_bg.store.clone(),
+                    graph: state_bg.graph.clone(),
+                    engine: state_bg.engine.clone(),
+                    repo_filter: repo_filter_ref,
+                    session_lock: Some(&state_bg.session_ingest_lock),
+                    progress: &progress,
+                }),
             ).await
         });
 

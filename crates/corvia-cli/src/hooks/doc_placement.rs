@@ -46,7 +46,7 @@ pub fn check(stdin: &serde_json::Value) -> Result<HookResult> {
     }
 
     // Common root-level files — always allowed
-    if ALLOWED_ROOT_FILES.iter().any(|f| rel_path == *f) {
+    if ALLOWED_ROOT_FILES.contains(&rel_path) {
         return Ok(HookResult::Allow);
     }
 

@@ -220,25 +220,24 @@ fn drop_caches_if_needed(quiet: bool) {
     let mut total = 0u64;
     for line in meminfo.lines() {
         if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            available = rest.trim().split_whitespace().next()
+            available = rest.split_whitespace().next()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
         } else if let Some(rest) = line.strip_prefix("MemTotal:") {
-            total = rest.trim().split_whitespace().next()
+            total = rest.split_whitespace().next()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
         }
     }
 
-    if total > 0 {
-        let pct_available = available * 100 / total;
-        if pct_available < 15 {
-            if !quiet {
-                eprintln!("  memory pressure detected ({pct_available}% available) — dropping caches");
-            }
-            // sync + drop caches
-            unsafe { libc::sync(); }
-            let _ = fs::write("/proc/sys/vm/drop_caches", "1");
+    if let Some(pct_available) = (available * 100).checked_div(total)
+        && pct_available < 15
+    {
+        if !quiet {
+            eprintln!("  memory pressure detected ({pct_available}% available) — dropping caches");
         }
+        // sync + drop caches
+        unsafe { libc::sync(); }
+        let _ = fs::write("/proc/sys/vm/drop_caches", "1");
     }
 }
