@@ -33,6 +33,11 @@ pub trait QueryableStore: Send + Sync {
         source_version: &str,
     ) -> Result<Option<KnowledgeEntry>>;
 
+    /// Record access for a batch of entries (updates last_accessed and access_count).
+    /// All updates are batched into a single write transaction.
+    /// Failures are non-fatal — implementations should log warnings, not propagate errors.
+    async fn record_access(&self, entry_ids: &[uuid::Uuid]) -> Result<()>;
+
     /// Downcast support for store-specific operations (e.g., LiteStore::rebuild_from_files).
     fn as_any(&self) -> &dyn Any;
 }

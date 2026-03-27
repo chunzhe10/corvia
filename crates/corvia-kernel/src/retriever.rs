@@ -15,7 +15,7 @@ use corvia_common::types::{EdgeDirection, SearchResult};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::rag_types::{RetrievalMetrics, RetrievalOpts, RetrievalResult};
 use crate::reasoner::cosine_similarity;
@@ -58,6 +58,23 @@ fn check_rbac_scope(
                 });
             }
     None
+}
+
+/// Fire-and-forget access recording for retrieved entries.
+///
+/// Spawns a background task to update `last_accessed` and `access_count` on all
+/// entries in the result set. The write does NOT block the search response.
+/// Failures are logged as warnings — access tracking is optimization, not correctness.
+fn spawn_access_recording(store: Arc<dyn QueryableStore>, results: &[SearchResult]) {
+    if results.is_empty() {
+        return;
+    }
+    let entry_ids: Vec<uuid::Uuid> = results.iter().map(|sr| sr.entry.id).collect();
+    tokio::spawn(async move {
+        if let Err(e) = store.record_access(&entry_ids).await {
+            warn!(error = %e, "Access recording failed");
+        }
+    });
 }
 
 /// First stage of the RAG pipeline: query -> ranked results.
@@ -149,6 +166,9 @@ impl Retriever for VectorRetriever {
 
         let search_latency_ms = search_start.elapsed().as_millis() as u64;
         let post_filter_count = filtered.len();
+
+        // Record access (fire-and-forget, non-blocking).
+        spawn_access_recording(Arc::clone(&self.store), &filtered);
 
         info!(
             retriever = self.name(),
@@ -451,6 +471,9 @@ impl Retriever for GraphExpandRetriever {
         let filter_latency_ms = filter_start.elapsed().as_millis() as u64;
         let search_latency_ms = search_start.elapsed().as_millis() as u64;
         let post_filter_count = filtered.len();
+
+        // Record access (fire-and-forget, non-blocking).
+        spawn_access_recording(Arc::clone(&self.store), &filtered);
 
         info!(
             retriever = self.name(),
@@ -1036,5 +1059,86 @@ mod tests {
             "expected graph_reinforced >= 1, got {}",
             result.metrics.graph_reinforced
         );
+    }
+
+    /// Verify that access_count increments and last_accessed updates after retrieval.
+    #[tokio::test]
+    async fn test_access_tracking_increments_on_retrieval() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+
+        let engine: Arc<dyn InferenceEngine> = Arc::new(MockEngine);
+
+        // Insert entries with slight embedding variation.
+        let mut entry_ids = Vec::new();
+        for i in 0..5 {
+            let mut entry = KnowledgeEntry::new(
+                format!("access tracking test item {i}"),
+                "access-scope".to_string(),
+                format!("v{i}"),
+            );
+            entry.embedding = Some(vec![1.0, i as f32 * 0.01, 0.0]);
+            entry_ids.push(entry.id);
+            store.insert(&entry).await.unwrap();
+        }
+
+        // Verify initial state: access_count = 0, last_accessed = None.
+        let initial = store.get(&entry_ids[0]).await.unwrap().unwrap();
+        assert_eq!(initial.access_count, 0);
+        assert!(initial.last_accessed.is_none());
+
+        let retriever = VectorRetriever::new(store.clone() as Arc<dyn QueryableStore>, engine);
+
+        let opts = RetrievalOpts {
+            limit: 5,
+            visibility: VisibilityMode::All,
+            ..Default::default()
+        };
+        let result = retriever.retrieve("test", "access-scope", &opts).await.unwrap();
+        assert!(!result.results.is_empty());
+
+        // Give the spawned task time to complete.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Verify access tracking updated for returned entries.
+        let returned_ids: Vec<uuid::Uuid> = result.results.iter().map(|sr| sr.entry.id).collect();
+        for id in &returned_ids {
+            let entry = store.get(id).await.unwrap().unwrap();
+            assert_eq!(entry.access_count, 1, "access_count should be 1 for entry {}", id);
+            assert!(entry.last_accessed.is_some(), "last_accessed should be set for entry {}", id);
+        }
+
+        // Search again — access_count should increment to 2.
+        let _result2 = retriever.retrieve("test", "access-scope", &opts).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        for id in &returned_ids {
+            let entry = store.get(id).await.unwrap().unwrap();
+            assert!(entry.access_count >= 2, "access_count should be >= 2 after second search, got {}", entry.access_count);
+        }
+    }
+
+    /// Verify that record_access is graceful on empty input.
+    #[tokio::test]
+    async fn test_access_tracking_empty_results_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+
+        // record_access with empty slice should not panic or error.
+        store.record_access(&[]).await.unwrap();
+    }
+
+    /// Verify that record_access is graceful with non-existent entry IDs.
+    #[tokio::test]
+    async fn test_access_tracking_nonexistent_entry_graceful() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+
+        let fake_id = uuid::Uuid::now_v7();
+        // Should not panic or error — just skip the missing entry.
+        store.record_access(&[fake_id]).await.unwrap();
     }
 }
