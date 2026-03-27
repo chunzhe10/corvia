@@ -180,7 +180,7 @@ async fn status_handler(
 /// Force-recompute coverage and return fresh snapshot.
 async fn refresh_coverage_handler(
     State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+) -> Json<corvia_common::dashboard::CoverageResponse> {
     let scope_id = state
         .default_scope_id
         .as_deref()
@@ -190,15 +190,7 @@ async fn refresh_coverage_handler(
         .refresh(&state.data_dir, scope_id, &*state.store)
         .await;
 
-    Json(serde_json::json!({
-        "index_coverage": snapshot.coverage,
-        "index_stale": snapshot.stale,
-        "index_disk_count": snapshot.disk_count,
-        "index_store_count": snapshot.store_count,
-        "index_hnsw_count": snapshot.hnsw_count,
-        "index_stale_threshold": snapshot.threshold,
-        "index_coverage_checked_at": snapshot.checked_at,
-    }))
+    Json(snapshot.into())
 }
 
 /// GET /api/dashboard/traces
@@ -1761,6 +1753,74 @@ mod tests {
         assert_eq!(status, axum::http::StatusCode::OK);
         // GPU handler returns a GpuStatusResponse; just verify it's valid JSON
         assert!(json.is_object(), "response should be a JSON object");
+    }
+
+    #[tokio::test]
+    async fn test_status_coverage_with_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        // Insert 7 entries (creates knowledge JSON files on disk + store + HNSW)
+        let scope_id = corvia_common::constants::DEFAULT_SCOPE_ID;
+        for _ in 0..7 {
+            let mut entry = corvia_common::types::KnowledgeEntry::new(
+                "test content".into(), scope_id.into(), "test.rs".into(),
+            );
+            entry.embedding = Some(vec![0.1, 0.2, 0.3]);
+            state.store.insert(&entry).await.unwrap();
+        }
+        // Add 3 extra JSON files to simulate partial ingest
+        let knowledge_dir = tmp.path().join("knowledge").join(scope_id);
+        for i in 0..3 {
+            std::fs::write(
+                knowledge_dir.join(format!("extra-{i}.json")),
+                format!(r#"{{"extra":{i}}}"#),
+            ).unwrap();
+        }
+
+        // Refresh coverage cache so status has data
+        state.coverage_cache
+            .refresh(&state.data_dir, scope_id, &*state.store)
+            .await;
+
+        let (status, json) = get_json(state, "/api/dashboard/status").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json["index_disk_count"], 10);
+        assert_eq!(json["index_store_count"], 7);
+        assert_eq!(json["index_hnsw_count"], 7);
+        assert_eq!(json["index_coverage"], 0.7);
+        assert_eq!(json["index_stale"], true);
+        assert_eq!(json["index_stale_threshold"], 0.9);
+        assert!(json["index_coverage_checked_at"].is_string(), "checked_at should be a string");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_populates_cache_for_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        // Status before any refresh — cache has defaults
+        let (_, json_before) = get_json(state.clone(), "/api/dashboard/status").await;
+        assert!(json_before["index_coverage"].is_null());
+        assert!(json_before["index_coverage_checked_at"].is_null());
+
+        // POST refresh-coverage to populate the cache
+        let app = router(state.clone());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/dashboard/status/refresh-coverage")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        // Status after refresh — checked_at should now be set
+        let (_, json_after) = get_json(state, "/api/dashboard/status").await;
+        assert!(
+            json_after["index_coverage_checked_at"].is_string(),
+            "after refresh, checked_at should be set"
+        );
     }
 
 }

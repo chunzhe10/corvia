@@ -93,6 +93,28 @@ pub struct DashboardStatusResponse {
     pub index_coverage_checked_at: Option<String>,
 }
 
+/// Coverage snapshot returned by both GET /api/dashboard/status (embedded)
+/// and POST /api/dashboard/status/refresh-coverage (standalone).
+/// Shared struct ensures both endpoints stay in sync.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoverageResponse {
+    /// Coverage ratio: HNSW entries / knowledge files on disk (0.0-1.0).
+    /// null when no knowledge files exist on disk.
+    pub index_coverage: Option<f64>,
+    /// true when coverage < threshold. null when coverage is null.
+    pub index_stale: Option<bool>,
+    /// Knowledge JSON files on disk for the default scope.
+    pub index_disk_count: u64,
+    /// Entries in Redb SCOPE_INDEX for the default scope.
+    pub index_store_count: u64,
+    /// Entries in Redb HNSW_TO_UUID table.
+    pub index_hnsw_count: u64,
+    /// Configured staleness threshold (0.0-1.0).
+    pub index_stale_threshold: f64,
+    /// ISO 8601 timestamp of last coverage computation.
+    pub index_coverage_checked_at: Option<String>,
+}
+
 /// A single structured log entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
