@@ -463,10 +463,10 @@ fn list_scope_dirs(knowledge_dir: &Path) -> Vec<String> {
     let mut scopes = Vec::new();
     if let Ok(entries) = std::fs::read_dir(knowledge_dir) {
         for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
-                    scopes.push(name.to_string());
-                }
+            if entry.path().is_dir()
+                && let Some(name) = entry.file_name().to_str()
+            {
+                scopes.push(name.to_string());
             }
         }
     }
