@@ -66,34 +66,35 @@ pub fn spawn_gc_worker(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let interval_minutes = {
-                let cfg = config.read().unwrap();
-                cfg.forgetting
+            // Read all config values in a single lock acquisition to avoid
+            // TOCTOU races between hot-reload and cycle execution.
+            let (interval_minutes, forgetting_config, scope_configs) = {
+                let cfg = config.read().unwrap_or_else(|poisoned| {
+                    warn!("Config lock poisoned in GC worker, using last known config");
+                    poisoned.into_inner()
+                });
+                let interval = cfg
+                    .forgetting
                     .as_ref()
                     .map(|f| f.interval_minutes)
-                    .unwrap_or(60)
+                    .unwrap_or(60);
+                let forgetting = cfg.forgetting.clone();
+                let scopes: HashMap<String, Option<ScopeForgettingOverride>> = cfg
+                    .scope
+                    .as_ref()
+                    .map(|sc| {
+                        sc.iter()
+                            .map(|s| (s.id.clone(), s.forgetting.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (interval, forgetting, scopes)
             };
+
             tokio::time::sleep(std::time::Duration::from_secs(
                 interval_minutes as u64 * 60,
             ))
             .await;
-
-            let forgetting_config = {
-                let cfg = config.read().unwrap();
-                cfg.forgetting.clone()
-            };
-            let scope_configs: HashMap<String, Option<ScopeForgettingOverride>> = {
-                let cfg = config.read().unwrap();
-                cfg.scope
-                    .as_ref()
-                    .map(|scopes| {
-                        scopes
-                            .iter()
-                            .map(|s| (s.id.clone(), s.forgetting.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            };
 
             match run_gc_cycle(&store, &graph, &data_dir, forgetting_config.as_ref(), &scope_configs).await {
                 Ok(report) => {
@@ -146,6 +147,19 @@ pub async fn run_gc_cycle(
     async move {
         let mut report = GcCycleReport::default();
 
+        // Downcast to LiteStore once for the entire cycle
+        let lite_store = store
+            .as_any()
+            .downcast_ref::<crate::lite_store::LiteStore>()
+            .ok_or_else(|| {
+                corvia_common::errors::CorviaError::Storage(
+                    "GC worker requires LiteStore backend".into(),
+                )
+            })?;
+
+        // Load ALL entries once (not per-scope) to avoid O(S*E) redundant scans
+        let all_entries = lite_store.fetch_all_entries()?;
+
         // Discover scopes from knowledge directory
         let knowledge_dir = data_dir.join("knowledge");
         let scopes = list_scope_dirs(&knowledge_dir);
@@ -156,9 +170,10 @@ pub async fn run_gc_cycle(
                 .and_then(|o| o.as_ref());
 
             process_scope(
-                store,
+                lite_store,
                 graph,
                 scope_id,
+                &all_entries,
                 forgetting,
                 scope_override,
                 &mut report,
@@ -176,24 +191,14 @@ pub async fn run_gc_cycle(
 
 /// Process a single scope: score all entries, determine transitions, apply batched writes.
 async fn process_scope(
-    store: &Arc<dyn QueryableStore>,
+    lite_store: &crate::lite_store::LiteStore,
     graph: &Arc<dyn GraphStore>,
     scope_id: &str,
+    all_entries: &[KnowledgeEntry],
     forgetting: &ForgettingConfig,
     scope_override: Option<&ScopeForgettingOverride>,
     report: &mut GcCycleReport,
 ) -> Result<()> {
-    // Load all entries from Redb via the store (downcast to LiteStore).
-    let lite_store = store
-        .as_any()
-        .downcast_ref::<crate::lite_store::LiteStore>()
-        .ok_or_else(|| {
-            corvia_common::errors::CorviaError::Storage(
-                "GC worker requires LiteStore backend".into(),
-            )
-        })?;
-
-    let all_entries = lite_store.fetch_all_entries()?;
     let scope_entries: Vec<&KnowledgeEntry> = all_entries
         .iter()
         .filter(|e| e.scope_id == scope_id)
@@ -223,11 +228,12 @@ async fn process_scope(
 
         report.entries_scored += 1;
 
-        // Compute retention params
-        let days_since_creation = (now - entry.recorded_at).num_seconds() as f64 / 86400.0;
+        // Compute retention params (clamp to non-negative for clock skew safety)
+        let days_since_creation =
+            (now - entry.recorded_at).num_seconds().max(0) as f64 / 86400.0;
         let days_since_access = entry
             .last_accessed
-            .map(|la| (now - la).num_seconds() as f64 / 86400.0);
+            .map(|la| (now - la).num_seconds().max(0) as f64 / 86400.0);
         let inbound_edges = graph
             .edges(&entry.id, EdgeDirection::Incoming)
             .await
@@ -256,6 +262,7 @@ async fn process_scope(
             &policy,
             retention_score,
             days_since_access,
+            days_since_creation,
         );
 
         // Take the WORSE transition (lower tier = worse)
@@ -290,8 +297,8 @@ async fn process_scope(
         .iter()
         .any(|t| t.old_tier == Tier::Warm && t.new_tier == Tier::Cold);
 
-    // Apply transitions + score updates in batches
-    apply_transitions_batched(lite_store, &transitions, &score_updates, &all_entries)?;
+    // Apply transitions + score updates in batches (read-modify-write preserves access tracking)
+    apply_transitions_batched(lite_store, &transitions, &score_updates)?;
 
     // Trigger HNSW rebuild if any Warm→Cold transitions (entries removed from HNSW)
     if has_warm_to_cold {
@@ -307,11 +314,14 @@ async fn process_scope(
 }
 
 /// Apply inactivity policy: force to Cold if inactive past threshold AND score < exemption.
+///
+/// `days_since_creation` is used as fallback when the entry has never been accessed.
 fn apply_inactivity_policy(
     entry: &KnowledgeEntry,
     policy: &corvia_common::config::ResolvedPolicy,
     retention_score: f32,
     days_since_access: Option<f64>,
+    days_since_creation: f64,
 ) -> Option<Tier> {
     // Only applies to Hot/Warm entries
     if entry.tier != Tier::Hot && entry.tier != Tier::Warm {
@@ -323,11 +333,8 @@ fn apply_inactivity_policy(
         return None;
     }
 
-    let inactive_days = days_since_access.unwrap_or_else(|| {
-        // Never accessed — use days since creation
-        let now = Utc::now();
-        (now - entry.recorded_at).num_seconds() as f64 / 86400.0
-    });
+    // Never accessed → use days since creation as inactivity measure
+    let inactive_days = days_since_access.unwrap_or(days_since_creation);
 
     if inactive_days > policy.max_inactive_days as f64 {
         Some(Tier::Cold)
@@ -382,11 +389,14 @@ fn clamp_one_step(current: Tier, target: Tier) -> Tier {
 }
 
 /// Apply tier transitions and score updates in batched Redb writes.
+///
+/// Uses read-modify-write via `GcEntryUpdate` to preserve concurrent access
+/// tracking updates (access_count, last_accessed) that may have occurred
+/// between the initial entry scan and this batch write.
 fn apply_transitions_batched(
     store: &crate::lite_store::LiteStore,
     transitions: &[TierTransition],
     score_updates: &[(uuid::Uuid, f32)],
-    all_entries: &[KnowledgeEntry],
 ) -> Result<()> {
     if transitions.is_empty() && score_updates.is_empty() {
         return Ok(());
@@ -398,10 +408,6 @@ fn apply_transitions_batched(
     let score_map: HashMap<uuid::Uuid, f32> =
         score_updates.iter().copied().collect();
 
-    // Build entry lookup
-    let entry_map: HashMap<uuid::Uuid, &KnowledgeEntry> =
-        all_entries.iter().map(|e| (e.id, e)).collect();
-
     // Collect all entry IDs that need updates
     let mut all_ids: Vec<uuid::Uuid> = score_map.keys().copied().collect();
     for t in transitions {
@@ -412,57 +418,41 @@ fn apply_transitions_batched(
     all_ids.sort();
     all_ids.dedup();
 
-    // Build updated entries
-    let mut updated_entries: Vec<KnowledgeEntry> = Vec::with_capacity(all_ids.len());
-    let mut warm_to_cold_ids: Vec<uuid::Uuid> = Vec::new();
+    // Build GcEntryUpdate structs (lightweight, no entry cloning)
+    let mut gc_updates: Vec<crate::lite_store::GcEntryUpdate> = Vec::with_capacity(all_ids.len());
+    let mut hnsw_removal_ids: Vec<uuid::Uuid> = Vec::new();
 
     for &entry_id in &all_ids {
-        let base = match entry_map.get(&entry_id) {
-            Some(e) => e,
-            None => {
-                warn!(entry_id = %entry_id, "Entry not found during GC batch update, skipping");
-                continue;
-            }
+        let score = match score_map.get(&entry_id) {
+            Some(&s) => s,
+            None => 0.0, // transition-only entry (shouldn't happen, but safe fallback)
         };
 
-        let mut entry = (*base).clone();
-        let mut changed = false;
-
-        // Apply score update
-        if let Some(&score) = score_map.get(&entry_id) {
-            entry.retention_score = Some(score);
-            changed = true;
-        }
-
-        // Apply tier transition
-        if let Some(transition) = transition_map.get(&entry_id) {
-            entry.tier = transition.new_tier;
-            entry.tier_changed_at = Some(Utc::now());
-
-            // Track Warm→Cold for HNSW mapping cleanup
-            if transition.old_tier == Tier::Warm && transition.new_tier == Tier::Cold {
-                warm_to_cold_ids.push(entry_id);
+        let (new_tier, tier_changed_at) = if let Some(transition) = transition_map.get(&entry_id) {
+            // Track entries leaving HNSW-indexed tiers for mapping cleanup.
+            // Warm→Cold is the primary case; Cold→Forgotten is defense-in-depth.
+            if transition.new_tier == Tier::Cold || transition.new_tier == Tier::Forgotten {
+                hnsw_removal_ids.push(entry_id);
             }
+            (Some(transition.new_tier), Some(Utc::now()))
+        } else {
+            (None, None)
+        };
 
-            // Forgotten = discard embedding
-            if transition.new_tier == Tier::Forgotten {
-                entry.embedding = None;
-            }
-            changed = true;
-        }
-
-        if changed {
-            updated_entries.push(entry);
-        }
+        gc_updates.push(crate::lite_store::GcEntryUpdate {
+            entry_id,
+            retention_score: score,
+            new_tier,
+            tier_changed_at,
+        });
     }
 
-    // Batch write to Redb + JSON files
-    let refs: Vec<&KnowledgeEntry> = updated_entries.iter().collect();
-    store.update_entries_batch(&refs, BATCH_SIZE)?;
+    // Batch write using read-modify-write (preserves access tracking fields)
+    store.update_entries_batch(&gc_updates, BATCH_SIZE)?;
 
-    // Delete HNSW mappings for Warm→Cold transitions (lazy orphaning)
-    if !warm_to_cold_ids.is_empty() {
-        store.remove_hnsw_mappings(&warm_to_cold_ids)?;
+    // Delete HNSW mappings for entries leaving indexed tiers (lazy orphaning)
+    if !hnsw_removal_ids.is_empty() {
+        store.remove_hnsw_mappings(&hnsw_removal_ids)?;
     }
 
     Ok(())
@@ -595,7 +585,7 @@ mod tests {
         let entry = make_entry(Tier::Hot, MemoryType::Episodic);
         let policy = default_policy();
         // Never accessed, 60 days old, low score
-        let result = apply_inactivity_policy(&entry, &policy, 0.30, None);
+        let result = apply_inactivity_policy(&entry, &policy, 0.30, None, 60.0);
         assert_eq!(result, Some(Tier::Cold));
     }
 
@@ -604,7 +594,7 @@ mod tests {
         let entry = make_entry(Tier::Hot, MemoryType::Episodic);
         let policy = default_policy();
         // High score exempts from inactivity policy
-        let result = apply_inactivity_policy(&entry, &policy, 0.65, None);
+        let result = apply_inactivity_policy(&entry, &policy, 0.65, None, 60.0);
         assert_eq!(result, None);
     }
 
@@ -612,7 +602,7 @@ mod tests {
     fn test_inactivity_skips_cold_entries() {
         let entry = make_entry(Tier::Cold, MemoryType::Episodic);
         let policy = default_policy();
-        let result = apply_inactivity_policy(&entry, &policy, 0.10, None);
+        let result = apply_inactivity_policy(&entry, &policy, 0.10, None, 60.0);
         assert_eq!(result, None);
     }
 
@@ -622,20 +612,19 @@ mod tests {
         // Accessed 10 days ago (under 30-day threshold)
         entry.last_accessed = Some(Utc::now() - chrono::Duration::days(10));
         let policy = default_policy();
-        let result = apply_inactivity_policy(&entry, &policy, 0.30, Some(10.0));
+        let result = apply_inactivity_policy(&entry, &policy, 0.30, Some(10.0), 60.0);
         assert_eq!(result, None);
     }
 
-    // ── Pinned entries ─────────────────────────────────────────────────────
+    // ── Tier ordering invariant ─────────────────────────────────────────────
 
     #[test]
-    fn test_pinned_entry_has_pin_info() {
-        let mut entry = make_entry(Tier::Hot, MemoryType::Episodic);
-        entry.pin = Some(PinInfo {
-            by: "admin".into(),
-            at: Utc::now(),
-        });
-        assert!(entry.pin.is_some());
+    fn test_tier_ordering_invariant() {
+        // worse_transition relies on Ord derivation from enum variant order.
+        // This test catches accidental reordering of Tier variants.
+        assert!(Tier::Forgotten < Tier::Cold);
+        assert!(Tier::Cold < Tier::Warm);
+        assert!(Tier::Warm < Tier::Hot);
     }
 
     // ── list_scope_dirs ────────────────────────────────────────────────────
@@ -912,5 +901,80 @@ mod tests {
         let updated = store.get(&entry.id).await.unwrap().unwrap();
         assert_eq!(updated.tier, Tier::Forgotten);
         assert!(updated.embedding.is_none(), "Forgotten entry should have no embedding");
+    }
+
+    #[tokio::test]
+    async fn test_gc_cycle_warm_to_cold_triggers_hnsw_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::lite_store::LiteStore::open(dir.path(), 768).unwrap());
+        store.init_schema().await.unwrap();
+
+        // Insert a Warm entry with very low score (should transition Warm → Cold)
+        let mut entry = make_entry(Tier::Warm, MemoryType::Episodic);
+        entry.scope_id = "test-scope".into();
+        entry.recorded_at = Utc::now() - chrono::Duration::days(365);
+        entry.embedding = Some(vec![0.1; 768]);
+        entry.confidence = Some(0.0);
+        entry.superseded_by = Some(uuid::Uuid::now_v7());
+        entry.tier = Tier::Warm;
+
+        crate::knowledge_files::write_entry(dir.path(), &entry).unwrap();
+        store.insert(&entry).await.unwrap();
+
+        let graph: Arc<dyn GraphStore> = store.clone();
+        let store_q: Arc<dyn QueryableStore> = store.clone();
+
+        let config = ForgettingConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+            .await
+            .unwrap();
+
+        assert_eq!(report.warm_to_cold, 1, "Expected Warm→Cold transition");
+        assert!(report.hnsw_rebuild_triggered, "HNSW rebuild should be triggered on Warm→Cold");
+
+        // Verify entry is now Cold
+        let updated = store.get(&entry.id).await.unwrap().unwrap();
+        assert_eq!(updated.tier, Tier::Cold);
+    }
+
+    #[tokio::test]
+    async fn test_gc_cycle_cold_to_warm_promotion() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::lite_store::LiteStore::open(dir.path(), 768).unwrap());
+        store.init_schema().await.unwrap();
+
+        // Insert a Cold entry with very high score (should promote Cold → Warm)
+        let mut entry = make_entry(Tier::Cold, MemoryType::Structural);
+        entry.scope_id = "test-scope".into();
+        entry.recorded_at = Utc::now(); // fresh
+        entry.embedding = Some(vec![0.1; 768]);
+        entry.access_count = 80;
+        entry.last_accessed = Some(Utc::now());
+        entry.confidence = Some(0.95);
+        entry.tier = Tier::Cold;
+
+        crate::knowledge_files::write_entry(dir.path(), &entry).unwrap();
+        store.insert(&entry).await.unwrap();
+
+        let graph: Arc<dyn GraphStore> = store.clone();
+        let store_q: Arc<dyn QueryableStore> = store.clone();
+
+        let config = ForgettingConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        let report = run_gc_cycle(&store_q, &graph, dir.path(), Some(&config), &HashMap::new())
+            .await
+            .unwrap();
+
+        assert_eq!(report.cold_to_warm, 1, "Expected Cold→Warm promotion");
+
+        let updated = store.get(&entry.id).await.unwrap().unwrap();
+        assert_eq!(updated.tier, Tier::Warm, "Cold entry with high score should promote to Warm");
     }
 }

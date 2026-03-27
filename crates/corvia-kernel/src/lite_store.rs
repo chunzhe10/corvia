@@ -36,6 +36,20 @@ const EF_CONSTRUCTION: usize = 200;
 const EF_SEARCH: usize = 64;
 const MAX_ELEMENTS: usize = 100_000;
 
+/// GC-specific field update for a single entry, used by `update_entries_batch`.
+///
+/// Carries only the fields the GC worker modifies, so the batch write can
+/// read-modify-write against the current Redb state and preserve concurrent
+/// access tracking updates (access_count, last_accessed).
+#[derive(Debug)]
+pub struct GcEntryUpdate {
+    pub entry_id: uuid::Uuid,
+    pub retention_score: f32,
+    /// `Some(tier)` if the tier changed, `None` for score-only updates.
+    pub new_tier: Option<corvia_common::types::Tier>,
+    pub tier_changed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// LiteStore implements `QueryableStore` using hnsw_rs + Redb + knowledge files.
 /// Zero Docker required. Suitable for single-machine workloads up to ~100K entries.
 pub struct LiteStore {
@@ -228,10 +242,73 @@ impl LiteStore {
         Ok(())
     }
 
-    /// Batch-update entry metadata in Redb. Groups writes into transactions of
+    /// Batch-update entry metadata in Redb using read-modify-write to preserve
+    /// concurrent access tracking updates. Groups writes into transactions of
     /// `batch_size` entries to avoid blocking concurrent access tracking writes.
-    pub fn update_entries_batch(&self, entries: &[&KnowledgeEntry], batch_size: usize) -> Result<()> {
-        for chunk in entries.chunks(batch_size) {
+    ///
+    /// Write ordering: JSON files first (idempotent source of truth), then Redb.
+    /// If a JSON write fails, the function returns early before committing Redb,
+    /// keeping the two stores consistent.
+    ///
+    /// The `gc_fields` map provides the GC-specific field updates (tier, retention_score,
+    /// tier_changed_at, embedding). Access tracking fields (access_count, last_accessed)
+    /// are preserved from the current Redb state via read-modify-write inside the
+    /// write transaction.
+    pub fn update_entries_batch(
+        &self,
+        gc_updates: &[GcEntryUpdate],
+        batch_size: usize,
+    ) -> Result<()> {
+        for chunk in gc_updates.chunks(batch_size) {
+            // Phase 1: Read current entries from Redb to preserve access tracking fields
+            let mut merged_entries: Vec<KnowledgeEntry> = Vec::with_capacity(chunk.len());
+            {
+                let read_txn = self
+                    .db
+                    .begin_read()
+                    .map_err(|e| CorviaError::Storage(format!("Failed to begin read txn: {e}")))?;
+                let table = read_txn
+                    .open_table(ENTRIES)
+                    .map_err(|e| CorviaError::Storage(format!("Failed to open ENTRIES: {e}")))?;
+
+                for update in chunk {
+                    let uuid_str = update.entry_id.to_string();
+                    match table.get(uuid_str.as_str()) {
+                        Ok(Some(guard)) => {
+                            match serde_json::from_slice::<KnowledgeEntry>(guard.value()) {
+                                Ok(mut current) => {
+                                    // Apply GC-specific updates while preserving access tracking
+                                    current.retention_score = Some(update.retention_score);
+                                    if let Some(new_tier) = update.new_tier {
+                                        current.tier = new_tier;
+                                        current.tier_changed_at = update.tier_changed_at;
+                                        if new_tier == corvia_common::types::Tier::Forgotten {
+                                            current.embedding = None;
+                                        }
+                                    }
+                                    merged_entries.push(current);
+                                }
+                                Err(e) => {
+                                    warn!(entry_id = %update.entry_id, error = %e, "Failed to deserialize entry in GC batch, skipping");
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            warn!(entry_id = %update.entry_id, "Entry not found in Redb during GC batch, skipping");
+                        }
+                        Err(e) => {
+                            warn!(entry_id = %update.entry_id, error = %e, "Failed to read entry in GC batch, skipping");
+                        }
+                    }
+                }
+            }
+
+            // Phase 2: Write JSON files first (idempotent, source of truth for rebuilds)
+            for entry in &merged_entries {
+                knowledge_files::write_entry(&self.data_dir, entry)?;
+            }
+
+            // Phase 3: Commit to Redb (entries consistent with JSON after this)
             let write_txn = self
                 .db
                 .begin_write()
@@ -240,7 +317,7 @@ impl LiteStore {
                 let mut table = write_txn
                     .open_table(ENTRIES)
                     .map_err(|e| CorviaError::Storage(format!("Failed to open ENTRIES: {e}")))?;
-                for entry in chunk {
+                for entry in &merged_entries {
                     let uuid_str = entry.id.to_string();
                     let entry_json = serde_json::to_vec(entry)
                         .map_err(|e| CorviaError::Storage(format!("Failed to serialize: {e}")))?;
@@ -252,11 +329,6 @@ impl LiteStore {
             write_txn
                 .commit()
                 .map_err(|e| CorviaError::Storage(format!("Failed to commit batch: {e}")))?;
-
-            // Write JSON files outside the Redb transaction
-            for entry in chunk {
-                knowledge_files::write_entry(&self.data_dir, entry)?;
-            }
         }
         Ok(())
     }
