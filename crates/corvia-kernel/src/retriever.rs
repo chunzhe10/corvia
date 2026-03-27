@@ -238,7 +238,7 @@ impl Retriever for VectorRetriever {
         // Apply tier_weight multiplier: deprioritize Warm/Cold, exclude Forgotten.
         // Fast path: skip filter/map/re-sort when all entries are Hot (common case).
         let any_non_hot = merged.iter().any(|sr| sr.entry.tier != Tier::Hot);
-        let mut tier_weighted = if any_non_hot {
+        let tier_weighted = if any_non_hot {
             let mut weighted: Vec<SearchResult> = merged
                 .into_iter()
                 .filter(|sr| sr.entry.tier != Tier::Forgotten)
@@ -1724,13 +1724,14 @@ mod tests {
             store.insert(&entry).await.unwrap();
         }
 
-        // Warm entry with LOW cosine similarity to query [1,0,0].
+        // Warm entry with moderate cosine similarity to query [1,0,0].
+        // cosine([0.4,0.9,0.0], [1,0,0]) ≈ 0.407 → weighted: 0.407 * 0.7 ≈ 0.285
         let mut warm = KnowledgeEntry::new(
             "warm low cosine".to_string(),
             "rank-scope".to_string(),
             "v1".to_string(),
         );
-        warm.embedding = Some(vec![0.0, 1.0, 0.0]); // orthogonal to query → cosine ~0
+        warm.embedding = Some(vec![0.4, 0.9, 0.0]); // moderate similarity to query
         warm.tier = Tier::Warm;
         store.insert(&warm).await.unwrap();
 
