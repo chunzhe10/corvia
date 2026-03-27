@@ -1589,6 +1589,15 @@ mod tests {
     }
 
     #[test]
+    fn test_unmapped_content_role_detects_empty_string() {
+        let mut e = entry("some entry", "test");
+        e.metadata.content_role = Some("".into());
+        let findings = check_unmapped_content_role(&[e], "test");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].check_type, CheckType::UnmappedContentRole);
+    }
+
+    #[test]
     fn test_unmapped_content_role_parse_and_str() {
         assert_eq!(CheckType::UnmappedContentRole.as_str(), "unmapped_content_role");
         assert_eq!("unmapped_content_role".parse::<CheckType>().unwrap(), CheckType::UnmappedContentRole);

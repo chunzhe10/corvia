@@ -99,6 +99,20 @@ impl std::str::FromStr for Tier {
 }
 
 impl MemoryType {
+    /// Try to map a content_role string to a MemoryType.
+    ///
+    /// Returns `Some(MemoryType)` for known roles, `None` for unrecognized values.
+    fn try_from_role(role: &str) -> Option<Self> {
+        match role {
+            "code" => Some(Self::Structural),
+            "design" | "decision" | "plan" => Some(Self::Decisional),
+            "memory" | "learning" => Some(Self::Episodic),
+            "finding" => Some(Self::Analytical),
+            "instruction" => Some(Self::Procedural),
+            _ => None,
+        }
+    }
+
     /// Classify a content_role string into a MemoryType.
     ///
     /// Returns the mapped MemoryType, or `Episodic` (default) for `None` or unrecognized values.
@@ -106,23 +120,16 @@ impl MemoryType {
     pub fn from_content_role(content_role: Option<&str>) -> Self {
         match content_role {
             None => Self::default(),
-            Some(role) => match role {
-                "code" => Self::Structural,
-                "design" | "decision" | "plan" => Self::Decisional,
-                "memory" | "learning" => Self::Episodic,
-                "finding" => Self::Analytical,
-                "instruction" => Self::Procedural,
-                _ => {
-                    tracing::warn!(content_role = role, "unmapped content_role, defaulting to Episodic");
-                    Self::default()
-                }
-            },
+            Some(role) => Self::try_from_role(role).unwrap_or_else(|| {
+                tracing::warn!(content_role = role, "unmapped content_role, defaulting to Episodic");
+                Self::default()
+            }),
         }
     }
 
     /// Returns true if the given content_role maps to a known MemoryType.
     pub fn is_known_content_role(role: &str) -> bool {
-        matches!(role, "code" | "design" | "decision" | "plan" | "memory" | "learning" | "finding" | "instruction")
+        Self::try_from_role(role).is_some()
     }
 }
 
@@ -253,6 +260,16 @@ impl KnowledgeEntry {
         self
     }
 
+    /// Set confidence score. Value is clamped to `[0.0, 1.0]`; NaN is rejected (set to None).
+    pub fn with_confidence(mut self, value: f32) -> Self {
+        if value.is_nan() {
+            self.confidence = None;
+        } else {
+            self.confidence = Some(value.clamp(0.0, 1.0));
+        }
+        self
+    }
+
     /// Auto-classify memory_type from the entry's content_role (mutates in place).
     pub fn auto_classify(&mut self) {
         self.memory_type = MemoryType::from_content_role(self.metadata.content_role.as_deref());
@@ -264,10 +281,21 @@ impl KnowledgeEntry {
         self
     }
 
+    /// Record an access to this entry. Uses saturating increment to prevent overflow.
+    pub fn record_access(&mut self) {
+        self.access_count = self.access_count.saturating_add(1);
+        self.last_accessed = Some(Utc::now());
+    }
+
     /// Pin this entry, exempting it from GC demotion.
+    ///
+    /// # Panics
+    /// Panics in debug mode if `by` is empty.
     pub fn pin(&mut self, by: impl Into<String>) {
+        let by = by.into();
+        debug_assert!(!by.is_empty(), "pin `by` must not be empty");
         self.pin = Some(PinInfo {
-            by: by.into(),
+            by,
             at: Utc::now(),
         });
     }
@@ -614,5 +642,85 @@ mod tests {
             let back: Tier = s.parse().unwrap();
             assert_eq!(*t, back);
         }
+    }
+
+    #[test]
+    fn test_with_confidence_clamps_range() {
+        let entry = KnowledgeEntry::new("t".into(), "s".into(), "v".into())
+            .with_confidence(0.5);
+        assert_eq!(entry.confidence, Some(0.5));
+
+        let entry = KnowledgeEntry::new("t".into(), "s".into(), "v".into())
+            .with_confidence(5.0);
+        assert_eq!(entry.confidence, Some(1.0));
+
+        let entry = KnowledgeEntry::new("t".into(), "s".into(), "v".into())
+            .with_confidence(-1.0);
+        assert_eq!(entry.confidence, Some(0.0));
+
+        let entry = KnowledgeEntry::new("t".into(), "s".into(), "v".into())
+            .with_confidence(f32::NAN);
+        assert!(entry.confidence.is_none());
+    }
+
+    #[test]
+    fn test_record_access_increments_and_timestamps() {
+        let mut entry = KnowledgeEntry::new("t".into(), "s".into(), "v".into());
+        assert_eq!(entry.access_count, 0);
+        assert!(entry.last_accessed.is_none());
+
+        entry.record_access();
+        assert_eq!(entry.access_count, 1);
+        assert!(entry.last_accessed.is_some());
+    }
+
+    #[test]
+    fn test_record_access_saturates_at_max() {
+        let mut entry = KnowledgeEntry::new("t".into(), "s".into(), "v".into());
+        entry.access_count = u32::MAX;
+        entry.record_access();
+        assert_eq!(entry.access_count, u32::MAX);
+    }
+
+    #[test]
+    fn test_from_str_case_sensitive() {
+        // FromStr is strictly lowercase — mixed case is rejected
+        assert!("Structural".parse::<MemoryType>().is_err());
+        assert!("HOT".parse::<Tier>().is_err());
+        assert!("Warm".parse::<Tier>().is_err());
+    }
+
+    #[test]
+    fn test_forward_compat_deserialization_with_all_tiered_fields() {
+        // JSON with all tiered fields explicitly set — tests forward compatibility
+        let json = r#"{
+            "id": "01960000-0000-7000-8000-000000000001",
+            "content": "rich entry",
+            "source_version": "v2",
+            "scope_id": "test",
+            "workstream": "main",
+            "recorded_at": "2026-03-01T00:00:00Z",
+            "valid_from": "2026-03-01T00:00:00Z",
+            "valid_to": null,
+            "superseded_by": null,
+            "embedding": null,
+            "metadata": {"content_role": "design"},
+            "memory_type": "decisional",
+            "confidence": 0.85,
+            "last_accessed": "2026-03-15T12:00:00Z",
+            "access_count": 42,
+            "tier": "warm",
+            "tier_changed_at": "2026-03-10T00:00:00Z",
+            "retention_score": 0.72,
+            "pin": {"by": "agent-1", "at": "2026-03-05T00:00:00Z"}
+        }"#;
+        let entry: KnowledgeEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.memory_type, MemoryType::Decisional);
+        assert_eq!(entry.confidence, Some(0.85));
+        assert_eq!(entry.access_count, 42);
+        assert_eq!(entry.tier, Tier::Warm);
+        assert_eq!(entry.retention_score, Some(0.72));
+        assert!(entry.is_pinned());
+        assert_eq!(entry.pin.unwrap().by, "agent-1");
     }
 }
