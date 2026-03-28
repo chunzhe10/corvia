@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use corvia_common::errors::Result;
-use corvia_common::types::{SearchResult, Tier};
+use corvia_common::types::{KnowledgeEntry, SearchResult, Tier};
 use tracing::{info, warn};
 
 use super::{
@@ -17,7 +17,7 @@ use super::{
 };
 use crate::lite_store::LiteStore;
 use crate::retriever::tier_weight;
-use crate::traits::{InferenceEngine, QueryableStore};
+use crate::traits::{FullTextSearchable, InferenceEngine, QueryableStore};
 
 /// First stage of the pipeline: query -> ranked candidates.
 ///
@@ -156,5 +156,227 @@ impl Searcher for VectorSearcher {
                 warnings: Vec::new(),
             },
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BM25Searcher — full-text search via FullTextSearchable
+// ---------------------------------------------------------------------------
+
+/// BM25/full-text searcher using a [`FullTextSearchable`] backend.
+///
+/// Store-agnostic: works with tantivy (LiteStore) or tsvector (PostgresStore).
+/// Applies min-max normalization to raw text-relevance scores before returning.
+pub struct BM25Searcher {
+    fts: Arc<dyn FullTextSearchable>,
+}
+
+impl BM25Searcher {
+    pub fn new(fts: Arc<dyn FullTextSearchable>) -> Self {
+        Self { fts }
+    }
+}
+
+#[async_trait]
+impl Searcher for BM25Searcher {
+    fn name(&self) -> &str {
+        "bm25"
+    }
+
+    fn needs_embedding(&self) -> bool {
+        false
+    }
+
+    async fn search(&self, ctx: &SearchContext) -> Result<RankedSet> {
+        let start = Instant::now();
+
+        let search_limit = if ctx.opts.content_role.is_some()
+            || ctx.opts.source_origin.is_some()
+            || ctx.opts.workstream.is_some()
+        {
+            ctx.opts.limit * 3
+        } else {
+            ctx.opts.limit
+        };
+
+        let raw_results = self
+            .fts
+            .search_text(&ctx.query, &ctx.scope_id, search_limit)
+            .await?;
+
+        // Convert to intermediate form with raw weighted scores.
+        struct RawCandidate {
+            entry: Arc<KnowledgeEntry>,
+            raw_score: f32,
+            weighted: f32,
+        }
+
+        let raw_candidates: Vec<RawCandidate> = raw_results
+            .into_iter()
+            .filter(|sr| sr.entry.tier != Tier::Forgotten)
+            .map(|sr| {
+                let raw_score = sr.score;
+                let weighted = raw_score * tier_weight(sr.entry.tier);
+                RawCandidate {
+                    entry: Arc::new(sr.entry),
+                    raw_score,
+                    weighted,
+                }
+            })
+            .collect();
+
+        // Min-max normalization on weighted scores before creating NormalizedScore.
+        let mut candidates: Vec<RankedCandidate> = if raw_candidates.is_empty() {
+            Vec::new()
+        } else {
+            let (min_s, max_s) = raw_candidates.iter().fold(
+                (f32::INFINITY, f32::NEG_INFINITY),
+                |(mn, mx), c| (mn.min(c.weighted), mx.max(c.weighted)),
+            );
+            let range = max_s - min_s;
+
+            raw_candidates
+                .into_iter()
+                .map(|rc| {
+                    let normalized = if range > f32::EPSILON {
+                        (rc.weighted - min_s) / range
+                    } else {
+                        // Degenerate case: all scores identical (or single result) -> 1.0.
+                        1.0
+                    };
+                    RankedCandidate {
+                        entry: rc.entry,
+                        scores: CandidateScores {
+                            components: HashMap::from([("bm25".to_string(), rc.raw_score)]),
+                            final_score: NormalizedScore::new(normalized),
+                        },
+                    }
+                })
+                .collect()
+        };
+
+        // Sort descending by final_score.
+        candidates.sort_unstable_by_key(|c| std::cmp::Reverse(c.scores.final_score));
+
+        let output_count = candidates.len();
+        let latency_ms = start.elapsed().as_millis() as u64;
+
+        info!(
+            searcher = self.name(),
+            output_count,
+            latency_ms,
+            "bm25 search complete"
+        );
+
+        Ok(RankedSet {
+            candidates,
+            metrics: StageMetrics {
+                stage_name: self.name().to_string(),
+                latency_ms,
+                input_count: 0,
+                output_count,
+                warnings: Vec::new(),
+            },
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use corvia_common::types::KnowledgeEntry;
+
+    /// Mock FullTextSearchable for testing BM25Searcher.
+    struct MockFts {
+        results: Vec<SearchResult>,
+    }
+
+    #[async_trait]
+    impl FullTextSearchable for MockFts {
+        async fn search_text(
+            &self,
+            _query: &str,
+            _scope_id: &str,
+            _limit: usize,
+        ) -> Result<Vec<SearchResult>> {
+            Ok(self.results.clone())
+        }
+    }
+
+    fn make_search_result(id_suffix: u8, score: f32) -> SearchResult {
+        let mut entry = KnowledgeEntry::new(
+            format!("content-{id_suffix}"),
+            "scope".into(),
+            format!("v{id_suffix}"),
+        );
+        entry.id = uuid::Uuid::from_bytes([
+            id_suffix, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+        SearchResult {
+            entry,
+            score,
+            tier: corvia_common::types::Tier::Hot,
+            retention_score: None,
+        }
+    }
+
+    fn make_ctx() -> SearchContext {
+        use crate::rag_types::RetrievalOpts;
+        SearchContext {
+            query_embedding: Arc::new(vec![]),
+            scope_id: "test".into(),
+            query: "test query".into(),
+            opts: RetrievalOpts {
+                limit: 10,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bm25_searcher_normalization() {
+        let fts = MockFts {
+            results: vec![
+                make_search_result(1, 8.0),
+                make_search_result(2, 4.0),
+                make_search_result(3, 2.0),
+            ],
+        };
+        let searcher = BM25Searcher::new(Arc::new(fts));
+        let result = searcher.search(&make_ctx()).await.unwrap();
+
+        assert_eq!(result.candidates.len(), 3);
+        // Highest raw score -> normalized 1.0.
+        assert!((result.candidates[0].scores.final_score.value() - 1.0).abs() < f32::EPSILON);
+        // Lowest raw score -> normalized 0.0.
+        assert!((result.candidates[2].scores.final_score.value() - 0.0).abs() < f32::EPSILON);
+        // Raw scores preserved in components.
+        assert!(result.candidates[0].scores.components.contains_key("bm25"));
+    }
+
+    #[tokio::test]
+    async fn test_bm25_searcher_single_result() {
+        let fts = MockFts {
+            results: vec![make_search_result(1, 5.0)],
+        };
+        let searcher = BM25Searcher::new(Arc::new(fts));
+        let result = searcher.search(&make_ctx()).await.unwrap();
+
+        assert_eq!(result.candidates.len(), 1);
+        // Single result degenerate case -> 1.0.
+        assert!((result.candidates[0].scores.final_score.value() - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_bm25_searcher_empty_results() {
+        let fts = MockFts { results: vec![] };
+        let searcher = BM25Searcher::new(Arc::new(fts));
+        let result = searcher.search(&make_ctx()).await.unwrap();
+
+        assert!(result.candidates.is_empty());
     }
 }

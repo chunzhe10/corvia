@@ -10,10 +10,10 @@ use std::sync::Arc;
 use corvia_common::errors::{CorviaError, Result};
 
 use super::expander::{Expander, NoOpExpander};
-use super::fusion::{Fusion, PassThrough};
-use super::searcher::{Searcher, VectorSearcher};
+use super::fusion::{Fusion, PassThrough, RRFusion};
+use super::searcher::{BM25Searcher, Searcher, VectorSearcher};
 use super::{IdentityReranker, Reranker};
-use crate::traits::{GraphStore, InferenceEngine, QueryableStore};
+use crate::traits::{FullTextSearchable, GraphStore, InferenceEngine, QueryableStore};
 
 /// Shared dependencies available to component factories.
 #[derive(Clone)]
@@ -21,6 +21,10 @@ pub struct ComponentDeps {
     pub store: Option<Arc<dyn QueryableStore>>,
     pub engine: Option<Arc<dyn InferenceEngine>>,
     pub graph: Option<Arc<dyn GraphStore>>,
+    /// Full-text search backend. Required by BM25Searcher.
+    pub fts: Option<Arc<dyn FullTextSearchable>>,
+    /// RRF smoothing constant k. Read from `[rag.pipeline.rrf]` config.
+    pub rrf_k: usize,
 }
 
 /// Error variants for pipeline component operations.
@@ -126,9 +130,21 @@ impl PipelineRegistry {
             Ok(Arc::new(VectorSearcher::new(store, engine)) as Arc<dyn Searcher>)
         });
 
+        searchers.register("bm25", |deps: &ComponentDeps| {
+            let fts = deps.fts.clone().ok_or_else(|| {
+                CorviaError::Config(
+                    "BM25Searcher requires FullTextSearchable (run `corvia rebuild` to build text index)".into(),
+                )
+            })?;
+            Ok(Arc::new(BM25Searcher::new(fts)) as Arc<dyn Searcher>)
+        });
+
         let mut fusions = ComponentRegistry::new();
         fusions.register("passthrough", |_deps: &ComponentDeps| {
             Ok(Arc::new(PassThrough) as Arc<dyn Fusion>)
+        });
+        fusions.register("rrf", |deps: &ComponentDeps| {
+            Ok(Arc::new(RRFusion::new(deps.rrf_k)) as Arc<dyn Fusion>)
         });
 
         let mut expanders = ComponentRegistry::new();
@@ -167,6 +183,8 @@ mod tests {
             store: None,
             engine: None,
             graph: None,
+            fts: None,
+            rrf_k: 60,
         };
         let result = registry.create("nonexistent", &deps);
         assert!(result.is_err());
@@ -179,6 +197,8 @@ mod tests {
             store: None,
             engine: None,
             graph: None,
+            fts: None,
+            rrf_k: 60,
         };
         // VectorSearcher requires store + engine.
         let result = reg.searchers.create("vector", &deps);
@@ -189,7 +209,9 @@ mod tests {
     fn test_registry_names() {
         let reg = PipelineRegistry::with_defaults();
         assert!(reg.searchers.contains("vector"));
+        assert!(reg.searchers.contains("bm25"));
         assert!(reg.fusions.contains("passthrough"));
+        assert!(reg.fusions.contains("rrf"));
         // "graph" expander is NOT in the registry; it requires config-driven alpha
         // and is constructed directly in build_pipeline_retriever.
         assert!(!reg.expanders.contains("graph"));
@@ -204,6 +226,8 @@ mod tests {
             store: None,
             engine: None,
             graph: None,
+            fts: None,
+            rrf_k: 60,
         };
         let fusion = reg.fusions.create("passthrough", &deps);
         assert!(fusion.is_ok());
@@ -216,6 +240,8 @@ mod tests {
             store: None,
             engine: None,
             graph: None,
+            fts: None,
+            rrf_k: 60,
         };
         let reranker = reg.rerankers.create("identity", &deps);
         assert!(reranker.is_ok());

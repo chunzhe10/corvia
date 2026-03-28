@@ -407,6 +407,8 @@ fn build_pipeline_retriever(
         store: Some(store.clone()),
         engine: Some(engine.clone()),
         graph: graph.clone(),
+        fts: None, // Populated by Phase 2a (tantivy) / Phase 2b (tsvector)
+        rrf_k: pipeline_cfg.rrf.k,
     };
 
     // Build searchers.

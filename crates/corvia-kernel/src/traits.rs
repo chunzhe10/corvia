@@ -145,6 +145,25 @@ pub trait GraphStore: Send + Sync {
     async fn remove_edges(&self, entry_id: &uuid::Uuid) -> Result<()>;
 }
 
+/// Full-text search interface for BM25/keyword retrieval.
+///
+/// Store-agnostic: LiteStore implements via tantivy (Phase 2a),
+/// PostgresStore via tsvector (Phase 2b). The BM25Searcher pipeline
+/// component consumes this trait.
+#[async_trait]
+pub trait FullTextSearchable: Send + Sync {
+    /// Full-text search returning entries ranked by text relevance.
+    ///
+    /// Named `search_text` (not `search_bm25`) because PostgresStore uses
+    /// ts_rank (TF-IDF variant), not BM25. The caller normalizes scores.
+    async fn search_text(
+        &self,
+        query: &str,
+        scope_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>>;
+}
+
 // Re-export ChatMessage so kernel consumers don't need a direct corvia-common dependency.
 pub use corvia_common::types::ChatMessage;
 
