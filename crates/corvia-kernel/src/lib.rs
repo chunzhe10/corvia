@@ -402,6 +402,7 @@ pub fn rebuild_pipeline_retriever(
     store: Arc<dyn traits::QueryableStore>,
     engine: Arc<dyn traits::InferenceEngine>,
     graph: Option<Arc<dyn traits::GraphStore>>,
+    generator: Option<Arc<dyn traits::GenerationEngine>>,
     config: &CorviaConfig,
 ) -> Result<rag_pipeline::RagPipeline> {
     let pipeline_cfg = config.rag.pipeline.as_ref().ok_or_else(|| {
@@ -465,7 +466,7 @@ pub fn rebuild_pipeline_retriever(
     Ok(rag_pipeline::RagPipeline::new(
         Arc::new(retriever),
         aug,
-        None, // Generator stays from original pipeline.
+        generator,
         config.rag.clone(),
     ))
 }

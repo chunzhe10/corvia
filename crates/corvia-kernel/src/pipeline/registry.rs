@@ -326,4 +326,97 @@ mod tests {
         let reranker = reg.rerankers.create("identity", &deps);
         assert!(reranker.is_ok());
     }
+
+    #[test]
+    fn test_validate_and_build_valid_config() {
+        use crate::lite_store::LiteStore;
+        use crate::traits::{InferenceEngine, QueryableStore};
+        use corvia_common::config::PipelineConfig;
+
+        struct MockEngine;
+        #[async_trait::async_trait]
+        impl InferenceEngine for MockEngine {
+            async fn embed(&self, _: &str) -> corvia_common::errors::Result<Vec<f32>> {
+                Ok(vec![1.0, 0.0, 0.0])
+            }
+            async fn embed_batch(&self, texts: &[String]) -> corvia_common::errors::Result<Vec<Vec<f32>>> {
+                Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect())
+            }
+            fn dimensions(&self) -> usize { 3 }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        let engine = Arc::new(MockEngine) as Arc<dyn InferenceEngine>;
+
+        let config = PipelineConfig::default();
+        let deps = ComponentDeps {
+            store: Some(store as Arc<dyn QueryableStore>),
+            engine: Some(engine),
+            graph: None,
+            fts: None,
+            rrf_k: 60,
+        };
+
+        let result = PipelineRegistry::validate_and_build(&config, &deps, None, 0.3);
+        assert!(result.is_ok(), "valid config should build successfully");
+    }
+
+    #[test]
+    fn test_validate_and_build_all_unknown_searchers() {
+        use corvia_common::config::PipelineConfig;
+
+        let mut config = PipelineConfig::default();
+        config.searchers = vec!["nonexistent1".into(), "nonexistent2".into()];
+
+        let deps = ComponentDeps {
+            store: None,
+            engine: None,
+            graph: None,
+            fts: None,
+            rrf_k: 60,
+        };
+
+        let result = PipelineRegistry::validate_and_build(&config, &deps, None, 0.3);
+        assert!(result.is_err(), "all unknown searchers should fail");
+        let err = format!("{}", result.err().unwrap());
+        assert!(err.contains("no valid searchers"), "error should mention no valid searchers, got: {err}");
+    }
+
+    #[test]
+    fn test_validate_and_build_unknown_fusion() {
+        use crate::lite_store::LiteStore;
+        use crate::traits::{InferenceEngine, QueryableStore};
+        use corvia_common::config::PipelineConfig;
+
+        struct MockEngine;
+        #[async_trait::async_trait]
+        impl InferenceEngine for MockEngine {
+            async fn embed(&self, _: &str) -> corvia_common::errors::Result<Vec<f32>> {
+                Ok(vec![1.0, 0.0, 0.0])
+            }
+            async fn embed_batch(&self, texts: &[String]) -> corvia_common::errors::Result<Vec<Vec<f32>>> {
+                Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect())
+            }
+            fn dimensions(&self) -> usize { 3 }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        let engine = Arc::new(MockEngine) as Arc<dyn InferenceEngine>;
+
+        let mut config = PipelineConfig::default();
+        config.fusion = "nonexistent".into();
+
+        let deps = ComponentDeps {
+            store: Some(store as Arc<dyn QueryableStore>),
+            engine: Some(engine),
+            graph: None,
+            fts: None,
+            rrf_k: 60,
+        };
+
+        let result = PipelineRegistry::validate_and_build(&config, &deps, None, 0.3);
+        assert!(result.is_err(), "unknown fusion should fail");
+    }
 }

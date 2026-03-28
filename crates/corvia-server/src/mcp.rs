@@ -1372,37 +1372,57 @@ async fn tool_corvia_config_set(
         .map_err(|e| (INTERNAL_ERROR, format!("Config set failed: {e}")))?;
 
     // Hot-swap pipeline when rag.pipeline config changes.
+    // Clone config and drop the write lock before rebuilding to avoid blocking
+    // concurrent config reads during I/O-heavy pipeline construction.
+    let config_snapshot = config.clone();
+    drop(config);
+
     let mut pipeline_swapped = false;
-    if section == "rag" && (key.starts_with("pipeline") || key == "graph_alpha") {
+    let mut pipeline_error: Option<String> = None;
+    if section == "rag" && (key.starts_with("pipeline.") || key == "graph_alpha" || key == "system_prompt") {
         if let Some(ref rag_swap) = state.rag {
+            // Preserve the current generator so ask() mode continues working.
+            let current_generator = rag_swap.load().generator().cloned();
             let graph = Some(state.graph.clone());
             match corvia_kernel::rebuild_pipeline_retriever(
                 state.store.clone(),
                 state.engine.clone(),
                 graph,
-                &config,
+                current_generator,
+                &config_snapshot,
             ) {
                 Ok(new_pipeline) => {
-                    rag_swap.store(std::sync::Arc::new(new_pipeline));
+                    let old = rag_swap.swap(std::sync::Arc::new(new_pipeline));
+                    // Defer deallocation of old pipeline off the async runtime.
+                    std::thread::spawn(move || drop(old));
                     pipeline_swapped = true;
                     tracing::info!(section, key, "RAG pipeline hot-swapped successfully");
                 }
                 Err(e) => {
                     tracing::warn!(section, key, error = %e, "Pipeline rebuild failed, keeping current pipeline");
+                    pipeline_error = Some(format!("{e}"));
                 }
             }
         }
     }
 
+    let mut resp = json!({
+        "status": "updated",
+        "section": section,
+        "key": key,
+    });
+    if pipeline_swapped {
+        resp["pipeline_swapped"] = json!(true);
+    }
+    if let Some(ref err) = pipeline_error {
+        resp["pipeline_swapped"] = json!(false);
+        resp["pipeline_error"] = json!(err);
+    }
+
     Ok(json!({
         "content": [{
             "type": "text",
-            "text": serde_json::to_string(&json!({
-                "status": "updated",
-                "section": section,
-                "key": key,
-                "pipeline_swapped": pipeline_swapped,
-            })).unwrap()
+            "text": serde_json::to_string(&resp).unwrap()
         }]
     }))
 }

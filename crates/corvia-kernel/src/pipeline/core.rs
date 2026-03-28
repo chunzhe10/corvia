@@ -1167,4 +1167,82 @@ mod tests {
             "should return error when all searchers fail"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // TEST 9: Hot-swap under concurrent load
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_hot_swap_under_concurrent_load() {
+        use arc_swap::ArcSwap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+
+        let queryable = store.clone() as Arc<dyn QueryableStore>;
+        let engine: Arc<dyn InferenceEngine> = Arc::new(MockEngine);
+
+        insert_entries(&store, "swap-scope", 10).await;
+
+        let pipeline = RetrievalPipeline::new(
+            vec![Arc::new(VectorSearcher::new(
+                queryable.clone(),
+                engine.clone(),
+            ))],
+            Arc::new(PassThrough),
+            Arc::new(crate::pipeline::expander::NoOpExpander),
+            Arc::new(IdentityReranker),
+            engine.clone(),
+            queryable.clone(),
+            5000,
+        );
+
+        let hot = Arc::new(ArcSwap::from_pointee(pipeline));
+
+        // Spawn 10 concurrent queries.
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let hot_ref = Arc::clone(&hot);
+            handles.push(tokio::spawn(async move {
+                let pipeline = hot_ref.load();
+                let opts = RetrievalOpts {
+                    limit: 5,
+                    expand_graph: false,
+                    visibility: VisibilityMode::All,
+                    ..Default::default()
+                };
+                let result = pipeline
+                    .retrieve("knowledge entry", "swap-scope", &opts)
+                    .await;
+                (i, result.is_ok())
+            }));
+        }
+
+        // Swap to a new pipeline mid-flight.
+        let new_pipeline = RetrievalPipeline::new(
+            vec![Arc::new(VectorSearcher::new(
+                queryable.clone(),
+                engine.clone(),
+            ))],
+            Arc::new(PassThrough),
+            Arc::new(crate::pipeline::expander::NoOpExpander),
+            Arc::new(IdentityReranker),
+            engine.clone(),
+            queryable.clone(),
+            5000,
+        );
+        let old = hot.swap(Arc::new(new_pipeline));
+        std::thread::spawn(move || drop(old));
+
+        // All queries should complete successfully.
+        let mut successes = 0;
+        for handle in handles {
+            let (_, ok) = handle.await.unwrap();
+            if ok {
+                successes += 1;
+            }
+        }
+        assert_eq!(successes, 10, "all concurrent queries should succeed during hot-swap");
+    }
 }

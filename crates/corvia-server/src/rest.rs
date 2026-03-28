@@ -76,9 +76,10 @@ pub struct AppState {
 impl AppState {
     /// Load a snapshot of the RAG pipeline for this request.
     ///
-    /// Uses `ArcSwap::load_full()` to clone the `Arc` without blocking
-    /// concurrent hot-swaps. In-flight requests continue using the pipeline
-    /// snapshot they loaded, even if a swap happens mid-request.
+    /// Uses `ArcSwap::load()` to obtain a `Guard` that pins the current
+    /// pipeline. In-flight requests continue using the pipeline snapshot
+    /// they loaded, even if a swap happens mid-request. The `Guard` is
+    /// lightweight and does not block concurrent hot-swaps.
     pub fn rag_pipeline(&self) -> Option<arc_swap::Guard<Arc<corvia_kernel::rag_pipeline::RagPipeline>>> {
         self.rag.as_ref().map(|a| a.load())
     }
