@@ -815,7 +815,7 @@ async fn rag_context_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RagAskRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let rag = state.rag.as_ref()
+    let rag = state.rag_pipeline()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "RAG pipeline not configured".into()))?;
 
     let opts = corvia_kernel::rag_types::RetrievalOpts {
@@ -848,7 +848,7 @@ async fn rag_ask_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RagAskRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let rag = state.rag.as_ref()
+    let rag = state.rag_pipeline()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "RAG pipeline not configured".into()))?;
 
     let opts = corvia_kernel::rag_types::RetrievalOpts {

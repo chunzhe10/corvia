@@ -687,7 +687,7 @@ async fn cmd_serve() -> Result<()> {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
     let state = Arc::new(corvia_server::rest::AppState {
         store, engine, coordinator, graph, temporal, data_dir,
-        rag: Some(rag), ready: ready.clone(), default_scope_id,
+        rag: Some(Arc::new(arc_swap::ArcSwap::new(rag))), ready: ready.clone(), default_scope_id,
         config: Arc::new(std::sync::RwLock::new(config.clone())),
         config_path,
         cluster_store: cluster_store.clone(),

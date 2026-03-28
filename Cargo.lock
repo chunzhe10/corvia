@@ -851,6 +851,7 @@ name = "corvia-cli"
 version = "0.4.6"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "axum 0.8.8",
  "chrono",
@@ -969,6 +970,7 @@ name = "corvia-server"
 version = "0.4.6"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-stream",
  "async-trait",
  "axum 0.8.8",

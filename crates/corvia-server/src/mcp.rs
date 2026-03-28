@@ -674,7 +674,7 @@ async fn tool_corvia_search(
     let include_cold = args.get("include_cold").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // Route through RAG pipeline if available (fixes ContextBuilder bypass)
-    if let Some(rag) = &state.rag {
+    if let Some(rag) = state.rag_pipeline() {
         let opts = corvia_kernel::rag_types::RetrievalOpts {
             limit,
             expand_graph: false, // search endpoint: pure vector (context/ask use graph)
@@ -1033,7 +1033,7 @@ async fn tool_corvia_context(
     let workstream = args.get("workstream").and_then(|v| v.as_str()).map(String::from);
     let include_cold = args.get("include_cold").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    let rag = state.rag.as_ref()
+    let rag = state.rag_pipeline()
         .ok_or((SERVICE_UNAVAILABLE, "RAG pipeline not configured".into()))?;
 
     let opts = corvia_kernel::rag_types::RetrievalOpts {
@@ -1084,7 +1084,7 @@ async fn tool_corvia_ask(
     let workstream = args.get("workstream").and_then(|v| v.as_str()).map(String::from);
     let include_cold = args.get("include_cold").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    let rag = state.rag.as_ref()
+    let rag = state.rag_pipeline()
         .ok_or((SERVICE_UNAVAILABLE, "RAG pipeline not configured".into()))?;
 
     let opts = corvia_kernel::rag_types::RetrievalOpts {
@@ -1371,6 +1371,29 @@ async fn tool_corvia_config_set(
     corvia_kernel::ops::config_set(&state.config_path, &mut config, section, key, value.clone())
         .map_err(|e| (INTERNAL_ERROR, format!("Config set failed: {e}")))?;
 
+    // Hot-swap pipeline when rag.pipeline config changes.
+    let mut pipeline_swapped = false;
+    if section == "rag" && (key.starts_with("pipeline") || key == "graph_alpha") {
+        if let Some(ref rag_swap) = state.rag {
+            let graph = Some(state.graph.clone());
+            match corvia_kernel::rebuild_pipeline_retriever(
+                state.store.clone(),
+                state.engine.clone(),
+                graph,
+                &config,
+            ) {
+                Ok(new_pipeline) => {
+                    rag_swap.store(std::sync::Arc::new(new_pipeline));
+                    pipeline_swapped = true;
+                    tracing::info!(section, key, "RAG pipeline hot-swapped successfully");
+                }
+                Err(e) => {
+                    tracing::warn!(section, key, error = %e, "Pipeline rebuild failed, keeping current pipeline");
+                }
+            }
+        }
+    }
+
     Ok(json!({
         "content": [{
             "type": "text",
@@ -1378,6 +1401,7 @@ async fn tool_corvia_config_set(
                 "status": "updated",
                 "section": section,
                 "key": key,
+                "pipeline_swapped": pipeline_swapped,
             })).unwrap()
         }]
     }))
@@ -1907,7 +1931,7 @@ mod tests {
             graph: store.clone() as Arc<dyn GraphStore>,
             temporal: store as Arc<dyn TemporalStore>,
             data_dir: dir.path().to_path_buf(),
-            rag: Some(rag),
+            rag: Some(Arc::new(arc_swap::ArcSwap::new(rag))),
             ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             default_scope_id: None,
             config: Arc::new(std::sync::RwLock::new(corvia_common::config::CorviaConfig::default())),

@@ -111,6 +111,86 @@ pub struct PipelineRegistry {
 }
 
 impl PipelineRegistry {
+    /// Validate pipeline config and build a complete `RetrievalPipeline`.
+    ///
+    /// Returns `Err` if the config references unknown components or required
+    /// dependencies are missing. Used by the hot-swap path to validate before
+    /// atomically swapping the live pipeline.
+    pub fn validate_and_build(
+        config: &corvia_common::config::PipelineConfig,
+        deps: &ComponentDeps,
+        graph: Option<Arc<dyn GraphStore>>,
+        graph_alpha: f32,
+    ) -> Result<super::RetrievalPipeline> {
+        let registry = Self::with_defaults();
+
+        // Build searchers.
+        let mut searchers: Vec<Arc<dyn Searcher>> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        for name in &config.searchers {
+            match registry.searchers.create(name, deps) {
+                Ok(s) => searchers.push(s),
+                Err(e) => errors.push(format!("searcher '{name}': {e}")),
+            }
+        }
+        if searchers.is_empty() {
+            return Err(CorviaError::Config(format!(
+                "no valid searchers in config: {}",
+                errors.join("; ")
+            )));
+        }
+
+        // Build fusion.
+        let fusion = registry.fusions.create(&config.fusion, deps)
+            .map_err(|e| CorviaError::Config(format!("fusion '{}': {e}", config.fusion)))?;
+
+        // Build expander.
+        let expander: Arc<dyn super::Expander> = match (config.expander.as_str(), graph) {
+            ("graph", Some(g)) => {
+                let store = deps.store.clone().ok_or_else(|| {
+                    CorviaError::Config("GraphExpander requires a store".into())
+                })?;
+                Arc::new(super::expander::GraphExpander::new(store, g, graph_alpha))
+            }
+            ("graph", None) => {
+                registry.expanders.create("noop", deps)
+                    .expect("noop expander is always registered")
+            }
+            (name, _) => {
+                registry.expanders.create(name, deps)
+                    .map_err(|e| CorviaError::Config(format!("expander '{name}': {e}")))?
+            }
+        };
+
+        // Build reranker.
+        let reranker = registry.rerankers.create(&config.reranker, deps)
+            .map_err(|e| CorviaError::Config(format!("reranker '{}': {e}", config.reranker)))?;
+
+        let engine = deps.engine.clone().ok_or_else(|| {
+            CorviaError::Config("Pipeline requires an InferenceEngine".into())
+        })?;
+        let store = deps.store.clone().ok_or_else(|| {
+            CorviaError::Config("Pipeline requires a store".into())
+        })?;
+
+        if !errors.is_empty() {
+            tracing::warn!(
+                skipped = ?errors,
+                "some searchers failed to create, continuing with available ones"
+            );
+        }
+
+        Ok(super::RetrievalPipeline::new(
+            searchers,
+            fusion,
+            expander,
+            reranker,
+            engine,
+            store,
+            config.searcher_timeout_ms,
+        ))
+    }
+
     /// Create a registry pre-loaded with built-in components.
     ///
     /// Registers:

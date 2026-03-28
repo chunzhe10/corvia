@@ -7,9 +7,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use corvia_common::errors::Result;
+use corvia_common::errors::{CorviaError, Result};
 use corvia_common::types::SearchResult;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use super::expander::Expander;
 use super::fusion::Fusion;
@@ -83,9 +83,25 @@ impl Retriever for RetrievalPipeline {
             return Ok(denied);
         }
 
-        // Step 1: Embed query (wrap in Arc for sharing across searchers).
+        // Step 1: Embed query with graceful degradation.
+        //
+        // If embedding fails but there are searchers that don't need embeddings
+        // (e.g. BM25), skip embedding-dependent searchers and proceed.
         let embed_start = Instant::now();
-        let embedding_arc = Arc::new(self.engine.embed(query).await?);
+        let has_non_embedding_searchers = self.searchers.iter().any(|s| !s.needs_embedding());
+
+        let (embedding_arc, embed_failed) = match self.engine.embed(query).await {
+            Ok(emb) => (Arc::new(emb), false),
+            Err(e) => {
+                if has_non_embedding_searchers {
+                    warn!(error = %e, "embedding failed, degrading to non-embedding searchers (e.g. BM25)");
+                    // Provide a zero-length placeholder; embedding-dependent searchers are skipped below.
+                    (Arc::new(Vec::new()), true)
+                } else {
+                    return Err(e);
+                }
+            }
+        };
         let embed_latency_ms = embed_start.elapsed().as_millis() as u64;
 
         let ctx = SearchContext {
@@ -95,32 +111,44 @@ impl Retriever for RetrievalPipeline {
             opts: opts.clone(),
         };
 
+        // Determine which searchers to run. If embedding failed, skip those
+        // that require embeddings.
+        let active_searchers: Vec<&Arc<dyn Searcher>> = if embed_failed {
+            self.searchers.iter().filter(|s| !s.needs_embedding()).collect()
+        } else {
+            self.searchers.iter().collect()
+        };
+
         // Step 2: Run searchers with timeout + panic isolation.
         // Fast path: single searcher avoids tokio::spawn overhead.
         let search_start = Instant::now();
         let mut searcher_results = Vec::new();
         let mut search_warnings: Vec<String> = Vec::new();
 
-        if self.searchers.len() == 1 {
+        if embed_failed {
+            search_warnings.push("embedding failed, vector searcher skipped".to_string());
+        }
+
+        if active_searchers.len() == 1 {
             let timeout = std::time::Duration::from_millis(self.searcher_timeout_ms);
-            match tokio::time::timeout(timeout, self.searchers[0].search(&ctx)).await {
+            match tokio::time::timeout(timeout, active_searchers[0].search(&ctx)).await {
                 Ok(Ok(set)) => searcher_results.push(set),
                 Ok(Err(e)) => {
-                    let name = self.searchers[0].name();
+                    let name = active_searchers[0].name();
                     warn!(searcher = name, error = %e, "searcher failed");
                     search_warnings.push(format!("searcher '{name}' failed: {e}"));
                 }
                 Err(_) => {
-                    let name = self.searchers[0].name();
+                    let name = active_searchers[0].name();
                     warn!(searcher = name, "searcher timed out");
                     search_warnings.push(format!("searcher '{name}' timed out"));
                 }
             }
-        } else {
+        } else if !active_searchers.is_empty() {
             let mut handles = Vec::new();
             let timeout = std::time::Duration::from_millis(self.searcher_timeout_ms);
 
-            for searcher in &self.searchers {
+            for searcher in &active_searchers {
                 let s = Arc::clone(searcher);
                 let c = ctx.clone();
                 let t = timeout;
@@ -133,7 +161,7 @@ impl Retriever for RetrievalPipeline {
                         }
                         Err(_) => {
                             warn!(searcher = s.name(), "searcher timed out");
-                            Err(corvia_common::errors::CorviaError::Infra(
+                            Err(CorviaError::Infra(
                                 format!("searcher '{}' timed out", s.name()),
                             ))
                         }
@@ -145,11 +173,11 @@ impl Retriever for RetrievalPipeline {
                 match handle.await {
                     Ok(Ok(set)) => searcher_results.push(set),
                     Ok(Err(e)) => {
-                        let name = self.searchers.get(i).map(|s| s.name()).unwrap_or("unknown");
+                        let name = active_searchers.get(i).map(|s| s.name()).unwrap_or("unknown");
                         search_warnings.push(format!("searcher '{name}' failed: {e}"));
                     }
                     Err(e) => {
-                        let name = self.searchers.get(i).map(|s| s.name()).unwrap_or("unknown");
+                        let name = active_searchers.get(i).map(|s| s.name()).unwrap_or("unknown");
                         search_warnings.push(format!("searcher '{name}' panicked: {e}"));
                     }
                 }
@@ -158,6 +186,18 @@ impl Retriever for RetrievalPipeline {
 
         if !search_warnings.is_empty() {
             warn!(warnings = ?search_warnings, "searcher warnings during pipeline execution");
+        }
+
+        // All searchers failed: return error instead of empty results.
+        if searcher_results.is_empty() && !active_searchers.is_empty() {
+            error!(
+                warnings = ?search_warnings,
+                "all searchers failed, cannot produce results"
+            );
+            return Err(CorviaError::Infra(format!(
+                "all searchers failed: {}",
+                search_warnings.join("; ")
+            )));
         }
 
         let hnsw_latency_ms = search_start.elapsed().as_millis() as u64;
@@ -258,8 +298,12 @@ impl Retriever for RetrievalPipeline {
                 fusion_latency_ms: Some(fusion_latency_ms),
                 stages: None,
             },
-            query_embedding: Some(Arc::try_unwrap(embedding_arc)
-                .unwrap_or_else(|arc| (*arc).clone())),
+            query_embedding: if embed_failed {
+                None
+            } else {
+                Some(Arc::try_unwrap(embedding_arc)
+                    .unwrap_or_else(|arc| (*arc).clone()))
+            },
         })
     }
 }
@@ -278,7 +322,7 @@ mod tests {
     use corvia_common::agent_types::{AgentPermission, EntryStatus, VisibilityMode};
     use corvia_common::errors::Result;
     use corvia_common::types::KnowledgeEntry;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     /// Mock embedding engine that returns a fixed 3-dim vector.
@@ -722,7 +766,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // TEST 3: Timeout -- searcher that sleeps should be timed out
+    // TEST 3: Timeout -- single searcher timeout returns error (all failed)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -758,8 +802,7 @@ mod tests {
         let start = std::time::Instant::now();
         let result = pipeline
             .retrieve("test query", "timeout-scope", &opts)
-            .await
-            .unwrap();
+            .await;
         let elapsed = start.elapsed();
 
         // Should complete well within 2 seconds (not 10s).
@@ -768,12 +811,360 @@ mod tests {
             "pipeline should not hang; elapsed: {elapsed:?}"
         );
 
-        // No candidates because the only searcher timed out.
-        assert_eq!(
-            result.results.len(),
-            0,
-            "timed-out searcher should produce 0 results"
+        // All searchers failed → error.
+        assert!(
+            result.is_err(),
+            "should return error when all searchers fail"
         );
-        assert_eq!(result.metrics.vector_results, 0);
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("all searchers failed"),
+            "error should mention all searchers failed, got: {err_msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TEST 4: Graceful degradation -- failing + working searcher
+    // -----------------------------------------------------------------------
+
+    /// Searcher that always returns an error.
+    struct FailingSearcher;
+
+    #[async_trait]
+    impl crate::pipeline::searcher::Searcher for FailingSearcher {
+        fn name(&self) -> &str {
+            "failing"
+        }
+        fn needs_embedding(&self) -> bool {
+            false
+        }
+        async fn search(
+            &self,
+            _ctx: &SearchContext,
+        ) -> Result<crate::pipeline::RankedSet> {
+            Err(corvia_common::errors::CorviaError::Infra(
+                "intentional test failure".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_graceful_degradation_failing_plus_working() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+
+        let queryable = store.clone() as Arc<dyn QueryableStore>;
+        let engine: Arc<dyn InferenceEngine> = Arc::new(MockEngine);
+
+        // Insert entries so vector searcher returns results.
+        insert_entries(&store, "degrade-scope", 10).await;
+
+        let pipeline = RetrievalPipeline::new(
+            vec![
+                Arc::new(FailingSearcher) as Arc<dyn crate::pipeline::searcher::Searcher>,
+                Arc::new(VectorSearcher::new(queryable.clone(), engine.clone())),
+            ],
+            Arc::new(PassThrough),
+            Arc::new(crate::pipeline::expander::NoOpExpander),
+            Arc::new(IdentityReranker),
+            engine.clone(),
+            queryable.clone(),
+            5000,
+        );
+
+        let opts = RetrievalOpts {
+            limit: 10,
+            expand_graph: false,
+            visibility: VisibilityMode::All,
+            ..Default::default()
+        };
+
+        // Should succeed with results from the working searcher.
+        let result = pipeline
+            .retrieve("knowledge entry", "degrade-scope", &opts)
+            .await
+            .unwrap();
+
+        assert!(
+            !result.results.is_empty(),
+            "should return results from the working searcher"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TEST 5: Panic searcher -- caught, pipeline continues with others
+    // -----------------------------------------------------------------------
+
+    /// Searcher that panics.
+    struct PanicSearcher;
+
+    #[async_trait]
+    impl crate::pipeline::searcher::Searcher for PanicSearcher {
+        fn name(&self) -> &str {
+            "panic"
+        }
+        fn needs_embedding(&self) -> bool {
+            false
+        }
+        async fn search(
+            &self,
+            _ctx: &SearchContext,
+        ) -> Result<crate::pipeline::RankedSet> {
+            panic!("intentional test panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_panic_searcher_caught() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+
+        let queryable = store.clone() as Arc<dyn QueryableStore>;
+        let engine: Arc<dyn InferenceEngine> = Arc::new(MockEngine);
+
+        insert_entries(&store, "panic-scope", 10).await;
+
+        let pipeline = RetrievalPipeline::new(
+            vec![
+                Arc::new(PanicSearcher) as Arc<dyn crate::pipeline::searcher::Searcher>,
+                Arc::new(VectorSearcher::new(queryable.clone(), engine.clone())),
+            ],
+            Arc::new(PassThrough),
+            Arc::new(crate::pipeline::expander::NoOpExpander),
+            Arc::new(IdentityReranker),
+            engine.clone(),
+            queryable.clone(),
+            5000,
+        );
+
+        let opts = RetrievalOpts {
+            limit: 10,
+            expand_graph: false,
+            visibility: VisibilityMode::All,
+            ..Default::default()
+        };
+
+        // Panic in one searcher should NOT crash the pipeline.
+        let result = pipeline
+            .retrieve("knowledge entry", "panic-scope", &opts)
+            .await
+            .unwrap();
+
+        assert!(
+            !result.results.is_empty(),
+            "should return results from non-panicking searcher"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TEST 6: Embedding failure -- degrades to BM25-only
+    // -----------------------------------------------------------------------
+
+    /// Mock engine that always fails embedding.
+    struct FailingEngine;
+
+    #[async_trait]
+    impl InferenceEngine for FailingEngine {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>> {
+            Err(corvia_common::errors::CorviaError::Infra(
+                "embedding service unavailable".into(),
+            ))
+        }
+        async fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Err(corvia_common::errors::CorviaError::Infra(
+                "embedding service unavailable".into(),
+            ))
+        }
+        fn dimensions(&self) -> usize {
+            3
+        }
+    }
+
+    /// Mock BM25-like searcher that doesn't need embedding and returns fixed results.
+    struct MockBM25Searcher {
+        results: Vec<crate::pipeline::RankedCandidate>,
+    }
+
+    #[async_trait]
+    impl crate::pipeline::searcher::Searcher for MockBM25Searcher {
+        fn name(&self) -> &str {
+            "mock_bm25"
+        }
+        fn needs_embedding(&self) -> bool {
+            false
+        }
+        async fn search(
+            &self,
+            _ctx: &SearchContext,
+        ) -> Result<crate::pipeline::RankedSet> {
+            Ok(crate::pipeline::RankedSet {
+                candidates: self.results.clone(),
+                metrics: crate::pipeline::StageMetrics {
+                    stage_name: "mock_bm25".into(),
+                    latency_ms: 1,
+                    input_count: 0,
+                    output_count: self.results.len(),
+                    warnings: Vec::new(),
+                },
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_embedding_failure_degrades_to_bm25() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+
+        let queryable = store.clone() as Arc<dyn QueryableStore>;
+        let engine: Arc<dyn InferenceEngine> = Arc::new(FailingEngine);
+
+        // Create a mock entry for the BM25 searcher to return.
+        let entry = KnowledgeEntry::new(
+            "test entry from BM25".to_string(),
+            "embed-fail-scope".to_string(),
+            "v1".to_string(),
+        );
+        let mock_candidate = crate::pipeline::RankedCandidate {
+            entry: Arc::new(entry),
+            scores: crate::pipeline::CandidateScores {
+                components: {
+                    let mut m = HashMap::new();
+                    m.insert("mock_bm25".to_string(), 0.8);
+                    m
+                },
+                final_score: crate::pipeline::NormalizedScore::new(0.8),
+            },
+        };
+
+        let pipeline = RetrievalPipeline::new(
+            vec![
+                Arc::new(VectorSearcher::new(queryable.clone(), engine.clone())),
+                Arc::new(MockBM25Searcher {
+                    results: vec![mock_candidate],
+                }),
+            ],
+            Arc::new(PassThrough),
+            Arc::new(crate::pipeline::expander::NoOpExpander),
+            Arc::new(IdentityReranker),
+            engine.clone(),
+            queryable.clone(),
+            5000,
+        );
+
+        let opts = RetrievalOpts {
+            limit: 10,
+            expand_graph: false,
+            visibility: VisibilityMode::All,
+            ..Default::default()
+        };
+
+        // Embedding fails, but pipeline should degrade to BM25 results.
+        let result = pipeline
+            .retrieve("test query", "embed-fail-scope", &opts)
+            .await
+            .unwrap();
+
+        assert!(
+            !result.results.is_empty(),
+            "should return BM25 results when embedding fails"
+        );
+        // query_embedding should be None when embedding failed.
+        assert!(
+            result.query_embedding.is_none(),
+            "query_embedding should be None when embedding failed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TEST 7: Embedding failure with no BM25 -- total failure
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_embedding_failure_no_bm25_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+
+        let queryable = store.clone() as Arc<dyn QueryableStore>;
+        let engine: Arc<dyn InferenceEngine> = Arc::new(FailingEngine);
+
+        // Only vector searcher, no BM25 fallback.
+        let pipeline = RetrievalPipeline::new(
+            vec![Arc::new(VectorSearcher::new(
+                queryable.clone(),
+                engine.clone(),
+            ))],
+            Arc::new(PassThrough),
+            Arc::new(crate::pipeline::expander::NoOpExpander),
+            Arc::new(IdentityReranker),
+            engine.clone(),
+            queryable.clone(),
+            5000,
+        );
+
+        let opts = RetrievalOpts {
+            limit: 10,
+            expand_graph: false,
+            visibility: VisibilityMode::All,
+            ..Default::default()
+        };
+
+        // Should fail because embedding failed and no BM25 fallback.
+        let result = pipeline
+            .retrieve("test query", "embed-fail-scope", &opts)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "should return error when embedding fails and no BM25 searcher"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TEST 8: All searchers fail -- returns error
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_all_searchers_fail_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+
+        let queryable = store.clone() as Arc<dyn QueryableStore>;
+        let engine: Arc<dyn InferenceEngine> = Arc::new(MockEngine);
+
+        let pipeline = RetrievalPipeline::new(
+            vec![
+                Arc::new(FailingSearcher) as Arc<dyn crate::pipeline::searcher::Searcher>,
+                Arc::new(SlowSearcher {
+                    delay: std::time::Duration::from_secs(10),
+                }),
+            ],
+            Arc::new(PassThrough),
+            Arc::new(crate::pipeline::expander::NoOpExpander),
+            Arc::new(IdentityReranker),
+            engine.clone(),
+            queryable.clone(),
+            100, // 100ms timeout for SlowSearcher
+        );
+
+        let opts = RetrievalOpts {
+            limit: 10,
+            expand_graph: false,
+            visibility: VisibilityMode::All,
+            ..Default::default()
+        };
+
+        let result = pipeline
+            .retrieve("test", "all-fail-scope", &opts)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "should return error when all searchers fail"
+        );
     }
 }
