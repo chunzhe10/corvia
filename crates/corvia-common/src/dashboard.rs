@@ -171,6 +171,84 @@ pub struct GcStatusResponse {
     pub scheduled: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Tiered knowledge dashboard types
+// ---------------------------------------------------------------------------
+
+/// GET /api/dashboard/tiers response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TiersResponse {
+    pub hot: u64,
+    pub warm: u64,
+    pub cold: u64,
+    pub forgotten: u64,
+    pub total: u64,
+    pub forgetting_enabled: bool,
+}
+
+/// A single tier transition event (extracted from structured trace logs)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TierTransitionDto {
+    pub entry_id: String,
+    pub scope_id: String,
+    pub from_tier: String,
+    pub to_tier: String,
+    pub retention_score: f64,
+    pub reason: String,
+    pub timestamp: String,
+}
+
+/// GET /api/dashboard/tiers/transitions response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TierTransitionsResponse {
+    pub transitions: Vec<TierTransitionDto>,
+    pub count: usize,
+}
+
+/// A pinned entry summary for dashboard display
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PinnedEntryDto {
+    pub entry_id: String,
+    pub content_preview: String,
+    pub pinned_by: String,
+    pub pinned_at: String,
+    pub scope_id: String,
+}
+
+/// GET /api/dashboard/tiers/pinned response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PinnedEntriesResponse {
+    pub entries: Vec<PinnedEntryDto>,
+    pub count: usize,
+}
+
+/// Knowledge GC cycle report DTO (distinct from session-level GcReportDto)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcCycleReportDto {
+    pub entries_scanned: usize,
+    pub entries_scored: usize,
+    pub hot_to_warm: usize,
+    pub warm_to_cold: usize,
+    pub cold_to_forgotten: usize,
+    pub warm_to_hot: usize,
+    pub cold_to_warm: usize,
+    pub hnsw_rebuild_triggered: bool,
+    pub rebuild_duration_ms: u64,
+    pub cycle_duration_ms: u64,
+    pub scopes_processed: usize,
+    pub chain_protected: usize,
+    pub auto_protected: usize,
+    pub budget_demoted: usize,
+    pub circuit_breaker_tripped: bool,
+}
+
+/// GET /api/dashboard/tiers/gc-history response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcCycleHistoryResponse {
+    pub cycles: Vec<GcCycleReportDto>,
+    pub count: usize,
+}
+
 /// Live session entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveSession {

@@ -78,6 +78,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/dashboard/activity", get(activity::activity_feed_handler))
         .route("/api/dashboard/gc", get(gc_status_handler))
         .route("/api/dashboard/gc/run", post(gc_run_handler))
+        .route("/api/dashboard/tiers", get(tiers_handler))
+        .route("/api/dashboard/tiers/transitions", get(tier_transitions_handler))
+        .route("/api/dashboard/tiers/pinned", get(pinned_entries_handler))
+        .route("/api/dashboard/tiers/gc-history", get(gc_knowledge_history_handler))
+        .route("/api/dashboard/tiers/unpin/{entry_id}", post(dashboard_unpin_handler))
         .route("/api/dashboard/sessions/live", get(live_sessions_handler))
         .route("/api/dashboard/sessions/hook", get(hook_sessions_handler))
         .route("/api/dashboard/sessions/hook/stream", get(hook_sessions_stream))
@@ -1029,6 +1034,212 @@ async fn gc_run_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Tiered knowledge endpoints
+// ---------------------------------------------------------------------------
+
+fn gc_cycle_to_dto(r: &corvia_kernel::gc_worker::GcCycleReport) -> corvia_common::dashboard::GcCycleReportDto {
+    corvia_common::dashboard::GcCycleReportDto {
+        entries_scanned: r.entries_scanned,
+        entries_scored: r.entries_scored,
+        hot_to_warm: r.hot_to_warm,
+        warm_to_cold: r.warm_to_cold,
+        cold_to_forgotten: r.cold_to_forgotten,
+        warm_to_hot: r.warm_to_hot,
+        cold_to_warm: r.cold_to_warm,
+        hnsw_rebuild_triggered: r.hnsw_rebuild_triggered,
+        rebuild_duration_ms: r.rebuild_duration_ms,
+        cycle_duration_ms: r.cycle_duration_ms,
+        scopes_processed: r.scopes_processed,
+        chain_protected: r.chain_protected,
+        auto_protected: r.auto_protected,
+        budget_demoted: r.budget_demoted,
+        circuit_breaker_tripped: r.circuit_breaker_tripped,
+    }
+}
+
+/// GET /api/dashboard/tiers
+/// Returns tier distribution and forgetting config status.
+async fn tiers_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<corvia_common::dashboard::TiersResponse> {
+    let scope_id = state
+        .default_scope_id
+        .as_deref()
+        .unwrap_or(DEFAULT_SCOPE_ID);
+
+    // Get tier distribution (lightweight — avoids full deserialization)
+    let dist = if let Some(lite_store) = state.store.as_any().downcast_ref::<corvia_kernel::lite_store::LiteStore>() {
+        lite_store.count_tiers_by_scope(scope_id).unwrap_or_default()
+    } else {
+        corvia_kernel::ops::TierDistribution::default()
+    };
+
+    let cfg = state.config.read().unwrap_or_else(|e| e.into_inner());
+    let forgetting_enabled = cfg.forgetting.as_ref().map(|f| f.enabled).unwrap_or(false);
+    drop(cfg);
+
+    let total = dist.hot + dist.warm + dist.cold + dist.forgotten;
+
+    Json(corvia_common::dashboard::TiersResponse {
+        hot: dist.hot,
+        warm: dist.warm,
+        cold: dist.cold,
+        forgotten: dist.forgotten,
+        total,
+        forgetting_enabled,
+    })
+}
+
+/// GET /api/dashboard/tiers/transitions
+/// Returns recent tier transitions extracted from structured trace logs.
+async fn tier_transitions_handler(
+    State(_state): State<Arc<AppState>>,
+    Query(params): Query<TransitionsQuery>,
+) -> Json<corvia_common::dashboard::TierTransitionsResponse> {
+    let limit = params.limit.unwrap_or(50).min(200);
+    let log_dir = traces::log_dir();
+    let transitions = parse_tier_transitions(&log_dir, limit);
+    let count = transitions.len();
+    Json(corvia_common::dashboard::TierTransitionsResponse { transitions, count })
+}
+
+#[derive(Deserialize)]
+struct TransitionsQuery {
+    limit: Option<usize>,
+}
+
+/// Parse tier_transition events from structured trace logs.
+fn parse_tier_transitions(
+    log_dir: &std::path::Path,
+    limit: usize,
+) -> Vec<corvia_common::dashboard::TierTransitionDto> {
+    let trace_file = log_dir.join("corvia-traces.log");
+    let content = match std::fs::read_to_string(&trace_file) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut transitions = Vec::new();
+
+    // Parse from end (most recent first) — iterate in reverse
+    for line in content.lines().rev() {
+        if transitions.len() >= limit {
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() || !line.starts_with('{') {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Look for tier_transition events
+        let msg = v
+            .get("fields")
+            .and_then(|f| f.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+
+        if msg != "tier_transition" {
+            continue;
+        }
+
+        let fields = match v.get("fields") {
+            Some(f) => f,
+            None => continue,
+        };
+
+        let entry_id = fields.get("entry_id").and_then(|e| e.as_str()).unwrap_or("").to_string();
+        let scope_id = fields.get("scope_id").and_then(|e| e.as_str()).unwrap_or("").to_string();
+        let from_tier = fields.get("from_tier").and_then(|e| e.as_str()).unwrap_or("").to_string();
+        let to_tier = fields.get("to_tier").and_then(|e| e.as_str()).unwrap_or("").to_string();
+        let retention_score = fields.get("retention_score").and_then(|e| e.as_f64()).unwrap_or(0.0);
+        let reason = fields.get("reason").and_then(|e| e.as_str()).unwrap_or("").to_string();
+        let timestamp = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string();
+
+        transitions.push(corvia_common::dashboard::TierTransitionDto {
+            entry_id,
+            scope_id,
+            from_tier,
+            to_tier,
+            retention_score,
+            reason,
+            timestamp,
+        });
+    }
+
+    transitions
+}
+
+/// GET /api/dashboard/tiers/pinned
+/// Returns all pinned entries for the default scope.
+async fn pinned_entries_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<corvia_common::dashboard::PinnedEntriesResponse>, (StatusCode, String)> {
+    let scope_id = state
+        .default_scope_id
+        .as_deref()
+        .unwrap_or(DEFAULT_SCOPE_ID);
+
+    let entries = load_scope_entries(&state.data_dir, scope_id).await?;
+
+    let pinned: Vec<corvia_common::dashboard::PinnedEntryDto> = entries
+        .into_iter()
+        .filter_map(|entry| {
+            let pin = entry.pin.as_ref()?;
+            let preview = if entry.content.len() > 120 {
+                format!("{}...", &entry.content[..120])
+            } else {
+                entry.content.clone()
+            };
+            Some(corvia_common::dashboard::PinnedEntryDto {
+                entry_id: entry.id.to_string(),
+                content_preview: preview,
+                pinned_by: pin.by.clone(),
+                pinned_at: pin.at.to_rfc3339(),
+                scope_id: entry.scope_id.clone(),
+            })
+        })
+        .collect();
+
+    let count = pinned.len();
+    Ok(Json(corvia_common::dashboard::PinnedEntriesResponse { entries: pinned, count }))
+}
+
+/// GET /api/dashboard/tiers/gc-history
+/// Returns knowledge GC cycle history (distinct from session-level GC).
+async fn gc_knowledge_history_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<corvia_common::dashboard::GcCycleHistoryResponse> {
+    let cycles: Vec<corvia_common::dashboard::GcCycleReportDto> = state
+        .gc_knowledge_history
+        .all()
+        .iter()
+        .map(gc_cycle_to_dto)
+        .collect();
+    let count = cycles.len();
+    Json(corvia_common::dashboard::GcCycleHistoryResponse { cycles, count })
+}
+
+/// POST /api/dashboard/tiers/unpin/{entry_id}
+/// Unpin an entry (makes it eligible for forgetting again).
+async fn dashboard_unpin_handler(
+    State(state): State<Arc<AppState>>,
+    Path(entry_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let uuid = uuid::Uuid::parse_str(&entry_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid UUID: {e}")))?;
+    let result = corvia_kernel::ops::unpin_entry(&state.store, &uuid)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Unpin failed: {e}")))?;
+    let json = serde_json::to_value(result)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Serialization failed: {e}")))?;
+    Ok(Json(json))
+}
+
+// ---------------------------------------------------------------------------
 // Live sessions endpoint
 // ---------------------------------------------------------------------------
 
@@ -1861,6 +2072,83 @@ mod tests {
             json_after["index_coverage_checked_at"].is_string(),
             "after refresh, checked_at should be set"
         );
+    }
+
+    // --- Tiered knowledge endpoint tests ---
+
+    #[tokio::test]
+    async fn test_tiers_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        let (status, json) = get_json(state, "/api/dashboard/tiers").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json["hot"], 0);
+        assert_eq!(json["warm"], 0);
+        assert_eq!(json["cold"], 0);
+        assert_eq!(json["forgotten"], 0);
+        assert_eq!(json["total"], 0);
+        assert_eq!(json["forgetting_enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn test_tiers_handler_forgetting_enabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        // Enable forgetting in config
+        {
+            let mut cfg = state.config.write().unwrap();
+            cfg.forgetting = Some(corvia_common::config::ForgettingConfig {
+                enabled: true,
+                ..corvia_common::config::ForgettingConfig::default()
+            });
+        }
+
+        let (status, json) = get_json(state, "/api/dashboard/tiers").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json["forgetting_enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn test_tier_transitions_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        let (status, json) = get_json(state, "/api/dashboard/tiers/transitions").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(json.get("transitions").is_some(), "missing transitions");
+        assert!(json["transitions"].is_array(), "transitions should be an array");
+        assert_eq!(json["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_pinned_entries_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        let (status, json) = get_json(state, "/api/dashboard/tiers/pinned").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(json.get("entries").is_some(), "missing entries");
+        assert!(json["entries"].is_array(), "entries should be an array");
+        assert_eq!(json["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_gc_knowledge_history_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        let (status, json) = get_json(state, "/api/dashboard/tiers/gc-history").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(json.get("cycles").is_some(), "missing cycles");
+        assert!(json["cycles"].is_array(), "cycles should be an array");
+        assert_eq!(json["count"], 0);
     }
 
 }
