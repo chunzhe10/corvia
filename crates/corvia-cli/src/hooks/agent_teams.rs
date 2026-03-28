@@ -84,6 +84,7 @@ fn flock_append(path: &Path, line: &str) -> Result<()> {
     // lock_file must be declared before data file for correct drop ordering
     let lock_file = OpenOptions::new()
         .create(true)
+        .truncate(true)
         .write(true)
         .open(&lock_path)?;
 
@@ -186,7 +187,7 @@ fn infer_team_from_task(tasks_dir: &Path, task_id: &str) -> Option<String> {
         }
     }
 
-    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
     candidates.into_iter().next().map(|(name, _)| name)
 }
 
@@ -316,10 +317,10 @@ fn handle_teammate_idle_inner(dirs: &Dirs, stdin: &serde_json::Value) -> Result<
     // 1. Copy config.json (if source newer than staging)
     let src_config = team_dir.join("config.json");
     let dst_config = staging_dir.join("config.json");
-    if src_config.exists() && should_copy(&src_config, &dst_config) {
-        if let Err(e) = atomic_copy(&src_config, &dst_config) {
-            eprintln!("Warning: TeammateIdle failed to copy config.json: {e}");
-        }
+    if src_config.exists() && should_copy(&src_config, &dst_config)
+        && let Err(e) = atomic_copy(&src_config, &dst_config)
+    {
+        eprintln!("Warning: TeammateIdle failed to copy config.json: {e}");
     }
 
     // 2. Copy teammate's inbox
@@ -328,19 +329,19 @@ fn handle_teammate_idle_inner(dirs: &Dirs, stdin: &serde_json::Value) -> Result<
 
     let src_inbox = team_dir.join("inboxes").join(format!("{teammate_name}.json"));
     let dst_inbox = inboxes_staging.join(format!("{teammate_name}.json"));
-    if src_inbox.exists() && should_copy(&src_inbox, &dst_inbox) {
-        if let Err(e) = atomic_copy(&src_inbox, &dst_inbox) {
-            eprintln!("Warning: TeammateIdle failed to copy inbox for {teammate_name}: {e}");
-        }
+    if src_inbox.exists() && should_copy(&src_inbox, &dst_inbox)
+        && let Err(e) = atomic_copy(&src_inbox, &dst_inbox)
+    {
+        eprintln!("Warning: TeammateIdle failed to copy inbox for {teammate_name}: {e}");
     }
 
     // 3. Copy lead's inbox (last writer wins via atomic rename)
     let src_lead = team_dir.join("inboxes").join("team-lead.json");
     let dst_lead = inboxes_staging.join("team-lead.json");
-    if src_lead.exists() && should_copy(&src_lead, &dst_lead) {
-        if let Err(e) = atomic_copy(&src_lead, &dst_lead) {
-            eprintln!("Warning: TeammateIdle failed to copy lead inbox: {e}");
-        }
+    if src_lead.exists() && should_copy(&src_lead, &dst_lead)
+        && let Err(e) = atomic_copy(&src_lead, &dst_lead)
+    {
+        eprintln!("Warning: TeammateIdle failed to copy lead inbox: {e}");
     }
 
     // 4. Append to .capture-log
@@ -402,34 +403,34 @@ fn team_sweep_inner(dirs: &Dirs, session_id: &str) -> Result<()> {
 
         // Copy config.json
         let src_config = entry.path().join("config.json");
-        if src_config.exists() {
-            if let Err(e) = atomic_copy(&src_config, &staging_dir.join("config.json")) {
-                eprintln!("Warning: team sweep failed to copy config.json for {team_name}: {e}");
-            }
+        if src_config.exists()
+            && let Err(e) = atomic_copy(&src_config, &staging_dir.join("config.json"))
+        {
+            eprintln!("Warning: team sweep failed to copy config.json for {team_name}: {e}");
         }
 
         // Copy all task files as sweep events
         let tasks_dir = dirs.claude_tasks.join(&team_name);
-        if tasks_dir.exists() {
-            if let Ok(task_entries) = fs::read_dir(&tasks_dir) {
-                let jsonl_path = staging_dir.join("tasks.jsonl");
-                for task_entry in task_entries.flatten() {
-                    let fname = task_entry.file_name().to_string_lossy().to_string();
-                    if fname.ends_with(".json") {
-                        let content = fs::read_to_string(task_entry.path()).unwrap_or_default();
-                        if let Ok(task) = serde_json::from_str::<serde_json::Value>(&content) {
-                            let task_id = fname.trim_end_matches(".json");
-                            let event = serde_json::json!({
-                                "v": SCHEMA_VERSION,
-                                "event": "sweep",
-                                "task_id": task_id,
-                                "timestamp": now_iso(),
-                                "full_task": task,
-                            });
-                            let line = serde_json::to_string(&event).unwrap_or_default();
-                            if let Err(e) = flock_append(&jsonl_path, &line) {
-                                eprintln!("Warning: team sweep failed to write task {task_id} for {team_name}: {e}");
-                            }
+        if tasks_dir.exists()
+            && let Ok(task_entries) = fs::read_dir(&tasks_dir)
+        {
+            let jsonl_path = staging_dir.join("tasks.jsonl");
+            for task_entry in task_entries.flatten() {
+                let fname = task_entry.file_name().to_string_lossy().to_string();
+                if fname.ends_with(".json") {
+                    let content = fs::read_to_string(task_entry.path()).unwrap_or_default();
+                    if let Ok(task) = serde_json::from_str::<serde_json::Value>(&content) {
+                        let task_id = fname.trim_end_matches(".json");
+                        let event = serde_json::json!({
+                            "v": SCHEMA_VERSION,
+                            "event": "sweep",
+                            "task_id": task_id,
+                            "timestamp": now_iso(),
+                            "full_task": task,
+                        });
+                        let line = serde_json::to_string(&event).unwrap_or_default();
+                        if let Err(e) = flock_append(&jsonl_path, &line) {
+                            eprintln!("Warning: team sweep failed to write task {task_id} for {team_name}: {e}");
                         }
                     }
                 }
