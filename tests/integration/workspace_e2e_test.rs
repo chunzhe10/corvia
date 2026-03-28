@@ -71,8 +71,19 @@ async fn test_workspace_multi_namespace_ingest_and_search() {
     store.insert(&entry_a).await.unwrap();
     store.insert(&entry_b).await.unwrap();
 
+    // Add filler entries for HNSW graph connectivity. HNSW approximate search
+    // is unreliable with <5 entries because the layered graph is too sparse.
+    for i in 0..8 {
+        let filler = KnowledgeEntry::new(
+            format!("filler entry {i}"),
+            "test".into(),
+            "v1".into(),
+        )
+        .with_embedding(vec![0.5, i as f32 * 0.1, 0.5]);
+        store.insert(&filler).await.unwrap();
+    }
+
     // Search returns results from both namespaces
-    // HNSW quirk: at <10 entries, approximate recall is unreliable — use >= assertions
     let results = store.search(&[1.0, 0.0, 0.0], "test", 10).await.unwrap();
     assert!(results.len() >= 2, "Expected at least 2 results, got {}", results.len());
 

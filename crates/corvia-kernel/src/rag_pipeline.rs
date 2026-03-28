@@ -266,7 +266,7 @@ mod tests {
         let mut idx = 0_usize;
         let mut next_emb = || {
             idx += 1;
-            vec![1.0, idx as f32 * 0.001, 0.0]
+            vec![1.0, idx as f32 * 0.1, 0.0]
         };
 
         for i in 0..10 {

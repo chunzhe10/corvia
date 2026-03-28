@@ -853,11 +853,12 @@ mod tests {
 
         let engine: Arc<dyn InferenceEngine> = Arc::new(MockEngine);
 
-        // Insert 10 entries with slight embedding variation for HNSW connectivity.
+        // Insert 10 entries with wider embedding spread for reliable HNSW recall.
+        // Previous 0.001 increments were too close, causing flaky approximate search.
         let mut idx: usize = 0;
         let mut next_emb = || {
             idx += 1;
-            vec![1.0, idx as f32 * 0.001, 0.0]
+            vec![1.0, idx as f32 * 0.1, 0.0]
         };
 
         for i in 0..10 {
@@ -901,7 +902,7 @@ mod tests {
         let mut idx: usize = 0;
         let mut next_emb = || {
             idx += 1;
-            vec![1.0, idx as f32 * 0.001, 0.0]
+            vec![1.0, idx as f32 * 0.1, 0.0]
         };
 
         for i in 0..10 {
@@ -943,7 +944,7 @@ mod tests {
         let mut idx: usize = 0;
         let mut next_emb = || {
             idx += 1;
-            vec![1.0, idx as f32 * 0.001, 0.0]
+            vec![1.0, idx as f32 * 0.1, 0.0]
         };
 
         // 8 filler merged entries for HNSW connectivity.
@@ -1033,7 +1034,7 @@ mod tests {
         let mut idx: usize = 0;
         let mut next_emb = || {
             idx += 1;
-            vec![1.0, idx as f32 * 0.001, 0.0]
+            vec![1.0, idx as f32 * 0.1, 0.0]
         };
 
         // Entry A — close embedding to the query vector [1,0,0].
@@ -1111,7 +1112,7 @@ mod tests {
         let mut idx: usize = 0;
         let mut next_emb = || {
             idx += 1;
-            vec![1.0, idx as f32 * 0.001, 0.0]
+            vec![1.0, idx as f32 * 0.1, 0.0]
         };
 
         // Entry A.
@@ -1187,7 +1188,7 @@ mod tests {
         let mut idx: usize = 0;
         let mut next_emb = || {
             idx += 1;
-            vec![1.0, idx as f32 * 0.001, 0.0]
+            vec![1.0, idx as f32 * 0.1, 0.0]
         };
 
         // Entry A — close to query vector [1,0,0]
@@ -1347,7 +1348,7 @@ mod tests {
         let mut idx: usize = 0;
         let mut next_emb = || {
             idx += 1;
-            vec![1.0, idx as f32 * 0.001, 0.0]
+            vec![1.0, idx as f32 * 0.1, 0.0]
         };
         for i in 0..10 {
             let mut entry = KnowledgeEntry::new(
@@ -1410,7 +1411,7 @@ mod tests {
         let mut idx: usize = 0;
         let mut next_emb = || {
             idx += 1;
-            vec![1.0, idx as f32 * 0.001, 0.0]
+            vec![1.0, idx as f32 * 0.1, 0.0]
         };
         for i in 0..10 {
             let mut entry = KnowledgeEntry::new(
@@ -1558,7 +1559,7 @@ mod tests {
             "tier-scope".to_string(),
             "v1".to_string(),
         );
-        hot.embedding = Some(vec![1.0, 0.001, 0.0]);
+        hot.embedding = Some(vec![1.0, 0.1, 0.0]);
         hot.tier = Tier::Hot;
         store.insert(&hot).await.unwrap();
 
@@ -1616,7 +1617,7 @@ mod tests {
                 "forgotten-scope".to_string(),
                 "v1".to_string(),
             );
-            entry.embedding = Some(vec![1.0, i as f32 * 0.001, 0.0]);
+            entry.embedding = Some(vec![1.0, i as f32 * 0.1, 0.0]);
             store.insert(&entry).await.unwrap();
         }
 
@@ -1669,7 +1670,7 @@ mod tests {
             "ratio-scope".to_string(),
             "v1".to_string(),
         );
-        hot.embedding = Some(vec![1.0, 0.001, 0.0]);
+        hot.embedding = Some(vec![1.0, 0.1, 0.0]);
         hot.tier = Tier::Hot;
         store.insert(&hot).await.unwrap();
 
@@ -1718,7 +1719,7 @@ mod tests {
                 "all-forgotten".to_string(),
                 "v1".to_string(),
             );
-            entry.embedding = Some(vec![1.0, i as f32 * 0.001, 0.0]);
+            entry.embedding = Some(vec![1.0, i as f32 * 0.1, 0.0]);
             entry.tier = Tier::Forgotten;
             store.insert(&entry).await.unwrap();
         }
@@ -1814,7 +1815,7 @@ mod tests {
         let mut idx: usize = 0;
         let mut next_emb = || {
             idx += 1;
-            vec![1.0, idx as f32 * 0.001, 0.0]
+            vec![1.0, idx as f32 * 0.1, 0.0]
         };
         for i in 0..10 {
             let mut entry = KnowledgeEntry::new(
@@ -1930,7 +1931,7 @@ mod tests {
         let mut idx: usize = 0;
         let mut next_emb = || {
             idx += 1;
-            vec![1.0, idx as f32 * 0.001, 0.0]
+            vec![1.0, idx as f32 * 0.1, 0.0]
         };
         for i in 0..10 {
             let mut entry = KnowledgeEntry::new(
