@@ -412,22 +412,30 @@ pub fn rebuild_pipeline_retriever(
         )
     })?;
 
-    // Initialize tantivy if needed (same logic as build_pipeline_retriever).
+    // Reuse existing tantivy from LiteStore if already initialized (OnceLock),
+    // otherwise open a new one. Reusing avoids tantivy file lock conflicts when
+    // the old pipeline's tantivy is being dropped in a background thread.
     let fts: Option<Arc<dyn traits::FullTextSearchable>> =
         if pipeline_cfg.searchers.iter().any(|s| s == "bm25") {
             if let Some(ls) = store.as_any().downcast_ref::<lite_store::LiteStore>() {
-                let cache_dir = std::path::Path::new(&config.storage.data_dir)
-                    .join("cache")
-                    .join("tantivy");
-                match tantivy_index::TantivyIndex::open(&cache_dir, ls.db().clone(), store.clone()) {
-                    Ok(idx) => {
-                        let idx = Arc::new(idx);
-                        ls.set_tantivy(Arc::clone(&idx));
-                        Some(idx as Arc<dyn traits::FullTextSearchable>)
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to open TantivyIndex during hot-swap");
-                        None
+                if let Some(existing) = ls.tantivy() {
+                    // Reuse the tantivy index already wired into LiteStore.
+                    Some(Arc::clone(existing) as Arc<dyn traits::FullTextSearchable>)
+                } else {
+                    // First time: open tantivy and wire it into LiteStore.
+                    let cache_dir = std::path::Path::new(&config.storage.data_dir)
+                        .join("cache")
+                        .join("tantivy");
+                    match tantivy_index::TantivyIndex::open(&cache_dir, ls.db().clone(), store.clone()) {
+                        Ok(idx) => {
+                            let idx = Arc::new(idx);
+                            ls.set_tantivy(Arc::clone(&idx));
+                            Some(idx as Arc<dyn traits::FullTextSearchable>)
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to open TantivyIndex during hot-swap");
+                            None
+                        }
                     }
                 }
             } else {
@@ -674,5 +682,62 @@ mod tests {
 
         let pipeline = create_rag_pipeline(store, engine, Some(graph), None, &config).await;
         assert_eq!(pipeline.retriever_name(), "graph_expand");
+    }
+
+    /// Verify that `rebuild_pipeline_retriever` reuses an existing tantivy index
+    /// from LiteStore's OnceLock instead of trying to open a new one (which would
+    /// fail due to file lock conflicts).
+    #[tokio::test]
+    async fn test_rebuild_pipeline_reuses_existing_tantivy() {
+        use corvia_common::config::PipelineConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = CorviaConfig::default();
+        config.storage.data_dir = dir.path().to_string_lossy().to_string();
+
+        // Set up pipeline config with both vector and bm25 searchers.
+        let mut pipeline_cfg = PipelineConfig::default();
+        pipeline_cfg.searchers = vec!["vector".into(), "bm25".into()];
+        pipeline_cfg.fusion = "rrf".into();
+        config.rag.pipeline = Some(pipeline_cfg);
+
+        // Create a LiteStore and initialize it.
+        let store = create_store(&config).await.unwrap();
+        store.init_schema().await.unwrap();
+        let store: Arc<dyn traits::QueryableStore> = Arc::from(store);
+
+        // Open a TantivyIndex and wire it into LiteStore via set_tantivy().
+        let ls = store.as_any().downcast_ref::<lite_store::LiteStore>().unwrap();
+        let cache_dir = dir.path().join("cache").join("tantivy");
+        let tantivy = tantivy_index::TantivyIndex::open(&cache_dir, ls.db().clone(), store.clone()).unwrap();
+        ls.set_tantivy(Arc::new(tantivy));
+
+        let engine: Arc<dyn traits::InferenceEngine> = Arc::new(
+            ollama_engine::OllamaEngine::new(
+                &config.embedding.url,
+                &config.embedding.model,
+                config.embedding.dimensions,
+            ),
+        );
+
+        // First hot-swap: should reuse the OnceLock tantivy, not open a new one.
+        let result = rebuild_pipeline_retriever(
+            store.clone(),
+            engine.clone(),
+            None,
+            None,
+            &config,
+        );
+        assert!(result.is_ok(), "First rebuild_pipeline_retriever should succeed");
+
+        // Second hot-swap: should still reuse the same OnceLock tantivy.
+        let result = rebuild_pipeline_retriever(
+            store.clone(),
+            engine.clone(),
+            None,
+            None,
+            &config,
+        );
+        assert!(result.is_ok(), "Second rebuild_pipeline_retriever should succeed (OnceLock reuse)");
     }
 }

@@ -217,7 +217,26 @@ pub fn config_set(
 
     // Convert JSON value to TOML value
     let toml_val = json_to_toml(&value)?;
-    section_table.insert(key.to_string(), toml_val);
+
+    // Handle dotted keys (e.g., "pipeline.searchers") by navigating/creating
+    // nested tables instead of inserting a flat key with dots.
+    let key_parts: Vec<&str> = key.split('.').collect();
+    if key_parts.len() == 1 {
+        section_table.insert(key.to_string(), toml_val);
+    } else {
+        let mut current = section_table;
+        for part in &key_parts[..key_parts.len() - 1] {
+            current = current
+                .entry(part.to_string())
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+                .ok_or_else(|| {
+                    CorviaError::Config(format!("Config key '{part}' is not a table"))
+                })?;
+        }
+        let leaf_key = key_parts[key_parts.len() - 1];
+        current.insert(leaf_key.to_string(), toml_val);
+    }
 
     // Write back
     let updated_toml = toml::to_string_pretty(&toml_value)
@@ -934,5 +953,105 @@ mod tests {
         assert_eq!(all[0].orphans_rolled_back, 2);
         assert_eq!(all[2].orphans_rolled_back, 4);
         assert_eq!(history.last().unwrap().orphans_rolled_back, 4);
+    }
+
+    #[test]
+    fn test_config_set_dotted_key_creates_nested_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("corvia.toml");
+        let mut config = CorviaConfig::default();
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let updated = config_set(
+            &config_path,
+            &mut config,
+            "rag",
+            "pipeline.searchers",
+            serde_json::json!(["vector", "graph"]),
+        )
+        .unwrap();
+
+        // Re-read the file and parse as raw TOML to verify nested structure
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: toml::Value = toml::from_str(&raw).unwrap();
+        let rag = parsed.get("rag").expect("rag section missing");
+        let pipeline = rag.get("pipeline").expect("pipeline table missing");
+        let searchers = pipeline.get("searchers").expect("searchers key missing");
+        assert!(searchers.is_array(), "searchers should be an array");
+        let arr = searchers.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0].as_str().unwrap(), "vector");
+        assert_eq!(arr[1].as_str().unwrap(), "graph");
+
+        // Also verify the returned config round-tripped successfully
+        let _ = updated;
+    }
+
+    #[test]
+    fn test_config_set_simple_key_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("corvia.toml");
+        let mut config = CorviaConfig::default();
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let _updated = config_set(
+            &config_path,
+            &mut config,
+            "rag",
+            "default_limit",
+            serde_json::json!(42),
+        )
+        .unwrap();
+
+        // Verify the value was written as a flat key (not nested)
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: toml::Value = toml::from_str(&raw).unwrap();
+        let rag = parsed.get("rag").expect("rag section missing");
+        let limit = rag.get("default_limit").expect("default_limit key missing");
+        assert_eq!(limit.as_integer().unwrap(), 42);
+    }
+
+    #[test]
+    fn test_config_set_dotted_key_existing_intermediate() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("corvia.toml");
+        let mut config = CorviaConfig::default();
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        // First: set pipeline.searchers
+        config_set(
+            &config_path,
+            &mut config,
+            "rag",
+            "pipeline.searchers",
+            serde_json::json!(["vector"]),
+        )
+        .unwrap();
+
+        // Second: set pipeline.fusion in the same intermediate table
+        config_set(
+            &config_path,
+            &mut config,
+            "rag",
+            "pipeline.fusion",
+            serde_json::json!("rrf"),
+        )
+        .unwrap();
+
+        // Verify both keys exist under the same nested pipeline table
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: toml::Value = toml::from_str(&raw).unwrap();
+        let rag = parsed.get("rag").expect("rag section missing");
+        let pipeline = rag.get("pipeline").expect("pipeline table missing");
+
+        let searchers = pipeline.get("searchers").expect("searchers key missing");
+        assert!(searchers.is_array());
+        assert_eq!(searchers.as_array().unwrap().len(), 1);
+
+        let fusion = pipeline.get("fusion").expect("fusion key missing");
+        assert_eq!(fusion.as_str().unwrap(), "rrf");
     }
 }

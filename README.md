@@ -70,7 +70,7 @@ Organizational memory:  why the auth system was redesigned, which decisions led 
 | **Observability** | Structured tracing across all kernel subsystems. Configurable exporters (stdout, file, OTLP). CLI metrics via `corvia status --metrics` |
 | **MCP control plane** | 18 MCP tools across 3 safety tiers (read-only, low-risk, medium-risk). Config hot-reload, GC, index rebuild |
 | **Retrieval quality** | Built-in `corvia bench` measures NDCG, MRR, Precision@K against your own knowledge. Current dogfood scores: NDCG 0.656, MRR 0.608, Precision@5 49.6% |
-| **Config-driven RAG** | Swappable retrievers (vector, graph-expanded), configurable augmentation, multiple generation backends. Tune retrieval without changing code |
+| **Config-driven RAG** | Composable retrieval pipeline: mix vector, BM25, and graph search via `[rag.pipeline]` config. Hot-swap at runtime for A/B benchmarking. RRF fusion for hybrid search |
 | **Three integration paths** | Rust crate, REST API (`:8020`), or MCP server for Claude and other agent frameworks |
 | **Embedded dashboard** | Single-binary serves dashboard on `:8021` with knowledge browser, semantic clustering, activity feed, agent status, and system health |
 | **GPU inference** | OpenVINO for Intel iGPU, CUDA for NVIDIA GPU. Runtime backend switching via config. CPU fallback with automatic detection |
@@ -148,7 +148,7 @@ for AI agents that support the Model Context Protocol:
 
 | Tool | Description |
 |------|-------------|
-| `corvia_search` | Semantic similarity search |
+| `corvia_search` | Search knowledge (vector, BM25, or hybrid depending on pipeline config) |
 | `corvia_write` | Write a knowledge entry (agent-authenticated) |
 | `corvia_history` | Supersession chain for an entry |
 | `corvia_graph` | Graph edges for an entry |
@@ -176,6 +176,53 @@ for AI agents that support the Model Context Protocol:
 | `corvia_agent_suspend` | Suspend an agent and close its sessions |
 | `corvia_merge_retry` | Retry failed merge queue entries |
 | `corvia_merge_queue` | Inspect merge queue status |
+
+## Retrieval Pipeline Configuration
+
+The RAG pipeline supports composable retrieval via `[rag.pipeline]` in `corvia.toml`.
+Default is vector-only with graph expansion. Configure at runtime via `corvia_config_set`
+(hot-swap, no restart needed).
+
+**Presets:**
+
+```toml
+# Vector-only + graph expansion (default)
+[rag.pipeline]
+searchers = ["vector"]
+fusion = "passthrough"
+expander = "graph"
+
+# Hybrid: vector + BM25 with RRF fusion
+[rag.pipeline]
+searchers = ["vector", "bm25"]
+fusion = "rrf"
+expander = "graph"
+
+# BM25-only (fast, lexical matching)
+[rag.pipeline]
+searchers = ["bm25"]
+fusion = "passthrough"
+expander = "noop"
+```
+
+**Components:** Searchers (`vector`, `bm25`), Fusion (`passthrough`, `rrf`),
+Expander (`graph`, `noop`), Reranker (`identity`).
+
+**Note:** BM25 requires a tantivy index. Run `corvia rebuild` after enabling BM25
+to populate the full-text index from existing entries. The index is a cache at
+`.corvia/cache/tantivy/` and is rebuilt automatically on `corvia rebuild`.
+
+**Benchmark results** (2026-03-28, self-ingested corvia codebase, 4,888 entries):
+
+| Config | Source Recall@5 | MRR | Keyword Recall | Latency p50 |
+|--------|----------|-----|----------------|-------------|
+| Vector + graph | 0.59 | 0.73 | 0.78 | 1121ms |
+| Hybrid (RRF) + graph | 0.52 | 0.58 | 0.86 | 2236ms |
+| BM25-only | 0.26 | 0.29 | 0.83 | 26ms |
+
+Vector + graph remains the default. BM25 improves keyword recall but RRF fusion
+currently degrades source-level precision. Hybrid search is available as opt-in
+for workloads that benefit from lexical matching.
 
 ## Architecture
 
