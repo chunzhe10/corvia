@@ -34,10 +34,6 @@ const GEN_META_FILE: &str = "corvia_fts_gen.json";
 /// Flush threshold: number of buffered entries before auto-flush.
 const FLUSH_ENTRY_THRESHOLD: u64 = 100;
 
-/// Flush interval in milliseconds (for future auto-flush timer).
-#[allow(dead_code)]
-const FLUSH_INTERVAL_MS: u64 = 500;
-
 /// Progress logging interval during rebuild.
 const REBUILD_LOG_INTERVAL: usize = 10_000;
 
@@ -138,9 +134,11 @@ pub fn tokenize_code_aware(text: &str) -> Vec<String> {
 }
 
 fn is_version_string(word: &str) -> bool {
-    let s = word.strip_prefix('v').or(Some(word)).unwrap();
-    // Must start with a digit and contain at least one dot.
-    s.starts_with(|c: char| c.is_ascii_digit()) && s.contains('.')
+    let s = word.strip_prefix('v').unwrap_or(word);
+    // Must start with a digit, contain at least two dots (X.Y.Z pattern),
+    // and only contain digits and dots.
+    s.starts_with(|c: char| c.is_ascii_digit())
+        && s.chars().filter(|&c| c == '.').count() >= 2
         && s.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
@@ -228,8 +226,6 @@ pub struct TantivyIndex {
     index: Index,
     reader: IndexReader,
     writer: Mutex<IndexWriter>,
-    #[allow(dead_code)]
-    schema: Schema,
     // Schema field handles.
     field_content: Field,
     field_entry_id: Field,
@@ -242,9 +238,6 @@ pub struct TantivyIndex {
     db: Arc<Database>,
     // Path to generation metadata file.
     gen_meta_path: PathBuf,
-    // Index directory path.
-    #[allow(dead_code)]
-    index_dir: PathBuf,
 }
 
 impl TantivyIndex {
@@ -306,7 +299,6 @@ impl TantivyIndex {
             index,
             reader,
             writer: Mutex::new(writer),
-            schema,
             field_content,
             field_entry_id,
             field_scope_id,
@@ -315,7 +307,6 @@ impl TantivyIndex {
             pending_count: AtomicU64::new(0),
             db,
             gen_meta_path,
-            index_dir: cache_dir.to_path_buf(),
         })
     }
 
@@ -369,12 +360,11 @@ impl TantivyIndex {
     }
 
     fn read_synced_generation(&self) -> u64 {
-        if let Ok(data) = std::fs::read_to_string(&self.gen_meta_path) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
-                return json.get("last_synced_generation")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-            }
+        if let Ok(data) = std::fs::read_to_string(&self.gen_meta_path)
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
+            return json.get("last_synced_generation")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
         }
         0
     }
@@ -387,6 +377,20 @@ impl TantivyIndex {
         self.reader.reload()
             .map_err(|e| CorviaError::Storage(format!("tantivy reader reload: {e}")))?;
         self.pending_count.store(0, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Remove all entries for a scope in a single writer lock acquisition.
+    pub async fn remove_scope(&self, scope_id: &str) -> Result<()> {
+        let term = tantivy::Term::from_field_text(self.field_scope_id, scope_id);
+        let mut writer = self.writer.lock().await;
+        writer.delete_term(term);
+        writer.commit()
+            .map_err(|e| CorviaError::Storage(format!("tantivy commit remove_scope: {e}")))?;
+        drop(writer);
+        self.reader.reload()
+            .map_err(|e| CorviaError::Storage(format!("tantivy reader reload: {e}")))?;
+        self.pending_count.store(0, Ordering::SeqCst);
         Ok(())
     }
 
@@ -444,15 +448,13 @@ impl FullTextSearchable for TantivyIndex {
             let doc: TantivyDocument = searcher.doc(doc_addr)
                 .map_err(|e| CorviaError::Storage(format!("tantivy doc fetch: {e}")))?;
 
-            if let Some(entry_id_val) = doc.get_first(self.field_entry_id) {
-                if let Some(id_str) = entry_id_val.as_str() {
-                    if let Ok(id) = uuid::Uuid::parse_str(id_str) {
-                        results.push(TextSearchResult {
-                            entry_id: id,
-                            score,
-                        });
-                    }
-                }
+            if let Some(entry_id_val) = doc.get_first(self.field_entry_id)
+                && let Some(id_str) = entry_id_val.as_str()
+                && let Ok(id) = uuid::Uuid::parse_str(id_str) {
+                results.push(TextSearchResult {
+                    entry_id: id,
+                    score,
+                });
             }
         }
 
@@ -465,16 +467,26 @@ impl FullTextSearchable for TantivyIndex {
         // Delete any existing document with this entry_id first (upsert).
         let term = tantivy::Term::from_field_text(self.field_entry_id, &entry.id.to_string());
 
-        {
-            let writer = self.writer.lock().await;
+        let needs_flush = {
+            let mut writer = self.writer.lock().await;
             writer.delete_term(term);
             writer.add_document(doc)
                 .map_err(|e| CorviaError::Storage(format!("tantivy add_document: {e}")))?;
-        }
+            let count = self.pending_count.fetch_add(1, Ordering::SeqCst) + 1;
+            if count >= FLUSH_ENTRY_THRESHOLD {
+                // Flush while holding the lock to prevent double-flush races.
+                writer.commit()
+                    .map_err(|e| CorviaError::Storage(format!("tantivy commit: {e}")))?;
+                self.pending_count.store(0, Ordering::SeqCst);
+                true
+            } else {
+                false
+            }
+        };
 
-        let count = self.pending_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if count >= FLUSH_ENTRY_THRESHOLD {
-            self.do_flush().await?;
+        if needs_flush {
+            self.reader.reload()
+                .map_err(|e| CorviaError::Storage(format!("tantivy reader reload: {e}")))?;
         }
 
         Ok(())
@@ -482,14 +494,24 @@ impl FullTextSearchable for TantivyIndex {
 
     async fn remove_entry(&self, entry_id: &uuid::Uuid) -> Result<()> {
         let term = tantivy::Term::from_field_text(self.field_entry_id, &entry_id.to_string());
-        {
-            let writer = self.writer.lock().await;
-            writer.delete_term(term);
-        }
 
-        let count = self.pending_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if count >= FLUSH_ENTRY_THRESHOLD {
-            self.do_flush().await?;
+        let needs_flush = {
+            let mut writer = self.writer.lock().await;
+            writer.delete_term(term);
+            let count = self.pending_count.fetch_add(1, Ordering::SeqCst) + 1;
+            if count >= FLUSH_ENTRY_THRESHOLD {
+                writer.commit()
+                    .map_err(|e| CorviaError::Storage(format!("tantivy commit: {e}")))?;
+                self.pending_count.store(0, Ordering::SeqCst);
+                true
+            } else {
+                false
+            }
+        };
+
+        if needs_flush {
+            self.reader.reload()
+                .map_err(|e| CorviaError::Storage(format!("tantivy reader reload: {e}")))?;
         }
 
         Ok(())
@@ -814,5 +836,104 @@ mod tests {
         // Should find via sub-token "searcher" from both VectorSearcher and searcher.rs.
         let results = idx.search_text("searcher", "test-scope", 10).await.unwrap();
         assert!(!results.is_empty(), "code-aware tokenizer should split CamelCase and file paths");
+    }
+
+    #[tokio::test]
+    async fn test_tantivy_upsert_replaces_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("tantivy");
+        let db = create_test_db(dir.path());
+
+        let idx = TantivyIndex::open(&cache_dir, db).unwrap();
+
+        let mut entry = make_test_entry("original content about vectors", "test-scope");
+        idx.index_entry(&entry).await.unwrap();
+        idx.flush().await.unwrap();
+
+        // Update the same entry with different content.
+        entry.content = "updated content about tantivy BM25 search".to_string();
+        idx.index_entry(&entry).await.unwrap();
+        idx.flush().await.unwrap();
+
+        // Should NOT find old content.
+        let old_results = idx.search_text("vectors", "test-scope", 10).await.unwrap();
+        assert!(old_results.is_empty(), "old content should be replaced");
+
+        // Should find new content.
+        let new_results = idx.search_text("tantivy BM25", "test-scope", 10).await.unwrap();
+        assert_eq!(new_results.len(), 1);
+        assert_eq!(new_results[0].entry_id, entry.id);
+
+        // Entry count should be 1, not 2.
+        assert_eq!(idx.entry_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_tantivy_first_run_bootstrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("nonexistent").join("tantivy");
+        let db = create_test_db(dir.path());
+
+        // First run: directory does not exist, should be created.
+        assert!(!cache_dir.exists());
+        let idx = TantivyIndex::open(&cache_dir, db).unwrap();
+        assert!(cache_dir.exists());
+
+        // Should work normally after bootstrap.
+        let entry = make_test_entry("bootstrap test content", "bootstrap-scope");
+        idx.index_entry(&entry).await.unwrap();
+        idx.flush().await.unwrap();
+
+        let results = idx.search_text("bootstrap", "bootstrap-scope", 10).await.unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_tantivy_remove_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("tantivy");
+        let db = create_test_db(dir.path());
+
+        let idx = TantivyIndex::open(&cache_dir, db).unwrap();
+
+        // Index entries in two scopes.
+        for i in 0..3 {
+            let entry = make_test_entry(&format!("scope-a content {i}"), "scope-a");
+            idx.index_entry(&entry).await.unwrap();
+        }
+        for i in 0..2 {
+            let entry = make_test_entry(&format!("scope-b content {i}"), "scope-b");
+            idx.index_entry(&entry).await.unwrap();
+        }
+        idx.flush().await.unwrap();
+
+        assert_eq!(idx.entry_count().await.unwrap(), 5);
+
+        // Remove scope-a.
+        idx.remove_scope("scope-a").await.unwrap();
+
+        assert_eq!(idx.entry_count().await.unwrap(), 2);
+        assert!(idx.search_text("content", "scope-a", 10).await.unwrap().is_empty());
+        assert_eq!(idx.search_text("content", "scope-b", 10).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_tantivy_entry_count_after_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("tantivy");
+        let db = create_test_db(dir.path());
+
+        let idx = TantivyIndex::open(&cache_dir, db).unwrap();
+
+        let entry = make_test_entry("count decrement test", "count-scope");
+        idx.index_entry(&entry).await.unwrap();
+        idx.flush().await.unwrap();
+
+        assert_eq!(idx.entry_count().await.unwrap(), 1);
+
+        idx.remove_entry(&entry.id).await.unwrap();
+        idx.flush().await.unwrap();
+
+        assert_eq!(idx.entry_count().await.unwrap(), 0);
     }
 }

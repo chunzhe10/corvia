@@ -5,6 +5,7 @@ use hnsw_rs::prelude::*;
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -59,8 +60,9 @@ pub struct LiteStore {
     next_hnsw_id: AtomicU64,
     dimensions: usize,
     graph: crate::graph_store::LiteGraphStore,
-    /// Optional tantivy full-text index. None when BM25 is not configured.
-    tantivy: Option<Arc<crate::tantivy_index::TantivyIndex>>,
+    /// Optional tantivy full-text index. Initialized via `set_tantivy()` after construction.
+    /// Uses OnceLock for interior mutability (set once via shared reference).
+    tantivy: OnceLock<Arc<crate::tantivy_index::TantivyIndex>>,
 }
 
 impl LiteStore {
@@ -158,7 +160,7 @@ impl LiteStore {
             next_hnsw_id: AtomicU64::new(next_id),
             dimensions,
             graph,
-            tantivy: None,
+            tantivy: OnceLock::new(),
         };
 
         // If HNSW was loaded from disk, rebuild only the temporal index (cheap, from Redb).
@@ -184,14 +186,15 @@ impl LiteStore {
     }
 
     /// Set the tantivy full-text index for BM25 search support.
-    /// Called during construction when BM25 is configured.
-    pub fn set_tantivy(&mut self, tantivy: Arc<crate::tantivy_index::TantivyIndex>) {
-        self.tantivy = Some(tantivy);
+    /// Uses interior mutability (OnceLock) so this works via shared reference.
+    /// Called from `build_pipeline_retriever` after the store is already behind Arc.
+    pub fn set_tantivy(&self, tantivy: Arc<crate::tantivy_index::TantivyIndex>) {
+        let _ = self.tantivy.set(tantivy);
     }
 
     /// Get a reference to the tantivy index, if configured.
     pub fn tantivy(&self) -> Option<&Arc<crate::tantivy_index::TantivyIndex>> {
-        self.tantivy.as_ref()
+        self.tantivy.get()
     }
 
     /// Get the shared Redb database handle (for TantivyIndex construction).
@@ -821,14 +824,17 @@ impl LiteStore {
         // the old index is simply leaked (acceptable for deallocation-only work).
         std::thread::spawn(move || drop(old_hnsw));
 
-        // Rebuild tantivy index if present (synchronous during rebuild).
-        if let Some(ref tantivy) = self.tantivy {
+        // Rebuild tantivy index if present.
+        // Uses block_in_place to avoid deadlocking the tokio runtime.
+        if let Some(tantivy) = self.tantivy.get() {
             let rt = tokio::runtime::Handle::try_current();
             if let Ok(handle) = rt {
                 let tantivy = Arc::clone(tantivy);
                 let entries = all_entries.clone();
-                let tantivy_count = handle.block_on(async {
-                    tantivy.rebuild_from_store(&entries).await
+                let tantivy_count = tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        tantivy.rebuild_from_store(&entries).await
+                    })
                 })?;
                 info!("Tantivy index rebuilt with {} entries", tantivy_count);
             } else {
@@ -973,19 +979,15 @@ impl super::traits::QueryableStore for LiteStore {
         // 4. Write temporal index entry
         self.write_temporal_index(entry)?;
 
-        // 5. Mirror to tantivy full-text index (buffered, non-blocking).
-        if let Some(ref tantivy) = self.tantivy {
-            // Increment write generation for staleness tracking.
+        // 5. Mirror to tantivy full-text index (buffered, fast -- just adds to writer buffer).
+        if let Some(tantivy) = self.tantivy.get() {
+            if let Err(e) = tantivy.index_entry(entry).await {
+                warn!(error = %e, "tantivy index_entry failed (non-fatal)");
+            }
+            // Increment write generation after successful indexing.
             if let Err(e) = tantivy.increment_generation() {
                 warn!(error = %e, "tantivy increment_generation failed (non-fatal)");
             }
-            let tantivy_clone = Arc::clone(tantivy);
-            let entry_clone = entry.clone();
-            tokio::spawn(async move {
-                if let Err(e) = tantivy_clone.index_entry(&entry_clone).await {
-                    warn!(error = %e, "tantivy index_entry failed (non-fatal)");
-                }
-            });
         }
 
         Ok(())
@@ -1257,17 +1259,10 @@ impl super::traits::QueryableStore for LiteStore {
         // Delete knowledge files for this scope
         knowledge_files::delete_scope_files(&self.data_dir, scope_id)?;
 
-        // Mirror to tantivy: remove all entries for this scope.
-        if let Some(ref tantivy) = self.tantivy {
-            for uuid_str in &uuids_to_delete {
-                if let Ok(id) = uuid::Uuid::parse_str(uuid_str) {
-                    if let Err(e) = tantivy.remove_entry(&id).await {
-                        warn!(error = %e, "tantivy remove_entry failed during delete_scope (non-fatal)");
-                    }
-                }
-            }
-            if let Err(e) = tantivy.flush().await {
-                warn!(error = %e, "tantivy flush failed during delete_scope (non-fatal)");
+        // Mirror to tantivy: remove all entries for this scope in one operation.
+        if let Some(tantivy) = self.tantivy.get() {
+            if let Err(e) = tantivy.remove_scope(scope_id).await {
+                warn!(error = %e, "tantivy remove_scope failed during delete_scope (non-fatal)");
             }
             if let Err(e) = tantivy.increment_generation() {
                 warn!(error = %e, "tantivy increment_generation failed (non-fatal)");

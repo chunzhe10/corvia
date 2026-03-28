@@ -414,6 +414,8 @@ fn build_pipeline_retriever(
                     Ok(idx) => {
                         let idx = Arc::new(idx);
                         info!("TantivyIndex initialized at {}", cache_dir.display());
+                        // Wire tantivy back into LiteStore for insert/delete mirroring.
+                        ls.set_tantivy(Arc::clone(&idx));
                         // Check staleness and rebuild if needed.
                         match idx.is_stale() {
                             Ok(true) => {

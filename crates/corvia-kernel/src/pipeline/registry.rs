@@ -111,7 +111,7 @@ impl PipelineRegistry {
     /// Create a registry pre-loaded with built-in components.
     ///
     /// Registers:
-    /// - Searchers: `"vector"`
+    /// - Searchers: `"vector"`, `"bm25"`
     /// - Fusions: `"passthrough"`
     /// - Expanders: `"graph"`, `"noop"`
     /// - Rerankers: `"identity"`
@@ -202,6 +202,7 @@ mod tests {
     fn test_registry_names() {
         let reg = PipelineRegistry::with_defaults();
         assert!(reg.searchers.contains("vector"));
+        assert!(reg.searchers.contains("bm25"));
         assert!(reg.fusions.contains("passthrough"));
         // "graph" expander is NOT in the registry; it requires config-driven alpha
         // and is constructed directly in build_pipeline_retriever.
