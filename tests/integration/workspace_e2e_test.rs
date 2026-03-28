@@ -20,6 +20,7 @@ fn make_workspace_config(repos: Vec<RepoConfig>) -> CorviaConfig {
         repos_dir: "repos".into(),
         repos,
         docs: None,
+        spokes: None,
     });
     config
 }

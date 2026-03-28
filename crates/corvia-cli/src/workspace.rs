@@ -103,6 +103,7 @@ pub fn generate_workspace_config(
         repos_dir: "repos".into(),
         repos,
         docs: None,
+        spokes: None,
     });
     Ok(config)
 }

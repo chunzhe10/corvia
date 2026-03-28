@@ -159,6 +159,55 @@ pub struct WorkspaceConfig {
     pub repos: Vec<RepoConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docs: Option<DocsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spokes: Option<SpokeConfig>,
+}
+
+/// Configuration for spoke containers in a multi-spoke workspace.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpokeConfig {
+    /// Docker image for spoke containers (default: "corvia-spoke:latest").
+    #[serde(default = "default_spoke_image")]
+    pub image: String,
+    /// Docker network override. Auto-detected from hub container if None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// Auth mode for spokes: credentials mount or API key.
+    #[serde(default)]
+    pub auth_mode: SpokeAuthMode,
+    /// Memory limit per spoke container (e.g., "4g").
+    #[serde(default = "default_spoke_memory_limit")]
+    pub memory_limit: String,
+    /// CPU shares per spoke container (default: 512).
+    #[serde(default = "default_spoke_cpu_shares")]
+    pub cpu_shares: u32,
+}
+
+impl Default for SpokeConfig {
+    fn default() -> Self {
+        Self {
+            image: default_spoke_image(),
+            network: None,
+            auth_mode: SpokeAuthMode::default(),
+            memory_limit: default_spoke_memory_limit(),
+            cpu_shares: default_spoke_cpu_shares(),
+        }
+    }
+}
+
+fn default_spoke_image() -> String { "corvia-spoke:latest".into() }
+fn default_spoke_memory_limit() -> String { "4g".into() }
+fn default_spoke_cpu_shares() -> u32 { 512 }
+
+/// How spokes authenticate with the Anthropic API.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SpokeAuthMode {
+    /// Mount .credentials.json from the hub container (default).
+    #[default]
+    Credentials,
+    /// Pass ANTHROPIC_API_KEY env var.
+    ApiKey,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -878,6 +927,14 @@ impl CorviaConfig {
         self.workspace.is_some()
     }
 
+    /// Returns spoke config with defaults applied, avoiding double-Option unwrapping.
+    pub fn spoke_config(&self) -> SpokeConfig {
+        self.workspace
+            .as_ref()
+            .and_then(|w| w.spokes.clone())
+            .unwrap_or_default()
+    }
+
     /// Return a config preset for PostgreSQL + vLLM.
     pub fn postgres_default() -> Self {
         Self {
@@ -1079,6 +1136,7 @@ port = 8020
                 },
             ],
             docs: None,
+            spokes: None,
         });
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let loaded: CorviaConfig = toml::from_str(&toml_str).unwrap();
@@ -1097,6 +1155,7 @@ port = 8020
             repos_dir: "repos".into(),
             repos: vec![],
             docs: None,
+            spokes: None,
         });
         assert!(ws_config.is_workspace());
     }
@@ -1585,6 +1644,7 @@ port = 8020
             repos_dir: "repos".into(),
             repos: vec![],
             docs: None,
+            spokes: None,
         });
         let toml_str = toml::to_string_pretty(&ws_config).unwrap();
         let loaded: CorviaConfig = toml::from_str(&toml_str).unwrap();
