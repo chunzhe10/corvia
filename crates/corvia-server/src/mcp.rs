@@ -1713,6 +1713,7 @@ mod tests {
             forgotten_access_counter: std::sync::Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
             gc_knowledge_history: std::sync::Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
             mcp_token: None,
+            docker_available: false,
         })
     }
 
@@ -2032,6 +2033,7 @@ mod tests {
             forgotten_access_counter: std::sync::Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
             gc_knowledge_history: std::sync::Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
             mcp_token: None,
+            docker_available: false,
         });
 
         let args = json!({ "query": "rag-routed", "scope_id": "rag-scope", "limit": 5 });
@@ -2457,6 +2459,7 @@ mod tests {
             forgotten_access_counter: std::sync::Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
             gc_knowledge_history: std::sync::Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
             mcp_token: Some(token.to_string()),
+            docker_available: false,
         })
     }
 

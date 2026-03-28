@@ -74,6 +74,10 @@ pub struct AppState {
     /// MCP bearer token for write operations. `Some` when server is bound to
     /// a non-loopback address (e.g., `0.0.0.0`). `None` for loopback-only binding.
     pub mcp_token: Option<String>,
+    /// Whether Docker is available for spoke container queries.
+    /// The actual Docker client is created on-demand inside `tokio::spawn` to
+    /// avoid bollard's axum 0.7 types leaking into handler futures.
+    pub docker_available: bool,
 }
 
 impl AppState {
@@ -1588,6 +1592,7 @@ mod tests {
             forgotten_access_counter: Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
             gc_knowledge_history: Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
             mcp_token: None,
+            docker_available: false,
         })
     }
 
@@ -1655,6 +1660,7 @@ mod tests {
             forgotten_access_counter: Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
             gc_knowledge_history: Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
             mcp_token: None,
+            docker_available: false,
         })
     }
 

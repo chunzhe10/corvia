@@ -211,6 +211,9 @@ pub struct SpokeInfo {
     pub agent_id: String,
     pub state: String,
     pub status: String,
+    pub created: i64,
+    pub health: String,
+    pub repo_url: Option<String>,
 }
 
 impl SpokeInfo {
@@ -223,14 +226,35 @@ impl SpokeInfo {
             .and_then(|n| n.first())
             .map(|n| n.trim_start_matches('/').to_string())
             .unwrap_or_default();
+
+        let health = container
+            .status
+            .as_deref()
+            .and_then(|s| {
+                if s.contains("healthy") && !s.contains("unhealthy") {
+                    Some("healthy")
+                } else if s.contains("unhealthy") {
+                    Some("unhealthy")
+                } else if s.contains("starting") {
+                    Some("starting")
+                } else {
+                    None
+                }
+            })
+            .unwrap_or("none")
+            .to_string();
+
         Some(Self {
             name,
             repo: labels.get("corvia.repo").cloned().unwrap_or_default(),
             branch: labels.get("corvia.branch").cloned().unwrap_or_default(),
             issue: labels.get("corvia.issue").cloned().unwrap_or_default(),
             agent_id: labels.get("corvia.agent_id").cloned().unwrap_or_default(),
-            state: container.state.as_ref().map(|s| s.to_string()).unwrap_or_default(),
+            state: container.state.as_ref().map(|s| format!("{s:?}").to_lowercase()).unwrap_or_default(),
             status: container.status.clone().unwrap_or_default(),
+            created: container.created.unwrap_or(0),
+            health,
+            repo_url: labels.get("corvia.repo_url").cloned(),
         })
     }
 }

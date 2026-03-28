@@ -6,6 +6,7 @@ pub mod coverage;
 pub mod gpu;
 pub mod health;
 pub mod session_watcher;
+pub mod spokes;
 pub mod traces;
 
 use std::sync::Arc;
@@ -53,6 +54,19 @@ fn gc_report_to_dto(r: GcReport) -> corvia_common::dashboard::GcReportDto {
     }
 }
 
+/// GET /api/dashboard/spokes
+async fn spokes_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<spokes::SpokesResponse> {
+    if !state.docker_available {
+        return Json(spokes::SpokesResponse {
+            spokes: vec![],
+            warning: Some("Docker not connected".into()),
+        });
+    }
+    Json(spokes::query_spokes().await)
+}
+
 /// Dashboard REST API router — mounts at /api/dashboard/*
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -88,6 +102,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/dashboard/sessions/hook/stream", get(hook_sessions_stream))
         .route("/api/dashboard/traces/recent", get(recent_traces_handler))
         .route("/api/dashboard/gpu", get(gpu_status_handler))
+        .route("/api/dashboard/spokes", get(spokes_handler))
         .route("/api/dashboard/status/refresh-coverage", post(refresh_coverage_handler))
         .with_state(state)
 }
@@ -163,6 +178,12 @@ async fn status_handler(
     // Index coverage (sync read from cache — refreshed at startup and via refresh endpoint)
     let cov = state.coverage_cache.get_cached();
 
+    // Spoke counts are computed client-side from GET /api/dashboard/spokes
+    // to avoid making status_handler's future too complex for axum 0.8
+    // (dual axum version causes handler trait bound failures with complex futures).
+    let spoke_count = 0usize;
+    let spokes_running = 0usize;
+
     Json(DashboardStatusResponse {
         services,
         entry_count,
@@ -178,6 +199,8 @@ async fn status_handler(
         index_hnsw_count: cov.hnsw_count,
         index_stale_threshold: cov.threshold,
         index_coverage_checked_at: cov.checked_at,
+        spoke_count,
+        spokes_running,
     })
 }
 
@@ -1771,6 +1794,7 @@ mod tests {
             forgotten_access_counter: std::sync::Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
             gc_knowledge_history: std::sync::Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
             mcp_token: None,
+            docker_available: false,
         })
     }
 
