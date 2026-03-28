@@ -91,6 +91,36 @@ rm .corvia/mcp-token
 corvia-dev down && sleep 3 && corvia-dev up --no-foreground
 ```
 
+## Hub Restart Procedure
+
+When the hub (corvia server) restarts, all spoke MCP connections drop.
+Claude Code's MCP client retries automatically on the next tool call, so
+brief restarts (under 30 seconds) are usually transparent.
+
+For longer restarts or binary updates:
+
+```bash
+# 1. Restart the hub
+corvia-dev down
+sleep 3
+corvia-dev up --no-foreground
+
+# 2. Verify hub is healthy
+curl -sf http://localhost:8020/api/dashboard/status
+
+# 3. If spokes are unresponsive, restart them all
+corvia workspace spoke restart --all
+```
+
+When to use `spoke restart --all`:
+- Hub was down for more than 30 seconds
+- Spokes show "unhealthy" in the dashboard after hub restart
+- MCP write operations from spokes are failing
+
+When you do NOT need to restart spokes:
+- Brief hub restart (under 30 seconds). Claude Code retries MCP calls.
+- Hub config changes that don't affect the MCP endpoint.
+
 ## Long-Running Session Considerations
 
 For spokes running dev-loop on large issues (hours), credential expiry is a

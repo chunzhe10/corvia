@@ -148,14 +148,18 @@ echo "On branch $(git branch --show-current 2>/dev/null || echo 'unknown')"
 
 # --- MCP configuration ---
 
-# Write .mcp.json to user home (NOT workspace) to prevent accidental git commits
-MCP_CONFIG='{"mcpServers":{"corvia":{"type":"http","url":"'"${CORVIA_MCP_URL}"'"'
-if [ -n "${CORVIA_MCP_TOKEN:-}" ]; then
-    MCP_CONFIG="${MCP_CONFIG}"',"headers":{"Authorization":"Bearer '"${CORVIA_MCP_TOKEN}"'"}'
-fi
-MCP_CONFIG="${MCP_CONFIG}"'}}}'
+# Write .mcp.json to user home (NOT workspace) to prevent accidental git commits.
+# Use jq for safe JSON construction (handles special chars in URL/token).
 mkdir -p ~/.claude
-echo "${MCP_CONFIG}" > ~/.claude/.mcp.json
+if [ -n "${CORVIA_MCP_TOKEN:-}" ]; then
+    jq -n --arg url "${CORVIA_MCP_URL}" --arg token "${CORVIA_MCP_TOKEN}" \
+        '{mcpServers:{corvia:{type:"http",url:$url,headers:{Authorization:("Bearer " + $token)}}}}' \
+        > ~/.claude/.mcp.json
+else
+    jq -n --arg url "${CORVIA_MCP_URL}" \
+        '{mcpServers:{corvia:{type:"http",url:$url}}}' \
+        > ~/.claude/.mcp.json
+fi
 echo "MCP config written to ~/.claude/.mcp.json (hub: ${CORVIA_MCP_URL})"
 
 # --- Permission hardening ---

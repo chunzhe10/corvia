@@ -37,7 +37,11 @@ pub mod spans {
     pub const GC_REBUILD: &str = "corvia.gc.rebuild";
     pub const ACCESS_RECORD: &str = "corvia.access.record";
 
-    // Spoke lifecycle spans
+    // Spoke lifecycle spans.
+    // Note: tracing's info_span! macro requires a string literal as the first
+    // argument, so these constants cannot be used directly in info_span! calls.
+    // They exist for the naming convention test and as the canonical reference
+    // for span names used inline in corvia-kernel/src/spoke.rs.
     pub const SPOKE_CREATE: &str = "corvia.spoke.create";
     pub const SPOKE_DESTROY: &str = "corvia.spoke.destroy";
     pub const SPOKE_PRUNE: &str = "corvia.spoke.prune";

@@ -930,18 +930,27 @@ async fn cmd_serve() -> Result<()> {
             use corvia_kernel::spoke::SpokeProvisioner;
             let interval = std::time::Duration::from_secs(300); // 5 minutes
             let max_age = std::time::Duration::from_secs(3600);  // 1 hour
+
+            // Create provisioner once, reconnect only on failure.
+            let mut provisioner = SpokeProvisioner::new().ok();
             loop {
                 tokio::time::sleep(interval).await;
-                if let Ok(provisioner) = SpokeProvisioner::new() {
-                    match provisioner.prune(max_age).await {
-                        Ok(pruned) if !pruned.is_empty() => {
-                            tracing::info!(count = pruned.len(), "Auto-pruned exited spokes");
-                        }
-                        Err(e) => {
-                            tracing::debug!(error = %e, "Spoke auto-prune failed");
-                        }
-                        _ => {}
+                if provisioner.is_none() {
+                    provisioner = SpokeProvisioner::new().ok();
+                    if provisioner.is_none() {
+                        tracing::warn!("Spoke auto-prune: Docker unavailable, will retry");
+                        continue;
                     }
+                }
+                match provisioner.as_ref().unwrap().prune(max_age).await {
+                    Ok(pruned) if !pruned.is_empty() => {
+                        tracing::info!(count = pruned.len(), "Auto-pruned exited spokes");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Spoke auto-prune failed, will reconnect");
+                        provisioner = None; // Force reconnect next tick
+                    }
+                    _ => {}
                 }
             }
         });
