@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::knowledge_files;
-use crate::traits::QueryableStore;
+use crate::traits::{FullTextSearchable, QueryableStore};
 
 // Redb table definitions
 const ENTRIES: TableDefinition<&str, &[u8]> = TableDefinition::new("entries");
@@ -59,6 +59,8 @@ pub struct LiteStore {
     next_hnsw_id: AtomicU64,
     dimensions: usize,
     graph: crate::graph_store::LiteGraphStore,
+    /// Optional tantivy full-text index. None when BM25 is not configured.
+    tantivy: Option<Arc<crate::tantivy_index::TantivyIndex>>,
 }
 
 impl LiteStore {
@@ -156,6 +158,7 @@ impl LiteStore {
             next_hnsw_id: AtomicU64::new(next_id),
             dimensions,
             graph,
+            tantivy: None,
         };
 
         // If HNSW was loaded from disk, rebuild only the temporal index (cheap, from Redb).
@@ -178,6 +181,22 @@ impl LiteStore {
         }
 
         Ok(store)
+    }
+
+    /// Set the tantivy full-text index for BM25 search support.
+    /// Called during construction when BM25 is configured.
+    pub fn set_tantivy(&mut self, tantivy: Arc<crate::tantivy_index::TantivyIndex>) {
+        self.tantivy = Some(tantivy);
+    }
+
+    /// Get a reference to the tantivy index, if configured.
+    pub fn tantivy(&self) -> Option<&Arc<crate::tantivy_index::TantivyIndex>> {
+        self.tantivy.as_ref()
+    }
+
+    /// Get the shared Redb database handle (for TantivyIndex construction).
+    pub fn db(&self) -> &Arc<Database> {
+        &self.db
     }
 
     /// Fetch all knowledge entries from the Redb ENTRIES table in a single pass.
@@ -802,6 +821,21 @@ impl LiteStore {
         // the old index is simply leaked (acceptable for deallocation-only work).
         std::thread::spawn(move || drop(old_hnsw));
 
+        // Rebuild tantivy index if present (synchronous during rebuild).
+        if let Some(ref tantivy) = self.tantivy {
+            let rt = tokio::runtime::Handle::try_current();
+            if let Ok(handle) = rt {
+                let tantivy = Arc::clone(tantivy);
+                let entries = all_entries.clone();
+                let tantivy_count = handle.block_on(async {
+                    tantivy.rebuild_from_store(&entries).await
+                })?;
+                info!("Tantivy index rebuilt with {} entries", tantivy_count);
+            } else {
+                warn!("No tokio runtime available for tantivy rebuild -- skipping");
+            }
+        }
+
         info!(
             "Rebuilt LiteStore from {} entries (HNSW + metadata + temporal index; graph edges preserved in Redb)",
             count
@@ -938,6 +972,21 @@ impl super::traits::QueryableStore for LiteStore {
 
         // 4. Write temporal index entry
         self.write_temporal_index(entry)?;
+
+        // 5. Mirror to tantivy full-text index (buffered, non-blocking).
+        if let Some(ref tantivy) = self.tantivy {
+            // Increment write generation for staleness tracking.
+            if let Err(e) = tantivy.increment_generation() {
+                warn!(error = %e, "tantivy increment_generation failed (non-fatal)");
+            }
+            let tantivy_clone = Arc::clone(tantivy);
+            let entry_clone = entry.clone();
+            tokio::spawn(async move {
+                if let Err(e) = tantivy_clone.index_entry(&entry_clone).await {
+                    warn!(error = %e, "tantivy index_entry failed (non-fatal)");
+                }
+            });
+        }
 
         Ok(())
     }
@@ -1207,6 +1256,23 @@ impl super::traits::QueryableStore for LiteStore {
 
         // Delete knowledge files for this scope
         knowledge_files::delete_scope_files(&self.data_dir, scope_id)?;
+
+        // Mirror to tantivy: remove all entries for this scope.
+        if let Some(ref tantivy) = self.tantivy {
+            for uuid_str in &uuids_to_delete {
+                if let Ok(id) = uuid::Uuid::parse_str(uuid_str) {
+                    if let Err(e) = tantivy.remove_entry(&id).await {
+                        warn!(error = %e, "tantivy remove_entry failed during delete_scope (non-fatal)");
+                    }
+                }
+            }
+            if let Err(e) = tantivy.flush().await {
+                warn!(error = %e, "tantivy flush failed during delete_scope (non-fatal)");
+            }
+            if let Err(e) = tantivy.increment_generation() {
+                warn!(error = %e, "tantivy increment_generation failed (non-fatal)");
+            }
+        }
 
         info!("Deleted scope '{}' ({} entries)", scope_id, uuids_to_delete.len());
         Ok(())

@@ -11,9 +11,9 @@ use corvia_common::errors::{CorviaError, Result};
 
 use super::expander::{Expander, NoOpExpander};
 use super::fusion::{Fusion, PassThrough};
-use super::searcher::{Searcher, VectorSearcher};
+use super::searcher::{Bm25Searcher, Searcher, VectorSearcher};
 use super::{IdentityReranker, Reranker};
-use crate::traits::{GraphStore, InferenceEngine, QueryableStore};
+use crate::traits::{FullTextSearchable, GraphStore, InferenceEngine, QueryableStore};
 
 /// Shared dependencies available to component factories.
 #[derive(Clone)]
@@ -21,6 +21,7 @@ pub struct ComponentDeps {
     pub store: Option<Arc<dyn QueryableStore>>,
     pub engine: Option<Arc<dyn InferenceEngine>>,
     pub graph: Option<Arc<dyn GraphStore>>,
+    pub fts: Option<Arc<dyn FullTextSearchable>>,
 }
 
 /// Error variants for pipeline component operations.
@@ -126,6 +127,16 @@ impl PipelineRegistry {
             Ok(Arc::new(VectorSearcher::new(store, engine)) as Arc<dyn Searcher>)
         });
 
+        searchers.register("bm25", |deps: &ComponentDeps| {
+            let store = deps.store.clone().ok_or_else(|| {
+                CorviaError::Config("Bm25Searcher requires a store".into())
+            })?;
+            let fts = deps.fts.clone().ok_or_else(|| {
+                CorviaError::Config("Bm25Searcher requires a FullTextSearchable backend".into())
+            })?;
+            Ok(Arc::new(Bm25Searcher::new(store, fts)) as Arc<dyn Searcher>)
+        });
+
         let mut fusions = ComponentRegistry::new();
         fusions.register("passthrough", |_deps: &ComponentDeps| {
             Ok(Arc::new(PassThrough) as Arc<dyn Fusion>)
@@ -167,6 +178,7 @@ mod tests {
             store: None,
             engine: None,
             graph: None,
+            fts: None,
         };
         let result = registry.create("nonexistent", &deps);
         assert!(result.is_err());
@@ -179,6 +191,7 @@ mod tests {
             store: None,
             engine: None,
             graph: None,
+            fts: None,
         };
         // VectorSearcher requires store + engine.
         let result = reg.searchers.create("vector", &deps);
@@ -204,6 +217,7 @@ mod tests {
             store: None,
             engine: None,
             graph: None,
+            fts: None,
         };
         let fusion = reg.fusions.create("passthrough", &deps);
         assert!(fusion.is_ok());
@@ -216,6 +230,7 @@ mod tests {
             store: None,
             engine: None,
             graph: None,
+            fts: None,
         };
         let reranker = reg.rerankers.create("identity", &deps);
         assert!(reranker.is_ok());

@@ -17,7 +17,7 @@ use super::{
 };
 use crate::lite_store::LiteStore;
 use crate::retriever::tier_weight;
-use crate::traits::{InferenceEngine, QueryableStore};
+use crate::traits::{FullTextSearchable, InferenceEngine, QueryableStore};
 
 /// First stage of the pipeline: query -> ranked candidates.
 ///
@@ -152,6 +152,105 @@ impl Searcher for VectorSearcher {
                 stage_name: self.name().to_string(),
                 latency_ms,
                 input_count: 0, // searchers have no input
+                output_count,
+                warnings: Vec::new(),
+            },
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bm25Searcher — full-text BM25 search via FullTextSearchable
+// ---------------------------------------------------------------------------
+
+/// BM25 full-text searcher using a [`FullTextSearchable`] backend (e.g., TantivyIndex).
+///
+/// Does NOT require an embedding (uses the raw query string). Looks up full
+/// entries from the store to apply tier weighting and build RankedCandidates.
+pub struct Bm25Searcher {
+    store: Arc<dyn QueryableStore>,
+    fts: Arc<dyn FullTextSearchable>,
+}
+
+impl Bm25Searcher {
+    pub fn new(store: Arc<dyn QueryableStore>, fts: Arc<dyn FullTextSearchable>) -> Self {
+        Self { store, fts }
+    }
+}
+
+#[async_trait]
+impl Searcher for Bm25Searcher {
+    fn name(&self) -> &str {
+        "bm25"
+    }
+
+    fn needs_embedding(&self) -> bool {
+        false
+    }
+
+    async fn search(&self, ctx: &SearchContext) -> Result<RankedSet> {
+        let start = Instant::now();
+
+        let fetch_limit = (ctx.opts.limit * ctx.opts.oversample_factor).max(10);
+        let text_results = self
+            .fts
+            .search_text(&ctx.query, &ctx.scope_id, fetch_limit)
+            .await?;
+
+        let bm25_count = text_results.len();
+
+        // Find max BM25 score for normalization.
+        let max_score = text_results
+            .iter()
+            .map(|r| r.score)
+            .fold(0.0f32, f32::max);
+
+        // Look up full entries and build candidates.
+        let mut candidates = Vec::with_capacity(text_results.len());
+        for tr in text_results {
+            if let Ok(Some(entry)) = self.store.get(&tr.entry_id).await {
+                if entry.tier == corvia_common::types::Tier::Forgotten {
+                    continue;
+                }
+
+                // Normalize BM25 score to [0, 1] via max-normalization.
+                let normalized = if max_score > 0.0 {
+                    tr.score / max_score
+                } else {
+                    0.0
+                };
+                let weighted = normalized * tier_weight(entry.tier);
+                let components = HashMap::from([("bm25".to_string(), weighted)]);
+
+                candidates.push(RankedCandidate {
+                    entry: Arc::new(entry),
+                    scores: CandidateScores {
+                        components,
+                        final_score: NormalizedScore::new(weighted),
+                    },
+                });
+            }
+        }
+
+        candidates.sort_unstable_by_key(|c| std::cmp::Reverse(c.scores.final_score));
+
+        let output_count = candidates.len();
+        let latency_ms = start.elapsed().as_millis() as u64;
+
+        info!(
+            searcher = self.name(),
+            bm25_count,
+            output_count,
+            latency_ms,
+            "BM25 search complete"
+        );
+
+        Ok(RankedSet {
+            candidates,
+            metrics: StageMetrics {
+                stage_name: self.name().to_string(),
+                latency_ms,
+                input_count: 0,
                 output_count,
                 warnings: Vec::new(),
             },

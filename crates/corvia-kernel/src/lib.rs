@@ -93,6 +93,7 @@ pub mod grpc_engine;
 pub mod grpc_chat;
 pub mod inference_provisioner;
 pub mod pipeline;
+pub mod tantivy_index;
 pub mod skill_registry;
 pub mod ingest;
 pub mod scoring;
@@ -402,11 +403,50 @@ fn build_pipeline_retriever(
 ) -> Arc<dyn retriever::Retriever> {
     use pipeline::{ComponentDeps, PipelineRegistry};
 
+    // Initialize tantivy if "bm25" is in the searchers list and store is LiteStore.
+    let fts: Option<Arc<dyn traits::FullTextSearchable>> =
+        if pipeline_cfg.searchers.iter().any(|s| s == "bm25") {
+            if let Some(ls) = store.as_any().downcast_ref::<lite_store::LiteStore>() {
+                let cache_dir = std::path::Path::new(&config.storage.data_dir)
+                    .join("cache")
+                    .join("tantivy");
+                match tantivy_index::TantivyIndex::open(&cache_dir, ls.db().clone()) {
+                    Ok(idx) => {
+                        let idx = Arc::new(idx);
+                        info!("TantivyIndex initialized at {}", cache_dir.display());
+                        // Check staleness and rebuild if needed.
+                        match idx.is_stale() {
+                            Ok(true) => {
+                                info!("Tantivy index is stale, rebuild will be triggered on first use or via 'corvia rebuild'");
+                            }
+                            Ok(false) => {
+                                info!("Tantivy index is up-to-date");
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Failed to check tantivy staleness");
+                            }
+                        }
+                        Some(idx as Arc<dyn traits::FullTextSearchable>)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to open TantivyIndex, BM25 searcher will be unavailable");
+                        None
+                    }
+                }
+            } else {
+                info!("BM25 searcher requested but store is not LiteStore, skipping");
+                None
+            }
+        } else {
+            None
+        };
+
     let registry = PipelineRegistry::with_defaults();
     let deps = ComponentDeps {
         store: Some(store.clone()),
         engine: Some(engine.clone()),
         graph: graph.clone(),
+        fts,
     };
 
     // Build searchers.

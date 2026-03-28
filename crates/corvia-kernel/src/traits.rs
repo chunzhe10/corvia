@@ -145,6 +145,42 @@ pub trait GraphStore: Send + Sync {
     async fn remove_edges(&self, entry_id: &uuid::Uuid) -> Result<()>;
 }
 
+/// Result from a full-text search query.
+#[derive(Debug, Clone)]
+pub struct TextSearchResult {
+    /// The entry ID matching the query.
+    pub entry_id: uuid::Uuid,
+    /// BM25 (or other algorithm) relevance score.
+    pub score: f32,
+}
+
+/// Full-text search interface (algorithm-agnostic).
+///
+/// Implemented by TantivyIndex (BM25). The trait uses algorithm-agnostic naming
+/// so alternative backends (e.g., PostgresStore tsvector) can implement it too.
+#[async_trait]
+pub trait FullTextSearchable: Send + Sync {
+    /// Search by text query within a scope.
+    async fn search_text(&self, query: &str, scope_id: &str, limit: usize) -> Result<Vec<TextSearchResult>>;
+
+    /// Index a knowledge entry for full-text search (buffered, may not be immediately visible).
+    async fn index_entry(&self, entry: &KnowledgeEntry) -> Result<()>;
+
+    /// Remove an entry from the full-text index.
+    async fn remove_entry(&self, entry_id: &uuid::Uuid) -> Result<()>;
+
+    /// Flush buffered writes to disk. Default no-op for stores that don't need it.
+    async fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Rebuild the full-text index from a set of entries.
+    async fn rebuild_from_store(&self, entries: &[KnowledgeEntry]) -> Result<usize>;
+
+    /// Return the number of indexed entries.
+    async fn entry_count(&self) -> Result<u64>;
+}
+
 // Re-export ChatMessage so kernel consumers don't need a direct corvia-common dependency.
 pub use corvia_common::types::ChatMessage;
 
