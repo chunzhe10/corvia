@@ -1095,12 +1095,16 @@ async fn tiers_handler(
 async fn tier_transitions_handler(
     State(_state): State<Arc<AppState>>,
     Query(params): Query<TransitionsQuery>,
-) -> Json<corvia_common::dashboard::TierTransitionsResponse> {
+) -> Result<Json<corvia_common::dashboard::TierTransitionsResponse>, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(50).min(200);
     let log_dir = traces::log_dir();
-    let transitions = parse_tier_transitions(&log_dir, limit);
+    let transitions = tokio::task::spawn_blocking(move || {
+        parse_tier_transitions(&log_dir, limit)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task join failed: {e}")))?;
     let count = transitions.len();
-    Json(corvia_common::dashboard::TierTransitionsResponse { transitions, count })
+    Ok(Json(corvia_common::dashboard::TierTransitionsResponse { transitions, count }))
 }
 
 #[derive(Deserialize)]
@@ -1190,7 +1194,14 @@ async fn pinned_entries_handler(
         .filter_map(|entry| {
             let pin = entry.pin.as_ref()?;
             let preview = if entry.content.len() > 120 {
-                format!("{}...", &entry.content[..120])
+                // Find the last char boundary at or before byte 120 to avoid
+                // panicking on multi-byte UTF-8 sequences.
+                let end = entry.content.char_indices()
+                    .map(|(i, _)| i)
+                    .take_while(|&i| i <= 120)
+                    .last()
+                    .unwrap_or(0);
+                format!("{}...", &entry.content[..end])
             } else {
                 entry.content.clone()
             };
@@ -2136,6 +2147,58 @@ mod tests {
         assert!(json.get("entries").is_some(), "missing entries");
         assert!(json["entries"].is_array(), "entries should be an array");
         assert_eq!(json["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_pinned_entries_handler_with_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        // Insert an entry with a pin
+        let scope_id = corvia_common::constants::DEFAULT_SCOPE_ID;
+        let mut entry = corvia_common::types::KnowledgeEntry::new(
+            "pinned test content".into(),
+            scope_id.into(),
+            "test.rs".into(),
+        );
+        entry.embedding = Some(vec![0.1, 0.2, 0.3]);
+        entry.pin = Some(corvia_common::types::PinInfo {
+            by: "test-agent".into(),
+            at: chrono::Utc::now(),
+        });
+        let entry_id = entry.id.to_string();
+        state.store.insert(&entry).await.unwrap();
+
+        // Ensure the knowledge dir has the JSON file so load_scope_entries finds it
+        let knowledge_dir = tmp.path().join("knowledge").join(scope_id);
+        std::fs::create_dir_all(&knowledge_dir).unwrap();
+        let json = serde_json::to_string(&entry).unwrap();
+        std::fs::write(knowledge_dir.join(format!("{}.json", entry.id)), &json).unwrap();
+
+        let (status, json_resp) = get_json(state, "/api/dashboard/tiers/pinned").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json_resp["count"], 1);
+        let entries = json_resp["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["entry_id"], entry_id);
+        assert_eq!(entries[0]["pinned_by"], "test-agent");
+        assert_eq!(entries[0]["content_preview"], "pinned test content");
+    }
+
+    #[tokio::test]
+    async fn test_unpin_bad_uuid_returns_400() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path()).await;
+
+        let app = router(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/dashboard/tiers/unpin/not-a-valid-uuid")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
