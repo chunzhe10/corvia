@@ -1770,6 +1770,7 @@ mod tests {
             gpu_cache: std::sync::Arc::new(tokio::sync::Mutex::new(super::gpu::GpuMetricsCache::new())),
             forgotten_access_counter: std::sync::Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
             gc_knowledge_history: std::sync::Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
+            mcp_token: None,
         })
     }
 

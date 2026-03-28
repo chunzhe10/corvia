@@ -685,6 +685,49 @@ async fn cmd_serve() -> Result<()> {
     let workspace_root = config_path.parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+
+    // Generate MCP bearer token for write operations when bound to non-loopback address.
+    // This protects write operations when the server is exposed on a network (e.g., 0.0.0.0).
+    let mcp_token = {
+        let host = &config.server.host;
+        let is_loopback = host.parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(host == "localhost");
+        if !is_loopback {
+            let token_path = data_dir.join("mcp-token");
+            // Reuse existing token across restarts so running spokes stay authorized.
+            // Only generate a new token on first run or if the file is missing/empty.
+            let token = if token_path.exists() {
+                let existing = std::fs::read_to_string(&token_path).unwrap_or_default();
+                let existing = existing.trim().to_string();
+                if existing.is_empty() {
+                    uuid::Uuid::new_v4().to_string()
+                } else {
+                    println!("MCP bearer token loaded from {} (required for write operations)", token_path.display());
+                    existing
+                }
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            };
+            // Write (or refresh) the token file with restricted permissions
+            std::fs::write(&token_path, &token).map_err(|e| {
+                anyhow::anyhow!("Failed to write MCP token to {}: {}", token_path.display(), e)
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| anyhow::anyhow!("Failed to set token file permissions: {}", e))?;
+            }
+            if !token_path.exists() || std::fs::read_to_string(&token_path).unwrap_or_default().trim() != token {
+                println!("MCP bearer token written to {} (required for write operations)", token_path.display());
+            }
+            Some(token)
+        } else {
+            None
+        }
+    };
+
     let state = Arc::new(corvia_server::rest::AppState {
         store, engine, coordinator, graph, temporal, data_dir,
         rag: Some(Arc::new(arc_swap::ArcSwap::new(rag))), ready: ready.clone(), default_scope_id,
@@ -700,6 +743,7 @@ async fn cmd_serve() -> Result<()> {
         gpu_cache: Arc::new(tokio::sync::Mutex::new(corvia_server::dashboard::gpu::GpuMetricsCache::new())),
         forgotten_access_counter: Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
         gc_knowledge_history: Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(50)),
+        mcp_token,
     });
     // Initial coverage cache population + background refresh.
     // NOTE: ttl_secs is captured once at startup. While `dashboard` is in
