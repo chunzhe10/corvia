@@ -1289,8 +1289,9 @@ mod tests {
         let result = retriever.retrieve("test", "access-scope", &opts).await.unwrap();
         assert!(!result.results.is_empty());
 
-        // Give the spawned task time to complete.
+        // Give the spawned task time to complete, then flush the access buffer.
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        store.flush_access_buffer();
 
         // Verify access tracking updated for returned entries.
         let returned_ids: Vec<uuid::Uuid> = result.results.iter().map(|sr| sr.entry.id).collect();
@@ -1303,6 +1304,7 @@ mod tests {
         // Search again — access_count should increment to 2.
         let _result2 = retriever.retrieve("test", "access-scope", &opts).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        store.flush_access_buffer();
 
         for id in &returned_ids {
             let entry = store.get(id).await.unwrap().unwrap();
