@@ -596,7 +596,13 @@ impl SpokeProvisioner {
         Ok(())
     }
 
-    /// Prune exited spoke containers older than the given threshold.
+    /// Prune exited spoke containers whose creation time exceeds the given threshold.
+    ///
+    /// Note: uses the container's `Created` timestamp, not its exit time, because
+    /// the Docker list API does not expose `FinishedAt`. A container created 2h ago
+    /// that just exited will be pruned if the threshold is 1h. This is acceptable
+    /// because spoke containers are single-use (one dev-loop run) and are not
+    /// expected to run for longer than the prune threshold.
     /// Returns the names of pruned containers.
     pub async fn prune(&self, max_age: std::time::Duration) -> Result<Vec<String>> {
         let span = info_span!("corvia.spoke.prune", max_age_secs = max_age.as_secs());

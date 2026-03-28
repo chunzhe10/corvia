@@ -76,18 +76,15 @@ fi
 
 # --- Credential validation ---
 
-# Verify credentials are usable before investing time in clone + setup.
-# Claude Code exits with error on invalid credentials, but early detection
-# saves time and produces a clearer error message.
+# Check that the credentials file is non-empty and contains an access token.
+# This is an offline check (no API call, no token cost). Claude Code will
+# detect expired tokens at startup and fail with a clear error message.
 if [ -f ~/.claude/.credentials.json ]; then
-    if command -v claude &>/dev/null; then
-        if claude -p "respond with OK" 2>/dev/null | grep -q "OK"; then
-            echo "Credential check: valid"
-        else
-            report_failure "Credential check failed. Token may be expired. Rotate credentials or use ANTHROPIC_API_KEY."
-            exit 1
-        fi
+    if ! jq -e '.accessToken // .claudeAiOauth' ~/.claude/.credentials.json >/dev/null 2>&1; then
+        report_failure "Credential file exists but contains no access token. Re-login or use ANTHROPIC_API_KEY."
+        exit 1
     fi
+    echo "Credential check: token present (offline check)"
 fi
 
 # --- Repository setup ---
@@ -110,7 +107,7 @@ clone_with_retry() {
 }
 
 # Skip clone if workspace already populated (spoke restart case)
-report_status "cloning" "Cloning ${CORVIA_REPO_URL}"
+echo "Cloning ${CORVIA_REPO_URL}..."
 if [ -d "/workspace/.git" ]; then
     echo "Workspace already populated, skipping clone."
     git -C /workspace fetch origin && git -C /workspace pull --rebase || true
@@ -122,11 +119,11 @@ else
 fi
 
 cd /workspace
-report_status "cloned" "Repository ready"
+echo "Repository ready."
 
 # --- Branch setup ---
 
-report_status "branch-setup" "Configuring branch"
+echo "Configuring branch..."
 if [ -n "${CORVIA_ISSUE:-}" ]; then
     # Derive branch name from issue
     ISSUE_TITLE=$(gh issue view "${CORVIA_ISSUE}" --json title --jq '.title' 2>/dev/null || echo "")
@@ -147,7 +144,7 @@ elif [ -n "${CORVIA_BRANCH:-}" ]; then
     fi
 fi
 
-report_status "branch-ready" "On branch $(git branch --show-current 2>/dev/null || echo 'unknown')"
+echo "On branch $(git branch --show-current 2>/dev/null || echo 'unknown')"
 
 # --- MCP configuration ---
 
@@ -199,7 +196,6 @@ cat > ~/.claude/settings.json << 'SETTINGS_EOF'
       "Bash(date *)",
       "Bash(pwd *)",
       "Bash(whoami *)",
-      "Bash(env *)",
       "Bash(which *)",
       "Bash(realpath *)",
       "Bash(dirname *)",
@@ -209,7 +205,6 @@ cat > ~/.claude/settings.json << 'SETTINGS_EOF'
       "Bash(tr *)",
       "Bash(cut *)",
       "Bash(uniq *)",
-      "Bash(xargs *)",
       "Bash(touch *)",
       "Read(*)",
       "Write(*)",
@@ -224,7 +219,8 @@ cat > ~/.claude/settings.json << 'SETTINGS_EOF'
       "Bash(ssh *)",
       "Bash(nc *)",
       "Bash(ncat *)",
-      "Bash(nmap *)"
+      "Bash(nmap *)",
+      "Bash(wget *)"
     ]
   }
 }

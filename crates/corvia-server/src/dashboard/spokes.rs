@@ -103,6 +103,8 @@ struct CpuStats {
     cpu_usage: CpuUsage,
     #[serde(default)]
     system_cpu_usage: Option<u64>,
+    #[serde(default)]
+    online_cpus: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -120,13 +122,15 @@ struct MemoryStats {
 }
 
 /// Calculate CPU percentage from Docker stats (same formula as `docker stats`).
+/// Includes the online_cpus multiplier so 100% = one full core.
 fn calc_cpu_percent(stats: &DockerStats) -> f64 {
     let cpu_delta = stats.cpu_stats.cpu_usage.total_usage
         .saturating_sub(stats.precpu_stats.cpu_usage.total_usage) as f64;
     let sys_delta = stats.cpu_stats.system_cpu_usage.unwrap_or(0)
         .saturating_sub(stats.precpu_stats.system_cpu_usage.unwrap_or(0)) as f64;
+    let num_cpus = stats.cpu_stats.online_cpus.unwrap_or(1).max(1) as f64;
     if sys_delta > 0.0 {
-        (cpu_delta / sys_delta) * 100.0
+        (cpu_delta / sys_delta) * num_cpus * 100.0
     } else {
         0.0
     }
@@ -136,6 +140,12 @@ fn calc_cpu_percent(stats: &DockerStats) -> f64 {
 async fn docker_container_stats(container_name: &str) -> Result<DockerStats, String> {
     use tokio::net::UnixStream;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Validate container name to prevent HTTP request smuggling via Docker socket.
+    // Docker container names contain only [a-zA-Z0-9_.-].
+    if !container_name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        return Err(format!("Invalid container name: {container_name}"));
+    }
 
     let socket_path = "/var/run/docker.sock";
     let mut stream = UnixStream::connect(socket_path)
@@ -242,13 +252,16 @@ pub async fn query_spokes() -> SpokesResponse {
                     .map(container_to_spoke)
                     .collect();
 
-                // Fetch stats for running containers (best-effort, parallel)
+                // Fetch stats for running containers (best-effort, parallel, 5s timeout each)
                 let mut handles = Vec::new();
                 for (i, spoke) in spokes.iter().enumerate() {
                     if spoke.container_state == "running" {
                         let name = spoke.name.clone();
                         handles.push((i, tokio::spawn(async move {
-                            docker_container_stats(&name).await
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                docker_container_stats(&name),
+                            ).await.unwrap_or(Err("stats timeout".into()))
                         })));
                     }
                 }
@@ -377,15 +390,18 @@ mod tests {
             cpu_stats: CpuStats {
                 cpu_usage: CpuUsage { total_usage: 200 },
                 system_cpu_usage: Some(10000),
+                online_cpus: Some(4),
             },
             precpu_stats: CpuStats {
                 cpu_usage: CpuUsage { total_usage: 100 },
                 system_cpu_usage: Some(9000),
+                online_cpus: None,
             },
             memory_stats: MemoryStats { usage: Some(512), limit: Some(1024) },
         };
         let pct = calc_cpu_percent(&stats);
-        assert!((pct - 10.0).abs() < 0.01);
+        // (100/1000) * 4 * 100 = 40.0
+        assert!((pct - 40.0).abs() < 0.01);
     }
 
     #[test]
@@ -394,10 +410,12 @@ mod tests {
             cpu_stats: CpuStats {
                 cpu_usage: CpuUsage { total_usage: 100 },
                 system_cpu_usage: Some(9000),
+                online_cpus: Some(2),
             },
             precpu_stats: CpuStats {
                 cpu_usage: CpuUsage { total_usage: 100 },
                 system_cpu_usage: Some(9000),
+                online_cpus: None,
             },
             memory_stats: MemoryStats::default(),
         };
