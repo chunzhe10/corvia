@@ -2310,5 +2310,34 @@ mod tests {
         let fake_id = uuid::Uuid::now_v7();
         // Should not panic or error.
         store.record_access(&[fake_id]).await.unwrap();
+        store.flush_access_buffer();
+    }
+
+    #[tokio::test]
+    async fn test_record_access_drop_flushes_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().to_path_buf();
+
+        let entry_id = {
+            let store = LiteStore::open(&db_path, 3).unwrap();
+            store.init_schema().await.unwrap();
+
+            let entry = KnowledgeEntry::new("drop test".into(), "scope".into(), "v1".into())
+                .with_embedding(vec![0.1, 0.2, 0.3]);
+            let id = entry.id;
+            store.insert(&entry).await.unwrap();
+
+            // Record access but do NOT flush — rely on Drop.
+            store.record_access(&[id]).await.unwrap();
+
+            id
+            // store is dropped here, which should trigger flush_sync
+        };
+
+        // Reopen the store and verify the access was persisted.
+        let store = LiteStore::open(&db_path, 3).unwrap();
+        let entry = store.get(&entry_id).await.unwrap().unwrap();
+        assert_eq!(entry.access_count, 1, "Drop should have flushed pending access events");
+        assert!(entry.last_accessed.is_some());
     }
 }
