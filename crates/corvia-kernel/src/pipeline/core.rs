@@ -1245,4 +1245,90 @@ mod tests {
         }
         assert_eq!(successes, 10, "all concurrent queries should succeed during hot-swap");
     }
+
+    // -----------------------------------------------------------------------
+    // TEST 10: Cold tier rescue -- BM25 surfaces cold entries that vector misses
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_cold_tier_rescue_via_bm25() {
+        use corvia_common::types::Tier;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap());
+        store.init_schema().await.unwrap();
+
+        let queryable = store.clone() as Arc<dyn QueryableStore>;
+        let engine: Arc<dyn InferenceEngine> = Arc::new(MockEngine);
+
+        // Insert a cold entry. It won't be in HNSW (vector search misses it),
+        // but BM25 can surface it via full-text search.
+        let mut cold_entry = KnowledgeEntry::new(
+            "cold archived API reference documentation".to_string(),
+            "cold-scope".to_string(),
+            "v1".to_string(),
+        );
+        cold_entry.tier = Tier::Cold;
+        cold_entry.embedding = Some(vec![1.0, 0.0, 0.0]);
+        queryable.insert(&cold_entry).await.unwrap();
+
+        // Insert some hot entries for HNSW connectivity.
+        for i in 0..5 {
+            let mut entry = KnowledgeEntry::new(
+                format!("hot entry about topic {i}"),
+                "cold-scope".to_string(),
+                "v1".to_string(),
+            );
+            entry.embedding = Some(vec![1.0, i as f32 * 0.1, 0.0]);
+            entry.tier = Tier::Hot;
+            queryable.insert(&entry).await.unwrap();
+        }
+
+        // Mock BM25 searcher that returns the cold entry (simulates tantivy finding it).
+        let cold_candidate = crate::pipeline::RankedCandidate {
+            entry: Arc::new(cold_entry.clone()),
+            scores: crate::pipeline::CandidateScores {
+                components: HashMap::from([("bm25".to_string(), 0.9 * 0.3)]), // score * cold weight
+                final_score: crate::pipeline::NormalizedScore::new(0.8),
+            },
+        };
+
+        let pipeline = RetrievalPipeline::new(
+            vec![
+                Arc::new(VectorSearcher::new(queryable.clone(), engine.clone())),
+                Arc::new(MockBM25Searcher {
+                    results: vec![cold_candidate],
+                }),
+            ],
+            Arc::new(PassThrough),
+            Arc::new(crate::pipeline::expander::NoOpExpander),
+            Arc::new(IdentityReranker),
+            engine.clone(),
+            queryable.clone(),
+            5000,
+        );
+
+        let opts = RetrievalOpts {
+            limit: 10,
+            expand_graph: false,
+            visibility: VisibilityMode::All,
+            ..Default::default()
+        };
+
+        let result = pipeline
+            .retrieve("cold archived API reference", "cold-scope", &opts)
+            .await
+            .unwrap();
+
+        // The cold entry should appear in results (rescued by BM25).
+        let has_cold = result.results.iter().any(|sr| sr.entry.id == cold_entry.id);
+        assert!(
+            has_cold,
+            "cold entry should be surfaced by BM25 in hybrid search results"
+        );
+
+        // Verify the cold entry has tier=Cold (confirming it's actually a cold entry).
+        let cold_result = result.results.iter().find(|sr| sr.entry.id == cold_entry.id).unwrap();
+        assert_eq!(cold_result.tier, Tier::Cold, "entry should still be Cold tier");
+    }
 }
