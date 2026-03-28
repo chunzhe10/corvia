@@ -348,8 +348,9 @@ impl crate::traits::QueryableStore for PostgresStore {
         .map_err(|e| CorviaError::Storage(format!("Failed to create pinned index: {e}")))?;
 
         // Full-text search: tsvector column + GIN index (Phase 2b).
-        // Uses a GENERATED ALWAYS AS stored column so tsvector updates automatically
-        // on INSERT/UPDATE. GIN index enables fast @@ matching.
+        // GENERATED ALWAYS AS stored column: tsvector updates automatically on
+        // INSERT/UPDATE with zero application-side maintenance. Verified on PG 12+
+        // (to_tsvector accepted despite STABLE volatility). English config only.
         sqlx::query(
             "ALTER TABLE knowledge ADD COLUMN IF NOT EXISTS tsv tsvector \
              GENERATED ALWAYS AS (to_tsvector('english', content)) STORED"
@@ -852,10 +853,26 @@ impl crate::traits::FullTextSearchable for PostgresStore {
         scope_id: &str,
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Lateral join on plainto_tsquery ensures the tsquery is parsed once.
+        // ts_rank_cd (cover density) rewards term proximity, closer to BM25
+        // behavior than ts_rank (simple frequency). English-only for now.
+        // Tier filter matches vector search (hot + warm only).
         let rows = sqlx::query(
-            r#"SELECT *, ts_rank_cd(tsv, plainto_tsquery('english', $1)) AS text_score
-               FROM knowledge
-               WHERE scope_id = $2 AND tsv @@ plainto_tsquery('english', $1)
+            r#"SELECT id, content, source_version, scope_id, workstream,
+                      recorded_at, valid_from, valid_to, superseded_by,
+                      embedding, metadata, agent_id, session_id, entry_status,
+                      memory_type, confidence, last_accessed, access_count,
+                      tier, tier_changed_at, retention_score,
+                      pinned, pinned_by, pinned_at,
+                      ts_rank_cd(k.tsv, q.query) AS text_score
+               FROM knowledge k, plainto_tsquery('english', $1) q(query)
+               WHERE k.scope_id = $2
+                 AND k.tier IN ('hot', 'warm')
+                 AND k.tsv @@ q.query
                ORDER BY text_score DESC
                LIMIT $3"#,
         )
@@ -869,16 +886,29 @@ impl crate::traits::FullTextSearchable for PostgresStore {
         let results = rows
             .iter()
             .filter_map(|row| {
-                let text_score: f32 = row.try_get::<f64, _>("text_score").ok()? as f32;
-                let entry = row_to_entry(row)?;
-                let tier = entry.tier;
-                let retention_score = entry.retention_score;
-                Some(SearchResult {
-                    entry,
-                    score: text_score,
-                    tier,
-                    retention_score,
-                })
+                let text_score: f32 = match row.try_get::<f64, _>("text_score") {
+                    Ok(s) => s as f32,
+                    Err(e) => {
+                        warn!("Failed to read text_score from FTS row: {e}");
+                        return None;
+                    }
+                };
+                match row_to_entry(row) {
+                    Some(entry) => {
+                        let tier = entry.tier;
+                        let retention_score = entry.retention_score;
+                        Some(SearchResult {
+                            entry,
+                            score: text_score,
+                            tier,
+                            retention_score,
+                        })
+                    }
+                    None => {
+                        warn!("Failed to deserialize FTS result row");
+                        None
+                    }
+                }
             })
             .collect();
 
@@ -1957,12 +1987,103 @@ mod tests {
         let results = store.search_text("database", "test-fts", 10).await.unwrap();
         assert_eq!(results.len(), 2);
         // ts_rank_cd should rank e1 higher (more term density)
+        assert_eq!(results[0].entry.content, e1.content, "higher density entry should rank first");
         assert!(
-            results[0].score >= results[1].score,
-            "results should be ordered by descending score"
+            results[0].score > results[1].score,
+            "results should have strictly different scores for different densities"
         );
 
         store.delete_scope("test-fts").await.unwrap();
         cleanup_test_db("fts_ranking").await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_fts_empty_query() {
+        let store = match connect_test_store("fts_empty_q").await {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("Skipping: PostgreSQL not available");
+                return;
+            }
+        };
+
+        let e1 = KnowledgeEntry::new(
+            "Rust programming language".into(),
+            "test-fts".into(),
+            "v1".into(),
+        )
+        .with_embedding(test_embedding(1.0, 0.0, 0.0));
+        store.insert(&e1).await.unwrap();
+
+        // Empty and whitespace-only queries return empty without hitting PG
+        let results = store.search_text("", "test-fts", 10).await.unwrap();
+        assert!(results.is_empty());
+        let results = store.search_text("   ", "test-fts", 10).await.unwrap();
+        assert!(results.is_empty());
+
+        store.delete_scope("test-fts").await.unwrap();
+        cleanup_test_db("fts_empty_q").await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_fts_excludes_cold_and_forgotten() {
+        let store = match connect_test_store("fts_tiers").await {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("Skipping: PostgreSQL not available");
+                return;
+            }
+        };
+
+        let mut hot = KnowledgeEntry::new(
+            "Rust programming language hot tier".into(),
+            "test-fts".into(),
+            "v1".into(),
+        )
+        .with_embedding(test_embedding(1.0, 0.0, 0.0));
+        hot.tier = corvia_common::types::Tier::Hot;
+
+        let mut warm = KnowledgeEntry::new(
+            "Rust programming language warm tier".into(),
+            "test-fts".into(),
+            "v2".into(),
+        )
+        .with_embedding(test_embedding(0.0, 1.0, 0.0));
+        warm.tier = corvia_common::types::Tier::Warm;
+
+        let mut cold = KnowledgeEntry::new(
+            "Rust programming language cold tier".into(),
+            "test-fts".into(),
+            "v3".into(),
+        )
+        .with_embedding(test_embedding(0.0, 0.0, 1.0));
+        cold.tier = corvia_common::types::Tier::Cold;
+
+        let mut forgotten = KnowledgeEntry::new(
+            "Rust programming language forgotten tier".into(),
+            "test-fts".into(),
+            "v4".into(),
+        )
+        .with_embedding(test_embedding(0.5, 0.5, 0.0));
+        forgotten.tier = corvia_common::types::Tier::Forgotten;
+
+        store.insert(&hot).await.unwrap();
+        store.insert(&warm).await.unwrap();
+        store.insert(&cold).await.unwrap();
+        store.insert(&forgotten).await.unwrap();
+
+        // FTS should only return hot + warm (matching vector search behavior)
+        let results = store.search_text("Rust programming", "test-fts", 10).await.unwrap();
+        assert_eq!(results.len(), 2, "expected only hot + warm entries");
+        for r in &results {
+            assert!(
+                r.tier == corvia_common::types::Tier::Hot || r.tier == corvia_common::types::Tier::Warm,
+                "unexpected tier: {:?}",
+                r.tier
+            );
+        }
+
+        store.delete_scope("test-fts").await.unwrap();
+        cleanup_test_db("fts_tiers").await;
     }
 }
