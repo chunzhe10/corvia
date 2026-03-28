@@ -163,3 +163,113 @@ pub fn counts_from_response(resp: &SpokesResponse) -> (usize, usize) {
     let running = resp.spokes.iter().filter(|s| s.container_state == "running").count();
     (total, running)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_health_healthy() {
+        assert_eq!(extract_health("Up 2 hours (healthy)"), "healthy");
+    }
+
+    #[test]
+    fn extract_health_unhealthy() {
+        assert_eq!(extract_health("Up 1 hour (unhealthy)"), "unhealthy");
+    }
+
+    #[test]
+    fn extract_health_starting() {
+        assert_eq!(extract_health("Up 30 seconds (health: starting)"), "starting");
+    }
+
+    #[test]
+    fn extract_health_exited() {
+        assert_eq!(extract_health("Exited (0) 5 minutes ago"), "none");
+    }
+
+    #[test]
+    fn extract_health_empty() {
+        assert_eq!(extract_health(""), "none");
+    }
+
+    #[test]
+    fn container_to_spoke_full_labels() {
+        let c = DockerContainer {
+            names: vec!["/spoke-42".to_string()],
+            state: "running".to_string(),
+            status: "Up 2 hours (healthy)".to_string(),
+            created: 1711600000,
+            labels: HashMap::from([
+                ("corvia.agent_id".into(), "spoke-42".into()),
+                ("corvia.repo".into(), "corvia".into()),
+                ("corvia.branch".into(), "feat/42-bm25".into()),
+                ("corvia.issue".into(), "42".into()),
+                ("corvia.repo_url".into(), "https://github.com/org/repo".into()),
+            ]),
+        };
+        let spoke = container_to_spoke(&c);
+        assert_eq!(spoke.name, "spoke-42");
+        assert_eq!(spoke.agent_id, "spoke-42");
+        assert_eq!(spoke.repo, "corvia");
+        assert_eq!(spoke.branch, "feat/42-bm25");
+        assert_eq!(spoke.issue, "42");
+        assert_eq!(spoke.container_state, "running");
+        assert_eq!(spoke.health, "healthy");
+        assert_eq!(spoke.repo_url.as_deref(), Some("https://github.com/org/repo"));
+    }
+
+    #[test]
+    fn container_to_spoke_missing_labels() {
+        let c = DockerContainer {
+            names: vec![],
+            state: "exited".to_string(),
+            status: "Exited (0)".to_string(),
+            created: 0,
+            labels: HashMap::new(),
+        };
+        let spoke = container_to_spoke(&c);
+        assert_eq!(spoke.name, "");
+        assert_eq!(spoke.agent_id, "");
+        assert_eq!(spoke.health, "none");
+        assert!(spoke.repo_url.is_none());
+    }
+
+    #[test]
+    fn url_encode_filter_encodes_special_chars() {
+        let input = r#"{"label":["corvia.spoke=true"]}"#;
+        let encoded = url_encode_filter(input);
+        assert!(!encoded.contains('{'));
+        assert!(!encoded.contains('}'));
+        assert!(!encoded.contains('"'));
+        assert!(!encoded.contains('['));
+        assert!(!encoded.contains(']'));
+        assert!(!encoded.contains('='));
+        assert!(encoded.contains("%7B"));
+        assert!(encoded.contains("%3D"));
+    }
+
+    #[test]
+    fn counts_from_response_mixed() {
+        let resp = SpokesResponse {
+            spokes: vec![
+                DashboardSpokeInfo {
+                    name: "s1".into(), agent_id: "a1".into(), repo: "r".into(),
+                    branch: "b".into(), issue: "1".into(), container_state: "running".into(),
+                    container_status: "Up".into(), created: 0, health: "healthy".into(),
+                    repo_url: None,
+                },
+                DashboardSpokeInfo {
+                    name: "s2".into(), agent_id: "a2".into(), repo: "r".into(),
+                    branch: "b".into(), issue: "2".into(), container_state: "exited".into(),
+                    container_status: "Exited".into(), created: 0, health: "none".into(),
+                    repo_url: None,
+                },
+            ],
+            warning: None,
+        };
+        let (total, running) = counts_from_response(&resp);
+        assert_eq!(total, 2);
+        assert_eq!(running, 1);
+    }
+}
