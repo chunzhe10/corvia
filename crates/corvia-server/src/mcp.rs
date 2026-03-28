@@ -1919,7 +1919,7 @@ mod tests {
                 "rag-scope".into(),
                 "v1".into(),
             );
-            entry.embedding = Some(vec![1.0, (i as f32) * 0.001, 0.0]);
+            entry.embedding = Some(vec![1.0, (i as f32) * 0.1, 0.0]);
             entry.entry_status = corvia_common::agent_types::EntryStatus::Merged;
             store.insert(&entry).await.unwrap();
         }

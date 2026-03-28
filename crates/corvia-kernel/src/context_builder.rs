@@ -102,7 +102,7 @@ mod tests {
         let mut idx = 0_usize;
         let mut next_emb = || {
             idx += 1;
-            let offset = idx as f32 * 0.001;
+            let offset = idx as f32 * 0.1;
             vec![1.0, offset, 0.0]
         };
 
