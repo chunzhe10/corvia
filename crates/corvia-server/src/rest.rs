@@ -1667,6 +1667,11 @@ mod tests {
                     graph_reinforced: 0,
                     post_filter_count: 0,
                     retriever_name: "mock".into(),
+                    bm25_latency_ms: None,
+                    bm25_results: None,
+                    fusion_method: None,
+                    fusion_latency_ms: None,
+                    stages: None,
                 },
                 query_embedding: None,
             })

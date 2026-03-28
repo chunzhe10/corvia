@@ -132,6 +132,21 @@ pub struct RetrievalMetrics {
     pub graph_reinforced: usize,
     pub post_filter_count: usize,
     pub retriever_name: String,
+    /// BM25 search latency (pipeline mode only, Phase 2a+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bm25_latency_ms: Option<u64>,
+    /// Number of BM25 results before fusion (pipeline mode only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bm25_results: Option<usize>,
+    /// Fusion method used (pipeline mode only, e.g. "passthrough", "rrf").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fusion_method: Option<String>,
+    /// Fusion stage latency (pipeline mode only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fusion_latency_ms: Option<u64>,
+    /// Per-stage metrics (pipeline mode only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stages: Option<Vec<crate::pipeline::StageMetrics>>,
 }
 
 /// Output of the augmentation stage.

@@ -46,7 +46,7 @@ pub(crate) const fn tier_weight(tier: Tier) -> f32 {
 ///
 /// Only `ReadWrite { scopes }` agents are scope-restricted. `ReadOnly` and `Admin`
 /// have no scope restriction by design (D19/D44).
-fn check_rbac_scope(
+pub(crate) fn check_rbac_scope(
     opts: &RetrievalOpts,
     scope_id: &str,
     retriever_name: &str,
@@ -76,6 +76,11 @@ fn check_rbac_scope(
                         graph_reinforced: 0,
                         post_filter_count: 0,
                         retriever_name: retriever_name.to_string(),
+                        bm25_latency_ms: None,
+                        bm25_results: None,
+                        fusion_method: None,
+                        fusion_latency_ms: None,
+                        stages: None,
                     },
                     query_embedding: None,
                 });
@@ -88,7 +93,7 @@ fn check_rbac_scope(
 /// Spawns a background task to update `last_accessed` and `access_count` on all
 /// entries in the result set. The write does NOT block the search response.
 /// Failures are logged as warnings — access tracking is optimization, not correctness.
-fn spawn_access_recording(store: Arc<dyn QueryableStore>, results: &[SearchResult]) {
+pub(crate) fn spawn_access_recording(store: Arc<dyn QueryableStore>, results: &[SearchResult]) {
     if results.is_empty() {
         return;
     }
@@ -306,6 +311,11 @@ impl Retriever for VectorRetriever {
                 graph_reinforced: 0,
                 post_filter_count,
                 retriever_name: self.name().to_string(),
+                bm25_latency_ms: None,
+                bm25_results: None,
+                fusion_method: None,
+                fusion_latency_ms: None,
+                stages: None,
             },
             query_embedding: Some(embedding),
         })
@@ -669,6 +679,11 @@ impl Retriever for GraphExpandRetriever {
                 graph_reinforced,
                 post_filter_count,
                 retriever_name: self.name().to_string(),
+                bm25_latency_ms: None,
+                bm25_results: None,
+                fusion_method: None,
+                fusion_latency_ms: None,
+                stages: None,
             },
             query_embedding: Some(embedding),
         })

@@ -92,6 +92,7 @@ pub mod ops;
 pub mod grpc_engine;
 pub mod grpc_chat;
 pub mod inference_provisioner;
+pub mod pipeline;
 pub mod skill_registry;
 pub mod ingest;
 pub mod scoring;
@@ -267,37 +268,18 @@ pub async fn create_rag_pipeline(
     generator: Option<Arc<dyn traits::GenerationEngine>>,
     config: &CorviaConfig,
 ) -> rag_pipeline::RagPipeline {
-    // Select retriever by config name (adapter-like pattern).
-    // Falls back to "vector" if requested retriever requires unavailable dependencies.
-    let ret: Arc<dyn retriever::Retriever> = match config.rag.retriever.as_str() {
-        "vector" => Arc::new(retriever::VectorRetriever::new(store.clone(), engine.clone())),
-        "graph_expand" => {
-            match graph {
-                Some(g) => Arc::new(retriever::GraphExpandRetriever::new(
-                    store.clone(),
-                    engine.clone(),
-                    g,
-                    config.rag.graph_alpha,
-                )),
-                None => {
-                    info!(fallback = "vector", "graph store unavailable, falling back to vector retriever");
-                    Arc::new(retriever::VectorRetriever::new(store.clone(), engine.clone()))
-                }
-            }
-        }
-        other => {
-            warn!(
-                retriever = other,
-                "unknown retriever '{other}', falling back to graph_expand. \
-                 Valid options: \"vector\", \"graph_expand\""
-            );
-            match graph {
-                Some(g) => Arc::new(retriever::GraphExpandRetriever::new(
-                    store.clone(), engine.clone(), g, config.rag.graph_alpha,
-                )),
-                None => Arc::new(retriever::VectorRetriever::new(store.clone(), engine.clone())),
-            }
-        }
+    // When [rag.pipeline] is configured, use the composable pipeline.
+    // Otherwise, fall back to legacy monolithic retrievers.
+    let ret: Arc<dyn retriever::Retriever> = if let Some(ref pipeline_cfg) = config.rag.pipeline {
+        build_pipeline_retriever(
+            store.clone(),
+            engine.clone(),
+            graph.clone(),
+            config,
+            pipeline_cfg,
+        )
+    } else {
+        build_legacy_retriever(store.clone(), engine.clone(), graph, config)
     };
 
     let system_prompt = if config.rag.system_prompt.is_empty() {
@@ -371,6 +353,128 @@ pub async fn create_store_at_with_graph(
             create_store_with_graph(config).await
         }
     }
+}
+
+/// Build a legacy monolithic retriever (backward compat when [rag.pipeline] is absent).
+fn build_legacy_retriever(
+    store: Arc<dyn traits::QueryableStore>,
+    engine: Arc<dyn traits::InferenceEngine>,
+    graph: Option<Arc<dyn traits::GraphStore>>,
+    config: &CorviaConfig,
+) -> Arc<dyn retriever::Retriever> {
+    match config.rag.retriever.as_str() {
+        "vector" => Arc::new(retriever::VectorRetriever::new(store, engine)),
+        "graph_expand" => {
+            match graph {
+                Some(g) => Arc::new(retriever::GraphExpandRetriever::new(
+                    store, engine, g, config.rag.graph_alpha,
+                )),
+                None => {
+                    info!(fallback = "vector", "graph store unavailable, falling back to vector retriever");
+                    Arc::new(retriever::VectorRetriever::new(store, engine))
+                }
+            }
+        }
+        other => {
+            warn!(
+                retriever = other,
+                "unknown retriever '{other}', falling back to graph_expand. \
+                 Valid options: \"vector\", \"graph_expand\""
+            );
+            match graph {
+                Some(g) => Arc::new(retriever::GraphExpandRetriever::new(
+                    store, engine, g, config.rag.graph_alpha,
+                )),
+                None => Arc::new(retriever::VectorRetriever::new(store, engine)),
+            }
+        }
+    }
+}
+
+/// Build a composable pipeline retriever from [rag.pipeline] config.
+fn build_pipeline_retriever(
+    store: Arc<dyn traits::QueryableStore>,
+    engine: Arc<dyn traits::InferenceEngine>,
+    graph: Option<Arc<dyn traits::GraphStore>>,
+    config: &CorviaConfig,
+    pipeline_cfg: &corvia_common::config::PipelineConfig,
+) -> Arc<dyn retriever::Retriever> {
+    use pipeline::{ComponentDeps, PipelineRegistry};
+
+    let registry = PipelineRegistry::with_defaults();
+    let deps = ComponentDeps {
+        store: Some(store.clone()),
+        engine: Some(engine.clone()),
+        graph: graph.clone(),
+    };
+
+    // Build searchers.
+    let mut searchers: Vec<Arc<dyn pipeline::Searcher>> = Vec::new();
+    for name in &pipeline_cfg.searchers {
+        match registry.searchers.create(name, &deps) {
+            Ok(s) => searchers.push(s),
+            Err(e) => {
+                warn!(searcher = name.as_str(), error = %e, "failed to create searcher, skipping");
+            }
+        }
+    }
+    if searchers.is_empty() {
+        warn!("no searchers configured, falling back to vector");
+        if let Ok(s) = registry.searchers.create("vector", &deps) {
+            searchers.push(s);
+        }
+    }
+
+    // Build fusion.
+    let fusion = registry
+        .fusions
+        .create(&pipeline_cfg.fusion, &deps)
+        .unwrap_or_else(|e| {
+            warn!(fusion = pipeline_cfg.fusion.as_str(), error = %e, "falling back to passthrough");
+            registry.fusions.create("passthrough", &deps).unwrap()
+        });
+
+    // Build expander (falls back to noop if graph store unavailable).
+    let expander = if pipeline_cfg.expander == "graph" && graph.is_none() {
+        info!("graph expander requested but no graph store, falling back to noop");
+        registry.expanders.create("noop", &deps).unwrap()
+    } else {
+        // For graph expander, create with config alpha.
+        if pipeline_cfg.expander == "graph" {
+            Arc::new(pipeline::expander::GraphExpander::new(
+                store.clone(),
+                graph.unwrap(),
+                config.rag.graph_alpha,
+            )) as Arc<dyn pipeline::Expander>
+        } else {
+            registry
+                .expanders
+                .create(&pipeline_cfg.expander, &deps)
+                .unwrap_or_else(|e| {
+                    warn!(expander = pipeline_cfg.expander.as_str(), error = %e, "falling back to noop");
+                    registry.expanders.create("noop", &deps).unwrap()
+                })
+        }
+    };
+
+    // Build reranker.
+    let reranker = registry
+        .rerankers
+        .create(&pipeline_cfg.reranker, &deps)
+        .unwrap_or_else(|e| {
+            warn!(reranker = pipeline_cfg.reranker.as_str(), error = %e, "falling back to identity");
+            registry.rerankers.create("identity", &deps).unwrap()
+        });
+
+    Arc::new(pipeline::RetrievalPipeline::new(
+        searchers,
+        fusion,
+        expander,
+        reranker,
+        engine,
+        store,
+        pipeline_cfg.searcher_timeout_ms,
+    ))
 }
 
 #[cfg(test)]

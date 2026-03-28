@@ -436,6 +436,10 @@ pub struct RagConfig {
     /// Fraction of context window reserved for skill content. Default: 0.15.
     #[serde(default = "default_reserve_for_skills")]
     pub reserve_for_skills: f32,
+    /// Composable pipeline config. When present, overrides the `retriever` field.
+    /// Maps to `[rag.pipeline]` in TOML.
+    #[serde(default)]
+    pub pipeline: Option<PipelineConfig>,
 }
 
 fn default_retriever() -> String { "graph_expand".into() }
@@ -450,6 +454,94 @@ fn default_skills_dirs() -> Vec<String> { vec!["skills".into()] }
 fn default_max_skills() -> usize { 3 }
 fn default_skill_threshold() -> f32 { 0.3 }
 fn default_reserve_for_skills() -> f32 { 0.15 }
+fn default_searcher_timeout_ms() -> u64 { 5000 }
+
+/// Configuration for the composable retrieval pipeline.
+///
+/// Maps to `[rag.pipeline]` in `corvia.toml`. When absent, the legacy
+/// `rag.retriever` field drives retriever selection with backward compatibility.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineConfig {
+    /// Searcher names to run in parallel. Default: `["vector"]`.
+    #[serde(default = "default_pipeline_searchers")]
+    pub searchers: Vec<String>,
+    /// Fusion strategy name. Default: `"passthrough"`.
+    #[serde(default = "default_pipeline_fusion")]
+    pub fusion: String,
+    /// Expander strategy name. Default: `"graph"` (falls back to `"noop"` if no graph store).
+    #[serde(default = "default_pipeline_expander")]
+    pub expander: String,
+    /// Reranker strategy name. Default: `"identity"`.
+    #[serde(default = "default_pipeline_reranker")]
+    pub reranker: String,
+    /// Per-searcher timeout in milliseconds. Default: 5000.
+    #[serde(default = "default_searcher_timeout_ms")]
+    pub searcher_timeout_ms: u64,
+    /// RRF parameters (for Phase 2c). Default k=60.
+    #[serde(default)]
+    pub rrf: RrfConfig,
+    /// BM25 parameters (for Phase 2a). Default: all defaults.
+    #[serde(default)]
+    pub bm25: Bm25Config,
+}
+
+fn default_pipeline_searchers() -> Vec<String> { vec!["vector".into()] }
+fn default_pipeline_fusion() -> String { "passthrough".into() }
+fn default_pipeline_expander() -> String { "graph".into() }
+fn default_pipeline_reranker() -> String { "identity".into() }
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            searchers: default_pipeline_searchers(),
+            fusion: default_pipeline_fusion(),
+            expander: default_pipeline_expander(),
+            reranker: default_pipeline_reranker(),
+            searcher_timeout_ms: default_searcher_timeout_ms(),
+            rrf: RrfConfig::default(),
+            bm25: Bm25Config::default(),
+        }
+    }
+}
+
+/// Reciprocal Rank Fusion parameters (Phase 2c).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RrfConfig {
+    /// RRF constant k. Default: 60.
+    #[serde(default = "default_rrf_k")]
+    pub k: usize,
+}
+
+fn default_rrf_k() -> usize { 60 }
+
+impl Default for RrfConfig {
+    fn default() -> Self {
+        Self { k: default_rrf_k() }
+    }
+}
+
+/// BM25 parameters (Phase 2a).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bm25Config {
+    /// BM25 k1 parameter. Default: 1.2.
+    #[serde(default = "default_bm25_k1")]
+    pub k1: f32,
+    /// BM25 b parameter. Default: 0.75.
+    #[serde(default = "default_bm25_b")]
+    pub b: f32,
+}
+
+fn default_bm25_k1() -> f32 { 1.2 }
+fn default_bm25_b() -> f32 { 0.75 }
+
+impl Default for Bm25Config {
+    fn default() -> Self {
+        Self {
+            k1: default_bm25_k1(),
+            b: default_bm25_b(),
+        }
+    }
+}
 
 impl Default for RagConfig {
     fn default() -> Self {
@@ -469,6 +561,7 @@ impl Default for RagConfig {
             max_skills: default_max_skills(),
             skill_threshold: default_skill_threshold(),
             reserve_for_skills: default_reserve_for_skills(),
+            pipeline: None,
         }
     }
 }
