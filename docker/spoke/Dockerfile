@@ -9,12 +9,11 @@
 
 FROM node:22-bookworm
 
-# System dependencies
+# System dependencies (no build-essential: Claude Code is pure JS, no native addons)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         git \
         curl \
-        build-essential \
         ca-certificates \
         jq \
     && rm -rf /var/lib/apt/lists/*
@@ -35,13 +34,14 @@ LABEL corvia.spoke.claude_code_version=${CLAUDE_CODE_VERSION}
 
 # Create non-root user for security
 RUN useradd -m -s /bin/bash spoke
-USER spoke
-WORKDIR /workspace
 
-# Copy entrypoint
+# Copy entrypoint (before USER switch so it lands in root-owned /usr/local/bin)
 COPY --chown=spoke:spoke spoke-entrypoint.sh /usr/local/bin/spoke-entrypoint.sh
 
+USER spoke
+WORKDIR /home/spoke
+
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD pgrep -f "claude" || exit 1
+    CMD pgrep -x "claude" || exit 1
 
 ENTRYPOINT ["/usr/local/bin/spoke-entrypoint.sh"]

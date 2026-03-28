@@ -43,10 +43,11 @@ documented CI/container use patterns.
 
 ### Token Lifecycle
 
-1. On server startup, if `config.server.host` is NOT loopback (`127.0.0.1` / `::1`):
-   - Generate a UUID v4 token
-   - Write to `{data_dir}/mcp-token`
+1. On server startup, if `config.server.host` is NOT loopback (parsed via `IpAddr::is_loopback()`):
+   - If `{data_dir}/mcp-token` exists and is non-empty: reuse it (stable across restarts)
+   - Otherwise: generate a UUID v4 token, write to `{data_dir}/mcp-token` with 0600 permissions
    - Store in `AppState` as `Option<String>`
+   - Token comparison uses constant-time algorithm to prevent timing attacks
 2. If host IS loopback: no token generated (backward compatible)
 
 ### Protected Operations (write tools)
@@ -58,6 +59,8 @@ These MCP tools require `Authorization: Bearer <token>`:
 - `corvia_rebuild_index`
 - `corvia_agent_suspend`
 - `corvia_merge_retry`
+- `corvia_pin`
+- `corvia_unpin`
 
 ### Unprotected Operations (read tools)
 

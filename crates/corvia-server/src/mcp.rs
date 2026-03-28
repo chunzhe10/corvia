@@ -32,6 +32,17 @@ const WRITE_TOOLS: &[&str] = &[
     "corvia_unpin",
 ];
 
+/// Constant-time byte comparison to prevent timing side-channel attacks on token validation.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
 /// Extract bearer token from Authorization header.
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
     headers
@@ -100,6 +111,8 @@ const INTERNAL_ERROR: i32 = -32603;
 /// Service unavailable (optional component not configured).
 /// Uses -32000 from the JSON-RPC implementation-defined server error range (-32000..-32099).
 const SERVICE_UNAVAILABLE: i32 = -32000;
+/// Unauthorized (bearer token missing or invalid for write operations).
+const UNAUTHORIZED: i32 = -32001;
 
 /// Check if a tool call has confirmation via _meta.confirmed.
 fn is_confirmed(meta: Option<&Value>) -> bool {
@@ -639,20 +652,20 @@ async fn handle_tools_call(
 
     // Bearer token auth: when the server has an MCP token configured (non-loopback
     // binding), write operations require a matching Authorization: Bearer <token> header.
+    // Uses constant-time comparison to prevent timing side-channel attacks.
     if let Some(expected_token) = &state.mcp_token
         && WRITE_TOOLS.contains(&tool_name)
     {
         match bearer_token {
-            Some(provided) if provided == expected_token => {} // authorized
+            Some(provided) if constant_time_eq(provided.as_bytes(), expected_token.as_bytes()) => {}
             Some(_) => {
-                return Err((SERVICE_UNAVAILABLE, format!(
+                return Err((UNAUTHORIZED, format!(
                     "Invalid bearer token for write operation '{}'", tool_name
                 )));
             }
             None => {
-                return Err((SERVICE_UNAVAILABLE, format!(
-                    "Authorization required: write operation '{}' requires Bearer token \
-                     (see .corvia/mcp-token)", tool_name
+                return Err((UNAUTHORIZED, format!(
+                    "Authorization required for write operation '{}'", tool_name
                 )));
             }
         }
@@ -2419,7 +2432,7 @@ mod tests {
         let result = handle_tools_call(&state, &params, None).await;
         assert!(result.is_err());
         let (code, msg) = result.unwrap_err();
-        assert_eq!(code, SERVICE_UNAVAILABLE);
+        assert_eq!(code, UNAUTHORIZED);
         assert!(msg.contains("Authorization required"), "Expected auth error, got: {msg}");
     }
 
@@ -2439,7 +2452,7 @@ mod tests {
         let result = handle_tools_call(&state, &params, Some("wrong-token")).await;
         assert!(result.is_err());
         let (code, msg) = result.unwrap_err();
-        assert_eq!(code, SERVICE_UNAVAILABLE);
+        assert_eq!(code, UNAUTHORIZED);
         assert!(msg.contains("Invalid bearer token"), "Expected invalid token error, got: {msg}");
     }
 
