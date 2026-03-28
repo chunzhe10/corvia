@@ -38,6 +38,20 @@ pub trait Searcher: Send + Sync {
     async fn search(&self, ctx: &SearchContext) -> Result<RankedSet>;
 }
 
+/// Compute the fetch limit for a searcher, accounting for metadata filters
+/// and oversample factor. Shared across all searcher implementations.
+fn fetch_limit(ctx: &SearchContext) -> usize {
+    let base = if ctx.opts.content_role.is_some()
+        || ctx.opts.source_origin.is_some()
+        || ctx.opts.workstream.is_some()
+    {
+        ctx.opts.limit * 3
+    } else {
+        ctx.opts.limit
+    };
+    (base * ctx.opts.oversample_factor).max(10)
+}
+
 // ---------------------------------------------------------------------------
 // VectorSearcher — extracted from VectorRetriever
 // ---------------------------------------------------------------------------
@@ -90,20 +104,10 @@ impl Searcher for VectorSearcher {
     async fn search(&self, ctx: &SearchContext) -> Result<RankedSet> {
         let start = Instant::now();
 
-        // Oversample to allow for post-filter elimination.
-        let search_limit = if ctx.opts.content_role.is_some()
-            || ctx.opts.source_origin.is_some()
-            || ctx.opts.workstream.is_some()
-        {
-            ctx.opts.limit * 3
-        } else {
-            ctx.opts.limit
-        };
-        let fetch_limit = (search_limit * ctx.opts.oversample_factor).max(10);
-
+        let limit = fetch_limit(ctx);
         let raw_results = self
             .store
-            .search(&ctx.query_embedding, &ctx.scope_id, fetch_limit)
+            .search(&ctx.query_embedding, &ctx.scope_id, limit)
             .await?;
         let vector_count = raw_results.len();
 
@@ -171,6 +175,13 @@ pub struct BM25Searcher {
     fts: Arc<dyn FullTextSearchable>,
 }
 
+/// Intermediate representation for BM25 candidates before normalization.
+#[derive(Debug)]
+struct RawBM25Candidate {
+    entry: Arc<KnowledgeEntry>,
+    weighted: f32,
+}
+
 impl BM25Searcher {
     pub fn new(fts: Arc<dyn FullTextSearchable>) -> Self {
         Self { fts }
@@ -190,35 +201,20 @@ impl Searcher for BM25Searcher {
     async fn search(&self, ctx: &SearchContext) -> Result<RankedSet> {
         let start = Instant::now();
 
-        // Oversample to allow for post-filter elimination (consistent with VectorSearcher).
-        let search_limit = if ctx.opts.content_role.is_some()
-            || ctx.opts.source_origin.is_some()
-            || ctx.opts.workstream.is_some()
-        {
-            ctx.opts.limit * 3
-        } else {
-            ctx.opts.limit
-        };
-        let fetch_limit = (search_limit * ctx.opts.oversample_factor).max(10);
-
+        let limit = fetch_limit(ctx);
         let raw_results = self
             .fts
-            .search_text(&ctx.query, &ctx.scope_id, fetch_limit)
+            .search_text(&ctx.query, &ctx.scope_id, limit)
             .await?;
 
         // Convert to intermediate form with tier-weighted scores.
         // Filter must precede tier_weight multiplication (Forgotten weight = 0.0).
-        struct RawCandidate {
-            entry: Arc<KnowledgeEntry>,
-            weighted: f32,
-        }
-
-        let raw_candidates: Vec<RawCandidate> = raw_results
+        let raw_candidates: Vec<RawBM25Candidate> = raw_results
             .into_iter()
             .filter(|sr| sr.entry.tier != Tier::Forgotten)
             .map(|sr| {
                 let weighted = sr.score * tier_weight(sr.entry.tier);
-                RawCandidate {
+                RawBM25Candidate {
                     entry: Arc::new(sr.entry),
                     weighted,
                 }

@@ -162,12 +162,15 @@ impl Fusion for RRFusion {
             return Ok(result);
         }
 
-        // Accumulate RRF scores and merge component scores by entry UUID.
-        // Each candidate's rank within its searcher set determines its RRF contribution.
-        let mut rrf_scores: HashMap<uuid::Uuid, f64> = HashMap::new();
-        let mut merged_components: HashMap<uuid::Uuid, HashMap<String, f32>> = HashMap::new();
-        let mut entries: HashMap<uuid::Uuid, Arc<corvia_common::types::KnowledgeEntry>> =
-            HashMap::new();
+        // Accumulate RRF scores, component scores, and entries in a single map
+        // for better cache locality and fewer hash probes.
+        struct Accumulator {
+            rrf_score: f64,
+            components: HashMap<String, f32>,
+            entry: Arc<corvia_common::types::KnowledgeEntry>,
+        }
+
+        let mut accum: HashMap<uuid::Uuid, Accumulator> = HashMap::new();
 
         for set in &sets {
             for (rank_0, candidate) in set.candidates.iter().enumerate() {
@@ -175,12 +178,16 @@ impl Fusion for RRFusion {
                 let rank = (rank_0 + 1) as f64; // 1-indexed
                 let rrf_contribution = 1.0 / (self.k as f64 + rank);
 
-                *rrf_scores.entry(id).or_insert(0.0) += rrf_contribution;
+                let acc = accum.entry(id).or_insert_with(|| Accumulator {
+                    rrf_score: 0.0,
+                    components: HashMap::new(),
+                    entry: Arc::clone(&candidate.entry),
+                });
+                acc.rrf_score += rrf_contribution;
 
                 // Merge component scores (max-wins for duplicate keys across sets).
-                let comps = merged_components.entry(id).or_default();
                 for (key, &val) in &candidate.scores.components {
-                    comps
+                    acc.components
                         .entry(key.clone())
                         .and_modify(|existing| {
                             if val > *existing {
@@ -189,27 +196,25 @@ impl Fusion for RRFusion {
                         })
                         .or_insert(val);
                 }
-
-                entries.entry(id).or_insert_with(|| Arc::clone(&candidate.entry));
             }
         }
 
         // Find max RRF score for normalization.
-        let max_rrf = rrf_scores.values().copied().fold(0.0f64, f64::max);
+        let max_rrf = accum.values().fold(0.0f64, |mx, a| mx.max(a.rrf_score));
 
         // Build final candidates with normalized scores.
-        let mut candidates: Vec<RankedCandidate> = rrf_scores
-            .into_iter()
-            .map(|(id, rrf_score)| {
+        let mut candidates: Vec<RankedCandidate> = accum
+            .into_values()
+            .map(|acc| {
                 let normalized = if max_rrf > f64::EPSILON {
-                    (rrf_score / max_rrf) as f32
+                    (acc.rrf_score / max_rrf) as f32
                 } else {
                     1.0
                 };
                 RankedCandidate {
-                    entry: entries.remove(&id).unwrap(),
+                    entry: acc.entry,
                     scores: CandidateScores {
-                        components: merged_components.remove(&id).unwrap_or_default(),
+                        components: acc.components,
                         final_score: NormalizedScore::new(normalized),
                     },
                 }
