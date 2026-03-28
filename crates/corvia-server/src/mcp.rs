@@ -1379,29 +1379,29 @@ async fn tool_corvia_config_set(
 
     let mut pipeline_swapped = false;
     let mut pipeline_error: Option<String> = None;
-    if section == "rag" && (key.starts_with("pipeline.") || key == "graph_alpha" || key == "system_prompt") {
-        if let Some(ref rag_swap) = state.rag {
-            // Preserve the current generator so ask() mode continues working.
-            let current_generator = rag_swap.load().generator().cloned();
-            let graph = Some(state.graph.clone());
-            match corvia_kernel::rebuild_pipeline_retriever(
-                state.store.clone(),
-                state.engine.clone(),
-                graph,
-                current_generator,
-                &config_snapshot,
-            ) {
-                Ok(new_pipeline) => {
-                    let old = rag_swap.swap(std::sync::Arc::new(new_pipeline));
-                    // Defer deallocation of old pipeline off the async runtime.
-                    std::thread::spawn(move || drop(old));
-                    pipeline_swapped = true;
-                    tracing::info!(section, key, "RAG pipeline hot-swapped successfully");
-                }
-                Err(e) => {
-                    tracing::warn!(section, key, error = %e, "Pipeline rebuild failed, keeping current pipeline");
-                    pipeline_error = Some(format!("{e}"));
-                }
+    let is_pipeline_key = section == "rag"
+        && (key.starts_with("pipeline.") || key == "graph_alpha" || key == "system_prompt");
+    if is_pipeline_key && let Some(ref rag_swap) = state.rag {
+        // Preserve the current generator so ask() mode continues working.
+        let current_generator = rag_swap.load().generator().cloned();
+        let graph = Some(state.graph.clone());
+        match corvia_kernel::rebuild_pipeline_retriever(
+            state.store.clone(),
+            state.engine.clone(),
+            graph,
+            current_generator,
+            &config_snapshot,
+        ) {
+            Ok(new_pipeline) => {
+                let old = rag_swap.swap(std::sync::Arc::new(new_pipeline));
+                // Defer deallocation of old pipeline off the async runtime.
+                std::thread::spawn(move || drop(old));
+                pipeline_swapped = true;
+                tracing::info!(section, key, "RAG pipeline hot-swapped successfully");
+            }
+            Err(e) => {
+                tracing::warn!(section, key, error = %e, "Pipeline rebuild failed, keeping current pipeline");
+                pipeline_error = Some(format!("{e}"));
             }
         }
     }
