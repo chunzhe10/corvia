@@ -231,13 +231,7 @@ impl Expander for GraphExpander {
         }
 
         // Re-sort by final_score descending.
-        scored.sort_unstable_by(|a, b| {
-            b.scores
-                .final_score
-                .value()
-                .partial_cmp(&a.scores.final_score.value())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        scored.sort_unstable_by_key(|c| std::cmp::Reverse(c.scores.final_score));
 
         let output_count = scored.len();
         let latency_ms = start.elapsed().as_millis() as u64;

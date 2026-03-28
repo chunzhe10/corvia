@@ -48,13 +48,13 @@ pub trait Searcher: Send + Sync {
 /// cosine similarity scores normalized by tier weight to `[0, 1]`.
 pub struct VectorSearcher {
     store: Arc<dyn QueryableStore>,
-    #[allow(dead_code)]
-    engine: Arc<dyn InferenceEngine>,
 }
 
 impl VectorSearcher {
-    pub fn new(store: Arc<dyn QueryableStore>, engine: Arc<dyn InferenceEngine>) -> Self {
-        Self { store, engine }
+    pub fn new(store: Arc<dyn QueryableStore>, _engine: Arc<dyn InferenceEngine>) -> Self {
+        // engine is accepted for API compatibility but not stored;
+        // embedding is provided via SearchContext.query_embedding.
+        Self { store }
     }
 
     /// Convert raw `SearchResult`s into `RankedCandidate`s with tier weighting.
@@ -64,8 +64,7 @@ impl VectorSearcher {
             .filter(|sr| sr.entry.tier != Tier::Forgotten)
             .map(|sr| {
                 let weighted = sr.score * tier_weight(sr.entry.tier);
-                let mut components = HashMap::new();
-                components.insert(component_name.to_string(), weighted);
+                let components = HashMap::from([(component_name.to_string(), weighted)]);
                 RankedCandidate {
                     entry: Arc::new(sr.entry),
                     scores: CandidateScores {
@@ -133,13 +132,7 @@ impl Searcher for VectorSearcher {
         let mut candidates = Self::to_candidates(all_results, "vector");
 
         // Sort by final_score descending.
-        candidates.sort_unstable_by(|a, b| {
-            b.scores
-                .final_score
-                .value()
-                .partial_cmp(&a.scores.final_score.value())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        candidates.sort_unstable_by_key(|c| std::cmp::Reverse(c.scores.final_score));
 
         let output_count = candidates.len();
         let latency_ms = start.elapsed().as_millis() as u64;

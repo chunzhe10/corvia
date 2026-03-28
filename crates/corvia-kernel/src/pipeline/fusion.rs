@@ -47,19 +47,20 @@ impl Fusion for PassThrough {
         let input_count: usize = sets.iter().map(|s| s.candidates.len()).sum();
 
         // Collect all candidates, deduplicating by entry ID (keep highest score).
+        // Uses into_iter to move candidates rather than cloning.
         let mut by_id: HashMap<uuid::Uuid, RankedCandidate> = HashMap::new();
-        for set in &sets {
-            for candidate in &set.candidates {
+        for set in sets {
+            for candidate in set.candidates {
                 let id = candidate.entry.id;
-                match by_id.get(&id) {
-                    Some(existing)
-                        if existing.scores.final_score.value()
-                            >= candidate.scores.final_score.value() =>
-                    {
-                        // Keep existing (higher score).
+                use std::collections::hash_map::Entry;
+                match by_id.entry(id) {
+                    Entry::Occupied(mut e) => {
+                        if candidate.scores.final_score > e.get().scores.final_score {
+                            e.insert(candidate);
+                        }
                     }
-                    _ => {
-                        by_id.insert(id, candidate.clone());
+                    Entry::Vacant(e) => {
+                        e.insert(candidate);
                     }
                 }
             }
@@ -69,7 +70,7 @@ impl Fusion for PassThrough {
 
         // Min-max normalize.
         if !candidates.is_empty() {
-            let (min_score, max_score) = candidates.iter().fold((f32::MAX, f32::MIN), |(mn, mx), c| {
+            let (min_score, max_score) = candidates.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(mn, mx), c| {
                 let v = c.scores.final_score.value();
                 (mn.min(v), mx.max(v))
             });
@@ -89,13 +90,7 @@ impl Fusion for PassThrough {
         }
 
         // Sort descending by final_score.
-        candidates.sort_unstable_by(|a, b| {
-            b.scores
-                .final_score
-                .value()
-                .partial_cmp(&a.scores.final_score.value())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        candidates.sort_unstable_by_key(|c| std::cmp::Reverse(c.scores.final_score));
 
         let output_count = candidates.len();
         Ok(RankedSet {

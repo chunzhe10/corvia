@@ -356,6 +356,7 @@ pub async fn create_store_at_with_graph(
 }
 
 /// Build a legacy monolithic retriever (backward compat when [rag.pipeline] is absent).
+#[allow(deprecated)]
 fn build_legacy_retriever(
     store: Arc<dyn traits::QueryableStore>,
     engine: Arc<dyn traits::InferenceEngine>,
@@ -431,28 +432,29 @@ fn build_pipeline_retriever(
         .create(&pipeline_cfg.fusion, &deps)
         .unwrap_or_else(|e| {
             warn!(fusion = pipeline_cfg.fusion.as_str(), error = %e, "falling back to passthrough");
-            registry.fusions.create("passthrough", &deps).unwrap()
+            registry.fusions.create("passthrough", &deps).expect("built-in 'passthrough' fusion must be registered")
         });
 
     // Build expander (falls back to noop if graph store unavailable).
-    let expander = if pipeline_cfg.expander == "graph" && graph.is_none() {
-        info!("graph expander requested but no graph store, falling back to noop");
-        registry.expanders.create("noop", &deps).unwrap()
-    } else {
-        // For graph expander, create with config alpha.
-        if pipeline_cfg.expander == "graph" {
+    let expander = match (pipeline_cfg.expander.as_str(), graph) {
+        ("graph", Some(g)) => {
             Arc::new(pipeline::expander::GraphExpander::new(
                 store.clone(),
-                graph.unwrap(),
+                g,
                 config.rag.graph_alpha,
             )) as Arc<dyn pipeline::Expander>
-        } else {
+        }
+        ("graph", None) => {
+            info!("graph expander requested but no graph store, falling back to noop");
+            registry.expanders.create("noop", &deps).expect("noop expander is always registered")
+        }
+        (name, _) => {
             registry
                 .expanders
-                .create(&pipeline_cfg.expander, &deps)
+                .create(name, &deps)
                 .unwrap_or_else(|e| {
-                    warn!(expander = pipeline_cfg.expander.as_str(), error = %e, "falling back to noop");
-                    registry.expanders.create("noop", &deps).unwrap()
+                    warn!(expander = name, error = %e, "falling back to noop");
+                    registry.expanders.create("noop", &deps).expect("noop expander is always registered")
                 })
         }
     };
@@ -463,7 +465,7 @@ fn build_pipeline_retriever(
         .create(&pipeline_cfg.reranker, &deps)
         .unwrap_or_else(|e| {
             warn!(reranker = pipeline_cfg.reranker.as_str(), error = %e, "falling back to identity");
-            registry.rerankers.create("identity", &deps).unwrap()
+            registry.rerankers.create("identity", &deps).expect("built-in 'identity' reranker must be registered")
         });
 
     Arc::new(pipeline::RetrievalPipeline::new(

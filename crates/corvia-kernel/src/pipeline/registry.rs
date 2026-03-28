@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use corvia_common::errors::{CorviaError, Result};
 
-use super::expander::{Expander, GraphExpander, NoOpExpander};
+use super::expander::{Expander, NoOpExpander};
 use super::fusion::{Fusion, PassThrough};
 use super::searcher::{Searcher, VectorSearcher};
 use super::{IdentityReranker, Reranker};
@@ -132,16 +132,8 @@ impl PipelineRegistry {
         });
 
         let mut expanders = ComponentRegistry::new();
-        expanders.register("graph", |deps: &ComponentDeps| {
-            let store = deps.store.clone().ok_or_else(|| {
-                CorviaError::Config("GraphExpander requires a store".into())
-            })?;
-            let graph = deps.graph.clone().ok_or_else(|| {
-                CorviaError::Config("GraphExpander requires a graph store".into())
-            })?;
-            // Default alpha; will be overridden by config.
-            Ok(Arc::new(GraphExpander::new(store, graph, 0.3)) as Arc<dyn Expander>)
-        });
+        // Note: "graph" expander is NOT registered here because it requires
+        // config-driven alpha. It is constructed directly in build_pipeline_retriever.
         expanders.register("noop", |_deps: &ComponentDeps| {
             Ok(Arc::new(NoOpExpander) as Arc<dyn Expander>)
         });
@@ -198,7 +190,9 @@ mod tests {
         let reg = PipelineRegistry::with_defaults();
         assert!(reg.searchers.contains("vector"));
         assert!(reg.fusions.contains("passthrough"));
-        assert!(reg.expanders.contains("graph"));
+        // "graph" expander is NOT in the registry; it requires config-driven alpha
+        // and is constructed directly in build_pipeline_retriever.
+        assert!(!reg.expanders.contains("graph"));
         assert!(reg.expanders.contains("noop"));
         assert!(reg.rerankers.contains("identity"));
     }

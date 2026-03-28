@@ -185,17 +185,23 @@ pub trait Retriever: Send + Sync {
 /// Baseline retriever: embed query -> vector search -> RBAC + visibility filter.
 ///
 /// This is the default retriever used when `expand_graph` is false.
+///
+/// **Deprecated:** Use [`pipeline::VectorSearcher`](crate::pipeline::searcher::VectorSearcher)
+/// with [`RetrievalPipeline`](crate::pipeline::RetrievalPipeline) instead.
+#[deprecated(note = "use pipeline::VectorSearcher + RetrievalPipeline instead")]
 pub struct VectorRetriever {
     store: Arc<dyn QueryableStore>,
     engine: Arc<dyn InferenceEngine>,
 }
 
+#[allow(deprecated)]
 impl VectorRetriever {
     pub fn new(store: Arc<dyn QueryableStore>, engine: Arc<dyn InferenceEngine>) -> Self {
         Self { store, engine }
     }
 }
 
+#[allow(deprecated)]
 #[async_trait]
 impl Retriever for VectorRetriever {
     fn name(&self) -> &str {
@@ -367,6 +373,10 @@ pub fn visibility_filter(
 ///
 /// When `expand_graph` is false in the opts, behaves identically to
 /// [`VectorRetriever`] (graph_expanded == 0).
+///
+/// **Deprecated:** Use [`pipeline::GraphExpander`](crate::pipeline::expander::GraphExpander)
+/// with [`RetrievalPipeline`](crate::pipeline::RetrievalPipeline) instead.
+#[deprecated(note = "use pipeline::GraphExpander + RetrievalPipeline instead")]
 pub struct GraphExpandRetriever {
     store: Arc<dyn QueryableStore>,
     engine: Arc<dyn InferenceEngine>,
@@ -374,6 +384,7 @@ pub struct GraphExpandRetriever {
     alpha: f32,
 }
 
+#[allow(deprecated)]
 impl GraphExpandRetriever {
     pub fn new(
         store: Arc<dyn QueryableStore>,
@@ -390,6 +401,7 @@ impl GraphExpandRetriever {
     }
 }
 
+#[allow(deprecated)]
 #[async_trait]
 impl Retriever for GraphExpandRetriever {
     fn name(&self) -> &str {

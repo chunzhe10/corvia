@@ -43,7 +43,7 @@ pub use searcher::Searcher;
 /// Constructed via [`NormalizedScore::new`] which clamps out-of-range values
 /// and warns on NaN. This prevents score corruption from propagating through
 /// the pipeline.
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct NormalizedScore(f32);
 
 impl NormalizedScore {
@@ -65,6 +65,27 @@ impl NormalizedScore {
     #[inline]
     pub fn value(self) -> f32 {
         self.0
+    }
+}
+
+impl PartialEq for NormalizedScore {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for NormalizedScore {}
+
+impl PartialOrd for NormalizedScore {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NormalizedScore {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Safe: NaN is excluded by construction in new().
+        self.0.partial_cmp(&other.0).unwrap()
     }
 }
 
