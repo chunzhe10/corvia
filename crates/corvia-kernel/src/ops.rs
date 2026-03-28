@@ -217,7 +217,26 @@ pub fn config_set(
 
     // Convert JSON value to TOML value
     let toml_val = json_to_toml(&value)?;
-    section_table.insert(key.to_string(), toml_val);
+
+    // Handle dotted keys (e.g., "pipeline.searchers") by navigating/creating
+    // nested tables instead of inserting a flat key with dots.
+    let key_parts: Vec<&str> = key.split('.').collect();
+    if key_parts.len() == 1 {
+        section_table.insert(key.to_string(), toml_val);
+    } else {
+        let mut current = section_table;
+        for part in &key_parts[..key_parts.len() - 1] {
+            current = current
+                .entry(part.to_string())
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+                .ok_or_else(|| {
+                    CorviaError::Config(format!("Config key '{part}' is not a table"))
+                })?;
+        }
+        let leaf_key = key_parts[key_parts.len() - 1];
+        current.insert(leaf_key.to_string(), toml_val);
+    }
 
     // Write back
     let updated_toml = toml::to_string_pretty(&toml_value)

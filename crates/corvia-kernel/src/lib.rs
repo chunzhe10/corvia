@@ -411,22 +411,30 @@ pub fn rebuild_pipeline_retriever(
         )
     })?;
 
-    // Initialize tantivy if needed (same logic as build_pipeline_retriever).
+    // Reuse existing tantivy from LiteStore if already initialized (OnceLock),
+    // otherwise open a new one. Reusing avoids tantivy file lock conflicts when
+    // the old pipeline's tantivy is being dropped in a background thread.
     let fts: Option<Arc<dyn traits::FullTextSearchable>> =
         if pipeline_cfg.searchers.iter().any(|s| s == "bm25") {
             if let Some(ls) = store.as_any().downcast_ref::<lite_store::LiteStore>() {
-                let cache_dir = std::path::Path::new(&config.storage.data_dir)
-                    .join("cache")
-                    .join("tantivy");
-                match tantivy_index::TantivyIndex::open(&cache_dir, ls.db().clone(), store.clone()) {
-                    Ok(idx) => {
-                        let idx = Arc::new(idx);
-                        ls.set_tantivy(Arc::clone(&idx));
-                        Some(idx as Arc<dyn traits::FullTextSearchable>)
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to open TantivyIndex during hot-swap");
-                        None
+                if let Some(existing) = ls.tantivy() {
+                    // Reuse the tantivy index already wired into LiteStore.
+                    Some(Arc::clone(existing) as Arc<dyn traits::FullTextSearchable>)
+                } else {
+                    // First time: open tantivy and wire it into LiteStore.
+                    let cache_dir = std::path::Path::new(&config.storage.data_dir)
+                        .join("cache")
+                        .join("tantivy");
+                    match tantivy_index::TantivyIndex::open(&cache_dir, ls.db().clone(), store.clone()) {
+                        Ok(idx) => {
+                            let idx = Arc::new(idx);
+                            ls.set_tantivy(Arc::clone(&idx));
+                            Some(idx as Arc<dyn traits::FullTextSearchable>)
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to open TantivyIndex during hot-swap");
+                            None
+                        }
                     }
                 }
             } else {
