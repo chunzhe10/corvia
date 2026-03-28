@@ -685,6 +685,25 @@ async fn cmd_serve() -> Result<()> {
     let workspace_root = config_path.parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+
+    // Generate MCP bearer token for write operations when bound to non-loopback address.
+    // This protects write operations when the server is exposed on a network (e.g., 0.0.0.0).
+    let mcp_token = {
+        let host = &config.server.host;
+        let is_loopback = host == "127.0.0.1" || host == "::1" || host == "localhost";
+        if !is_loopback {
+            let token = uuid::Uuid::new_v4().to_string();
+            let token_path = data_dir.join("mcp-token");
+            std::fs::write(&token_path, &token).map_err(|e| {
+                anyhow::anyhow!("Failed to write MCP token to {}: {}", token_path.display(), e)
+            })?;
+            println!("MCP bearer token written to {} (required for write operations)", token_path.display());
+            Some(token)
+        } else {
+            None
+        }
+    };
+
     let state = Arc::new(corvia_server::rest::AppState {
         store, engine, coordinator, graph, temporal, data_dir,
         rag: Some(rag), ready: ready.clone(), default_scope_id,
@@ -700,6 +719,7 @@ async fn cmd_serve() -> Result<()> {
         gpu_cache: Arc::new(tokio::sync::Mutex::new(corvia_server::dashboard::gpu::GpuMetricsCache::new())),
         forgotten_access_counter: Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
         gc_knowledge_history: Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(50)),
+        mcp_token,
     });
     // Initial coverage cache population + background refresh.
     // NOTE: ttl_secs is captured once at startup. While `dashboard` is in

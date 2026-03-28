@@ -71,6 +71,9 @@ pub struct AppState {
     pub forgotten_access_counter: Arc<corvia_kernel::gc_worker::ForgottenAccessCounter>,
     /// In-memory ring buffer of recent knowledge GC cycle reports.
     pub gc_knowledge_history: Arc<corvia_kernel::ops::GcKnowledgeHistory>,
+    /// MCP bearer token for write operations. `Some` when server is bound to
+    /// a non-loopback address (e.g., `0.0.0.0`). `None` for loopback-only binding.
+    pub mcp_token: Option<String>,
 }
 
 // --- Existing memory types ---
@@ -1572,6 +1575,7 @@ mod tests {
             gpu_cache: Arc::new(tokio::sync::Mutex::new(crate::dashboard::gpu::GpuMetricsCache::new())),
             forgotten_access_counter: Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
             gc_knowledge_history: Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
+            mcp_token: None,
         })
     }
 
@@ -1638,6 +1642,7 @@ mod tests {
             gpu_cache: Arc::new(tokio::sync::Mutex::new(crate::dashboard::gpu::GpuMetricsCache::new())),
             forgotten_access_counter: Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
             gc_knowledge_history: Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
+            mcp_token: None,
         })
     }
 

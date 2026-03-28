@@ -19,6 +19,28 @@ use uuid::Uuid;
 
 use crate::rest::AppState;
 
+/// MCP tools that modify state and require bearer token auth when the server
+/// is bound to a non-loopback address.
+const WRITE_TOOLS: &[&str] = &[
+    "corvia_write",
+    "corvia_gc_run",
+    "corvia_config_set",
+    "corvia_rebuild_index",
+    "corvia_agent_suspend",
+    "corvia_merge_retry",
+    "corvia_pin",
+    "corvia_unpin",
+];
+
+/// Extract bearer token from Authorization header.
+fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.to_string())
+}
+
 // --- MCP state (stateless — no session tracking) ---
 
 // NOTE: McpSessions removed. The MCP server is fully stateless: no session
@@ -427,16 +449,19 @@ async fn handle_mcp_post(
     // agent identity comes from _meta.agent_id in tool calls, not transport sessions.
     // Any Mcp-Session-Id header from the client is accepted but not validated.
 
+    // Extract bearer token for write operation auth
+    let bearer_token = extract_bearer_token(&headers);
+
     // Process request(s)
     let (responses, is_batch) = match input {
         JsonRpcInput::Single(req) => {
-            let resp = process_single_request(&state, &req).await;
+            let resp = process_single_request(&state, &req, bearer_token.as_deref()).await;
             (resp.into_iter().collect::<Vec<_>>(), false)
         }
         JsonRpcInput::Batch(reqs) => {
             let mut responses = Vec::new();
             for req in &reqs {
-                if let Some(resp) = process_single_request(&state, req).await {
+                if let Some(resp) = process_single_request(&state, req, bearer_token.as_deref()).await {
                     responses.push(resp);
                 }
             }
@@ -502,16 +527,17 @@ async fn handle_mcp_post(
 async fn process_single_request(
     state: &McpState,
     req: &JsonRpcRequest,
+    bearer_token: Option<&str>,
 ) -> Option<JsonRpcResponse> {
     let is_notification = req.id.is_none() && req.method != "initialize";
 
     if is_notification {
         // Fire-and-forget: dispatch but don't return a response
-        let _ = dispatch(&state.app, req).await;
+        let _ = dispatch(&state.app, req, bearer_token).await;
         return None;
     }
 
-    let response = dispatch(&state.app, req).await;
+    let response = dispatch(&state.app, req, bearer_token).await;
     let rpc_response = match response {
         Ok(result) => JsonRpcResponse::success(req.id.clone(), result),
         Err((code, msg)) => JsonRpcResponse::error(req.id.clone(), code, msg),
@@ -553,12 +579,13 @@ async fn handle_mcp_delete(
 async fn dispatch(
     state: &AppState,
     req: &JsonRpcRequest,
+    bearer_token: Option<&str>,
 ) -> Result<Value, (i32, String)> {
     match req.method.as_str() {
         "initialize" => handle_initialize(&req.params),
         "notifications/initialized" => Ok(json!({})),
         "tools/list" => Ok(handle_tools_list()),
-        "tools/call" => handle_tools_call(state, &req.params).await,
+        "tools/call" => handle_tools_call(state, &req.params, bearer_token).await,
         other => Err((METHOD_NOT_FOUND, format!("Method not found: {other}"))),
     }
 }
@@ -604,10 +631,32 @@ fn handle_tools_list() -> Value {
 async fn handle_tools_call(
     state: &AppState,
     params: &Value,
+    bearer_token: Option<&str>,
 ) -> Result<Value, (i32, String)> {
     let tool_name = params.get("name")
         .and_then(|v| v.as_str())
         .ok_or((INVALID_PARAMS, "Missing tool name".into()))?;
+
+    // Bearer token auth: when the server has an MCP token configured (non-loopback
+    // binding), write operations require a matching Authorization: Bearer <token> header.
+    if let Some(expected_token) = &state.mcp_token
+        && WRITE_TOOLS.contains(&tool_name)
+    {
+        match bearer_token {
+            Some(provided) if provided == expected_token => {} // authorized
+            Some(_) => {
+                return Err((SERVICE_UNAVAILABLE, format!(
+                    "Invalid bearer token for write operation '{}'", tool_name
+                )));
+            }
+            None => {
+                return Err((SERVICE_UNAVAILABLE, format!(
+                    "Authorization required: write operation '{}' requires Bearer token \
+                     (see .corvia/mcp-token)", tool_name
+                )));
+            }
+        }
+    }
 
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
@@ -1606,6 +1655,7 @@ mod tests {
             gpu_cache: std::sync::Arc::new(tokio::sync::Mutex::new(crate::dashboard::gpu::GpuMetricsCache::new())),
             forgotten_access_counter: std::sync::Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
             gc_knowledge_history: std::sync::Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
+            mcp_token: None,
         })
     }
 
@@ -1924,6 +1974,7 @@ mod tests {
             gpu_cache: std::sync::Arc::new(tokio::sync::Mutex::new(crate::dashboard::gpu::GpuMetricsCache::new())),
             forgotten_access_counter: std::sync::Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
             gc_knowledge_history: std::sync::Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
+            mcp_token: None,
         });
 
         let args = json!({ "query": "rag-routed", "scope_id": "rag-scope", "limit": 5 });
@@ -1946,7 +1997,7 @@ mod tests {
             "name": "corvia_system_status",
             "arguments": { "scope_id": "test" }
         });
-        let result = handle_tools_call(&state, &params).await.unwrap();
+        let result = handle_tools_call(&state, &params, None).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["entry_count"], 0);
@@ -1960,7 +2011,7 @@ mod tests {
             "name": "corvia_agents_list",
             "arguments": {}
         });
-        let result = handle_tools_call(&state, &params).await.unwrap();
+        let result = handle_tools_call(&state, &params, None).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
         assert!(parsed["agents"].as_array().unwrap().is_empty());
@@ -1974,7 +2025,7 @@ mod tests {
             "name": "corvia_merge_queue",
             "arguments": {}
         });
-        let result = handle_tools_call(&state, &params).await.unwrap();
+        let result = handle_tools_call(&state, &params, None).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["depth"], 0);
@@ -1988,7 +2039,7 @@ mod tests {
             "name": "corvia_config_get",
             "arguments": {}
         });
-        let result = handle_tools_call(&state, &params).await.unwrap();
+        let result = handle_tools_call(&state, &params, None).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
         assert!(parsed.get("storage").is_some());
@@ -2005,7 +2056,7 @@ mod tests {
             method: "unknown/method".into(),
             params: json!({}),
         };
-        let result = dispatch(&state, &req).await;
+        let result = dispatch(&state, &req, None).await;
         assert!(result.is_err());
         let (code, _) = result.unwrap_err();
         assert_eq!(code, METHOD_NOT_FOUND);
@@ -2023,7 +2074,7 @@ mod tests {
             "name": "corvia_config_set",
             "arguments": { "section": "rag", "key": "default_limit", "value": 20 }
         });
-        let result = handle_tools_call(&state, &params).await.unwrap();
+        let result = handle_tools_call(&state, &params, None).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["confirmation_required"], true);
@@ -2047,7 +2098,7 @@ mod tests {
             "_meta": { "confirmed": true },
             "arguments": { "section": "rag", "key": "default_limit", "value": 20 }
         });
-        let result = handle_tools_call(&state, &params).await.unwrap();
+        let result = handle_tools_call(&state, &params, None).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["status"], "updated");
@@ -2071,7 +2122,7 @@ mod tests {
             "_meta": { "confirmed": true },
             "arguments": { "section": "storage", "key": "data_dir", "value": "/new" }
         });
-        let result = handle_tools_call(&state, &params).await;
+        let result = handle_tools_call(&state, &params, None).await;
         assert!(result.is_err());
     }
 
@@ -2084,7 +2135,7 @@ mod tests {
             "name": "corvia_gc_run",
             "arguments": {}
         });
-        let result = handle_tools_call(&state, &params).await.unwrap();
+        let result = handle_tools_call(&state, &params, None).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["confirmation_required"], true);
@@ -2101,7 +2152,7 @@ mod tests {
             "_meta": { "confirmed": true },
             "arguments": {}
         });
-        let result = handle_tools_call(&state, &params).await.unwrap();
+        let result = handle_tools_call(&state, &params, None).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["orphans_rolled_back"], 0);
@@ -2116,7 +2167,7 @@ mod tests {
             "name": "corvia_rebuild_index",
             "arguments": {}
         });
-        let result = handle_tools_call(&state, &params).await.unwrap();
+        let result = handle_tools_call(&state, &params, None).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["confirmation_required"], true);
@@ -2134,7 +2185,7 @@ mod tests {
             "name": "corvia_agent_suspend",
             "arguments": { "agent_id": "test-agent" }
         });
-        let result = handle_tools_call(&state, &params).await.unwrap();
+        let result = handle_tools_call(&state, &params, None).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["confirmation_required"], true);
@@ -2151,7 +2202,7 @@ mod tests {
             "_meta": { "confirmed": true },
             "arguments": { "agent_id": "test-agent", "dry_run": true }
         });
-        let result = handle_tools_call(&state, &params).await.unwrap();
+        let result = handle_tools_call(&state, &params, None).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["dry_run"], true);
@@ -2168,7 +2219,7 @@ mod tests {
             "name": "corvia_merge_retry",
             "arguments": { "entry_ids": [id] }
         });
-        let result = handle_tools_call(&state, &params).await.unwrap();
+        let result = handle_tools_call(&state, &params, None).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["confirmation_required"], true);
@@ -2186,7 +2237,7 @@ mod tests {
             "_meta": { "confirmed": true },
             "arguments": { "entry_ids": [id], "dry_run": true }
         });
-        let result = handle_tools_call(&state, &params).await.unwrap();
+        let result = handle_tools_call(&state, &params, None).await.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["dry_run"], true);
@@ -2306,6 +2357,169 @@ mod tests {
         let dist = &parsed["tier_distribution"];
         assert!(dist["hot"].as_u64().unwrap() >= 1);
         assert!(dist["cold"].as_u64().unwrap() >= 1);
+    }
+
+    // --- MCP bearer token auth tests ---
+
+    /// Build a test AppState with an MCP token configured (simulating non-loopback binding).
+    async fn test_state_with_token(dir: &std::path::Path, token: &str) -> Arc<AppState> {
+        let store = Arc::new(LiteStore::open(dir, 3).unwrap());
+        store.init_schema().await.unwrap();
+        let engine = Arc::new(MockEngine) as Arc<dyn InferenceEngine>;
+        let gen_engine = Arc::new(MockGenerationEngine) as Arc<dyn GenerationEngine>;
+        let coordinator = Arc::new(AgentCoordinator::new(
+            store.clone() as Arc<dyn QueryableStore>,
+            engine.clone(),
+            dir,
+            corvia_common::config::AgentLifecycleConfig::default(),
+            corvia_common::config::MergeConfig { similarity_threshold: 2.0, ..Default::default() },
+            gen_engine,
+        ).unwrap());
+        Arc::new(AppState {
+            store: store.clone() as Arc<dyn QueryableStore>,
+            engine,
+            coordinator,
+            graph: store.clone() as Arc<dyn GraphStore>,
+            temporal: store as Arc<dyn TemporalStore>,
+            data_dir: dir.to_path_buf(),
+            rag: None,
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            default_scope_id: None,
+            config: Arc::new(std::sync::RwLock::new(corvia_common::config::CorviaConfig::default())),
+            config_path: dir.join("corvia.toml"),
+            cluster_store: Arc::new(crate::dashboard::clustering::ClusterStore::new()),
+            gc_history: Arc::new(corvia_kernel::ops::GcHistory::new(50)),
+            session_ingest_lock: tokio::sync::Mutex::new(()),
+            hook_sessions: crate::dashboard::session_watcher::SessionWatcherState::new().0,
+            coverage_cache: Arc::new(
+                crate::dashboard::coverage::IndexCoverageCache::new(0.9, 60),
+            ),
+            workspace_root: dir.to_path_buf(),
+            ingest_status: Arc::new(std::sync::RwLock::new(corvia_kernel::ingest::IngestStatus::idle())),
+            gpu_cache: std::sync::Arc::new(tokio::sync::Mutex::new(crate::dashboard::gpu::GpuMetricsCache::new())),
+            forgotten_access_counter: std::sync::Arc::new(corvia_kernel::gc_worker::ForgottenAccessCounter::new()),
+            gc_knowledge_history: std::sync::Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
+            mcp_token: Some(token.to_string()),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_write_tool_rejected_without_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_token(dir.path(), "test-secret-token").await;
+        let params = json!({
+            "name": "corvia_write",
+            "arguments": {
+                "scope_id": "test",
+                "content": "test content",
+                "agent_id": "test-agent"
+            }
+        });
+        // No bearer token provided -> should be rejected
+        let result = handle_tools_call(&state, &params, None).await;
+        assert!(result.is_err());
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, SERVICE_UNAVAILABLE);
+        assert!(msg.contains("Authorization required"), "Expected auth error, got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_write_tool_rejected_with_wrong_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_token(dir.path(), "test-secret-token").await;
+        let params = json!({
+            "name": "corvia_write",
+            "arguments": {
+                "scope_id": "test",
+                "content": "test content",
+                "agent_id": "test-agent"
+            }
+        });
+        // Wrong bearer token -> should be rejected
+        let result = handle_tools_call(&state, &params, Some("wrong-token")).await;
+        assert!(result.is_err());
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, SERVICE_UNAVAILABLE);
+        assert!(msg.contains("Invalid bearer token"), "Expected invalid token error, got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_write_tool_accepted_with_correct_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_token(dir.path(), "test-secret-token").await;
+        let params = json!({
+            "name": "corvia_write",
+            "arguments": {
+                "scope_id": "test",
+                "content": "test content",
+                "agent_id": "test-agent"
+            }
+        });
+        // Correct bearer token -> should succeed
+        let result = handle_tools_call(&state, &params, Some("test-secret-token")).await;
+        assert!(result.is_ok(), "Expected success with correct token, got: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn test_read_tool_allowed_without_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_token(dir.path(), "test-secret-token").await;
+        let params = json!({
+            "name": "corvia_system_status",
+            "arguments": { "scope_id": "test" }
+        });
+        // Read tools should work without any token even when mcp_token is configured
+        let result = handle_tools_call(&state, &params, None).await;
+        assert!(result.is_ok(), "Read tools should not require auth, got: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn test_no_token_required_on_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+        // Default test_state has mcp_token: None (loopback binding)
+        let state = test_state(dir.path()).await;
+        let params = json!({
+            "name": "corvia_write",
+            "arguments": {
+                "scope_id": "test",
+                "content": "test content",
+                "agent_id": "test-agent"
+            }
+        });
+        // No token configured -> write should succeed without auth
+        let result = handle_tools_call(&state, &params, None).await;
+        assert!(result.is_ok(), "Loopback binding should not require auth, got: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn test_extract_bearer_token() {
+        let mut headers = HeaderMap::new();
+        assert!(extract_bearer_token(&headers).is_none());
+
+        headers.insert("authorization", "Bearer my-token".parse().unwrap());
+        assert_eq!(extract_bearer_token(&headers), Some("my-token".to_string()));
+
+        headers.insert("authorization", "Basic other".parse().unwrap());
+        assert!(extract_bearer_token(&headers).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_all_write_tools_require_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state_with_token(dir.path(), "secret").await;
+
+        for tool_name in WRITE_TOOLS {
+            let params = json!({
+                "name": tool_name,
+                "arguments": {
+                    "scope_id": "test",
+                    "content": "test",
+                    "agent_id": "test-agent"
+                }
+            });
+            let result = handle_tools_call(&state, &params, None).await;
+            assert!(result.is_err(), "Write tool '{}' should require auth", tool_name);
+        }
     }
 
 }
