@@ -407,6 +407,90 @@ enum WorkspaceCommands {
     },
     /// Generate enforcement hooks from corvia.toml config
     InitHooks,
+    /// Manage spoke containers for multi-agent development
+    Spoke {
+        #[command(subcommand)]
+        command: SpokeCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum SpokeCommands {
+    /// Spawn a spoke container for an issue or branch
+    Create {
+        /// Which repo to clone (must be in corvia.toml [[repos]])
+        #[arg(long)]
+        repo: String,
+        /// GitHub issue number (determines branch name + dev-loop target)
+        #[arg(long)]
+        issue: Option<u32>,
+        /// Explicit branch name (alternative to --issue)
+        #[arg(long)]
+        branch: Option<String>,
+        /// Override spoke name
+        #[arg(long)]
+        name: Option<String>,
+        /// Override Docker image
+        #[arg(long)]
+        image: Option<String>,
+        /// Memory limit (e.g., "4g", "8g")
+        #[arg(long)]
+        memory: Option<String>,
+        /// Replace existing spoke with same name
+        #[arg(long)]
+        force: bool,
+        /// Skip GITHUB_TOKEN validation
+        #[arg(long)]
+        no_github: bool,
+        /// Start interactive claude session instead of headless dev-loop
+        #[arg(long)]
+        interactive: bool,
+    },
+    /// Show running spokes with status
+    List {
+        /// Include stopped/exited spokes
+        #[arg(long)]
+        all: bool,
+        /// JSON output for scripting
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stream container logs from a spoke
+    Logs {
+        /// Spoke name or prefix
+        name: String,
+        /// Stream logs continuously
+        #[arg(long, short)]
+        follow: bool,
+        /// Number of lines to show (default: 50)
+        #[arg(long, default_value = "50")]
+        tail: u32,
+    },
+    /// Stop and remove a spoke container
+    Destroy {
+        /// Spoke name or prefix (omit for --all)
+        name: Option<String>,
+        /// Destroy all spokes
+        #[arg(long)]
+        all: bool,
+        /// Skip confirmation for --all
+        #[arg(long)]
+        yes: bool,
+        /// Skip 10-second graceful shutdown; send SIGKILL immediately
+        #[arg(long)]
+        immediate: bool,
+    },
+    /// Restart a spoke, preserving repo checkout
+    Restart {
+        /// Spoke name or prefix
+        name: String,
+    },
+    /// Validate environment is spoke-capable
+    Check {
+        /// JSON output for scripting
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1743,6 +1827,303 @@ async fn cmd_workspace(command: WorkspaceCommands) -> Result<()> {
             let root = std::env::current_dir()?;
             let config = load_config()?;
             hooks::settings::init_hooks(&root, &config)?;
+            Ok(())
+        }
+        WorkspaceCommands::Spoke { command } => {
+            cmd_spoke(command).await
+        }
+    }
+}
+
+async fn cmd_spoke(command: SpokeCommands) -> Result<()> {
+    use corvia_kernel::spoke::{
+        CheckStatus, HubContext, SpokeProvisioner, generate_agent_id, generate_spoke_name,
+        select_network,
+    };
+    use futures_util::StreamExt;
+
+    match command {
+        SpokeCommands::Create {
+            repo,
+            issue,
+            branch,
+            name,
+            image,
+            memory,
+            force,
+            no_github,
+            interactive,
+        } => {
+            let config = load_config()?;
+            let ws = config
+                .workspace
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Not a workspace"))?;
+
+            // Find the repo in config
+            let repo_config = ws
+                .repos
+                .iter()
+                .find(|r| r.name == repo)
+                .ok_or_else(|| {
+                    let names: Vec<_> = ws.repos.iter().map(|r| r.name.as_str()).collect();
+                    anyhow::anyhow!(
+                        "Repo '{}' not found in corvia.toml. Available: {:?}",
+                        repo,
+                        names
+                    )
+                })?;
+
+            // Must have --issue or --branch
+            if issue.is_none() && branch.is_none() {
+                anyhow::bail!("Provide --issue <number> or --branch <name>");
+            }
+
+            // GITHUB_TOKEN check (unless --no-github)
+            if !no_github && std::env::var("GITHUB_TOKEN").unwrap_or_default().is_empty() {
+                anyhow::bail!(
+                    "GITHUB_TOKEN required for spoke creation. Use --no-github to skip."
+                );
+            }
+
+            let provisioner = SpokeProvisioner::new()?;
+
+            // Detect hub context
+            let hub = HubContext::detect(provisioner.docker()).await?;
+
+            // Resolve network
+            let mut spoke_config = config.spoke_config();
+            if let Some(img) = image {
+                spoke_config.image = img;
+            }
+            if let Some(mem) = memory {
+                spoke_config.memory_limit = mem;
+            }
+            let network = select_network(&hub.networks, spoke_config.network.as_deref())?;
+
+            // Generate names - use branch if provided, otherwise use issue number
+            let branch_name = branch.clone().unwrap_or_else(|| {
+                format!("feat/issue-{}", issue.unwrap_or(0))
+            });
+            let agent_id = generate_agent_id(issue, branch.as_deref());
+            let spoke_name = name.unwrap_or_else(|| {
+                generate_spoke_name(&config.project.name, issue, branch.as_deref())
+            });
+
+            // Check for duplicate
+            if !force
+                && let Some(existing) = provisioner.find(&spoke_name).await?
+                && existing.state == "running"
+            {
+                anyhow::bail!(
+                    "Spoke '{}' already running. Use --force to replace.",
+                    existing.name
+                );
+            }
+
+            let workspace_root = std::env::current_dir()?
+                .to_string_lossy()
+                .to_string();
+
+            provisioner
+                .create(
+                    &spoke_name,
+                    &agent_id,
+                    &hub,
+                    &config,
+                    &spoke_config,
+                    &network,
+                    &repo,
+                    &repo_config.url,
+                    issue,
+                    &branch_name,
+                    &workspace_root,
+                )
+                .await?;
+
+            let mode = if interactive { "interactive" } else { "dev-loop" };
+            println!("Spoke '{}' started ({})", spoke_name, mode);
+            println!("  Repo:    {}", repo);
+            println!("  Branch:  {}", branch_name);
+            if let Some(n) = issue {
+                println!("  Issue:   #{}", n);
+            }
+            println!("  Agent:   {}", agent_id);
+            println!("  Memory:  {}", spoke_config.memory_limit);
+            println!("  Network: {}", network);
+            println!("\nView logs: corvia workspace spoke logs {}", spoke_name);
+            Ok(())
+        }
+
+        SpokeCommands::List { all, json } => {
+            let provisioner = SpokeProvisioner::new()?;
+            let spokes = provisioner.list(all).await?;
+
+            if json {
+                let items: Vec<serde_json::Value> = spokes
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "name": s.name,
+                            "repo": s.repo,
+                            "branch": s.branch,
+                            "issue": s.issue,
+                            "agent_id": s.agent_id,
+                            "state": s.state,
+                            "status": s.status,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&items)?);
+            } else if spokes.is_empty() {
+                println!("No spokes running.");
+                if !all {
+                    println!("Use --all to include stopped spokes.");
+                }
+            } else {
+                println!(
+                    "{:<45} {:<12} {:<35} {:<8} {:<15}",
+                    "NAME", "REPO", "BRANCH", "ISSUE", "STATUS"
+                );
+                for s in &spokes {
+                    let issue_display = if s.issue.is_empty() || s.issue == "0" {
+                        "-".to_string()
+                    } else {
+                        format!("#{}", s.issue)
+                    };
+                    println!(
+                        "{:<45} {:<12} {:<35} {:<8} {:<15}",
+                        s.name, s.repo, s.branch, issue_display, s.state
+                    );
+                }
+                // Show hidden stopped count
+                if !all {
+                    let all_spokes = provisioner.list(true).await?;
+                    let hidden = all_spokes.len() - spokes.len();
+                    if hidden > 0 {
+                        println!("\n{} stopped spoke(s) not shown. Use --all to include.", hidden);
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        SpokeCommands::Logs { name, follow, tail } => {
+            let provisioner = SpokeProvisioner::new()?;
+            let spoke = provisioner
+                .find(&name)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Spoke '{}' not found", name))?;
+
+            let mut stream = provisioner.logs(&spoke.name, follow, tail).await?;
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(output) => print!("{output}"),
+                    Err(e) => {
+                        eprintln!("Log stream error: {e}");
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        SpokeCommands::Destroy {
+            name,
+            all,
+            yes,
+            immediate,
+        } => {
+            let provisioner = SpokeProvisioner::new()?;
+
+            if all {
+                if !yes {
+                    eprint!("Destroy ALL spokes? [y/N] ");
+                    use std::io::Write;
+                    std::io::stderr().flush()?;
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input)?;
+                    if !input.trim().eq_ignore_ascii_case("y") {
+                        println!("Aborted.");
+                        return Ok(());
+                    }
+                }
+                let (success, failures) = provisioner.destroy_all(immediate).await?;
+                println!("Destroyed {} spoke(s).", success);
+                if !failures.is_empty() {
+                    eprintln!("Failed to destroy: {}", failures.join(", "));
+                }
+            } else if let Some(name) = name {
+                let spoke = provisioner
+                    .find(&name)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Spoke '{}' not found", name))?;
+                provisioner.destroy(&spoke.name, immediate).await?;
+                println!("Spoke '{}' destroyed.", spoke.name);
+            } else {
+                anyhow::bail!("Provide a spoke name or use --all");
+            }
+            Ok(())
+        }
+
+        SpokeCommands::Restart { name } => {
+            let provisioner = SpokeProvisioner::new()?;
+            let spoke = provisioner
+                .find(&name)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Spoke '{}' not found", name))?;
+            provisioner.restart(&spoke.name).await?;
+            println!("Spoke '{}' restarted.", spoke.name);
+            Ok(())
+        }
+
+        SpokeCommands::Check { json } => {
+            let config = load_config().ok();
+            let data_dir = config.as_ref().map(|c| std::path::PathBuf::from(&c.storage.data_dir));
+            let provisioner = SpokeProvisioner::new()?;
+            let results = provisioner.check(data_dir.as_deref()).await;
+
+            if json {
+                let items: Vec<serde_json::Value> = results
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "name": r.name,
+                            "status": match r.status {
+                                CheckStatus::Pass => "pass",
+                                CheckStatus::Warn => "warn",
+                                CheckStatus::Fail => "fail",
+                            },
+                            "message": r.message,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&items)?);
+            } else {
+                let mut has_fail = false;
+                for r in &results {
+                    let icon = match r.status {
+                        CheckStatus::Pass => "OK ",
+                        CheckStatus::Warn => "!! ",
+                        CheckStatus::Fail => {
+                            has_fail = true;
+                            "ERR"
+                        }
+                    };
+                    if r.message.is_empty() {
+                        println!("[{icon}] {}", r.name);
+                    } else {
+                        println!("[{icon}] {}: {}", r.name, r.message);
+                    }
+                }
+
+                if has_fail {
+                    println!("\nEnvironment is NOT spoke-capable. Fix the errors above.");
+                    std::process::exit(1);
+                } else {
+                    println!("\nEnvironment is spoke-capable.");
+                }
+            }
             Ok(())
         }
     }

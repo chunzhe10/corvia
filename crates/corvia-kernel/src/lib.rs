@@ -98,6 +98,7 @@ pub mod skill_registry;
 pub mod ingest;
 pub mod scoring;
 pub mod gc_worker;
+pub mod spoke;
 pub(crate) mod access_buffer;
 #[cfg(feature = "postgres")]
 pub mod postgres_store;
