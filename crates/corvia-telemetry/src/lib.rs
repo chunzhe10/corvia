@@ -37,6 +37,13 @@ pub mod spans {
     pub const GC_REBUILD: &str = "corvia.gc.rebuild";
     pub const ACCESS_RECORD: &str = "corvia.access.record";
 
+    // Spoke lifecycle spans
+    pub const SPOKE_CREATE: &str = "corvia.spoke.create";
+    pub const SPOKE_DESTROY: &str = "corvia.spoke.destroy";
+    pub const SPOKE_PRUNE: &str = "corvia.spoke.prune";
+    pub const SPOKE_RESTART: &str = "corvia.spoke.restart";
+    pub const SPOKE_CHECK: &str = "corvia.spoke.check";
+
     // Hook lifecycle spans (embedded in JSONL events, reconstructed during ingestion)
     pub const HOOK_DISPATCH: &str = "corvia.hook.dispatch";
     pub const HOOK_SESSION_RECORD: &str = "corvia.hook.session_record";
@@ -221,6 +228,11 @@ mod tests {
             spans::GC_TRANSITION,
             spans::GC_REBUILD,
             spans::ACCESS_RECORD,
+            spans::SPOKE_CREATE,
+            spans::SPOKE_DESTROY,
+            spans::SPOKE_PRUNE,
+            spans::SPOKE_RESTART,
+            spans::SPOKE_CHECK,
         ];
         for name in &all {
             assert!(

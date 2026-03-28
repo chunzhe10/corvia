@@ -482,8 +482,20 @@ enum SpokeCommands {
     },
     /// Restart a spoke, preserving repo checkout
     Restart {
-        /// Spoke name or prefix
-        name: String,
+        /// Spoke name or prefix (omit for --all)
+        name: Option<String>,
+        /// Restart all running spokes
+        #[arg(long)]
+        all: bool,
+    },
+    /// Remove exited spoke containers older than a threshold
+    Prune {
+        /// Maximum age before pruning (e.g., "1h", "30m", "2h")
+        #[arg(long, default_value = "1h")]
+        max_age: String,
+        /// JSON output for scripting
+        #[arg(long)]
+        json: bool,
     },
     /// Validate environment is spoke-capable
     Check {
@@ -900,6 +912,7 @@ async fn cmd_serve() -> Result<()> {
         corvia_kernel::gc_worker::spawn_gc_worker(gc_store, gc_graph, gc_config, gc_data_dir, gc_counter);
     }
 
+    let has_docker = state.docker_available;
     let mut app = corvia_server::rest::router(state.clone());
     app = app.merge(corvia_server::mcp::mcp_router(state.clone()));
     app = app.merge(corvia_server::dashboard::router(state));
@@ -910,6 +923,30 @@ async fn cmd_serve() -> Result<()> {
     // Spawn JSONL session watcher for real-time dashboard visibility.
     corvia_server::dashboard::session_watcher::spawn_session_watcher(hook_sessions).await;
     println!("Session watcher: monitoring ~/.claude/sessions/");
+
+    // Spawn spoke auto-prune task (prune exited containers every 5 minutes, max age 1 hour).
+    if has_docker {
+        tokio::spawn(async {
+            use corvia_kernel::spoke::SpokeProvisioner;
+            let interval = std::time::Duration::from_secs(300); // 5 minutes
+            let max_age = std::time::Duration::from_secs(3600);  // 1 hour
+            loop {
+                tokio::time::sleep(interval).await;
+                if let Ok(provisioner) = SpokeProvisioner::new() {
+                    match provisioner.prune(max_age).await {
+                        Ok(pruned) if !pruned.is_empty() => {
+                            tracing::info!(count = pruned.len(), "Auto-pruned exited spokes");
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "Spoke auto-prune failed");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+        println!("Spoke auto-prune: every 5m, max age 1h");
+    }
 
     ready.store(true, std::sync::atomic::Ordering::Relaxed);
     println!("Corvia server listening on {addr}");
@@ -2067,14 +2104,43 @@ async fn cmd_spoke(command: SpokeCommands) -> Result<()> {
             Ok(())
         }
 
-        SpokeCommands::Restart { name } => {
+        SpokeCommands::Restart { name, all } => {
             let provisioner = SpokeProvisioner::new()?;
-            let spoke = provisioner
-                .find(&name)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("Spoke '{}' not found", name))?;
-            provisioner.restart(&spoke.name).await?;
-            println!("Spoke '{}' restarted.", spoke.name);
+            if all {
+                let (success, failures) = provisioner.restart_all().await?;
+                println!("Restarted {} spoke(s).", success);
+                if !failures.is_empty() {
+                    eprintln!("Failed to restart: {}", failures.join(", "));
+                }
+            } else if let Some(name) = name {
+                let spoke = provisioner
+                    .find(&name)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Spoke '{}' not found", name))?;
+                provisioner.restart(&spoke.name).await?;
+                println!("Spoke '{}' restarted.", spoke.name);
+            } else {
+                anyhow::bail!("Provide a spoke name or use --all");
+            }
+            Ok(())
+        }
+
+        SpokeCommands::Prune { max_age, json } => {
+            let provisioner = SpokeProvisioner::new()?;
+            let chrono_dur = parse_duration(&max_age)?;
+            let duration = chrono_dur.to_std().map_err(|_| anyhow::anyhow!("Invalid duration"))?;
+            let pruned = provisioner.prune(duration).await?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&pruned)?);
+            } else if pruned.is_empty() {
+                println!("No exited spokes older than {} to prune.", max_age);
+            } else {
+                println!("Pruned {} spoke(s):", pruned.len());
+                for name in &pruned {
+                    println!("  - {}", name);
+                }
+            }
             Ok(())
         }
 
@@ -2570,8 +2636,12 @@ fn parse_duration(s: &str) -> Result<chrono::Duration> {
         let n: i64 = hours.parse().map_err(|_| anyhow::anyhow!("Invalid duration: {s}"))?;
         if n <= 0 { anyhow::bail!("Duration must be positive: {s}"); }
         Ok(chrono::Duration::hours(n))
+    } else if let Some(minutes) = s.strip_suffix('m') {
+        let n: i64 = minutes.parse().map_err(|_| anyhow::anyhow!("Invalid duration: {s}"))?;
+        if n <= 0 { anyhow::bail!("Duration must be positive: {s}"); }
+        Ok(chrono::Duration::minutes(n))
     } else {
-        anyhow::bail!("Invalid duration format: {s}. Use '7d' for days or '1h' for hours.")
+        anyhow::bail!("Invalid duration format: {s}. Use '7d' for days, '1h' for hours, or '30m' for minutes.")
     }
 }
 

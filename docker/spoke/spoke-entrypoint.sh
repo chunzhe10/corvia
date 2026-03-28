@@ -6,8 +6,8 @@ set -euo pipefail
 # server, and starts Claude Code on an assigned issue or branch.
 #
 # Required env vars:
-#   REPO_URL          - Git repo URL (e.g., https://github.com/owner/repo.git)
 #   CORVIA_MCP_URL    - Hub MCP endpoint (e.g., http://app:8020/mcp)
+#   CORVIA_REPO_URL   - Git repo URL (e.g., https://github.com/owner/repo.git)
 #
 # Optional env vars:
 #   CORVIA_ISSUE      - GitHub issue number to work on
@@ -19,15 +19,31 @@ set -euo pipefail
 
 # --- Validate required env vars ---
 
-: "${REPO_URL:?REPO_URL is required (e.g., https://github.com/owner/repo.git)}"
 : "${CORVIA_MCP_URL:?CORVIA_MCP_URL is required (e.g., http://app:8020/mcp)}"
+: "${CORVIA_REPO_URL:?CORVIA_REPO_URL is required (e.g., https://github.com/owner/repo.git)}"
 
-# --- Error reporting ---
+# --- Status and error reporting ---
+
+# Write a status update to corvia via MCP (best-effort, never blocks)
+report_status() {
+    local status="$1"
+    local detail="${2:-}"
+    echo "SPOKE STATUS: ${status}${detail:+ - ${detail}}"
+    local content="Spoke ${CORVIA_AGENT_ID:-unknown} status: ${status}${detail:+. ${detail}}"
+    local payload
+    payload=$(jq -n \
+        --arg agent "${CORVIA_AGENT_ID:-spoke-unknown}" \
+        --arg content "$content" \
+        '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"corvia_write",arguments:{scope_id:"corvia",agent_id:$agent,content_role:"finding",source_origin:"workspace",content:$content}}}')
+    curl -sf -X POST "${CORVIA_MCP_URL:-}" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer ${CORVIA_MCP_TOKEN:-}" \
+        -d "$payload" 2>/dev/null || true
+}
 
 report_failure() {
     local msg="$1"
     echo "SPOKE FAILURE: ${msg}" >&2
-    # Best-effort write to corvia using jq for safe JSON construction
     local payload
     payload=$(jq -n \
         --arg agent "${CORVIA_AGENT_ID:-spoke-unknown}" \
@@ -40,6 +56,8 @@ report_failure() {
 }
 
 trap 'report_failure "Entrypoint failed at line $LINENO (exit $?)"' ERR
+
+report_status "starting" "Spoke container initialized"
 
 # --- Credential setup ---
 
@@ -56,17 +74,33 @@ else
     exit 1
 fi
 
+# --- Credential validation ---
+
+# Verify credentials are usable before investing time in clone + setup.
+# Claude Code exits with error on invalid credentials, but early detection
+# saves time and produces a clearer error message.
+if [ -f ~/.claude/.credentials.json ]; then
+    if command -v claude &>/dev/null; then
+        if claude -p "respond with OK" 2>/dev/null | grep -q "OK"; then
+            echo "Credential check: valid"
+        else
+            report_failure "Credential check failed. Token may be expired. Rotate credentials or use ANTHROPIC_API_KEY."
+            exit 1
+        fi
+    fi
+fi
+
 # --- Repository setup ---
 
 clone_with_retry() {
     # Extract owner/repo from GitHub URL for API call
     local repo_slug
-    repo_slug=$(echo "${REPO_URL}" | sed 's|.*github\.com[/:]||; s|\.git$||')
+    repo_slug=$(echo "${CORVIA_REPO_URL}" | sed 's|.*github\.com[/:]||; s|\.git$||')
     local default_branch
     default_branch=$(gh api "repos/${repo_slug}" --jq '.default_branch' 2>/dev/null || echo "master")
 
     for i in 1 2 3; do
-        if git clone --depth 100 --branch "${default_branch}" "${REPO_URL}" /workspace 2>&1; then
+        if git clone --depth 100 --branch "${default_branch}" "${CORVIA_REPO_URL}" /workspace 2>&1; then
             return 0
         fi
         echo "Clone failed (attempt $i/3), retrying in $((3 + RANDOM % 3))s..." >&2
@@ -76,6 +110,7 @@ clone_with_retry() {
 }
 
 # Skip clone if workspace already populated (spoke restart case)
+report_status "cloning" "Cloning ${CORVIA_REPO_URL}"
 if [ -d "/workspace/.git" ]; then
     echo "Workspace already populated, skipping clone."
     git -C /workspace fetch origin && git -C /workspace pull --rebase || true
@@ -87,9 +122,11 @@ else
 fi
 
 cd /workspace
+report_status "cloned" "Repository ready"
 
 # --- Branch setup ---
 
+report_status "branch-setup" "Configuring branch"
 if [ -n "${CORVIA_ISSUE:-}" ]; then
     # Derive branch name from issue
     ISSUE_TITLE=$(gh issue view "${CORVIA_ISSUE}" --json title --jq '.title' 2>/dev/null || echo "")
@@ -110,6 +147,8 @@ elif [ -n "${CORVIA_BRANCH:-}" ]; then
     fi
 fi
 
+report_status "branch-ready" "On branch $(git branch --show-current 2>/dev/null || echo 'unknown')"
+
 # --- MCP configuration ---
 
 # Write .mcp.json to user home (NOT workspace) to prevent accidental git commits
@@ -121,6 +160,76 @@ MCP_CONFIG="${MCP_CONFIG}"'}}}'
 mkdir -p ~/.claude
 echo "${MCP_CONFIG}" > ~/.claude/.mcp.json
 echo "MCP config written to ~/.claude/.mcp.json (hub: ${CORVIA_MCP_URL})"
+
+# --- Permission hardening ---
+
+# Scope Claude Code's Bash access to safe commands. Block docker (container
+# escape), ssh, and network scanning tools. Claude Code reads this at startup.
+cat > ~/.claude/settings.json << 'SETTINGS_EOF'
+{
+  "permissions": {
+    "allow": [
+      "Bash(git *)",
+      "Bash(cargo *)",
+      "Bash(npm *)",
+      "Bash(npx *)",
+      "Bash(gh *)",
+      "Bash(curl *)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(mkdir *)",
+      "Bash(cp *)",
+      "Bash(rm *)",
+      "Bash(mv *)",
+      "Bash(chmod *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(wc *)",
+      "Bash(diff *)",
+      "Bash(sort *)",
+      "Bash(grep *)",
+      "Bash(find *)",
+      "Bash(tee *)",
+      "Bash(echo *)",
+      "Bash(printf *)",
+      "Bash(test *)",
+      "Bash(true *)",
+      "Bash(false *)",
+      "Bash(sleep *)",
+      "Bash(date *)",
+      "Bash(pwd *)",
+      "Bash(whoami *)",
+      "Bash(env *)",
+      "Bash(which *)",
+      "Bash(realpath *)",
+      "Bash(dirname *)",
+      "Bash(basename *)",
+      "Bash(sed *)",
+      "Bash(awk *)",
+      "Bash(tr *)",
+      "Bash(cut *)",
+      "Bash(uniq *)",
+      "Bash(xargs *)",
+      "Bash(touch *)",
+      "Read(*)",
+      "Write(*)",
+      "Edit(*)",
+      "Glob(*)",
+      "Grep(*)",
+      "Agent(*)",
+      "mcp__corvia__*"
+    ],
+    "deny": [
+      "Bash(docker *)",
+      "Bash(ssh *)",
+      "Bash(nc *)",
+      "Bash(ncat *)",
+      "Bash(nmap *)"
+    ]
+  }
+}
+SETTINGS_EOF
+echo "Permission hardening applied via ~/.claude/settings.json"
 
 # --- Hub health check ---
 
@@ -139,13 +248,26 @@ for i in $(seq 1 10); do
     sleep $((3 + RANDOM % 3))
 done
 
+report_status "mcp-connected" "Hub MCP reachable at ${CORVIA_MCP_URL}"
+
 # --- Start Claude Code ---
 
-echo "Starting Claude Code..."
+report_status "claude-starting" "Launching Claude Code"
+SPOKE_EXIT_CODE=0
 if [ -n "${CORVIA_ISSUE:-}" ]; then
-    exec claude -p "/dev-loop ${CORVIA_ISSUE}"
+    claude -p "/dev-loop ${CORVIA_ISSUE}" || SPOKE_EXIT_CODE=$?
 elif [ -n "${CORVIA_PROMPT:-}" ]; then
-    exec claude -p "${CORVIA_PROMPT}"
+    claude -p "${CORVIA_PROMPT}" || SPOKE_EXIT_CODE=$?
 else
-    exec claude
+    claude || SPOKE_EXIT_CODE=$?
 fi
+
+# --- Report completion ---
+
+if [ "$SPOKE_EXIT_CODE" -eq 0 ]; then
+    report_status "completed" "Claude Code exited successfully"
+else
+    report_status "failed" "Claude Code exited with code ${SPOKE_EXIT_CODE}"
+fi
+
+exit "$SPOKE_EXIT_CODE"

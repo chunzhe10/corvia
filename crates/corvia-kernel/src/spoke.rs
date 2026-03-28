@@ -16,7 +16,7 @@ use bollard::Docker;
 use corvia_common::config::{CorviaConfig, SpokeAuthMode, SpokeConfig};
 use corvia_common::errors::{CorviaError, Result};
 use std::collections::HashMap;
-use tracing::{info, warn};
+use tracing::{info, info_span, warn, Instrument};
 
 /// Check if the current process is running inside a Docker container.
 pub fn is_in_container() -> bool {
@@ -323,6 +323,36 @@ impl SpokeProvisioner {
         branch_name: &str,
         workspace_root: &str,
     ) -> Result<()> {
+        let span = info_span!(
+            "corvia.spoke.create",
+            spoke_name,
+            agent_id,
+            repo = repo_name,
+            issue = issue.unwrap_or(0),
+        );
+        self.create_inner(
+            spoke_name, agent_id, hub, config, spoke_config, network,
+            repo_name, repo_url, issue, branch_name, workspace_root,
+        )
+        .instrument(span)
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_inner(
+        &self,
+        spoke_name: &str,
+        agent_id: &str,
+        hub: &HubContext,
+        config: &CorviaConfig,
+        spoke_config: &SpokeConfig,
+        network: &str,
+        repo_name: &str,
+        repo_url: &str,
+        issue: Option<u32>,
+        branch_name: &str,
+        workspace_root: &str,
+    ) -> Result<()> {
         // Read the MCP token from data dir
         let data_dir = std::path::Path::new(&config.storage.data_dir);
         let mcp_token_path = data_dir.join("mcp-token");
@@ -492,6 +522,11 @@ impl SpokeProvisioner {
 
     /// Stop and remove a spoke container.
     pub async fn destroy(&self, spoke_name: &str, force: bool) -> Result<()> {
+        let span = info_span!("corvia.spoke.destroy", spoke_name, force);
+        self.destroy_inner(spoke_name, force).instrument(span).await
+    }
+
+    async fn destroy_inner(&self, spoke_name: &str, force: bool) -> Result<()> {
         if !force {
             // Graceful: send SIGTERM, wait 10s, then SIGKILL
             self.docker
@@ -538,6 +573,11 @@ impl SpokeProvisioner {
 
     /// Restart a spoke container, preserving its filesystem.
     pub async fn restart(&self, spoke_name: &str) -> Result<()> {
+        let span = info_span!("corvia.spoke.restart", spoke_name);
+        self.restart_inner(spoke_name).instrument(span).await
+    }
+
+    async fn restart_inner(&self, spoke_name: &str) -> Result<()> {
         self.docker
             .stop_container(spoke_name, Some(StopContainerOptions { t: Some(10), signal: None }))
             .await
@@ -554,6 +594,92 @@ impl SpokeProvisioner {
 
         info!(spoke_name, "Spoke restarted");
         Ok(())
+    }
+
+    /// Prune exited spoke containers older than the given threshold.
+    /// Returns the names of pruned containers.
+    pub async fn prune(&self, max_age: std::time::Duration) -> Result<Vec<String>> {
+        let span = info_span!("corvia.spoke.prune", max_age_secs = max_age.as_secs());
+        self.prune_inner(max_age).instrument(span).await
+    }
+
+    async fn prune_inner(&self, max_age: std::time::Duration) -> Result<Vec<String>> {
+        let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+        filters.insert("label".into(), vec!["corvia.spoke=true".into()]);
+        filters.insert("status".into(), vec!["exited".into()]);
+
+        let options = ListContainersOptionsBuilder::new()
+            .all(true)
+            .filters(&filters)
+            .build();
+
+        let containers = self
+            .docker
+            .list_containers(Some(options))
+            .await
+            .map_err(|e| CorviaError::Docker(format!("Failed to list exited spokes: {e}")))?;
+
+        let now = chrono::Utc::now().timestamp();
+        let threshold = max_age.as_secs() as i64;
+        let mut pruned = Vec::new();
+
+        for container in &containers {
+            let created = container.created.unwrap_or(0);
+            let age = now - created;
+            if age < threshold {
+                continue; // Too young to prune
+            }
+
+            let name = container
+                .names
+                .as_ref()
+                .and_then(|n| n.first())
+                .map(|n| n.trim_start_matches('/').to_string())
+                .unwrap_or_default();
+
+            if name.is_empty() {
+                continue;
+            }
+
+            match self
+                .docker
+                .remove_container(
+                    &name,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+            {
+                Ok(()) => {
+                    info!(spoke = %name, age_secs = age, "Pruned exited spoke");
+                    pruned.push(name);
+                }
+                Err(e) => {
+                    warn!(spoke = %name, error = %e, "Failed to prune spoke");
+                }
+            }
+        }
+
+        Ok(pruned)
+    }
+
+    /// Restart all running spoke containers. Returns (success_count, failed_names).
+    pub async fn restart_all(&self) -> Result<(u32, Vec<String>)> {
+        let spokes = self.list(false).await?; // Only running spokes
+        let mut success = 0u32;
+        let mut failures = Vec::new();
+        for spoke in &spokes {
+            match self.restart(&spoke.name).await {
+                Ok(()) => success += 1,
+                Err(e) => {
+                    warn!(spoke = %spoke.name, error = %e, "Failed to restart spoke");
+                    failures.push(spoke.name.clone());
+                }
+            }
+        }
+        Ok((success, failures))
     }
 
     /// Run pre-flight checks for spoke capability.
