@@ -220,6 +220,10 @@ pub fn record_event(session_id: &str, event: &HookEvent, stdin: &serde_json::Val
             // session_end event is appended by finalize_session()
             return Ok(());
         }
+        // Agent Teams events are handled by agent_teams.rs, not session recording
+        HookEvent::TaskCreated | HookEvent::TaskCompleted | HookEvent::TeammateIdle => {
+            return Ok(());
+        }
     };
 
     append_event(session_id, &json_event)

@@ -75,6 +75,9 @@ pub struct HooksConfig {
     pub orphan_cleanup: bool,
     #[serde(default = "default_true")]
     pub corvia_first_reminder: bool,
+    /// Agent Teams capture hooks (default false — only active when Agent Teams is enabled).
+    #[serde(default)]
+    pub agent_teams: bool,
 }
 
 impl Default for HooksConfig {
@@ -87,6 +90,7 @@ impl Default for HooksConfig {
             write_reminder: true,
             orphan_cleanup: true,
             corvia_first_reminder: true,
+            agent_teams: false,
         }
     }
 }
@@ -102,6 +106,7 @@ impl HooksConfig {
             "write_reminder" => self.write_reminder,
             "orphan_cleanup" => self.orphan_cleanup,
             "corvia_first_reminder" => self.corvia_first_reminder,
+            "agent_teams" => self.agent_teams,
             _ => true,
         }
     }

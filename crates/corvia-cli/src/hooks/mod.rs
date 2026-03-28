@@ -9,6 +9,7 @@
 //! - 2: block (action prevented, stderr = reason)
 
 pub mod agent_check;
+pub mod agent_teams;
 pub mod cleanup;
 pub mod doc_placement;
 #[allow(dead_code)]
@@ -45,6 +46,9 @@ pub enum HookEvent {
     PreToolUse,
     PostToolUse,
     SessionEnd,
+    TaskCreated,
+    TaskCompleted,
+    TeammateIdle,
 }
 
 impl FromStr for HookEvent {
@@ -56,6 +60,9 @@ impl FromStr for HookEvent {
             "PreToolUse" => Ok(Self::PreToolUse),
             "PostToolUse" => Ok(Self::PostToolUse),
             "SessionEnd" => Ok(Self::SessionEnd),
+            "TaskCreated" => Ok(Self::TaskCreated),
+            "TaskCompleted" => Ok(Self::TaskCompleted),
+            "TeammateIdle" => Ok(Self::TeammateIdle),
             _ => anyhow::bail!("Unknown hook event: {s}"),
         }
     }
@@ -179,6 +186,11 @@ pub fn run_hook_from_args(event_str: &str, handler_str: Option<&str>) -> Result<
                     println!("{msg}");
                 }
                 HookEvent::SessionEnd => {
+                    // Agent Teams sweep (non-fatal — must not break session history)
+                    if hooks_config.agent_teams && !session_id.is_empty() {
+                        hook_debug!("agent-teams: SessionEnd sweep");
+                        agent_teams::team_sweep(&session_id);
+                    }
                     if hooks_config.orphan_cleanup {
                         hook_debug!("orphan-cleanup: scanning");
                         cleanup::orphan_cleanup(true);
@@ -187,6 +199,24 @@ pub fn run_hook_from_args(event_str: &str, handler_str: Option<&str>) -> Result<
                     if hooks_config.session_recording && !session_id.is_empty() {
                         hook_debug!("session-finalize: gzip + ingest");
                         session::finalize_session(&session_id);
+                    }
+                }
+                HookEvent::TaskCreated if hooks_config.agent_teams => {
+                    hook_debug!("agent-teams: TaskCreated");
+                    if let Err(e) = agent_teams::handle_task_created(&stdin) {
+                        eprintln!("Warning: TaskCreated capture failed: {e}");
+                    }
+                }
+                HookEvent::TaskCompleted if hooks_config.agent_teams => {
+                    hook_debug!("agent-teams: TaskCompleted");
+                    if let Err(e) = agent_teams::handle_task_completed(&stdin) {
+                        eprintln!("Warning: TaskCompleted capture failed: {e}");
+                    }
+                }
+                HookEvent::TeammateIdle if hooks_config.agent_teams => {
+                    hook_debug!("agent-teams: TeammateIdle");
+                    if let Err(e) = agent_teams::handle_teammate_idle(&stdin) {
+                        eprintln!("Warning: TeammateIdle capture failed: {e}");
                     }
                 }
                 _ => {}
@@ -221,6 +251,9 @@ mod tests {
         assert_eq!("PostToolUse".parse::<HookEvent>().unwrap(), HookEvent::PostToolUse);
         assert_eq!("UserPromptSubmit".parse::<HookEvent>().unwrap(), HookEvent::UserPromptSubmit);
         assert_eq!("SessionEnd".parse::<HookEvent>().unwrap(), HookEvent::SessionEnd);
+        assert_eq!("TaskCreated".parse::<HookEvent>().unwrap(), HookEvent::TaskCreated);
+        assert_eq!("TaskCompleted".parse::<HookEvent>().unwrap(), HookEvent::TaskCompleted);
+        assert_eq!("TeammateIdle".parse::<HookEvent>().unwrap(), HookEvent::TeammateIdle);
         assert!("Invalid".parse::<HookEvent>().is_err());
     }
 

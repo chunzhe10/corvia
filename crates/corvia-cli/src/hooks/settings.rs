@@ -40,14 +40,20 @@ pub fn init_hooks(root: &Path, config: &CorviaConfig) -> Result<()> {
         json!({})
     };
 
+    let mut hooks_config = config.hooks.clone().unwrap_or_default();
+
+    // Auto-enable agent_teams hooks if Agent Teams is enabled in settings.json env block
+    // (checked before taking mutable borrow on settings)
+    if !hooks_config.agent_teams {
+        hooks_config.agent_teams = has_agent_teams_env(&settings);
+    }
+
     let root_obj = settings.as_object_mut()
         .ok_or_else(|| corvia_common::errors::CorviaError::Config("settings.json root is not a JSON object".into()))?;
 
     let hooks = root_obj.entry("hooks").or_insert(json!({}));
     let hooks_obj = hooks.as_object_mut()
         .ok_or_else(|| corvia_common::errors::CorviaError::Config("settings.json 'hooks' is not a JSON object".into()))?;
-
-    let hooks_config = config.hooks.clone().unwrap_or_default();
 
     // Purge old corvia-managed entries from all event arrays
     for (_event_name, entries) in hooks_obj.iter_mut() {
@@ -138,6 +144,18 @@ fn add_hooks(hooks_obj: &mut serde_json::Map<String, serde_json::Value>, config:
         let arr = ensure_array(hooks_obj, "SessionEnd");
         arr.push(hook_entry(None, "corvia hooks run --event SessionEnd", 30000));
     }
+
+    // Agent Teams hooks (conditional — only when Agent Teams is enabled)
+    if config.agent_teams {
+        let arr = ensure_array(hooks_obj, "TaskCreated");
+        arr.push(hook_entry(None, "corvia hooks run --event TaskCreated", 5000));
+
+        let arr = ensure_array(hooks_obj, "TaskCompleted");
+        arr.push(hook_entry(None, "corvia hooks run --event TaskCompleted", 5000));
+
+        let arr = ensure_array(hooks_obj, "TeammateIdle");
+        arr.push(hook_entry(None, "corvia hooks run --event TeammateIdle", 5000));
+    }
 }
 
 fn ensure_array<'a>(obj: &'a mut serde_json::Map<String, serde_json::Value>, key: &str) -> &'a mut Vec<serde_json::Value> {
@@ -170,6 +188,17 @@ fn hook_entry(matcher: Option<&str>, command: &str, timeout: u64) -> serde_json:
         entry.as_object_mut().unwrap().insert("matcher".into(), json!(m));
     }
     entry
+}
+
+/// Check if settings.json has Agent Teams enabled in its env block.
+///
+/// Looks for `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: "1"` in the `env` object.
+fn has_agent_teams_env(settings: &serde_json::Value) -> bool {
+    settings.get("env")
+        .and_then(|env| env.get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"))
+        .and_then(|v| v.as_str())
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -243,6 +272,56 @@ mod tests {
         // PostToolUse should have session-recording but NOT write-reminder
         let post = hooks_obj.get("PostToolUse").unwrap().as_array().unwrap();
         assert_eq!(post.len(), 1); // session-recording only
+    }
+
+    #[test]
+    fn test_agent_teams_hooks_added_when_enabled() {
+        let mut hooks_obj = serde_json::Map::new();
+        let mut config = HooksConfig::default();
+        config.agent_teams = true;
+        add_hooks(&mut hooks_obj, &config);
+
+        assert!(hooks_obj.contains_key("TaskCreated"));
+        assert!(hooks_obj.contains_key("TaskCompleted"));
+        assert!(hooks_obj.contains_key("TeammateIdle"));
+
+        let task_created = hooks_obj.get("TaskCreated").unwrap().as_array().unwrap();
+        assert_eq!(task_created.len(), 1);
+        let cmd = task_created[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("corvia hooks run --event TaskCreated"));
+    }
+
+    #[test]
+    fn test_agent_teams_hooks_omitted_when_disabled() {
+        let mut hooks_obj = serde_json::Map::new();
+        let config = HooksConfig::default(); // agent_teams defaults to false
+        add_hooks(&mut hooks_obj, &config);
+
+        assert!(!hooks_obj.contains_key("TaskCreated"));
+        assert!(!hooks_obj.contains_key("TaskCompleted"));
+        assert!(!hooks_obj.contains_key("TeammateIdle"));
+    }
+
+    #[test]
+    fn test_has_agent_teams_env_true() {
+        let settings = json!({
+            "env": {
+                "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+            }
+        });
+        assert!(has_agent_teams_env(&settings));
+    }
+
+    #[test]
+    fn test_has_agent_teams_env_false() {
+        let settings = json!({});
+        assert!(!has_agent_teams_env(&settings));
+
+        let settings = json!({"env": {}});
+        assert!(!has_agent_teams_env(&settings));
+
+        let settings = json!({"env": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "0"}});
+        assert!(!has_agent_teams_env(&settings));
     }
 
     #[test]
