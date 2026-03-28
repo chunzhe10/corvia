@@ -248,14 +248,19 @@ def compute_query_metrics(query_def: dict, response: dict, k: int = 5) -> dict:
 
 def compute_aggregate(query_results: list) -> dict:
     """Compute aggregate metrics across all queries."""
-    recalls = [q["recall_at_5"] for q in query_results]
-    rrs = [q["reciprocal_rank"] for q in query_results]
-    kw_recalls = [q["keyword_recall"] for q in query_results]
-    latencies = [q["latency_ms"] for q in query_results if q["latency_ms"] > 0]
+    # Exclude failed queries (those with an "error" key) from quality aggregates
+    # to avoid silently dragging down metrics with zero-score failures.
+    successful = [q for q in query_results if "error" not in q]
+    failed_count = len(query_results) - len(successful)
 
-    # Per-category
+    recalls = [q["recall_at_5"] for q in successful]
+    rrs = [q["reciprocal_rank"] for q in successful]
+    kw_recalls = [q["keyword_recall"] for q in successful]
+    latencies = [q["latency_ms"] for q in successful if q["latency_ms"] > 0]
+
+    # Per-category (successful queries only)
     categories = {}
-    for q in query_results:
+    for q in successful:
         cat = q["category"]
         if cat not in categories:
             categories[cat] = {"recalls": [], "rrs": [], "kw_recalls": []}
@@ -291,6 +296,8 @@ def compute_aggregate(query_results: list) -> dict:
         "latency_p95_ms": percentile(latency_sorted, 95),
         "latency_p99_ms": percentile(latency_sorted, 99),
         "query_count": len(query_results),
+        "successful_count": len(successful),
+        "failed_count": failed_count,
         "by_category": by_category,
     }
 

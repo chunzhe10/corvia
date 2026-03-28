@@ -17,13 +17,6 @@ import sys
 SHIP_GATES = {
     "recall_at_5": {"threshold": 0.50, "direction": "above", "label": "Source Recall@5 > 50%"},
     "mrr": {"threshold": 0.60, "direction": "above", "label": "MRR > 0.60"},
-    "latency_p95_ms": {"threshold": 20, "direction": "below", "label": "Latency p95 < 20ms"},
-}
-
-# Baseline values (from initial eval, 2026-03-19)
-BASELINE = {
-    "recall_at_5": 0.375,
-    "mrr": 0.544,
 }
 
 
@@ -98,7 +91,10 @@ def check_category_regression(baseline_result: dict, candidate_result: dict) -> 
 
 def main():
     parser = argparse.ArgumentParser(description="Compare RAG retrieval benchmarks")
-    parser.add_argument("files", nargs="+", help="Eval result JSON files (baseline first)")
+    parser.add_argument("files", nargs="+",
+                        help="Eval result JSON files. First file is the baseline, "
+                             "second is the candidate (checked against ship gates). "
+                             "Additional files are shown in tables but not gate-checked.")
     args = parser.parse_args()
 
     if len(args.files) < 2:

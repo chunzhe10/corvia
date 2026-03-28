@@ -32,20 +32,21 @@ MCP_URL="$URL/mcp"
 
 phase() { echo ""; echo "== $1 =="; }
 
-# ── Helper: call MCP tool ──────────────────────────────────────────────────
+# ── Helper: call MCP tool (uses sys.argv to avoid shell injection) ─────────
 mcp_call() {
   local tool="$1" args="$2"
   curl -s -X POST "$MCP_URL" -H "Content-Type: application/json" -d "$(python3 -c "
-import json
+import json, sys
+tool, args_json = sys.argv[1], sys.argv[2]
 print(json.dumps({
     'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
     'params': {
-        'name': '$tool',
+        'name': tool,
         '_meta': {'confirmed': True},
-        'arguments': $args
+        'arguments': json.loads(args_json)
     }
 }))
-")"
+" "$tool" "$args")"
 }
 
 # ── Helper: hot-swap config via MCP ────────────────────────────────────────
@@ -53,21 +54,22 @@ config_set() {
   local section="$1" key="$2" value="$3"
   local payload
   payload=$(python3 -c "
-import json
+import json, sys
+scope_id, section, key, value_json = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 print(json.dumps({
     'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
     'params': {
         'name': 'corvia_config_set',
         '_meta': {'confirmed': True},
         'arguments': {
-            'scope_id': '$SCOPE_ID',
-            'section': '$section',
-            'key': '$key',
-            'value': $value
+            'scope_id': scope_id,
+            'section': section,
+            'key': key,
+            'value': json.loads(value_json)
         }
     }
 }))
-")
+" "$SCOPE_ID" "$section" "$key" "$value")
   local resp
   resp=$(curl -s -X POST "$MCP_URL" -H "Content-Type: application/json" -d "$payload")
   # Check for errors
@@ -77,6 +79,16 @@ print(json.dumps({
     echo "  Config response: $resp" | head -c 200
   fi
 }
+
+# ── Cleanup trap: restore config on failure ────────────────────────────────
+restore_config() {
+  echo ""
+  echo "== Restoring default config =="
+  config_set "rag" "pipeline.searchers" '["vector"]' 2>/dev/null
+  config_set "rag" "pipeline.fusion" '"passthrough"' 2>/dev/null
+  config_set "rag" "pipeline.expander" '"graph"' 2>/dev/null
+}
+trap restore_config EXIT
 
 # ── Phase 0: Preflight ────────────────────────────────────────────────────
 phase "Phase 0: Preflight"
@@ -131,13 +143,9 @@ python3 "$SCRIPT_DIR/eval.py" \
   --label "bm25-only" \
   -o "$RESULTS_DIR/bm25-only.json"
 
-# ── Phase 4: Restore and compare ───────────────────────────────────────────
-phase "Phase 4: Restore original config and compare"
-# Restore to vector-only (original default)
-config_set "rag" "pipeline.searchers" '["vector"]'
-config_set "rag" "pipeline.fusion" '"passthrough"'
-config_set "rag" "pipeline.expander" '"graph"'
-
+# ── Phase 4: Compare results ──────────────────────────────────────────────
+# Config is restored by the EXIT trap handler.
+phase "Phase 4: Compare results"
 echo ""
 python3 "$SCRIPT_DIR/compare.py" \
   "$RESULTS_DIR/vector-only.json" \

@@ -214,7 +214,7 @@ to populate the full-text index from existing entries. The index is a cache at
 
 **Benchmark results** (2026-03-28, self-ingested corvia codebase, 4,888 entries):
 
-| Config | Recall@5 | MRR | Keyword Recall | Latency p50 |
+| Config | Source Recall@5 | MRR | Keyword Recall | Latency p50 |
 |--------|----------|-----|----------------|-------------|
 | Vector + graph | 0.59 | 0.73 | 0.78 | 1121ms |
 | Hybrid (RRF) + graph | 0.52 | 0.58 | 0.86 | 2236ms |
