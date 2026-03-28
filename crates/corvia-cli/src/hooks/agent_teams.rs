@@ -9,15 +9,21 @@
 //! - Directory permissions: 0700 via umask + mkdir
 //! - Atomic writes: temp-then-rename for single files, flock for JSONL appends
 //! - Truncation: 64 KB max for task descriptions
+//!
+//! Staging format: see `docs/rfcs/2026-03-28-agent-teams-adapter-design.md` Section 8.
 
 use anyhow::Result;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
-/// Max task description size (64 KB). Descriptions exceeding this are truncated.
-const MAX_DESCRIPTION_BYTES: usize = 64 * 1024;
+/// Schema version for staging events. Increment when the JSONL format changes.
+const SCHEMA_VERSION: u32 = 1;
+
+/// Max event line size (64 KB). Lines exceeding this trigger fallback serialization.
+const MAX_EVENT_LINE_BYTES: usize = 64 * 1024;
 
 /// Directory layout for Agent Teams hook operations.
 /// Production code uses `Dirs::from_home()`; tests inject custom paths.
@@ -40,13 +46,19 @@ impl Dirs {
 
     fn ensure_staging_dir(&self, team_name: &str) -> Result<PathBuf> {
         let dir = self.staging_root.join(team_name);
-        fs::create_dir_all(&dir)?;
+        // Set restrictive umask before creating to avoid TOCTOU permission gap
+        let old_umask = unsafe { libc::umask(0o077) };
+        let result = fs::create_dir_all(&dir);
+        unsafe { libc::umask(old_umask) };
+        result?;
+        // Ensure 0700 even if directory pre-existed with different permissions
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
         Ok(dir)
     }
 }
 
 /// Validate team/teammate names against `^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$`.
+#[must_use]
 fn is_valid_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 64 {
         return false;
@@ -59,19 +71,22 @@ fn is_valid_name(name: &str) -> bool {
 }
 
 /// Append a JSON line to a file using flock for serialization.
+///
+/// The lock file (`{path}.lock`) serializes concurrent appends from multiple hook
+/// processes. `lock_file` is declared before `file` so it is dropped (unlocked) AFTER
+/// `file` is flushed and closed (Rust drops in reverse declaration order).
 fn flock_append(path: &Path, line: &str) -> Result<()> {
-    let lock_path = path.with_extension(
-        path.extension()
-            .map(|e| format!("{}.lock", e.to_string_lossy()))
-            .unwrap_or_else(|| "lock".to_string()),
-    );
+    let lock_path = path.with_file_name(format!(
+        "{}.lock",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
 
+    // lock_file must be declared before data file for correct drop ordering
     let lock_file = OpenOptions::new()
         .create(true)
         .write(true)
         .open(&lock_path)?;
 
-    use std::os::unix::io::AsRawFd;
     let fd = lock_file.as_raw_fd();
     let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
     if ret != 0 {
@@ -86,20 +101,31 @@ fn flock_append(path: &Path, line: &str) -> Result<()> {
     if !line.ends_with('\n') {
         file.write_all(b"\n")?;
     }
+    file.flush()?;
+    // file is dropped here (closed), then lock_file is dropped (flock released)
 
     Ok(())
 }
 
-/// Atomic file copy: write to temp, then rename.
+/// Atomic file copy: write to temp (with PID suffix), then rename.
+///
+/// Caller must ensure source and target are on the same filesystem for atomicity.
+/// On failure, best-effort cleanup of the temp file is attempted.
 fn atomic_copy(source: &Path, target: &Path) -> Result<()> {
-    let tmp = target.with_extension("tmp");
-    fs::copy(source, &tmp)?;
-    fs::rename(&tmp, target)?;
+    let tmp = target.with_file_name(format!(
+        "{}.{}.tmp",
+        target.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    if let Err(e) = fs::copy(source, &tmp).and_then(|_| fs::rename(&tmp, target)) {
+        let _ = fs::remove_file(&tmp); // best-effort cleanup
+        return Err(e.into());
+    }
     Ok(())
 }
 
 /// Truncate a string to at most `max_bytes` bytes (on a char boundary).
-fn truncate_str(s: &str, max_bytes: usize) -> &str {
+fn truncate_to_bytes(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
     }
@@ -110,55 +136,29 @@ fn truncate_str(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
-/// Get current ISO 8601 timestamp.
+/// Get current ISO 8601 timestamp with millisecond precision.
 fn now_iso() -> String {
-    use std::time::SystemTime;
-    let dur = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = dur.as_secs();
-    let nanos = dur.subsec_nanos();
-    let days = secs / 86400;
-    let time_secs = secs % 86400;
-    let hours = time_secs / 3600;
-    let minutes = (time_secs % 3600) / 60;
-    let seconds = time_secs % 60;
-    let (y, m, d) = days_to_ymd(days);
-    format!(
-        "{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z",
-        millis = nanos / 1_000_000
-    )
-}
-
-/// Convert days since Unix epoch to (year, month, day).
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
 /// Check if source file is newer than target (or target doesn't exist).
+/// Returns false if source metadata cannot be read (file may have been deleted).
 fn should_copy(source: &Path, target: &Path) -> bool {
     let src_mtime = match source.metadata().and_then(|m| m.modified()) {
         Ok(t) => t,
-        Err(_) => return true,
+        Err(_) => return false, // Can't read source, don't attempt copy
     };
     let dst_mtime = match target.metadata().and_then(|m| m.modified()) {
         Ok(t) => t,
-        Err(_) => return true,
+        Err(_) => return true, // Target doesn't exist, should copy
     };
     src_mtime > dst_mtime
 }
 
 /// Infer team name by scanning tasks directory for the directory containing `task_id`.
+///
+/// If multiple teams have the same task_id (rare, since Claude Code limits to one team
+/// per session), the most recently modified directory wins.
 fn infer_team_from_task(tasks_dir: &Path, task_id: &str) -> Option<String> {
     if !tasks_dir.exists() {
         return None;
@@ -168,12 +168,20 @@ fn infer_team_from_task(tasks_dir: &Path, task_id: &str) -> Option<String> {
 
     for entry in entries.flatten() {
         let team_name = entry.file_name().to_string_lossy().to_string();
-        if !entry.file_type().ok()?.is_dir() {
+        // Skip entries with unreadable metadata instead of aborting the whole scan
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if !ft.is_dir() {
             continue;
         }
         let task_file = entry.path().join(format!("{task_id}.json"));
         if task_file.exists() {
-            let mtime = entry.metadata().ok()?.modified().ok()?;
+            let mtime = match entry.metadata().and_then(|m| m.modified()) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
             candidates.push((team_name, mtime));
         }
     }
@@ -193,7 +201,7 @@ fn handle_task_created_inner(dirs: &Dirs, stdin: &serde_json::Value) -> Result<(
 
     let subject = stdin.get("task_subject").and_then(|v| v.as_str()).unwrap_or("");
     let description_raw = stdin.get("task_description").and_then(|v| v.as_str()).unwrap_or("");
-    let description = truncate_str(description_raw, MAX_DESCRIPTION_BYTES);
+    let description = truncate_to_bytes(description_raw, MAX_EVENT_LINE_BYTES);
 
     let team_name = match infer_team_from_task(&dirs.claude_tasks, task_id) {
         Some(name) => name,
@@ -212,6 +220,7 @@ fn handle_task_created_inner(dirs: &Dirs, stdin: &serde_json::Value) -> Result<(
     let jsonl_path = staging_dir.join("tasks.jsonl");
 
     let event = serde_json::json!({
+        "v": SCHEMA_VERSION,
         "event": "created",
         "task_id": task_id,
         "subject": subject,
@@ -258,6 +267,7 @@ fn handle_task_completed_inner(dirs: &Dirs, stdin: &serde_json::Value) -> Result
     let jsonl_path = staging_dir.join("tasks.jsonl");
 
     let event = serde_json::json!({
+        "v": SCHEMA_VERSION,
         "event": "completed",
         "task_id": task_id,
         "subject": subject,
@@ -267,8 +277,9 @@ fn handle_task_completed_inner(dirs: &Dirs, stdin: &serde_json::Value) -> Result
     });
 
     let mut line = serde_json::to_string(&event)?;
-    if line.len() > MAX_DESCRIPTION_BYTES {
+    if line.len() > MAX_EVENT_LINE_BYTES {
         let fallback = serde_json::json!({
+            "v": SCHEMA_VERSION,
             "event": "completed",
             "task_id": task_id,
             "subject": subject,
@@ -335,6 +346,7 @@ fn handle_teammate_idle_inner(dirs: &Dirs, stdin: &serde_json::Value) -> Result<
     // 4. Append to .capture-log
     let log_path = staging_dir.join(".capture-log");
     let log_entry = serde_json::json!({
+        "v": SCHEMA_VERSION,
         "event": "TeammateIdle",
         "teammate": teammate_name,
         "team": team_name,
@@ -355,7 +367,11 @@ fn team_sweep_inner(dirs: &Dirs, session_id: &str) -> Result<()> {
     let entries = fs::read_dir(&dirs.claude_teams)?;
     for entry in entries.flatten() {
         let team_name = entry.file_name().to_string_lossy().to_string();
-        if !entry.file_type()?.is_dir() {
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if !ft.is_dir() {
             continue;
         }
         if !is_valid_name(&team_name) {
@@ -387,7 +403,9 @@ fn team_sweep_inner(dirs: &Dirs, session_id: &str) -> Result<()> {
         // Copy config.json
         let src_config = entry.path().join("config.json");
         if src_config.exists() {
-            let _ = atomic_copy(&src_config, &staging_dir.join("config.json"));
+            if let Err(e) = atomic_copy(&src_config, &staging_dir.join("config.json")) {
+                eprintln!("Warning: team sweep failed to copy config.json for {team_name}: {e}");
+            }
         }
 
         // Copy all task files as sweep events
@@ -402,13 +420,16 @@ fn team_sweep_inner(dirs: &Dirs, session_id: &str) -> Result<()> {
                         if let Ok(task) = serde_json::from_str::<serde_json::Value>(&content) {
                             let task_id = fname.trim_end_matches(".json");
                             let event = serde_json::json!({
+                                "v": SCHEMA_VERSION,
                                 "event": "sweep",
                                 "task_id": task_id,
                                 "timestamp": now_iso(),
                                 "full_task": task,
                             });
                             let line = serde_json::to_string(&event).unwrap_or_default();
-                            let _ = flock_append(&jsonl_path, &line);
+                            if let Err(e) = flock_append(&jsonl_path, &line) {
+                                eprintln!("Warning: team sweep failed to write task {task_id} for {team_name}: {e}");
+                            }
                         }
                     }
                 }
@@ -424,7 +445,9 @@ fn team_sweep_inner(dirs: &Dirs, session_id: &str) -> Result<()> {
                 for inbox_entry in inbox_entries.flatten() {
                     let fname = inbox_entry.file_name();
                     let dst = staging_inboxes.join(&fname);
-                    let _ = atomic_copy(&inbox_entry.path(), &dst);
+                    if let Err(e) = atomic_copy(&inbox_entry.path(), &dst) {
+                        eprintln!("Warning: team sweep failed to copy inbox {:?} for {team_name}: {e}", fname);
+                    }
                 }
             }
         }
@@ -456,6 +479,10 @@ pub fn team_sweep(session_id: &str) {
         eprintln!("Warning: Agent Teams sweep failed (non-fatal): {e}");
     }
 }
+
+// ─── Tests ─────────────────────────────────────────────────────────────────
+// Test IDs (T1-T3) reference the test plan in
+// docs/rfcs/2026-03-28-agent-teams-adapter-design.md Section 7.
 
 #[cfg(test)]
 mod tests {
@@ -527,7 +554,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let dirs = test_dirs(dir.path());
 
-        // Set up mock task file for team inference
         setup_task(&dirs, "my-team", "1", &serde_json::json!({"status": "open"}));
 
         let stdin = serde_json::json!({
@@ -545,6 +571,7 @@ mod tests {
 
         let content = fs::read_to_string(&jsonl_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(parsed["v"], SCHEMA_VERSION);
         assert_eq!(parsed["event"], "created");
         assert_eq!(parsed["task_id"], "1");
         assert_eq!(parsed["subject"], "Review auth module");
@@ -577,6 +604,7 @@ mod tests {
         let jsonl_path = dirs.staging_root.join("my-team/tasks.jsonl");
         let content = fs::read_to_string(&jsonl_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(parsed["v"], SCHEMA_VERSION);
         assert_eq!(parsed["event"], "completed");
         assert_eq!(parsed["task_id"], "1");
         assert_eq!(parsed["owner"], "researcher");
@@ -604,21 +632,17 @@ mod tests {
         handle_teammate_idle_inner(&dirs, &stdin).unwrap();
 
         let staging = dirs.staging_root.join("my-team");
-        // Config copied
         assert!(staging.join("config.json").exists());
         let config_content: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(staging.join("config.json")).unwrap()).unwrap();
         assert_eq!(config_content["leadSessionId"], "sess-123");
 
-        // Teammate inbox copied
         assert!(staging.join("inboxes/researcher.json").exists());
-
-        // Lead inbox copied
         assert!(staging.join("inboxes/team-lead.json").exists());
 
-        // Capture log written
         let log = fs::read_to_string(staging.join(".capture-log")).unwrap();
         let log_entry: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
+        assert_eq!(log_entry["v"], SCHEMA_VERSION);
         assert_eq!(log_entry["event"], "TeammateIdle");
         assert_eq!(log_entry["teammate"], "researcher");
     }
@@ -630,7 +654,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let dirs = test_dirs(dir.path());
 
-        // Create task under an invalid team name (path traversal)
         let bad_dir = dirs.claude_tasks.join("../etc");
         fs::create_dir_all(&bad_dir).unwrap();
         fs::write(bad_dir.join("1.json"), "{}").unwrap();
@@ -641,13 +664,12 @@ mod tests {
             "task_description": "pwned"
         });
 
-        // Should return Ok (non-blocking) but not write any staging files
         handle_task_created_inner(&dirs, &stdin).unwrap();
         assert!(!dirs.staging_root.exists() || fs::read_dir(&dirs.staging_root).unwrap().count() == 0);
     }
 
     #[test]
-    fn t2_teammate_idle_rejects_path_traversal() {
+    fn t2_teammate_idle_rejects_path_traversal_team() {
         let dir = TempDir::new().unwrap();
         let dirs = test_dirs(dir.path());
 
@@ -657,8 +679,26 @@ mod tests {
         });
 
         handle_teammate_idle_inner(&dirs, &stdin).unwrap();
-        // No staging dir should be created for path traversal
         assert!(!dirs.staging_root.join("../etc").exists());
+    }
+
+    #[test]
+    fn t2_teammate_idle_rejects_path_traversal_teammate() {
+        let dir = TempDir::new().unwrap();
+        let dirs = test_dirs(dir.path());
+
+        let config = serde_json::json!({"leadSessionId": "sess-123"});
+        setup_team(&dirs, "my-team", &config, &[]);
+
+        let stdin = serde_json::json!({
+            "team_name": "my-team",
+            "teammate_name": "../exploit"
+        });
+
+        handle_teammate_idle_inner(&dirs, &stdin).unwrap();
+        // No inbox file should be created for invalid teammate name
+        let inboxes = dirs.staging_root.join("my-team/inboxes");
+        assert!(!inboxes.exists() || fs::read_dir(&inboxes).unwrap().count() == 0);
     }
 
     // ─── T3: Concurrent flock writes produce valid JSONL ───────────────────
@@ -668,7 +708,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("tasks.jsonl");
 
-        // Spawn 10 threads, each writing 10 lines
         let threads: Vec<_> = (0..10)
             .map(|thread_id| {
                 let path = path.clone();
@@ -689,7 +728,6 @@ mod tests {
             t.join().unwrap();
         }
 
-        // Verify: 100 lines, all valid JSON, no interleaving
         let content = fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 100, "expected 100 lines, got {}", lines.len());
@@ -697,6 +735,41 @@ mod tests {
         for (i, line) in lines.iter().enumerate() {
             let parsed: Result<serde_json::Value, _> = serde_json::from_str(line);
             assert!(parsed.is_ok(), "line {i} is not valid JSON: {line}");
+        }
+    }
+
+    #[test]
+    fn t3_concurrent_flock_writes_large_payloads() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tasks.jsonl");
+
+        // Lines > PIPE_BUF (4096 bytes) to verify flock serialization
+        let threads: Vec<_> = (0..4)
+            .map(|thread_id| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..5 {
+                        let line = serde_json::json!({
+                            "thread": thread_id,
+                            "seq": i,
+                            "data": "x".repeat(8000), // > PIPE_BUF
+                        });
+                        flock_append(&path, &serde_json::to_string(&line).unwrap()).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        let content = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 20);
+        for (i, line) in lines.iter().enumerate() {
+            assert!(serde_json::from_str::<serde_json::Value>(line).is_ok(),
+                "line {i} is not valid JSON (len={})", line.len());
         }
     }
 
@@ -719,6 +792,12 @@ mod tests {
         assert!(staging.join("config.json").exists());
         assert!(staging.join("tasks.jsonl").exists());
         assert!(staging.join("inboxes/researcher.json").exists());
+
+        // Verify sweep events have schema version
+        let content = fs::read_to_string(staging.join("tasks.jsonl")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(parsed["v"], SCHEMA_VERSION);
+        assert_eq!(parsed["event"], "sweep");
     }
 
     #[test]
@@ -726,12 +805,18 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let dirs = test_dirs(dir.path());
 
-        let config = serde_json::json!({"leadSessionId": "sess-other"});
-        setup_team(&dirs, "other-team", &config, &[]);
+        // Set up matching team AND non-matching team
+        let matching_config = serde_json::json!({"leadSessionId": "sess-abc"});
+        setup_team(&dirs, "my-team", &matching_config, &[]);
+        setup_task(&dirs, "my-team", "1", &serde_json::json!({"status": "done"}));
+
+        let other_config = serde_json::json!({"leadSessionId": "sess-other"});
+        setup_team(&dirs, "other-team", &other_config, &[]);
 
         team_sweep_inner(&dirs, "sess-abc").unwrap();
 
-        // No staging dir should be created for non-matching team
+        // Matching team staged, non-matching team NOT staged
+        assert!(dirs.staging_root.join("my-team/config.json").exists());
         assert!(!dirs.staging_root.join("other-team").exists());
     }
 
@@ -739,19 +824,78 @@ mod tests {
     fn test_team_sweep_no_teams_dir() {
         let dir = TempDir::new().unwrap();
         let dirs = test_dirs(dir.path());
-        // Should succeed even when ~/.claude/teams doesn't exist
         team_sweep_inner(&dirs, "sess-abc").unwrap();
+    }
+
+    // ─── Missing file / edge case tests (from QA review) ──────────────────
+
+    #[test]
+    fn test_task_created_missing_task_file_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let dirs = test_dirs(dir.path());
+        // task_id "99" has no file on disk
+        let stdin = serde_json::json!({
+            "task_id": "99",
+            "task_subject": "ghost task",
+            "task_description": "does not exist"
+        });
+        handle_task_created_inner(&dirs, &stdin).unwrap();
+        assert!(!dirs.staging_root.exists());
+    }
+
+    #[test]
+    fn test_task_completed_oversized_full_task_truncates() {
+        let dir = TempDir::new().unwrap();
+        let dirs = test_dirs(dir.path());
+
+        // Create a task file with a very large description field
+        let big_task = serde_json::json!({
+            "status": "completed",
+            "owner": "researcher",
+            "description": "x".repeat(MAX_EVENT_LINE_BYTES + 1000),
+        });
+        setup_task(&dirs, "my-team", "1", &big_task);
+
+        let stdin = serde_json::json!({
+            "task_id": "1",
+            "task_subject": "big task"
+        });
+
+        handle_task_completed_inner(&dirs, &stdin).unwrap();
+
+        let content = fs::read_to_string(dirs.staging_root.join("my-team/tasks.jsonl")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(parsed["full_task_truncated"], true);
+        assert!(parsed.get("full_task").is_none());
+    }
+
+    #[test]
+    fn test_teammate_idle_missing_team_dir_writes_log_only() {
+        let dir = TempDir::new().unwrap();
+        let dirs = test_dirs(dir.path());
+        // Team exists in name but no files on disk under claude_teams
+        let stdin = serde_json::json!({
+            "team_name": "ghost-team",
+            "teammate_name": "researcher"
+        });
+
+        handle_teammate_idle_inner(&dirs, &stdin).unwrap();
+
+        // Staging dir created, capture-log written, but no config/inbox copies
+        let staging = dirs.staging_root.join("ghost-team");
+        assert!(staging.join(".capture-log").exists());
+        assert!(!staging.join("config.json").exists());
     }
 
     // ─── Utility tests ─────────────────────────────────────────────────────
 
     #[test]
-    fn test_truncate_str() {
-        assert_eq!(truncate_str("hello", 10), "hello");
-        assert_eq!(truncate_str("hello", 3), "hel");
-        assert_eq!(truncate_str("", 5), "");
-        assert_eq!(truncate_str("café", 4), "caf");
-        assert_eq!(truncate_str("café", 5), "café");
+    fn test_truncate_to_bytes() {
+        assert_eq!(truncate_to_bytes("hello", 10), "hello");
+        assert_eq!(truncate_to_bytes("hello", 3), "hel");
+        assert_eq!(truncate_to_bytes("", 5), "");
+        assert_eq!(truncate_to_bytes("café", 4), "caf");
+        assert_eq!(truncate_to_bytes("café", 5), "café");
     }
 
     #[test]
@@ -764,6 +908,15 @@ mod tests {
     }
 
     #[test]
+    fn test_should_copy_source_missing_returns_false() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("nonexistent.json");
+        let dst = dir.path().join("dst.json");
+        fs::write(&dst, "{}").unwrap();
+        assert!(!should_copy(&src, &dst));
+    }
+
+    #[test]
     fn test_atomic_copy() {
         let dir = TempDir::new().unwrap();
         let src = dir.path().join("src.json");
@@ -771,7 +924,6 @@ mod tests {
         let dst = dir.path().join("dst.json");
         atomic_copy(&src, &dst).unwrap();
         assert_eq!(fs::read_to_string(&dst).unwrap(), r#"{"key":"value"}"#);
-        assert!(!dir.path().join("dst.tmp").exists());
     }
 
     #[test]
@@ -788,13 +940,6 @@ mod tests {
         let ts = now_iso();
         assert!(ts.ends_with('Z'));
         assert!(ts.contains('T'));
-        assert_eq!(ts.len(), 24);
-    }
-
-    #[test]
-    fn test_days_to_ymd() {
-        let (y, m, d) = days_to_ymd(20454);
-        assert_eq!((y, m, d), (2026, 1, 1));
     }
 
     #[test]
@@ -823,7 +968,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let dirs = test_dirs(dir.path());
 
-        let big_desc = "x".repeat(MAX_DESCRIPTION_BYTES + 1000);
+        let big_desc = "x".repeat(MAX_EVENT_LINE_BYTES + 1000);
         setup_task(&dirs, "my-team", "1", &serde_json::json!({}));
 
         let stdin = serde_json::json!({
@@ -837,6 +982,6 @@ mod tests {
         let content = fs::read_to_string(dirs.staging_root.join("my-team/tasks.jsonl")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
         let desc = parsed["description"].as_str().unwrap();
-        assert!(desc.len() <= MAX_DESCRIPTION_BYTES);
+        assert!(desc.len() <= MAX_EVENT_LINE_BYTES);
     }
 }

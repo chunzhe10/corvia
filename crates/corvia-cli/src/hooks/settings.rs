@@ -81,6 +81,9 @@ pub fn init_hooks(root: &Path, config: &CorviaConfig) -> Result<()> {
         super::legacy::generate_post_commit_hooks(root, ws)?;
     }
 
+    if hooks_config.agent_teams {
+        println!("  Agent Teams capture hooks: enabled");
+    }
     println!("Generated hook entries for corvia hooks run");
     Ok(())
 }
