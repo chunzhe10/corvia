@@ -393,6 +393,84 @@ fn build_legacy_retriever(
     }
 }
 
+/// Rebuild a composable pipeline retriever from updated config.
+///
+/// This is the hot-swap entry point: called when `config_set` modifies
+/// `rag.pipeline.*` fields. Validates the config and builds a new pipeline.
+/// Returns `Err` if the config is invalid (caller should keep the old pipeline).
+pub fn rebuild_pipeline_retriever(
+    store: Arc<dyn traits::QueryableStore>,
+    engine: Arc<dyn traits::InferenceEngine>,
+    graph: Option<Arc<dyn traits::GraphStore>>,
+    generator: Option<Arc<dyn traits::GenerationEngine>>,
+    config: &CorviaConfig,
+) -> Result<rag_pipeline::RagPipeline> {
+    let pipeline_cfg = config.rag.pipeline.as_ref().ok_or_else(|| {
+        corvia_common::errors::CorviaError::Config(
+            "[rag.pipeline] section not found in config".into(),
+        )
+    })?;
+
+    // Initialize tantivy if needed (same logic as build_pipeline_retriever).
+    let fts: Option<Arc<dyn traits::FullTextSearchable>> =
+        if pipeline_cfg.searchers.iter().any(|s| s == "bm25") {
+            if let Some(ls) = store.as_any().downcast_ref::<lite_store::LiteStore>() {
+                let cache_dir = std::path::Path::new(&config.storage.data_dir)
+                    .join("cache")
+                    .join("tantivy");
+                match tantivy_index::TantivyIndex::open(&cache_dir, ls.db().clone(), store.clone()) {
+                    Ok(idx) => {
+                        let idx = Arc::new(idx);
+                        ls.set_tantivy(Arc::clone(&idx));
+                        Some(idx as Arc<dyn traits::FullTextSearchable>)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to open TantivyIndex during hot-swap");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+    let deps = pipeline::ComponentDeps {
+        store: Some(store.clone()),
+        engine: Some(engine.clone()),
+        graph: graph.clone(),
+        fts,
+        rrf_k: pipeline_cfg.rrf.k,
+    };
+
+    let retriever = pipeline::PipelineRegistry::validate_and_build(
+        pipeline_cfg,
+        &deps,
+        graph.clone(),
+        config.rag.graph_alpha,
+    )?;
+
+    let system_prompt = if config.rag.system_prompt.is_empty() {
+        String::new()
+    } else {
+        config.rag.system_prompt.clone()
+    };
+
+    let aug: Arc<dyn augmenter::Augmenter> = if system_prompt.is_empty() {
+        Arc::new(augmenter::StructuredAugmenter::new())
+    } else {
+        Arc::new(augmenter::StructuredAugmenter::with_system_prompt(system_prompt))
+    };
+
+    Ok(rag_pipeline::RagPipeline::new(
+        Arc::new(retriever),
+        aug,
+        generator,
+        config.rag.clone(),
+    ))
+}
+
 /// Build a composable pipeline retriever from [rag.pipeline] config.
 fn build_pipeline_retriever(
     store: Arc<dyn traits::QueryableStore>,

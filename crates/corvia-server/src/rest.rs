@@ -43,7 +43,7 @@ pub struct AppState {
     pub graph: Arc<dyn GraphStore>,
     pub temporal: Arc<dyn TemporalStore>,
     pub data_dir: std::path::PathBuf,
-    pub rag: Option<Arc<corvia_kernel::rag_pipeline::RagPipeline>>,
+    pub rag: Option<Arc<arc_swap::ArcSwap<corvia_kernel::rag_pipeline::RagPipeline>>>,
     pub ready: Arc<AtomicBool>,
     /// Default scope_id from config, used when MCP clients omit scope_id.
     pub default_scope_id: Option<String>,
@@ -71,6 +71,18 @@ pub struct AppState {
     pub forgotten_access_counter: Arc<corvia_kernel::gc_worker::ForgottenAccessCounter>,
     /// In-memory ring buffer of recent knowledge GC cycle reports.
     pub gc_knowledge_history: Arc<corvia_kernel::ops::GcKnowledgeHistory>,
+}
+
+impl AppState {
+    /// Load a snapshot of the RAG pipeline for this request.
+    ///
+    /// Uses `ArcSwap::load()` to obtain a `Guard` that pins the current
+    /// pipeline. In-flight requests continue using the pipeline snapshot
+    /// they loaded, even if a swap happens mid-request. The `Guard` is
+    /// lightweight and does not block concurrent hot-swaps.
+    pub fn rag_pipeline(&self) -> Option<arc_swap::Guard<Arc<corvia_kernel::rag_pipeline::RagPipeline>>> {
+        self.rag.as_ref().map(|a| a.load())
+    }
 }
 
 // --- Existing memory types ---
@@ -759,7 +771,7 @@ async fn search_memories(
     let workstream = req.workstream.clone();
 
     // Route through RAG pipeline if available (fixes ContextBuilder bypass bug)
-    if let Some(rag) = &state.rag {
+    if let Some(rag) = state.rag_pipeline() {
         let opts = corvia_kernel::rag_types::RetrievalOpts {
             limit,
             expand_graph: false, // search endpoint: pure vector (context/ask use graph)
@@ -809,7 +821,7 @@ async fn rag_context(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RagRequest>,
 ) -> std::result::Result<Json<RagResponseDto>, (StatusCode, String)> {
-    let rag = state.rag.as_ref()
+    let rag = state.rag_pipeline()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "RAG pipeline not configured".into()))?;
 
     let opts = corvia_kernel::rag_types::RetrievalOpts {
@@ -832,7 +844,7 @@ async fn rag_ask(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RagRequest>,
 ) -> std::result::Result<Json<RagResponseDto>, (StatusCode, String)> {
-    let rag = state.rag.as_ref()
+    let rag = state.rag_pipeline()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "RAG pipeline not configured".into()))?;
 
     let opts = corvia_kernel::rag_types::RetrievalOpts {
@@ -1276,7 +1288,7 @@ async fn classify_sessions(
     }
 
     // Get generation engine
-    let generator = state.rag.as_ref()
+    let generator = state.rag_pipeline()
         .and_then(|rag| rag.generator().cloned())
         .ok_or_else(|| (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1619,7 +1631,7 @@ mod tests {
             graph: store.clone() as Arc<dyn GraphStore>,
             temporal: store as Arc<dyn TemporalStore>,
             data_dir: dir.to_path_buf(),
-            rag: Some(Arc::new(rag)),
+            rag: Some(Arc::new(arc_swap::ArcSwap::from_pointee(rag))),
             ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             default_scope_id: None,
             config: Arc::new(std::sync::RwLock::new(
