@@ -305,6 +305,10 @@ mod tests {
         ) -> Result<Vec<SearchResult>> {
             Ok(self.results.clone())
         }
+        async fn index_entry(&self, _entry: &KnowledgeEntry) -> Result<()> { Ok(()) }
+        async fn remove_entry(&self, _entry_id: &uuid::Uuid) -> Result<()> { Ok(()) }
+        async fn rebuild_from_store(&self, _entries: &[KnowledgeEntry]) -> Result<usize> { Ok(0) }
+        async fn entry_count(&self) -> Result<u64> { Ok(0) }
     }
 
     fn make_search_result(id_suffix: u8, score: f32) -> SearchResult {

@@ -164,6 +164,23 @@ pub trait FullTextSearchable: Send + Sync {
         scope_id: &str,
         limit: usize,
     ) -> Result<Vec<SearchResult>>;
+
+    /// Index a knowledge entry for full-text search (buffered, may not be immediately visible).
+    async fn index_entry(&self, entry: &KnowledgeEntry) -> Result<()>;
+
+    /// Remove an entry from the full-text index.
+    async fn remove_entry(&self, entry_id: &uuid::Uuid) -> Result<()>;
+
+    /// Flush buffered writes to disk. Default no-op for stores that don't need it.
+    async fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Rebuild the full-text index from a set of entries.
+    async fn rebuild_from_store(&self, entries: &[KnowledgeEntry]) -> Result<usize>;
+
+    /// Return the number of indexed entries.
+    async fn entry_count(&self) -> Result<u64>;
 }
 
 // Re-export ChatMessage so kernel consumers don't need a direct corvia-common dependency.
