@@ -347,6 +347,25 @@ impl crate::traits::QueryableStore for PostgresStore {
         .await
         .map_err(|e| CorviaError::Storage(format!("Failed to create pinned index: {e}")))?;
 
+        // Full-text search: tsvector column + GIN index (Phase 2b).
+        // GENERATED ALWAYS AS stored column: tsvector updates automatically on
+        // INSERT/UPDATE with zero application-side maintenance. Verified on PG 12+
+        // (to_tsvector accepted despite STABLE volatility). English config only.
+        sqlx::query(
+            "ALTER TABLE knowledge ADD COLUMN IF NOT EXISTS tsv tsvector \
+             GENERATED ALWAYS AS (to_tsvector('english', content)) STORED"
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CorviaError::Storage(format!("Failed to add tsvector column: {e}")))?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_knowledge_fts ON knowledge USING GIN (tsv)"
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CorviaError::Storage(format!("Failed to create GIN index: {e}")))?;
+
         info!("PostgreSQL schema initialized (embedding dim={dim})");
         Ok(())
     }
@@ -826,10 +845,81 @@ impl crate::traits::GraphStore for PostgresStore {
     }
 }
 
+#[async_trait]
+impl crate::traits::FullTextSearchable for PostgresStore {
+    async fn search_text(
+        &self,
+        query: &str,
+        scope_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Lateral join on plainto_tsquery ensures the tsquery is parsed once.
+        // ts_rank_cd (cover density) rewards term proximity, closer to BM25
+        // behavior than ts_rank (simple frequency). English-only for now.
+        // Tier filter matches vector search (hot + warm only).
+        let rows = sqlx::query(
+            r#"SELECT id, content, source_version, scope_id, workstream,
+                      recorded_at, valid_from, valid_to, superseded_by,
+                      embedding, metadata, agent_id, session_id, entry_status,
+                      memory_type, confidence, last_accessed, access_count,
+                      tier, tier_changed_at, retention_score,
+                      pinned, pinned_by, pinned_at,
+                      ts_rank_cd(k.tsv, q.query) AS text_score
+               FROM knowledge k, plainto_tsquery('english', $1) q(query)
+               WHERE k.scope_id = $2
+                 AND k.tier IN ('hot', 'warm')
+                 AND k.tsv @@ q.query
+               ORDER BY text_score DESC
+               LIMIT $3"#,
+        )
+        .bind(query)
+        .bind(scope_id)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CorviaError::Storage(format!("Full-text search failed: {e}")))?;
+
+        let results = rows
+            .iter()
+            .filter_map(|row| {
+                let text_score: f32 = match row.try_get::<f64, _>("text_score") {
+                    Ok(s) => s as f32,
+                    Err(e) => {
+                        warn!("Failed to read text_score from FTS row: {e}");
+                        return None;
+                    }
+                };
+                match row_to_entry(row) {
+                    Some(entry) => {
+                        let tier = entry.tier;
+                        let retention_score = entry.retention_score;
+                        Some(SearchResult {
+                            entry,
+                            score: text_score,
+                            tier,
+                            retention_score,
+                        })
+                    }
+                    None => {
+                        warn!("Failed to deserialize FTS result row");
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        Ok(results)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::{GraphStore, QueryableStore, TemporalStore};
+    use crate::traits::{FullTextSearchable, GraphStore, QueryableStore, TemporalStore};
     use corvia_common::types::EdgeDirection;
 
     const TEST_DIM: usize = 768;
@@ -1671,5 +1761,329 @@ mod tests {
 
         store.delete_scope("test-tiered").await.unwrap();
         cleanup_test_db("forgotten_tier").await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Full-text search (tsvector) tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_pg_fts_basic_search() {
+        let store = match connect_test_store("fts_basic").await {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("Skipping: PostgreSQL not available");
+                return;
+            }
+        };
+
+        let e1 = KnowledgeEntry::new(
+            "Rust programming language has excellent memory safety guarantees".into(),
+            "test-fts".into(),
+            "v1".into(),
+        )
+        .with_embedding(test_embedding(1.0, 0.0, 0.0));
+
+        let e2 = KnowledgeEntry::new(
+            "Python is a popular scripting language for data science".into(),
+            "test-fts".into(),
+            "v2".into(),
+        )
+        .with_embedding(test_embedding(0.0, 1.0, 0.0));
+
+        let e3 = KnowledgeEntry::new(
+            "PostgreSQL provides robust full-text search capabilities".into(),
+            "test-fts".into(),
+            "v3".into(),
+        )
+        .with_embedding(test_embedding(0.0, 0.0, 1.0));
+
+        store.insert(&e1).await.unwrap();
+        store.insert(&e2).await.unwrap();
+        store.insert(&e3).await.unwrap();
+
+        // Search for "Rust memory" — should find e1
+        let results = store.search_text("Rust memory", "test-fts", 10).await.unwrap();
+        assert!(!results.is_empty(), "expected results for 'Rust memory'");
+        assert_eq!(results[0].entry.content, e1.content);
+
+        // Search for "data science" — should find e2
+        let results = store.search_text("data science", "test-fts", 10).await.unwrap();
+        assert!(!results.is_empty(), "expected results for 'data science'");
+        assert_eq!(results[0].entry.content, e2.content);
+
+        // Search for "full-text search" — should find e3
+        let results = store.search_text("full-text search", "test-fts", 10).await.unwrap();
+        assert!(!results.is_empty(), "expected results for 'full-text search'");
+        assert_eq!(results[0].entry.content, e3.content);
+
+        store.delete_scope("test-fts").await.unwrap();
+        cleanup_test_db("fts_basic").await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_fts_scope_isolation() {
+        let store = match connect_test_store("fts_scope").await {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("Skipping: PostgreSQL not available");
+                return;
+            }
+        };
+
+        let e1 = KnowledgeEntry::new(
+            "Rust concurrency primitives are powerful".into(),
+            "scope-a".into(),
+            "v1".into(),
+        )
+        .with_embedding(test_embedding(1.0, 0.0, 0.0));
+
+        let e2 = KnowledgeEntry::new(
+            "Rust ownership model prevents data races".into(),
+            "scope-b".into(),
+            "v1".into(),
+        )
+        .with_embedding(test_embedding(0.0, 1.0, 0.0));
+
+        store.insert(&e1).await.unwrap();
+        store.insert(&e2).await.unwrap();
+
+        // Search scope-a — should only find e1
+        let results = store.search_text("Rust", "scope-a", 10).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entry.scope_id, "scope-a");
+
+        // Search scope-b — should only find e2
+        let results = store.search_text("Rust", "scope-b", 10).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entry.scope_id, "scope-b");
+
+        store.delete_scope("scope-a").await.unwrap();
+        store.delete_scope("scope-b").await.unwrap();
+        cleanup_test_db("fts_scope").await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_fts_no_match_returns_empty() {
+        let store = match connect_test_store("fts_empty").await {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("Skipping: PostgreSQL not available");
+                return;
+            }
+        };
+
+        let e1 = KnowledgeEntry::new(
+            "Rust programming language".into(),
+            "test-fts".into(),
+            "v1".into(),
+        )
+        .with_embedding(test_embedding(1.0, 0.0, 0.0));
+        store.insert(&e1).await.unwrap();
+
+        // Search for something completely unrelated
+        let results = store
+            .search_text("quantum physics thermodynamics", "test-fts", 10)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+
+        store.delete_scope("test-fts").await.unwrap();
+        cleanup_test_db("fts_empty").await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_fts_respects_limit() {
+        let store = match connect_test_store("fts_limit").await {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("Skipping: PostgreSQL not available");
+                return;
+            }
+        };
+
+        // Insert 5 entries all matching "programming"
+        for i in 0..5 {
+            let entry = KnowledgeEntry::new(
+                format!("programming language tutorial part {i}"),
+                "test-fts".into(),
+                format!("v{i}"),
+            )
+            .with_embedding(test_embedding(i as f32, 0.0, 0.0));
+            store.insert(&entry).await.unwrap();
+        }
+
+        // Limit to 2 results
+        let results = store.search_text("programming", "test-fts", 2).await.unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Limit to 10 — should get all 5
+        let results = store.search_text("programming", "test-fts", 10).await.unwrap();
+        assert_eq!(results.len(), 5);
+
+        store.delete_scope("test-fts").await.unwrap();
+        cleanup_test_db("fts_limit").await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_fts_scores_are_positive() {
+        let store = match connect_test_store("fts_scores").await {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("Skipping: PostgreSQL not available");
+                return;
+            }
+        };
+
+        let e1 = KnowledgeEntry::new(
+            "Rust memory safety prevents buffer overflows and data races".into(),
+            "test-fts".into(),
+            "v1".into(),
+        )
+        .with_embedding(test_embedding(1.0, 0.0, 0.0));
+        store.insert(&e1).await.unwrap();
+
+        let results = store.search_text("memory safety", "test-fts", 10).await.unwrap();
+        assert!(!results.is_empty());
+        for r in &results {
+            assert!(r.score > 0.0, "text search scores must be positive, got {}", r.score);
+        }
+
+        store.delete_scope("test-fts").await.unwrap();
+        cleanup_test_db("fts_scores").await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_fts_ranking_order() {
+        let store = match connect_test_store("fts_ranking").await {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("Skipping: PostgreSQL not available");
+                return;
+            }
+        };
+
+        // e1 mentions "database" multiple times — should rank higher
+        let e1 = KnowledgeEntry::new(
+            "PostgreSQL is a powerful database. This database supports JSON, \
+             full-text search, and the database can handle complex queries efficiently."
+                .into(),
+            "test-fts".into(),
+            "v1".into(),
+        )
+        .with_embedding(test_embedding(1.0, 0.0, 0.0));
+
+        // e2 mentions "database" once
+        let e2 = KnowledgeEntry::new(
+            "Redis is an in-memory database used for caching and session storage".into(),
+            "test-fts".into(),
+            "v2".into(),
+        )
+        .with_embedding(test_embedding(0.0, 1.0, 0.0));
+
+        store.insert(&e1).await.unwrap();
+        store.insert(&e2).await.unwrap();
+
+        let results = store.search_text("database", "test-fts", 10).await.unwrap();
+        assert_eq!(results.len(), 2);
+        // ts_rank_cd should rank e1 higher (more term density)
+        assert_eq!(results[0].entry.content, e1.content, "higher density entry should rank first");
+        assert!(
+            results[0].score > results[1].score,
+            "results should have strictly different scores for different densities"
+        );
+
+        store.delete_scope("test-fts").await.unwrap();
+        cleanup_test_db("fts_ranking").await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_fts_empty_query() {
+        let store = match connect_test_store("fts_empty_q").await {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("Skipping: PostgreSQL not available");
+                return;
+            }
+        };
+
+        let e1 = KnowledgeEntry::new(
+            "Rust programming language".into(),
+            "test-fts".into(),
+            "v1".into(),
+        )
+        .with_embedding(test_embedding(1.0, 0.0, 0.0));
+        store.insert(&e1).await.unwrap();
+
+        // Empty and whitespace-only queries return empty without hitting PG
+        let results = store.search_text("", "test-fts", 10).await.unwrap();
+        assert!(results.is_empty());
+        let results = store.search_text("   ", "test-fts", 10).await.unwrap();
+        assert!(results.is_empty());
+
+        store.delete_scope("test-fts").await.unwrap();
+        cleanup_test_db("fts_empty_q").await;
+    }
+
+    #[tokio::test]
+    async fn test_pg_fts_excludes_cold_and_forgotten() {
+        let store = match connect_test_store("fts_tiers").await {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("Skipping: PostgreSQL not available");
+                return;
+            }
+        };
+
+        let mut hot = KnowledgeEntry::new(
+            "Rust programming language hot tier".into(),
+            "test-fts".into(),
+            "v1".into(),
+        )
+        .with_embedding(test_embedding(1.0, 0.0, 0.0));
+        hot.tier = corvia_common::types::Tier::Hot;
+
+        let mut warm = KnowledgeEntry::new(
+            "Rust programming language warm tier".into(),
+            "test-fts".into(),
+            "v2".into(),
+        )
+        .with_embedding(test_embedding(0.0, 1.0, 0.0));
+        warm.tier = corvia_common::types::Tier::Warm;
+
+        let mut cold = KnowledgeEntry::new(
+            "Rust programming language cold tier".into(),
+            "test-fts".into(),
+            "v3".into(),
+        )
+        .with_embedding(test_embedding(0.0, 0.0, 1.0));
+        cold.tier = corvia_common::types::Tier::Cold;
+
+        let mut forgotten = KnowledgeEntry::new(
+            "Rust programming language forgotten tier".into(),
+            "test-fts".into(),
+            "v4".into(),
+        )
+        .with_embedding(test_embedding(0.5, 0.5, 0.0));
+        forgotten.tier = corvia_common::types::Tier::Forgotten;
+
+        store.insert(&hot).await.unwrap();
+        store.insert(&warm).await.unwrap();
+        store.insert(&cold).await.unwrap();
+        store.insert(&forgotten).await.unwrap();
+
+        // FTS should only return hot + warm (matching vector search behavior)
+        let results = store.search_text("Rust programming", "test-fts", 10).await.unwrap();
+        assert_eq!(results.len(), 2, "expected only hot + warm entries");
+        for r in &results {
+            assert!(
+                r.tier == corvia_common::types::Tier::Hot || r.tier == corvia_common::types::Tier::Warm,
+                "unexpected tier: {:?}",
+                r.tier
+            );
+        }
+
+        store.delete_scope("test-fts").await.unwrap();
+        cleanup_test_db("fts_tiers").await;
     }
 }
