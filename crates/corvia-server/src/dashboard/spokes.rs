@@ -74,7 +74,7 @@ fn container_to_spoke(c: &DockerContainer) -> DashboardSpokeInfo {
     }
 }
 
-/// Minimal URL encoding for the Docker filter parameter.
+/// URL encoding for the Docker filter parameter.
 fn url_encode_filter(s: &str) -> String {
     s.replace('{', "%7B")
      .replace('}', "%7D")
@@ -82,6 +82,9 @@ fn url_encode_filter(s: &str) -> String {
      .replace('[', "%5B")
      .replace(']', "%5D")
      .replace(':', "%3A")
+     .replace('=', "%3D")
+     .replace(' ', "%20")
+     .replace('&', "%26")
 }
 
 /// Query Docker for spoke containers via Unix socket.
@@ -107,18 +110,30 @@ async fn docker_list_spokes() -> Result<Vec<DockerContainer>, String> {
     stream.write_all(request.as_bytes()).await
         .map_err(|e| format!("Docker write failed: {e}"))?;
 
+    // Bounded read: cap at 1MB to prevent unbounded memory consumption
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await
+    stream.take(1_048_576).read_to_end(&mut buf).await
         .map_err(|e| format!("Docker read failed: {e}"))?;
 
     let response = String::from_utf8_lossy(&buf);
+
+    // Verify HTTP status before parsing body
+    let status_line = response.lines().next().unwrap_or("");
+    if !status_line.contains("200") {
+        return Err(format!("Docker returned: {status_line}"));
+    }
 
     let body = response
         .split("\r\n\r\n")
         .nth(1)
         .ok_or_else(|| "Invalid Docker response".to_string())?;
 
-    serde_json::from_str(body.trim())
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Ok(vec![]);
+    }
+
+    serde_json::from_str(trimmed)
         .map_err(|e| format!("Docker JSON parse failed: {e}"))
 }
 
@@ -142,17 +157,9 @@ pub async fn query_spokes() -> SpokesResponse {
     })
 }
 
-/// Query spoke counts via tokio::spawn.
-pub async fn query_spoke_counts() -> (usize, usize) {
-    let handle = tokio::spawn(async move {
-        match docker_list_spokes().await {
-            Ok(containers) => {
-                let total = containers.len();
-                let running = containers.iter().filter(|c| c.state == "running").count();
-                (total, running)
-            }
-            Err(_) => (0, 0),
-        }
-    });
-    handle.await.unwrap_or((0, 0))
+/// Query spoke counts. Returns (total, running).
+pub fn counts_from_response(resp: &SpokesResponse) -> (usize, usize) {
+    let total = resp.spokes.len();
+    let running = resp.spokes.iter().filter(|s| s.container_state == "running").count();
+    (total, running)
 }

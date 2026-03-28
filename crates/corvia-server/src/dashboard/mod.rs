@@ -178,12 +178,6 @@ async fn status_handler(
     // Index coverage (sync read from cache — refreshed at startup and via refresh endpoint)
     let cov = state.coverage_cache.get_cached();
 
-    // Spoke counts are computed client-side from GET /api/dashboard/spokes
-    // to avoid making status_handler's future too complex for axum 0.8
-    // (dual axum version causes handler trait bound failures with complex futures).
-    let spoke_count = 0usize;
-    let spokes_running = 0usize;
-
     Json(DashboardStatusResponse {
         services,
         entry_count,
@@ -199,8 +193,6 @@ async fn status_handler(
         index_hnsw_count: cov.hnsw_count,
         index_stale_threshold: cov.threshold,
         index_coverage_checked_at: cov.checked_at,
-        spoke_count,
-        spokes_running,
     })
 }
 

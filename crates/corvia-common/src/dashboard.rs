@@ -91,12 +91,6 @@ pub struct DashboardStatusResponse {
     pub index_stale_threshold: f64,
     /// ISO 8601 timestamp of last coverage computation.
     pub index_coverage_checked_at: Option<String>,
-    /// Total spoke containers (running + exited).
-    #[serde(default)]
-    pub spoke_count: usize,
-    /// Currently running spoke containers.
-    #[serde(default)]
-    pub spokes_running: usize,
 }
 
 /// Coverage snapshot returned by both GET /api/dashboard/status (embedded)
@@ -532,8 +526,6 @@ mod tests {
             index_hnsw_count: 0,
             index_stale_threshold: 0.9,
             index_coverage_checked_at: None,
-            spoke_count: 0,
-            spokes_running: 0,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("traces"));

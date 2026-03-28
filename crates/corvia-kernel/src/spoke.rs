@@ -406,6 +406,7 @@ impl SpokeProvisioner {
             ),
             ("corvia.branch".into(), branch_name.into()),
             ("corvia.agent_id".into(), agent_id.into()),
+            ("corvia.repo_url".into(), repo_url.into()),
         ]);
 
         // Log config
