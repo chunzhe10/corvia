@@ -936,6 +936,7 @@ dependencies = [
  "futures-util",
  "glob",
  "hnsw_rs",
+ "libc",
  "opentelemetry",
  "pdf-extract",
  "petgraph",

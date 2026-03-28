@@ -16,7 +16,15 @@ use bollard::Docker;
 use corvia_common::config::{CorviaConfig, SpokeAuthMode, SpokeConfig};
 use corvia_common::errors::{CorviaError, Result};
 use std::collections::HashMap;
-use tracing::info;
+use tracing::{info, warn};
+
+/// Check if the current process is running inside a Docker container.
+pub fn is_in_container() -> bool {
+    std::path::Path::new("/.dockerenv").exists()
+        || std::fs::read_to_string("/proc/1/cgroup")
+            .map(|s| s.contains("docker") || s.contains("containerd"))
+            .unwrap_or(false)
+}
 
 /// Resolved identity and mount table for the hub container.
 ///
@@ -39,12 +47,7 @@ impl HubContext {
     /// Detect the hub container by inspecting the current hostname.
     /// Returns an error if not running inside a Docker container.
     pub async fn detect(docker: &Docker) -> Result<Self> {
-        let in_container = std::path::Path::new("/.dockerenv").exists()
-            || std::fs::read_to_string("/proc/1/cgroup")
-                .map(|s| s.contains("docker") || s.contains("containerd"))
-                .unwrap_or(false);
-
-        if !in_container {
+        if !is_in_container() {
             return Err(CorviaError::Config(
                 "Spoke management requires running inside a Docker container \
                  with the host Docker socket mounted. \
@@ -109,16 +112,22 @@ impl HubContext {
     }
 
     /// Translate a container path to a host path. Returns None if no mount covers this path.
+    ///
+    /// Enforces path boundaries: a mount for `/data` will NOT match `/datafiles`.
+    /// The container path must either equal the mount path or have a `/` separator.
     pub fn host_path(&self, container_path: &str) -> Option<String> {
         let mut best_match: Option<(&str, &str)> = None;
         for (cpath, hpath) in &self.host_mounts {
-            if container_path.starts_with(cpath.as_str())
-                && best_match.is_none_or(|(bp, _)| cpath.len() > bp.len())
-            {
-                best_match = Some((cpath.as_str(), hpath.as_str()));
+            let cpath = cpath.trim_end_matches('/');
+            // Enforce path boundary: exact match or followed by '/'
+            let is_match = container_path == cpath
+                || container_path.starts_with(&format!("{cpath}/"));
+            if is_match && best_match.is_none_or(|(bp, _)| cpath.len() > bp.len()) {
+                best_match = Some((cpath, hpath.as_str()));
             }
         }
         best_match.map(|(cpath, hpath)| {
+            let hpath = hpath.trim_end_matches('/');
             let suffix = &container_path[cpath.len()..];
             format!("{hpath}{suffix}")
         })
@@ -173,15 +182,23 @@ pub fn select_network(
 }
 
 /// Parse a memory limit string (e.g., "4g", "512m") to bytes.
-pub fn parse_memory_limit(limit: &str) -> i64 {
+/// Returns an error for unrecognized formats.
+pub fn parse_memory_limit(limit: &str) -> Result<i64> {
     let limit = limit.trim().to_lowercase();
     if let Some(val) = limit.strip_suffix('g') {
-        val.parse::<i64>().unwrap_or(4) * 1024 * 1024 * 1024
+        let n: i64 = val.parse().map_err(|_| {
+            CorviaError::Config(format!("Invalid memory limit '{limit}'. Use e.g. '4g' or '512m'."))
+        })?;
+        Ok(n * 1024 * 1024 * 1024)
     } else if let Some(val) = limit.strip_suffix('m') {
-        val.parse::<i64>().unwrap_or(4096) * 1024 * 1024
+        let n: i64 = val.parse().map_err(|_| {
+            CorviaError::Config(format!("Invalid memory limit '{limit}'. Use e.g. '4g' or '512m'."))
+        })?;
+        Ok(n * 1024 * 1024)
     } else {
-        // Default to 4GB
-        4 * 1024 * 1024 * 1024
+        Err(CorviaError::Config(format!(
+            "Invalid memory limit '{limit}'. Use a suffix: e.g. '4g' or '512m'."
+        )))
     }
 }
 
@@ -285,10 +302,20 @@ impl SpokeProvisioner {
         // Read the MCP token from data dir
         let data_dir = std::path::Path::new(&config.storage.data_dir);
         let mcp_token_path = data_dir.join("mcp-token");
-        let mcp_token = std::fs::read_to_string(&mcp_token_path).unwrap_or_default();
-        let mcp_token = mcp_token.trim().to_string();
+        let mcp_token = match std::fs::read_to_string(&mcp_token_path) {
+            Ok(t) => t.trim().to_string(),
+            Err(_) => {
+                warn!(
+                    "MCP token not found at {}. Spoke MCP writes will fail. \
+                     Start the server with 0.0.0.0 binding to generate it.",
+                    mcp_token_path.display()
+                );
+                String::new()
+            }
+        };
 
-        // Generate per-spoke auth token
+        // Per-spoke auth token (Phase 2: register with AgentCoordinator for verification)
+        // TODO(phase2): register bcrypt-hashed token in agent registry for spoke identity verification
         let spoke_token = uuid::Uuid::new_v4().to_string();
 
         // Resolve GitHub token from env
@@ -366,6 +393,8 @@ impl SpokeProvisioner {
             ])),
         };
 
+        let mem_bytes = parse_memory_limit(&spoke_config.memory_limit)?;
+
         let host_config = HostConfig {
             binds: if binds.is_empty() {
                 None
@@ -373,9 +402,15 @@ impl SpokeProvisioner {
                 Some(binds)
             },
             network_mode: Some(network.into()),
-            memory: Some(parse_memory_limit(&spoke_config.memory_limit)),
-            cpu_shares: Some(spoke_config.cpu_shares as i64),
+            memory: Some(mem_bytes),
+            memory_swap: Some(mem_bytes), // Equal to memory = no swap usage
+            cpu_shares: Some(spoke_config.cpu_shares.into()),
+            pids_limit: Some(512),
             log_config: Some(log_config),
+            restart_policy: Some(bollard::models::RestartPolicy {
+                name: Some(bollard::models::RestartPolicyNameEnum::ON_FAILURE),
+                maximum_retry_count: Some(3),
+            }),
             ..Default::default()
         };
 
@@ -459,14 +494,21 @@ impl SpokeProvisioner {
         Ok(())
     }
 
-    /// Destroy all spoke containers.
-    pub async fn destroy_all(&self) -> Result<u32> {
+    /// Destroy all spoke containers. Returns (success_count, failed_names).
+    pub async fn destroy_all(&self, force: bool) -> Result<(u32, Vec<String>)> {
         let spokes = self.list(true).await?;
-        let count = spokes.len() as u32;
+        let mut success = 0u32;
+        let mut failures = Vec::new();
         for spoke in &spokes {
-            let _ = self.destroy(&spoke.name, true).await;
+            match self.destroy(&spoke.name, force).await {
+                Ok(()) => success += 1,
+                Err(e) => {
+                    warn!(spoke = %spoke.name, error = %e, "Failed to destroy spoke");
+                    failures.push(spoke.name.clone());
+                }
+            }
         }
-        Ok(count)
+        Ok((success, failures))
     }
 
     /// Restart a spoke container, preserving its filesystem.
@@ -490,7 +532,8 @@ impl SpokeProvisioner {
     }
 
     /// Run pre-flight checks for spoke capability.
-    pub async fn check(&self) -> Vec<CheckResult> {
+    /// If `data_dir` is provided, checks MCP token at that location.
+    pub async fn check(&self, data_dir: Option<&std::path::Path>) -> Vec<CheckResult> {
         let mut results = Vec::new();
 
         // 1. Docker socket
@@ -503,11 +546,7 @@ impl SpokeProvisioner {
         }
 
         // 2. Container detection
-        let in_container = std::path::Path::new("/.dockerenv").exists()
-            || std::fs::read_to_string("/proc/1/cgroup")
-                .map(|s| s.contains("docker") || s.contains("containerd"))
-                .unwrap_or(false);
-        if in_container {
+        if is_in_container() {
             results.push(CheckResult::pass("Running inside a container"));
         } else {
             results.push(CheckResult::fail(
@@ -529,8 +568,9 @@ impl SpokeProvisioner {
             results.push(CheckResult::pass("GITHUB_TOKEN is set"));
         }
 
-        // 4. Credentials file
-        let creds = std::path::Path::new("/root/.claude/.credentials.json");
+        // 4. Credentials file (use $HOME, not hardcoded /root)
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        let creds = std::path::PathBuf::from(&home).join(".claude/.credentials.json");
         if creds.exists() {
             results.push(CheckResult::pass("Claude credentials found"));
         } else {
@@ -541,18 +581,48 @@ impl SpokeProvisioner {
         }
 
         // 5. MCP token
-        // Try to find data_dir from config
-        let mcp_token_exists = std::path::Path::new(".corvia/mcp-token").exists();
-        if mcp_token_exists {
+        let mcp_token_path = data_dir
+            .map(|d| d.join("mcp-token"))
+            .unwrap_or_else(|| std::path::PathBuf::from(".corvia/mcp-token"));
+        if mcp_token_path.exists() {
             results.push(CheckResult::pass("MCP token found"));
         } else {
             results.push(CheckResult::warn(
                 "MCP token",
-                ".corvia/mcp-token not found. Server may need to be started with 0.0.0.0 binding.",
+                &format!("{} not found. Server may need 0.0.0.0 binding.", mcp_token_path.display()),
             ));
         }
 
+        // 6. Disk space (warn if < 4GB free)
+        if let Ok(stat) = nix_statvfs(std::path::Path::new("/")) {
+            let free_gb = stat / (1024 * 1024 * 1024);
+            if free_gb < 4 {
+                results.push(CheckResult::warn(
+                    "Disk space",
+                    &format!("Only {}GB free. Each spoke needs ~2-4GB.", free_gb),
+                ));
+            } else {
+                results.push(CheckResult::pass(&format!("Disk space: {}GB free", free_gb)));
+            }
+        }
+
         results
+    }
+}
+
+/// Get available bytes on the filesystem containing `path` using statvfs.
+fn nix_statvfs(path: &std::path::Path) -> std::io::Result<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(std::io::Error::other)?;
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
+            Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
     }
 }
 
@@ -600,7 +670,7 @@ pub fn generate_spoke_name(workspace_name: &str, issue: Option<u32>, branch: Opt
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '-' })
         .collect::<String>();
-    let timestamp = chrono::Utc::now().format("%m%d%H%M");
+    let timestamp = chrono::Utc::now().format("%m%d%H%M%S");
     let suffix = if let Some(n) = issue {
         n.to_string()
     } else if let Some(b) = branch {
@@ -626,7 +696,7 @@ pub fn generate_agent_id(issue: Option<u32>, branch: Option<&str>) -> String {
             .collect();
         format!("spoke-{slug}")
     } else {
-        format!("spoke-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("x"))
+        format!("spoke-{}", &uuid::Uuid::new_v4().to_string()[..8])
     }
 }
 
@@ -755,20 +825,65 @@ mod tests {
 
     #[test]
     fn test_parse_memory_limit_gigabytes() {
-        assert_eq!(parse_memory_limit("4g"), 4 * 1024 * 1024 * 1024);
-        assert_eq!(parse_memory_limit("2G"), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_memory_limit("4g").unwrap(), 4 * 1024 * 1024 * 1024);
+        assert_eq!(parse_memory_limit("2G").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_memory_limit("  8G  ").unwrap(), 8 * 1024 * 1024 * 1024);
     }
 
     #[test]
     fn test_parse_memory_limit_megabytes() {
-        assert_eq!(parse_memory_limit("512m"), 512 * 1024 * 1024);
-        assert_eq!(parse_memory_limit("1024M"), 1024 * 1024 * 1024);
+        assert_eq!(parse_memory_limit("512m").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(parse_memory_limit("1024M").unwrap(), 1024 * 1024 * 1024);
     }
 
     #[test]
-    fn test_parse_memory_limit_invalid_defaults() {
-        // Invalid number defaults to 4GB
-        assert_eq!(parse_memory_limit("xyzg"), 4 * 1024 * 1024 * 1024);
+    fn test_parse_memory_limit_invalid_returns_error() {
+        assert!(parse_memory_limit("xyzg").is_err());
+        assert!(parse_memory_limit("banana").is_err());
+        assert!(parse_memory_limit("100").is_err()); // No suffix
+    }
+
+    #[test]
+    fn test_host_path_boundary_no_false_prefix_match() {
+        // Mount for /data should NOT match /datafiles
+        let hub = HubContext {
+            container_name: "test".into(),
+            networks: HashMap::new(),
+            host_mounts: HashMap::from([("/data".into(), "/host/data".into())]),
+        };
+        assert_eq!(hub.host_path("/datafiles"), None);
+        assert_eq!(
+            hub.host_path("/data/file.txt"),
+            Some("/host/data/file.txt".into())
+        );
+        // Exact match
+        assert_eq!(hub.host_path("/data"), Some("/host/data".into()));
+    }
+
+    #[test]
+    fn test_host_path_trailing_slash_mount() {
+        let hub = HubContext {
+            container_name: "test".into(),
+            networks: HashMap::new(),
+            host_mounts: HashMap::from([("/workspaces/".into(), "/host/ws".into())]),
+        };
+        assert_eq!(
+            hub.host_path("/workspaces/file.txt"),
+            Some("/host/ws/file.txt".into())
+        );
+    }
+
+    #[test]
+    fn test_generate_agent_id_none_none() {
+        let id = generate_agent_id(None, None);
+        assert!(id.starts_with("spoke-"));
+        assert_eq!(id.len(), 14); // "spoke-" + 8 hex chars
+    }
+
+    #[test]
+    fn test_select_network_empty() {
+        let networks = HashMap::new();
+        assert!(select_network(&networks, None).is_err());
     }
 
     #[test]
