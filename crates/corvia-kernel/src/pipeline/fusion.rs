@@ -125,7 +125,9 @@ pub struct RRFusion {
 
 impl RRFusion {
     pub fn new(k: usize) -> Self {
-        Self { k }
+        debug_assert!(k > 0, "RRF k must be > 0 (typical: 60)");
+        // Clamp to 1 in release builds if misconfigured.
+        Self { k: k.max(1) }
     }
 }
 
@@ -155,7 +157,9 @@ impl Fusion for RRFusion {
 
         // Single set: delegate to PassThrough behavior (min-max normalization).
         if sets.len() == 1 {
-            return PassThrough.fuse(sets).await;
+            let mut result = PassThrough.fuse(sets).await?;
+            result.metrics.stage_name = self.name().to_string();
+            return Ok(result);
         }
 
         // Accumulate RRF scores and merge component scores by entry UUID.
@@ -173,10 +177,17 @@ impl Fusion for RRFusion {
 
                 *rrf_scores.entry(id).or_insert(0.0) += rrf_contribution;
 
-                // Merge component scores (keeps all components from all searchers).
+                // Merge component scores (max-wins for duplicate keys across sets).
                 let comps = merged_components.entry(id).or_default();
                 for (key, &val) in &candidate.scores.components {
-                    comps.entry(key.clone()).or_insert(val);
+                    comps
+                        .entry(key.clone())
+                        .and_modify(|existing| {
+                            if val > *existing {
+                                *existing = val;
+                            }
+                        })
+                        .or_insert(val);
                 }
 
                 entries.entry(id).or_insert_with(|| Arc::clone(&candidate.entry));

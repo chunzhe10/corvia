@@ -190,6 +190,7 @@ impl Searcher for BM25Searcher {
     async fn search(&self, ctx: &SearchContext) -> Result<RankedSet> {
         let start = Instant::now();
 
+        // Oversample to allow for post-filter elimination (consistent with VectorSearcher).
         let search_limit = if ctx.opts.content_role.is_some()
             || ctx.opts.source_origin.is_some()
             || ctx.opts.workstream.is_some()
@@ -198,16 +199,17 @@ impl Searcher for BM25Searcher {
         } else {
             ctx.opts.limit
         };
+        let fetch_limit = (search_limit * ctx.opts.oversample_factor).max(10);
 
         let raw_results = self
             .fts
-            .search_text(&ctx.query, &ctx.scope_id, search_limit)
+            .search_text(&ctx.query, &ctx.scope_id, fetch_limit)
             .await?;
 
-        // Convert to intermediate form with raw weighted scores.
+        // Convert to intermediate form with tier-weighted scores.
+        // Filter must precede tier_weight multiplication (Forgotten weight = 0.0).
         struct RawCandidate {
             entry: Arc<KnowledgeEntry>,
-            raw_score: f32,
             weighted: f32,
         }
 
@@ -215,17 +217,18 @@ impl Searcher for BM25Searcher {
             .into_iter()
             .filter(|sr| sr.entry.tier != Tier::Forgotten)
             .map(|sr| {
-                let raw_score = sr.score;
-                let weighted = raw_score * tier_weight(sr.entry.tier);
+                let weighted = sr.score * tier_weight(sr.entry.tier);
                 RawCandidate {
                     entry: Arc::new(sr.entry),
-                    raw_score,
                     weighted,
                 }
             })
             .collect();
 
         // Min-max normalization on weighted scores before creating NormalizedScore.
+        // Raw BM25/text-relevance scores are unbounded positive; this maps them to [0,1].
+        // Note: lowest result maps to 0.0 even if highly relevant. This is acceptable
+        // because RRF uses ranks (not scores) and PassThrough re-normalizes.
         let mut candidates: Vec<RankedCandidate> = if raw_candidates.is_empty() {
             Vec::new()
         } else {
@@ -247,7 +250,8 @@ impl Searcher for BM25Searcher {
                     RankedCandidate {
                         entry: rc.entry,
                         scores: CandidateScores {
-                            components: HashMap::from([("bm25".to_string(), rc.raw_score)]),
+                            // Store tier-weighted score (consistent with VectorSearcher).
+                            components: HashMap::from([("bm25".to_string(), rc.weighted)]),
                             final_score: NormalizedScore::new(normalized),
                         },
                     }
@@ -354,8 +358,9 @@ mod tests {
         assert!((result.candidates[0].scores.final_score.value() - 1.0).abs() < f32::EPSILON);
         // Lowest raw score -> normalized 0.0.
         assert!((result.candidates[2].scores.final_score.value() - 0.0).abs() < f32::EPSILON);
-        // Raw scores preserved in components.
+        // Tier-weighted scores preserved in components (Hot tier weight = 1.0).
         assert!(result.candidates[0].scores.components.contains_key("bm25"));
+        assert!((result.candidates[0].scores.components["bm25"] - 8.0).abs() < f32::EPSILON);
     }
 
     #[tokio::test]

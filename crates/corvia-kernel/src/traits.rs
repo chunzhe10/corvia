@@ -155,7 +155,9 @@ pub trait FullTextSearchable: Send + Sync {
     /// Full-text search returning entries ranked by text relevance.
     ///
     /// Named `search_text` (not `search_bm25`) because PostgresStore uses
-    /// ts_rank (TF-IDF variant), not BM25. The caller normalizes scores.
+    /// ts_rank (TF-IDF variant), not BM25. Scores are raw relevance values
+    /// (unbounded positive, not normalized). The caller (BM25Searcher)
+    /// handles normalization to `[0, 1]`.
     async fn search_text(
         &self,
         query: &str,
