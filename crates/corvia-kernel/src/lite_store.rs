@@ -14,7 +14,7 @@ use crate::knowledge_files;
 use crate::traits::{FullTextSearchable, QueryableStore};
 
 // Redb table definitions
-const ENTRIES: TableDefinition<&str, &[u8]> = TableDefinition::new("entries");
+pub(crate) const ENTRIES: TableDefinition<&str, &[u8]> = TableDefinition::new("entries");
 const SCOPE_INDEX: TableDefinition<&str, &str> = TableDefinition::new("scope_index");
 const HNSW_TO_UUID: TableDefinition<u64, &str> = TableDefinition::new("hnsw_to_uuid");
 const UUID_TO_HNSW: TableDefinition<&str, u64> = TableDefinition::new("uuid_to_hnsw");
@@ -63,6 +63,9 @@ pub struct LiteStore {
     /// Optional tantivy full-text index. Initialized via `set_tantivy()` after construction.
     /// Uses OnceLock for interior mutability (set once via shared reference).
     tantivy: OnceLock<Arc<crate::tantivy_index::TantivyIndex>>,
+    /// Buffered access tracking. Accumulates record_access() events and flushes
+    /// to Redb periodically. See `access_buffer::AccessBuffer` for design.
+    access_buffer: crate::access_buffer::AccessBuffer,
 }
 
 impl LiteStore {
@@ -161,6 +164,7 @@ impl LiteStore {
             dimensions,
             graph,
             tantivy: OnceLock::new(),
+            access_buffer: crate::access_buffer::AccessBuffer::new(60, 256),
         };
 
         // If HNSW was loaded from disk, rebuild only the temporal index (cheap, from Redb).
@@ -200,6 +204,11 @@ impl LiteStore {
     /// Get the shared Redb database handle (for TantivyIndex construction).
     pub fn db(&self) -> &Arc<Database> {
         &self.db
+    }
+
+    /// Force-flush the access buffer to Redb. Returns the number of entries flushed.
+    pub fn flush_access_buffer(&self) -> usize {
+        self.access_buffer.flush_sync(&self.db)
     }
 
     /// Fetch all knowledge entries from the Redb ENTRIES table in a single pass.
@@ -895,6 +904,10 @@ impl LiteStore {
 
 impl Drop for LiteStore {
     fn drop(&mut self) {
+        let flushed = self.access_buffer.flush_sync(&self.db);
+        if flushed > 0 {
+            tracing::info!(count = flushed, "LiteStore: flushed pending access events on drop");
+        }
         if let Err(e) = self.flush_hnsw() {
             tracing::warn!(error = %e, "LiteStore: failed to flush HNSW on drop");
         } else {
@@ -1076,63 +1089,8 @@ impl super::traits::QueryableStore for LiteStore {
         if entry_ids.is_empty() {
             return Ok(());
         }
-
-        let write_txn = match self.db.begin_write() {
-            Ok(txn) => txn,
-            Err(e) => {
-                warn!(error = %e, "Failed to begin write txn for access recording");
-                return Ok(());
-            }
-        };
-
-        {
-            let mut entries_table = match write_txn.open_table(ENTRIES) {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(error = %e, "Failed to open ENTRIES for access recording");
-                    return Ok(());
-                }
-            };
-
-            for id in entry_ids {
-                let uuid_str = id.to_string();
-                let entry_bytes = match entries_table.get(uuid_str.as_str()) {
-                    Ok(Some(val)) => val.value().to_vec(),
-                    Ok(None) => continue,
-                    Err(e) => {
-                        warn!(entry_id = %id, error = %e, "Failed to read entry for access recording");
-                        continue;
-                    }
-                };
-
-                let mut entry: KnowledgeEntry = match serde_json::from_slice(&entry_bytes) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        warn!(entry_id = %id, error = %e, "Failed to deserialize entry for access recording");
-                        continue;
-                    }
-                };
-
-                entry.record_access();
-
-                let updated_bytes = match serde_json::to_vec(&entry) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        warn!(entry_id = %id, error = %e, "Failed to serialize entry for access recording");
-                        continue;
-                    }
-                };
-
-                if let Err(e) = entries_table.insert(uuid_str.as_str(), updated_bytes.as_slice()) {
-                    warn!(entry_id = %id, error = %e, "Failed to write entry for access recording");
-                }
-            }
-        }
-
-        if let Err(e) = write_txn.commit() {
-            warn!(error = %e, "Failed to commit access recording transaction");
-        }
-
+        self.access_buffer.record(entry_ids);
+        self.access_buffer.try_flush(&self.db);
         Ok(())
     }
 
@@ -2300,8 +2258,9 @@ mod tests {
         assert_eq!(before.access_count, 0);
         assert!(before.last_accessed.is_none());
 
-        // Record access.
+        // Record access (buffered — flush to persist).
         store.record_access(&[entry_id]).await.unwrap();
+        store.flush_access_buffer();
 
         let after = store.get(&entry_id).await.unwrap().unwrap();
         assert_eq!(after.access_count, 1);
@@ -2309,6 +2268,7 @@ mod tests {
 
         // Record access again — should increment.
         store.record_access(&[entry_id]).await.unwrap();
+        store.flush_access_buffer();
 
         let after2 = store.get(&entry_id).await.unwrap().unwrap();
         assert_eq!(after2.access_count, 2);
@@ -2330,8 +2290,9 @@ mod tests {
             store.insert(&entry).await.unwrap();
         }
 
-        // Batch record access for all three.
+        // Batch record access for all three (buffered — flush to persist).
         store.record_access(&ids).await.unwrap();
+        store.flush_access_buffer();
 
         for id in &ids {
             let entry = store.get(id).await.unwrap().unwrap();
@@ -2349,5 +2310,34 @@ mod tests {
         let fake_id = uuid::Uuid::now_v7();
         // Should not panic or error.
         store.record_access(&[fake_id]).await.unwrap();
+        store.flush_access_buffer();
+    }
+
+    #[tokio::test]
+    async fn test_record_access_drop_flushes_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().to_path_buf();
+
+        let entry_id = {
+            let store = LiteStore::open(&db_path, 3).unwrap();
+            store.init_schema().await.unwrap();
+
+            let entry = KnowledgeEntry::new("drop test".into(), "scope".into(), "v1".into())
+                .with_embedding(vec![0.1, 0.2, 0.3]);
+            let id = entry.id;
+            store.insert(&entry).await.unwrap();
+
+            // Record access but do NOT flush — rely on Drop.
+            store.record_access(&[id]).await.unwrap();
+
+            id
+            // store is dropped here, which should trigger flush_sync
+        };
+
+        // Reopen the store and verify the access was persisted.
+        let store = LiteStore::open(&db_path, 3).unwrap();
+        let entry = store.get(&entry_id).await.unwrap().unwrap();
+        assert_eq!(entry.access_count, 1, "Drop should have flushed pending access events");
+        assert!(entry.last_accessed.is_some());
     }
 }
