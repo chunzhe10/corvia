@@ -765,10 +765,15 @@ fn default_staging_dir() -> PathBuf {
 const STAGING_RETENTION_SECS: u64 = 7 * 24 * 3600;
 
 fn ingest_agent_teams<W: Write>(scope_id: &str, out: &mut W) {
-    ingest_agent_teams_from(scope_id, &default_staging_dir(), out);
+    ingest_agent_teams_from(scope_id, &default_staging_dir(), &default_sessions_dir(), out);
 }
 
-fn ingest_agent_teams_from<W: Write>(scope_id: &str, staging_root: &Path, out: &mut W) {
+fn ingest_agent_teams_from<W: Write>(
+    scope_id: &str,
+    staging_root: &Path,
+    sessions_dir: &Path,
+    out: &mut W,
+) {
     if !staging_root.is_dir() {
         let done = DoneMsg { done: true, total_files: 0 };
         writeln!(out, "{}", serde_json::to_string(&done).unwrap()).ok();
@@ -817,6 +822,33 @@ fn ingest_agent_teams_from<W: Write>(scope_id: &str, staging_root: &Path, out: &
             // A4: Parse tasks
             let tasks = parse_tasks_jsonl(&team_dir);
 
+            // G6: Run subagent correlation to map teammate names -> session IDs
+            let members: Vec<(String, String)> = cfg
+                .members
+                .iter()
+                .map(|m| (m.name.clone(), m.joined_at.clone()))
+                .collect();
+            let correlation =
+                correlation::correlate_teammates(&cfg.lead_session_id, sessions_dir, &members);
+
+            // G1: ran_during edge (team -> lead session's turn-1)
+            // G2: has_member edges (team -> each teammate's subagent session turn-1)
+            let mut team_edge_hints = Vec::new();
+            if !cfg.lead_session_id.is_empty() {
+                team_edge_hints.push(EdgeHint {
+                    relation: "ran_during".into(),
+                    target_source_version: format!("{}:turn-1", cfg.lead_session_id),
+                });
+            }
+            for member in &cfg.members {
+                if let Some(session_id) = correlation.get(&member.name) {
+                    team_edge_hints.push(EdgeHint {
+                        relation: "has_member".into(),
+                        target_source_version: format!("{session_id}:turn-1"),
+                    });
+                }
+            }
+
             // Emit team structure entry (A3)
             let team_content = format_team_structure(&team_name, cfg, &tasks, &team_dir);
             let msg = SourceFileMsg {
@@ -832,17 +864,67 @@ fn ingest_agent_teams_from<W: Write>(scope_id: &str, staging_root: &Path, out: &
                         content_role: Some("memory".into()),
                         source_origin: Some(source_origin.clone()),
                         parent_session_id: None,
-                                edge_hints: vec![],
+                        edge_hints: team_edge_hints,
                     },
                 },
             };
             writeln!(out, "{}", serde_json::to_string(&msg).unwrap()).ok();
             team_entries += 1;
 
-            // A5: Emit task entries
+            // A5: Emit task entries with G3 (assigned_to) and G4 (depends_on) edges
             let grouped_tasks = group_tasks(&tasks);
             for (task_id, task_events) in &grouped_tasks {
                 let task_content = format_task_entry(&team_name, task_id, task_events);
+
+                let mut task_edge_hints = Vec::new();
+
+                // G3: assigned_to edge (task -> owner's subagent session)
+                let owner = task_events
+                    .iter()
+                    .find(|e| !e.owner.is_empty())
+                    .map(|e| e.owner.clone())
+                    .or_else(|| {
+                        task_events.iter().find_map(|e| {
+                            e.full_task
+                                .as_ref()
+                                .and_then(|ft| ft.get("owner"))
+                                .and_then(|v| v.as_str())
+                                .map(String::from)
+                        })
+                    });
+                if let Some(ref owner_name) = owner {
+                    if let Some(session_id) = correlation.get(owner_name) {
+                        task_edge_hints.push(EdgeHint {
+                            relation: "assigned_to".into(),
+                            target_source_version: format!("{session_id}:turn-1"),
+                        });
+                    }
+                }
+
+                // G4: depends_on edges (task -> blocking tasks within same team)
+                let best = task_events
+                    .iter()
+                    .max_by_key(|e| match e.event.as_str() {
+                        "completed" => 3,
+                        "sweep" => 2,
+                        "created" => 1,
+                        _ => 0,
+                    });
+                if let Some(best_event) = best {
+                    if let Some(ref ft) = best_event.full_task {
+                        if let Some(blocked_by) = ft.get("blockedBy").and_then(|v| v.as_array()) {
+                            for dep_id in blocked_by.iter().filter_map(|v| v.as_str()) {
+                                task_edge_hints.push(EdgeHint {
+                                    relation: "depends_on".into(),
+                                    target_source_version: format!(
+                                        "{team_name}:task:{dep_id}"
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+
                 let msg = SourceFileMsg {
                     source_file: SourceFilePayload {
                         content: task_content,
@@ -856,7 +938,7 @@ fn ingest_agent_teams_from<W: Write>(scope_id: &str, staging_root: &Path, out: &
                             content_role: Some("task".into()),
                             source_origin: Some(source_origin.clone()),
                             parent_session_id: None,
-                                edge_hints: vec![],
+                            edge_hints: task_edge_hints,
                         },
                     },
                 };
@@ -864,7 +946,7 @@ fn ingest_agent_teams_from<W: Write>(scope_id: &str, staging_root: &Path, out: &
                 team_entries += 1;
             }
 
-            // A6: Parse and emit message entries
+            // A6: Parse and emit message entries with G5 (discusses) edges
             let messages = parse_inbox_messages(&team_dir);
             if !messages.is_empty() {
                 let deduped = dedup_broadcasts(messages);
@@ -875,6 +957,16 @@ fn ingest_agent_teams_from<W: Write>(scope_id: &str, staging_root: &Path, out: &
                         "{team_name}:messages:{}",
                         group_key.replace(' ', "-").to_lowercase()
                     );
+
+                    // G5: discusses edge (messages -> task)
+                    let mut msg_edge_hints = Vec::new();
+                    if let Some(task_id) = group_key.strip_prefix("task-") {
+                        msg_edge_hints.push(EdgeHint {
+                            relation: "discusses".into(),
+                            target_source_version: format!("{team_name}:task:{task_id}"),
+                        });
+                    }
+
                     let msg = SourceFileMsg {
                         source_file: SourceFilePayload {
                             content: msg_content,
@@ -888,7 +980,7 @@ fn ingest_agent_teams_from<W: Write>(scope_id: &str, staging_root: &Path, out: &
                                 content_role: Some("finding".into()),
                                 source_origin: Some(source_origin.clone()),
                                 parent_session_id: None,
-                                edge_hints: vec![],
+                                edge_hints: msg_edge_hints,
                             },
                         },
                     };
@@ -1891,7 +1983,7 @@ mod tests {
         setup_team_staging(staging, "security-review", &config, tasks, &inboxes);
 
         let mut output = Vec::new();
-        ingest_agent_teams_from(DEFAULT_SCOPE, staging, &mut output);
+        ingest_agent_teams_from(DEFAULT_SCOPE, staging, staging, &mut output);
 
         let (entries, done) = parse_output_entries(&output);
 
@@ -1952,7 +2044,7 @@ mod tests {
         ]);
 
         let mut output = Vec::new();
-        ingest_agent_teams_from(DEFAULT_SCOPE, staging, &mut output);
+        ingest_agent_teams_from(DEFAULT_SCOPE, staging, staging, &mut output);
 
         let (entries, _) = parse_output_entries(&output);
 
@@ -2007,7 +2099,7 @@ mod tests {
         ]);
 
         let mut output = Vec::new();
-        ingest_agent_teams_from(DEFAULT_SCOPE, staging, &mut output);
+        ingest_agent_teams_from(DEFAULT_SCOPE, staging, staging, &mut output);
 
         let (entries, _) = parse_output_entries(&output);
 
@@ -2037,14 +2129,14 @@ mod tests {
 
         // First run
         let mut output1 = Vec::new();
-        ingest_agent_teams_from(DEFAULT_SCOPE, staging, &mut output1);
+        ingest_agent_teams_from(DEFAULT_SCOPE, staging, staging, &mut output1);
         let (entries1, done1) = parse_output_entries(&output1);
         assert_eq!(done1["total_files"].as_u64().unwrap(), 1);
         assert_eq!(entries1.len(), 2); // team + task
 
         // Second run (same staging)
         let mut output2 = Vec::new();
-        ingest_agent_teams_from(DEFAULT_SCOPE, staging, &mut output2);
+        ingest_agent_teams_from(DEFAULT_SCOPE, staging, staging, &mut output2);
         let (entries2, done2) = parse_output_entries(&output2);
         assert_eq!(done2["total_files"].as_u64().unwrap(), 0, "second run should produce 0 files");
         assert_eq!(entries2.len(), 0, "second run should produce 0 entries");
@@ -2075,7 +2167,7 @@ mod tests {
         setup_team_staging(staging, "partial-team", &config, tasks, &[]);
 
         let mut output = Vec::new();
-        ingest_agent_teams_from(DEFAULT_SCOPE, staging, &mut output);
+        ingest_agent_teams_from(DEFAULT_SCOPE, staging, staging, &mut output);
 
         let (entries, done) = parse_output_entries(&output);
         assert_eq!(done["total_files"].as_u64().unwrap(), 1);
@@ -2102,7 +2194,7 @@ mod tests {
         setup_team_staging(staging, "empty-team", &config, "", &[]);
 
         let mut output = Vec::new();
-        ingest_agent_teams_from(DEFAULT_SCOPE, staging, &mut output);
+        ingest_agent_teams_from(DEFAULT_SCOPE, staging, staging, &mut output);
 
         let (entries, done) = parse_output_entries(&output);
         assert_eq!(done["total_files"].as_u64().unwrap(), 1);
@@ -2125,7 +2217,7 @@ mod tests {
         std::fs::create_dir_all(staging).unwrap();
 
         let mut output = Vec::new();
-        ingest_agent_teams_from(DEFAULT_SCOPE, staging, &mut output);
+        ingest_agent_teams_from(DEFAULT_SCOPE, staging, staging, &mut output);
 
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("\"done\":true"));
@@ -2249,7 +2341,7 @@ mod tests {
 
         // First run: should skip but NOT add to .ingested
         let mut output1 = Vec::new();
-        ingest_agent_teams_from(DEFAULT_SCOPE, staging, &mut output1);
+        ingest_agent_teams_from(DEFAULT_SCOPE, staging, staging, &mut output1);
 
         let ingested = std::fs::read_to_string(staging.join(".ingested")).unwrap_or_default();
         assert!(!ingested.contains("bad-config-team"), "failed config should not be marked ingested");
@@ -2264,7 +2356,7 @@ mod tests {
 
         // Second run: should now process the team
         let mut output2 = Vec::new();
-        ingest_agent_teams_from(DEFAULT_SCOPE, staging, &mut output2);
+        ingest_agent_teams_from(DEFAULT_SCOPE, staging, staging, &mut output2);
 
         let (entries, done) = parse_output_entries(&output2);
         assert_eq!(done["total_files"].as_u64().unwrap(), 1);
