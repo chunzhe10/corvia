@@ -989,7 +989,7 @@ const PYTHON_DUNDER_DENY_LIST: &[&str] = &[
 /// Python base classes that add noise (common builtins/ABCs).
 const PYTHON_BASE_CLASS_DENY_LIST: &[&str] = &[
     "object", "ABC", "Exception", "BaseException", "type",
-    "dict", "list", "tuple", "set",
+    "dict", "list", "tuple", "set", "Generic", "Protocol",
 ];
 
 fn extract_python_relations(
@@ -1166,6 +1166,26 @@ fn extract_python_class_bases(
                         let text = source[child.byte_range()].to_string();
                         text.rsplit('.').next().unwrap_or(&text).to_string()
                     })
+            }
+            "subscript" => {
+                // e.g., `Generic[T]`, `Handler[Request]` -> extract the base name
+                match child.child_by_field_name("value") {
+                    Some(v) if v.kind() == "identifier" => {
+                        source[v.byte_range()].to_string()
+                    }
+                    Some(v) if v.kind() == "attribute" => {
+                        v.child_by_field_name("attribute")
+                            .map(|a| source[a.byte_range()].to_string())
+                            .unwrap_or_else(|| {
+                                let text = source[v.byte_range()].to_string();
+                                text.rsplit('.').next().unwrap_or(&text).to_string()
+                            })
+                    }
+                    _ => {
+                        let text = source[child.byte_range()].to_string();
+                        text.split('[').next().unwrap_or(&text).trim().to_string()
+                    }
+                }
             }
             _ => continue,
         };
@@ -2455,6 +2475,51 @@ class MyAbstract(SomeBase, metaclass=ABCMeta):
             .collect();
         assert_eq!(extends.len(), 1, "Should extract SomeBase but not metaclass=ABCMeta");
         assert_eq!(extends[0].to_name.as_deref(), Some("SomeBase"));
+    }
+
+    #[test]
+    fn test_python_generic_subscript_base() {
+        let source = r#"
+from typing import Generic, TypeVar, Protocol
+
+T = TypeVar('T')
+
+class Handler(Generic[T]):
+    def handle(self, item: T):
+        pass
+
+class Registry(Protocol[T]):
+    def get(self, key: str) -> T:
+        pass
+
+class TypedHandler(BaseHandler[Request]):
+    def handle(self, req: Request):
+        pass
+"#;
+        let result = chunk_file_with_relations("app.py", source, "py");
+        let extends: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "extends")
+            .collect();
+        // Generic[T] and Protocol[T] should be denied (noise base classes)
+        let names: Vec<&str> = extends.iter().filter_map(|r| r.to_name.as_deref()).collect();
+        assert!(
+            !names.contains(&"Generic"),
+            "Generic should be denied, got: {:?}",
+            names
+        );
+        assert!(
+            !names.contains(&"Protocol"),
+            "Protocol should be denied, got: {:?}",
+            names
+        );
+        // But BaseHandler[Request] should extract "BaseHandler" (meaningful)
+        assert!(
+            names.contains(&"BaseHandler"),
+            "BaseHandler from subscript should be extracted, got: {:?}",
+            names
+        );
     }
 
     #[test]
