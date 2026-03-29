@@ -213,16 +213,35 @@ pub fn blocked_path_match(pattern: &str, path: &str) -> bool {
     }
 }
 
+/// JS/TS barrel file index extensions, in probing order.
+const JS_TS_INDEX_EXTENSIONS: &[&str] = &[
+    "/index.ts", "/index.tsx", "/index.js", "/index.jsx",
+];
+
 /// Wire chunk-level graph relations produced by the chunking pipeline.
 ///
 /// Resolves `ChunkRelation` references (source_file + start_line) to stored
 /// entry UUIDs, then creates graph edges. Returns the number of relations stored.
+///
+/// When the target file doesn't match directly, tries barrel file fallbacks:
+/// - JS/TS: `./components` -> `./components/index.ts`, `.tsx`, `.js`, `.jsx`
+/// - Python: `package.module` -> `package/module/__init__.py`
 pub async fn wire_pipeline_relations(
     relations: &[ChunkRelation],
     processed: &[ProcessedChunk],
     stored_ids: &[uuid::Uuid],
     graph: &dyn GraphStore,
 ) -> usize {
+    // Build a file index for fast lookup: source_file -> Vec<(chunk_index, &ProcessedChunk)>
+    let mut file_index: std::collections::HashMap<&str, Vec<(usize, &ProcessedChunk)>> =
+        std::collections::HashMap::new();
+    for (i, pc) in processed.iter().enumerate() {
+        file_index
+            .entry(pc.metadata.source_file.as_str())
+            .or_default()
+            .push((i, pc));
+    }
+
     let mut relations_stored = 0;
     let mut source_miss = 0u64;
     let mut target_miss = 0u64;
@@ -244,18 +263,23 @@ pub async fn wire_pipeline_relations(
             }
         };
 
-        let to_uuid = processed.iter().zip(stored_ids.iter()).find_map(|(pc, id)| {
-            if pc.metadata.source_file == rel.to_file {
-                if let Some(ref name) = rel.to_name {
-                    if pc.content.contains(name) {
-                        return Some(*id);
+        // Try direct file match first
+        let to_uuid = resolve_target(&file_index, stored_ids, &rel.to_file, &rel.to_name)
+            // Barrel file fallback: try index.ts/tsx/js/jsx variants
+            .or_else(|| {
+                for suffix in JS_TS_INDEX_EXTENSIONS {
+                    let candidate = format!("{}{}", rel.to_file, suffix);
+                    if let Some(id) = resolve_target(&file_index, stored_ids, &candidate, &rel.to_name) {
+                        return Some(id);
                     }
-                } else {
-                    return Some(*id);
                 }
-            }
-            None
-        });
+                None
+            })
+            // Python __init__.py fallback: package/module -> package/module/__init__.py
+            .or_else(|| {
+                let init_candidate = format!("{}/__init__.py", rel.to_file.replace('.', "/"));
+                resolve_target(&file_index, stored_ids, &init_candidate, &rel.to_name)
+            });
 
         if let Some(to_uuid) = to_uuid {
             if (rel.relation == "imports" || rel.relation == "calls") && to_uuid == from_uuid {
@@ -284,7 +308,7 @@ pub async fn wire_pipeline_relations(
                 stored = relations_stored,
                 source_miss,
                 target_miss,
-                "wire_pipeline_relations: most relations failed to resolve — check adapter version"
+                "wire_pipeline_relations: most relations failed to resolve - check adapter version"
             );
         } else {
             tracing::info!(
@@ -297,6 +321,32 @@ pub async fn wire_pipeline_relations(
         }
     }
     relations_stored
+}
+
+/// Resolve a target file + optional name to a stored entry UUID.
+///
+/// Uses the file_index for O(1) file lookup, then content-based name matching
+/// within matching chunks.
+fn resolve_target(
+    file_index: &std::collections::HashMap<&str, Vec<(usize, &ProcessedChunk)>>,
+    stored_ids: &[uuid::Uuid],
+    target_file: &str,
+    target_name: &Option<String>,
+) -> Option<uuid::Uuid> {
+    let chunks = file_index.get(target_file)?;
+    for &(idx, pc) in chunks {
+        if idx >= stored_ids.len() {
+            continue;
+        }
+        if let Some(name) = target_name {
+            if pc.content.contains(name.as_str()) {
+                return Some(stored_ids[idx]);
+            }
+        } else {
+            return Some(stored_ids[idx]);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1224,5 +1274,170 @@ mod tests {
         assert_eq!(status.state, IngestState::Idle);
         assert!(status.started_at.is_none());
         assert!(status.error.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // P3: Barrel file and __init__.py resolution tests
+    // -----------------------------------------------------------------------
+
+    use crate::chunking_strategy::{ChunkMetadata, ProcessedChunk, ProcessingInfo, ChunkRelation};
+
+    fn make_processed_chunk(source_file: &str, start_line: u32, content: &str) -> ProcessedChunk {
+        ProcessedChunk {
+            content: content.to_string(),
+            original_content: content.to_string(),
+            chunk_type: "test".to_string(),
+            start_line,
+            end_line: start_line + 10,
+            metadata: ChunkMetadata {
+                source_file: source_file.to_string(),
+                language: None,
+                parent_chunk_id: None,
+                merge_group: None,
+            },
+            token_estimate: 100,
+            processing: ProcessingInfo {
+                strategy_name: "test".to_string(),
+                was_split: false,
+                was_merged: false,
+                overlap_tokens: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn test_resolve_target_direct_match() {
+        let chunks = vec![
+            make_processed_chunk("src/utils.ts", 1, "export function helper() {}"),
+        ];
+        let ids = vec![uuid::Uuid::now_v7()];
+        let mut file_index: std::collections::HashMap<&str, Vec<(usize, &ProcessedChunk)>> =
+            std::collections::HashMap::new();
+        for (i, pc) in chunks.iter().enumerate() {
+            file_index.entry(pc.metadata.source_file.as_str()).or_default().push((i, pc));
+        }
+
+        let result = resolve_target(&file_index, &ids, "src/utils.ts", &Some("helper".into()));
+        assert_eq!(result, Some(ids[0]));
+    }
+
+    #[test]
+    fn test_resolve_target_barrel_index_ts() {
+        let chunks = vec![
+            make_processed_chunk("src/components/index.ts", 1, "export { Button } from './Button';"),
+        ];
+        let ids = vec![uuid::Uuid::now_v7()];
+        let mut file_index: std::collections::HashMap<&str, Vec<(usize, &ProcessedChunk)>> =
+            std::collections::HashMap::new();
+        for (i, pc) in chunks.iter().enumerate() {
+            file_index.entry(pc.metadata.source_file.as_str()).or_default().push((i, pc));
+        }
+
+        // Direct match fails
+        let direct = resolve_target(&file_index, &ids, "src/components", &None);
+        assert!(direct.is_none(), "Direct match should fail for barrel dir");
+
+        // Barrel fallback: try index.ts
+        let mut resolved = None;
+        for suffix in JS_TS_INDEX_EXTENSIONS {
+            let candidate = format!("src/components{}", suffix);
+            if let Some(id) = resolve_target(&file_index, &ids, &candidate, &None) {
+                resolved = Some(id);
+                break;
+            }
+        }
+        assert_eq!(resolved, Some(ids[0]), "Should resolve via index.ts fallback");
+    }
+
+    #[test]
+    fn test_resolve_target_python_init_py() {
+        let chunks = vec![
+            make_processed_chunk("package/submodule/__init__.py", 1, "from .core import Engine"),
+        ];
+        let ids = vec![uuid::Uuid::now_v7()];
+        let mut file_index: std::collections::HashMap<&str, Vec<(usize, &ProcessedChunk)>> =
+            std::collections::HashMap::new();
+        for (i, pc) in chunks.iter().enumerate() {
+            file_index.entry(pc.metadata.source_file.as_str()).or_default().push((i, pc));
+        }
+
+        // Direct match with dotted path fails
+        let direct = resolve_target(&file_index, &ids, "package.submodule", &None);
+        assert!(direct.is_none(), "Direct dotted path should fail");
+
+        // __init__.py fallback
+        let init_candidate = "package.submodule".replace('.', "/") + "/__init__.py";
+        let resolved = resolve_target(&file_index, &ids, &init_candidate, &None);
+        assert_eq!(resolved, Some(ids[0]), "Should resolve via __init__.py fallback");
+    }
+
+    #[test]
+    fn test_resolve_target_extension_probe_order() {
+        // Both index.ts and index.js exist; .ts should win (probed first)
+        let chunks = vec![
+            make_processed_chunk("lib/index.js", 1, "module.exports = {}"),
+            make_processed_chunk("lib/index.ts", 1, "export default {}"),
+        ];
+        let ids = vec![uuid::Uuid::now_v7(), uuid::Uuid::now_v7()];
+        let mut file_index: std::collections::HashMap<&str, Vec<(usize, &ProcessedChunk)>> =
+            std::collections::HashMap::new();
+        for (i, pc) in chunks.iter().enumerate() {
+            file_index.entry(pc.metadata.source_file.as_str()).or_default().push((i, pc));
+        }
+
+        let mut resolved = None;
+        for suffix in JS_TS_INDEX_EXTENSIONS {
+            let candidate = format!("lib{}", suffix);
+            if let Some(id) = resolve_target(&file_index, &ids, &candidate, &None) {
+                resolved = Some(id);
+                break;
+            }
+        }
+        assert_eq!(resolved, Some(ids[1]), ".ts should be probed before .js");
+    }
+
+    #[test]
+    fn test_resolve_target_rust_unchanged() {
+        // Rust CRATE_REF resolution should still work via direct match
+        let chunks = vec![
+            make_processed_chunk("CRATE_REF:src:foo", 1, "pub fn process() {}"),
+        ];
+        let ids = vec![uuid::Uuid::now_v7()];
+        let mut file_index: std::collections::HashMap<&str, Vec<(usize, &ProcessedChunk)>> =
+            std::collections::HashMap::new();
+        for (i, pc) in chunks.iter().enumerate() {
+            file_index.entry(pc.metadata.source_file.as_str()).or_default().push((i, pc));
+        }
+
+        let result = resolve_target(&file_index, &ids, "CRATE_REF:src:foo", &Some("process".into()));
+        assert_eq!(result, Some(ids[0]), "Rust CRATE_REF resolution should still work");
+    }
+
+    #[test]
+    fn test_resolve_target_no_match() {
+        let chunks = vec![
+            make_processed_chunk("src/app.ts", 1, "const x = 1;"),
+        ];
+        let ids = vec![uuid::Uuid::now_v7()];
+        let mut file_index: std::collections::HashMap<&str, Vec<(usize, &ProcessedChunk)>> =
+            std::collections::HashMap::new();
+        for (i, pc) in chunks.iter().enumerate() {
+            file_index.entry(pc.metadata.source_file.as_str()).or_default().push((i, pc));
+        }
+
+        // Neither direct nor fallback should match
+        let result = resolve_target(&file_index, &ids, "nonexistent/module", &None);
+        assert!(result.is_none());
+
+        // Barrel fallback also fails
+        let mut resolved = None;
+        for suffix in JS_TS_INDEX_EXTENSIONS {
+            let candidate = format!("nonexistent/module{}", suffix);
+            if let Some(id) = resolve_target(&file_index, &ids, &candidate, &None) {
+                resolved = Some(id);
+                break;
+            }
+        }
+        assert!(resolved.is_none(), "Nonexistent paths should not match any fallback");
     }
 }
