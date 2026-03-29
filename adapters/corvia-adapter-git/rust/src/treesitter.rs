@@ -576,8 +576,21 @@ fn resolve_rust_module_path(file_path: &str, module_path: &str) -> String {
 // JavaScript/TypeScript relation extraction
 // ---------------------------------------------------------------------------
 
+/// JS/TS deny-list: common methods that would create edge explosion.
+const JS_TS_CALL_DENY_LIST: &[&str] = &[
+    "log", "warn", "error", "info", "debug",                   // console
+    "then", "catch", "finally",                                 // promises
+    "map", "filter", "reduce", "forEach", "find", "some",      // array
+    "push", "pop", "shift", "unshift", "splice", "slice",      // array mutation
+    "toString", "valueOf", "hasOwnProperty",                    // object
+    "stringify", "parse",                                       // JSON
+    "createElement",                                            // React DOM
+    "resolve", "reject",                                        // Promise
+    "require",                                                  // CJS
+];
+
 fn extract_js_ts_relations(
-    _file_path: &str,
+    file_path: &str,
     source: &str,
     extension: &str,
     chunks: &[CodeChunk],
@@ -600,45 +613,33 @@ fn extract_js_ts_relations(
     let root = tree.root_node();
     let mut cursor = root.walk();
 
+    // Pass 1: Walk top-level children for imports and class declarations
     if cursor.goto_first_child() {
         loop {
             let node = cursor.node();
-            if node.is_named() && node.kind() == "import_statement" {
-                let owner_idx = find_owning_chunk(chunks, node.start_position().row as u32 + 1);
-                if let Some(source_node) = node.child_by_field_name("source") {
-                    let raw = source[source_node.byte_range()].to_string();
-                    // Strip quotes from the import source string
-                    let import_path = raw.trim_matches(|c| c == '\'' || c == '"').to_string();
-
-                    // Try to extract named imports from import_clause
-                    let mut names = Vec::new();
-                    for i in 0..node.child_count() {
-                        let Some(child) = node.child(i as u32) else {
-                            continue;
-                        };
-                        if child.kind() == "import_clause" {
-                            collect_js_import_names(&mut names, source, &child);
+            if node.is_named() {
+                match node.kind() {
+                    "import_statement" => {
+                        extract_js_ts_import(&mut relations, source, &node, chunks);
+                    }
+                    "class_declaration" => {
+                        extract_js_ts_class_heritage(
+                            &mut relations, source, &node, file_path, chunks,
+                        );
+                    }
+                    "export_statement" => {
+                        // Check for exported class: `export class Foo extends Bar {}`
+                        for i in 0..node.child_count() {
+                            if let Some(child) = node.child(i as u32) {
+                                if child.kind() == "class_declaration" || child.kind() == "class" {
+                                    extract_js_ts_class_heritage(
+                                        &mut relations, source, &child, file_path, chunks,
+                                    );
+                                }
+                            }
                         }
                     }
-
-                    if names.is_empty() {
-                        // Bare import or couldn't parse names
-                        relations.push(CodeRelation {
-                            from_chunk_index: owner_idx,
-                            relation: "imports".to_string(),
-                            to_file: import_path,
-                            to_name: None,
-                        });
-                    } else {
-                        for name in names {
-                            relations.push(CodeRelation {
-                                from_chunk_index: owner_idx,
-                                relation: "imports".to_string(),
-                                to_file: import_path.clone(),
-                                to_name: Some(name),
-                            });
-                        }
-                    }
+                    _ => {}
                 }
             }
             if !cursor.goto_next_sibling() {
@@ -647,7 +648,280 @@ fn extract_js_ts_relations(
         }
     }
 
+    // Pass 2: Recursive walk for call expressions (catches nested/arrow/method calls)
+    extract_js_ts_calls(&mut relations, source, &root, file_path, chunks);
+
     relations
+}
+
+/// Extract import relations from a JS/TS `import_statement` node.
+fn extract_js_ts_import(
+    relations: &mut Vec<CodeRelation>,
+    source: &str,
+    node: &Node,
+    chunks: &[CodeChunk],
+) {
+    let owner_idx = find_owning_chunk(chunks, node.start_position().row as u32 + 1);
+    if let Some(source_node) = node.child_by_field_name("source") {
+        let raw = source[source_node.byte_range()].to_string();
+        let import_path = raw.trim_matches(|c| c == '\'' || c == '"').to_string();
+
+        let mut names = Vec::new();
+        for i in 0..node.child_count() {
+            let Some(child) = node.child(i as u32) else {
+                continue;
+            };
+            if child.kind() == "import_clause" {
+                collect_js_import_names(&mut names, source, &child);
+            }
+        }
+
+        if names.is_empty() {
+            relations.push(CodeRelation {
+                from_chunk_index: owner_idx,
+                relation: "imports".to_string(),
+                to_file: import_path,
+                to_name: None,
+            });
+        } else {
+            for name in names {
+                relations.push(CodeRelation {
+                    from_chunk_index: owner_idx,
+                    relation: "imports".to_string(),
+                    to_file: import_path.clone(),
+                    to_name: Some(name),
+                });
+            }
+        }
+    }
+}
+
+/// Extract `extends` and `implements` relations from a JS/TS class declaration.
+///
+/// Handles both JavaScript (`class_heritage` with direct expression) and TypeScript
+/// (`class_heritage` with `extends_clause`/`implements_clause` children).
+/// Strips generic type arguments: `Bar<T>` -> `"Bar"`.
+fn extract_js_ts_class_heritage(
+    relations: &mut Vec<CodeRelation>,
+    source: &str,
+    node: &Node,
+    file_path: &str,
+    chunks: &[CodeChunk],
+) {
+    let owner_idx = find_owning_chunk(chunks, node.start_position().row as u32 + 1);
+
+    // Walk children to find `class_heritage` node (it's a node kind, not a field)
+    for i in 0..node.child_count() {
+        let Some(child) = node.child(i as u32) else {
+            continue;
+        };
+        if child.kind() != "class_heritage" {
+            continue;
+        }
+
+        // Check for TypeScript extends_clause / implements_clause children
+        let mut found_ts_clauses = false;
+        for j in 0..child.child_count() {
+            let Some(clause) = child.child(j as u32) else {
+                continue;
+            };
+            match clause.kind() {
+                "extends_clause" => {
+                    found_ts_clauses = true;
+                    // Extract the type expression (first named child that is a type/identifier)
+                    if let Some(name) = extract_extends_type_name(source, &clause) {
+                        relations.push(CodeRelation {
+                            from_chunk_index: owner_idx,
+                            relation: "extends".to_string(),
+                            to_file: file_path.to_string(),
+                            to_name: Some(name),
+                        });
+                    }
+                }
+                "implements_clause" => {
+                    found_ts_clauses = true;
+                    // Each type in the implements list is a separate relation
+                    for k in 0..clause.child_count() {
+                        if let Some(type_node) = clause.child(k as u32) {
+                            if !type_node.is_named() {
+                                continue;
+                            }
+                            if let Some(name) = extract_type_identifier(source, &type_node) {
+                                relations.push(CodeRelation {
+                                    from_chunk_index: owner_idx,
+                                    relation: "implements".to_string(),
+                                    to_file: file_path.to_string(),
+                                    to_name: Some(name),
+                                });
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // JavaScript: class_heritage directly contains the base class expression
+        // (no extends_clause/implements_clause wrapper)
+        if !found_ts_clauses {
+            // The heritage node's children include the base class expression
+            for j in 0..child.child_count() {
+                if let Some(expr) = child.child(j as u32) {
+                    if !expr.is_named() {
+                        continue;
+                    }
+                    if let Some(name) = extract_type_identifier(source, &expr) {
+                        relations.push(CodeRelation {
+                            from_chunk_index: owner_idx,
+                            relation: "extends".to_string(),
+                            to_file: file_path.to_string(),
+                            to_name: Some(name),
+                        });
+                        break; // JS only has single inheritance
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Extract the base class name from a TypeScript `extends_clause`.
+/// Handles generics: `extends Bar<T>` -> "Bar".
+fn extract_extends_type_name(source: &str, clause: &Node) -> Option<String> {
+    for i in 0..clause.child_count() {
+        let child = clause.child(i as u32)?;
+        if !child.is_named() {
+            continue;
+        }
+        return extract_type_identifier(source, &child);
+    }
+    None
+}
+
+/// Extract a type identifier name, stripping generic parameters.
+/// `Bar` -> "Bar", `Bar<T>` -> "Bar" (via generic_type's name field),
+/// `member_expression` -> last segment.
+fn extract_type_identifier(source: &str, node: &Node) -> Option<String> {
+    match node.kind() {
+        "identifier" | "type_identifier" => {
+            Some(source[node.byte_range()].to_string())
+        }
+        "generic_type" => {
+            // Extract the name part before type arguments
+            node.child_by_field_name("name")
+                .map(|n| source[n.byte_range()].to_string())
+        }
+        "member_expression" => {
+            // e.g., `module.ClassName` -> extract "ClassName"
+            node.child_by_field_name("property")
+                .map(|p| source[p.byte_range()].to_string())
+        }
+        _ => {
+            // Fallback: try raw text, strip anything after '<'
+            let text = source[node.byte_range()].to_string();
+            let name = text.split('<').next().unwrap_or(&text).trim();
+            if name.is_empty() {
+                None
+            } else {
+                Some(name.to_string())
+            }
+        }
+    }
+}
+
+/// Extract "calls" relations from JS/TS code via recursive AST walk.
+///
+/// Walks the entire AST tree to catch calls in arrow functions, nested functions,
+/// class methods, and other nested scopes. Handles dynamic `import()` as an
+/// "imports" relation.
+fn extract_js_ts_calls(
+    relations: &mut Vec<CodeRelation>,
+    source: &str,
+    root: &Node,
+    file_path: &str,
+    chunks: &[CodeChunk],
+) {
+    let mut call_nodes = Vec::new();
+    collect_call_expressions(root, &mut call_nodes, 0);
+
+    for call_node in &call_nodes {
+        let Some(func_node) = call_node.child_by_field_name("function") else {
+            continue;
+        };
+
+        let func_text = source[func_node.byte_range()].to_string();
+
+        // Dynamic import(): `import('./module')` -> emit "imports" not "calls"
+        if func_text == "import" {
+            if let Some(args) = call_node.child_by_field_name("arguments") {
+                for i in 0..args.child_count() {
+                    if let Some(arg) = args.child(i as u32) {
+                        if arg.kind() == "string" || arg.kind() == "template_string" {
+                            let raw = source[arg.byte_range()].to_string();
+                            let path = raw.trim_matches(|c| c == '\'' || c == '"' || c == '`');
+                            let owner_idx = find_owning_chunk(
+                                chunks,
+                                call_node.start_position().row as u32 + 1,
+                            );
+                            relations.push(CodeRelation {
+                                from_chunk_index: owner_idx,
+                                relation: "imports".to_string(),
+                                to_file: path.to_string(),
+                                to_name: None,
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Extract the callable name
+        let fn_name = extract_js_call_name(source, &func_node);
+
+        // Skip deny-listed methods
+        if JS_TS_CALL_DENY_LIST.contains(&fn_name.as_str()) {
+            continue;
+        }
+        // Skip single-char or empty names
+        if fn_name.len() <= 1 {
+            continue;
+        }
+
+        let owner_idx = find_owning_chunk(chunks, call_node.start_position().row as u32 + 1);
+
+        relations.push(CodeRelation {
+            from_chunk_index: owner_idx,
+            relation: "calls".to_string(),
+            to_file: file_path.to_string(),
+            to_name: Some(fn_name),
+        });
+    }
+}
+
+/// Extract the function/method name from a JS/TS call expression's function node.
+/// Handles: simple identifiers, member expressions (`this.foo`, `obj.bar.baz`),
+/// and optional chaining (`obj?.method`).
+fn extract_js_call_name(source: &str, node: &Node) -> String {
+    match node.kind() {
+        "identifier" => source[node.byte_range()].to_string(),
+        "member_expression" | "optional_chain_expression" => {
+            // Extract the last property: `this.foo` -> "foo", `a.b.c` -> "c"
+            node.child_by_field_name("property")
+                .map(|p| source[p.byte_range()].to_string())
+                .unwrap_or_else(|| {
+                    // Fallback: last segment after '.'
+                    let text = source[node.byte_range()].to_string();
+                    text.rsplit('.').next().unwrap_or(&text).to_string()
+                })
+        }
+        _ => {
+            // Fallback: try last segment
+            let text = source[node.byte_range()].to_string();
+            text.rsplit('.').next().unwrap_or(&text).to_string()
+        }
+    }
 }
 
 /// Collect named import symbols from a JS/TS import_clause node.
@@ -1366,5 +1640,359 @@ fn handler() {
             "crate:: call should resolve to CRATE_REF, got: {}",
             process_call.unwrap().to_file
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // P1: JS/TS class inheritance and function call tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_js_class_extends() {
+        let source = r#"
+class Animal {
+    constructor(name) {
+        this.name = name;
+    }
+}
+
+class Dog extends Animal {
+    bark() {
+        return "woof";
+    }
+}
+"#;
+        let result = chunk_file_with_relations("app.js", source, "js");
+        let extends: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "extends")
+            .collect();
+        assert_eq!(extends.len(), 1, "Expected 1 extends relation, got {}", extends.len());
+        assert_eq!(extends[0].to_name.as_deref(), Some("Animal"));
+    }
+
+    #[test]
+    fn test_ts_class_extends_with_generics() {
+        let source = r#"
+class Base<T> {
+    value: T;
+    constructor(val: T) {
+        this.value = val;
+    }
+}
+
+class Derived extends Base<string> {
+    greet(): string {
+        return this.value;
+    }
+}
+"#;
+        let result = chunk_file_with_relations("app.ts", source, "ts");
+        let extends: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "extends")
+            .collect();
+        assert_eq!(extends.len(), 1, "Expected 1 extends relation");
+        assert_eq!(
+            extends[0].to_name.as_deref(),
+            Some("Base"),
+            "Should extract 'Base' not 'Base<string>'"
+        );
+    }
+
+    #[test]
+    fn test_ts_class_implements() {
+        let source = r#"
+interface ISerializable {
+    serialize(): string;
+}
+
+interface ICloneable {
+    clone(): ICloneable;
+}
+
+class MyClass implements ISerializable, ICloneable {
+    serialize(): string {
+        return "{}";
+    }
+    clone(): ICloneable {
+        return new MyClass();
+    }
+}
+"#;
+        let result = chunk_file_with_relations("app.ts", source, "ts");
+        let implements: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "implements")
+            .collect();
+        assert!(
+            implements.len() >= 2,
+            "Expected at least 2 implements relations (ISerializable, ICloneable), got {}",
+            implements.len()
+        );
+        let names: Vec<&str> = implements.iter().filter_map(|r| r.to_name.as_deref()).collect();
+        assert!(names.contains(&"ISerializable"), "Missing ISerializable, got: {:?}", names);
+        assert!(names.contains(&"ICloneable"), "Missing ICloneable, got: {:?}", names);
+    }
+
+    #[test]
+    fn test_js_function_call_in_method() {
+        let source = r#"
+function helper() {
+    return 42;
+}
+
+class Service {
+    process() {
+        const result = helper();
+        return result;
+    }
+}
+"#;
+        let result = chunk_file_with_relations("app.js", source, "js");
+        let calls: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "calls")
+            .collect();
+        let names: Vec<&str> = calls.iter().filter_map(|r| r.to_name.as_deref()).collect();
+        assert!(
+            names.contains(&"helper"),
+            "Expected call to 'helper' inside method body, got: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_js_call_in_arrow_function() {
+        let source = r#"
+const handler = () => {
+    processData();
+    return true;
+};
+"#;
+        let result = chunk_file_with_relations("app.js", source, "js");
+        let calls: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "calls")
+            .collect();
+        let names: Vec<&str> = calls.iter().filter_map(|r| r.to_name.as_deref()).collect();
+        assert!(
+            names.contains(&"processData"),
+            "Expected call to 'processData' in arrow function, got: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_js_deny_listed_calls_skipped() {
+        let source = r#"
+function doStuff() {
+    console.log("hello");
+    arr.map(x => x + 1);
+    promise.then(r => r);
+    arr.push(1);
+    JSON.stringify({});
+    return true;
+}
+"#;
+        let result = chunk_file_with_relations("app.js", source, "js");
+        let calls: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "calls")
+            .collect();
+        for call in &calls {
+            let name = call.to_name.as_deref().unwrap_or("");
+            assert!(
+                !["log", "map", "then", "push", "stringify"].contains(&name),
+                "Deny-listed method '{name}' should have been filtered"
+            );
+        }
+    }
+
+    #[test]
+    fn test_js_this_method_call() {
+        let source = r#"
+class MyClass {
+    helperMethod() {
+        return 42;
+    }
+
+    process() {
+        this.helperMethod();
+        return true;
+    }
+}
+"#;
+        let result = chunk_file_with_relations("app.js", source, "js");
+        let calls: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "calls")
+            .collect();
+        let names: Vec<&str> = calls.iter().filter_map(|r| r.to_name.as_deref()).collect();
+        assert!(
+            names.contains(&"helperMethod"),
+            "Should extract 'helperMethod' from this.helperMethod(), got: {:?}",
+            names
+        );
+        assert!(
+            !names.contains(&"this"),
+            "'this' should not appear as a call target"
+        );
+    }
+
+    #[test]
+    fn test_js_dynamic_import() {
+        let source = r#"
+async function loadModule() {
+    const mod = await import('./lazy-module');
+    return mod;
+}
+"#;
+        let result = chunk_file_with_relations("app.js", source, "js");
+        let imports: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "imports")
+            .collect();
+        assert!(
+            imports.iter().any(|r| r.to_file == "./lazy-module"),
+            "Dynamic import('./lazy-module') should produce an imports relation, got: {:?}",
+            imports.iter().map(|r| &r.to_file).collect::<Vec<_>>()
+        );
+
+        // Should NOT produce a "calls" relation for import()
+        let calls: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "calls" && r.to_name.as_deref() == Some("import"))
+            .collect();
+        assert!(calls.is_empty(), "import() should not produce a 'calls' relation");
+    }
+
+    #[test]
+    fn test_js_syntax_error_partial_extraction() {
+        let source = r#"
+class Good extends Base {
+    method() {
+        return 1;
+    }
+}
+
+// Syntax error below
+const broken = {{{;
+
+class AlsoGood extends Other {
+    run() {
+        return 2;
+    }
+}
+"#;
+        let result = chunk_file_with_relations("app.js", source, "js");
+        // tree-sitter is error-tolerant; should still extract from valid parts
+        let extends: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "extends")
+            .collect();
+        assert!(
+            !extends.is_empty(),
+            "Should extract at least some extends relations despite syntax error"
+        );
+    }
+
+    #[test]
+    fn test_js_empty_class_no_crash() {
+        let source = r#"
+class EmptyClass {
+}
+"#;
+        let result = chunk_file_with_relations("app.js", source, "js");
+        // Should not crash, may or may not produce chunks (class has no body methods)
+        // Key assertion: no panic
+        let _ = result.relations;
+    }
+
+    #[test]
+    fn test_js_minified_single_line() {
+        let source = "class A extends B{constructor(){super();this.init()}}class C extends D{run(){return compute()}}";
+        let result = chunk_file_with_relations("app.min.js", source, "js");
+        let extends: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "extends")
+            .collect();
+        assert!(
+            extends.len() >= 2,
+            "Minified JS should still extract extends relations, got {}",
+            extends.len()
+        );
+    }
+
+    #[test]
+    fn test_ts_exported_class_extends() {
+        let source = r#"
+export class Controller extends BaseController {
+    handle() {
+        return "ok";
+    }
+}
+"#;
+        let result = chunk_file_with_relations("controller.ts", source, "ts");
+        let extends: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "extends")
+            .collect();
+        assert_eq!(extends.len(), 1, "Exported class should have extends relation");
+        assert_eq!(extends[0].to_name.as_deref(), Some("BaseController"));
+    }
+
+    #[test]
+    fn test_existing_rust_extraction_unchanged() {
+        // Regression: existing Rust extraction must still work
+        let source = r#"
+use crate::foo::Bar;
+
+pub trait MyTrait {
+    fn do_thing(&self);
+}
+
+impl MyTrait for MyStruct {
+    fn do_thing(&self) {
+        println!("hello");
+    }
+}
+
+fn main() {
+    helper();
+}
+"#;
+        let result = chunk_file_with_relations("src/main.rs", source, "rs");
+        let imports: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "imports")
+            .collect();
+        assert!(!imports.is_empty(), "Rust imports should still work");
+
+        let implements: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "implements")
+            .collect();
+        assert!(!implements.is_empty(), "Rust implements should still work");
+
+        let calls: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "calls")
+            .collect();
+        assert!(!calls.is_empty(), "Rust calls should still work");
     }
 }
