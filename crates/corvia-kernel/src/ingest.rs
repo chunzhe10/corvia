@@ -357,6 +357,151 @@ fn resolve_target(
 }
 
 // ---------------------------------------------------------------------------
+// Semantic sub-splitting (V1: post-ingest with real embeddings)
+// ---------------------------------------------------------------------------
+
+/// Identify oversized heading_section chunks, sub-split them semantically using
+/// the Max-Min algorithm with real embeddings, store the sub-chunks, and wire
+/// "split_from" graph edges. Returns the number of sub-chunks created.
+///
+/// The original entries are NOT deleted or superseded in V1. This is additive:
+/// sub-chunks coexist with the original chunk. The sub-chunks have higher
+/// embedding precision and will rank higher in retrieval when relevant.
+async fn semantic_subsplit(
+    processed: &[ProcessedChunk],
+    stored_ids: &[uuid::Uuid],
+    engine: &dyn crate::traits::InferenceEngine,
+    store: &dyn crate::traits::QueryableStore,
+    graph: &dyn crate::traits::GraphStore,
+    scope_id: &str,
+    threshold_tokens: usize,
+    max_tokens: usize,
+) -> usize {
+    use crate::semantic_split::{
+        split_into_segments, max_min_split, EmbeddingSimilarity,
+        reassemble_groups, enforce_token_budget,
+    };
+
+    let mut sub_chunks_created = 0usize;
+
+    for (i, pc) in processed.iter().enumerate() {
+        // Only sub-split oversized heading_section chunks from Markdown
+        if pc.chunk_type != "heading_section" {
+            continue;
+        }
+        if pc.token_estimate <= threshold_tokens {
+            continue;
+        }
+        if i >= stored_ids.len() {
+            continue;
+        }
+
+        let original_id = stored_ids[i];
+
+        // Split into Markdown-aware segments (code blocks atomic, paragraph-first)
+        let segments = split_into_segments(&pc.content);
+        if segments.len() <= 1 {
+            continue; // Single segment, nothing to sub-split
+        }
+
+        // Bail if too many segments (N^2 similarity is too expensive)
+        if segments.len() > 50 {
+            tracing::debug!(
+                source_file = %pc.metadata.source_file,
+                segments = segments.len(),
+                "semantic_subsplit: too many segments, skipping"
+            );
+            continue;
+        }
+
+        // Embed all segments
+        let texts: Vec<String> = segments.iter().cloned().collect();
+        let embeddings = match engine.embed_batch(&texts).await {
+            Ok(embs) => embs,
+            Err(e) => {
+                tracing::warn!(
+                    source_file = %pc.metadata.source_file,
+                    error = %e,
+                    "semantic_subsplit: embedding failed, skipping"
+                );
+                continue;
+            }
+        };
+
+        // Run Max-Min grouping
+        let similarity = EmbeddingSimilarity::new(embeddings);
+        let groups = max_min_split(segments.len(), &similarity);
+
+        if groups.len() <= 1 {
+            continue; // All segments are coherent, no split needed
+        }
+
+        // Reassemble groups into sub-chunk content
+        let sub_contents = reassemble_groups(&segments, &groups);
+
+        // Enforce token budget
+        let sub_contents = enforce_token_budget(sub_contents, max_tokens);
+
+        if sub_contents.len() <= 1 {
+            continue;
+        }
+
+        // Embed and store each sub-chunk
+        let sub_texts: Vec<String> = sub_contents.iter().cloned().collect();
+        let sub_embeddings = match engine.embed_batch(&sub_texts).await {
+            Ok(embs) => embs,
+            Err(e) => {
+                tracing::warn!(error = %e, "semantic_subsplit: sub-chunk embedding failed");
+                continue;
+            }
+        };
+
+        for (j, (content, embedding)) in sub_contents.into_iter().zip(sub_embeddings).enumerate() {
+            let mut entry = corvia_common::types::KnowledgeEntry::new(
+                content,
+                scope_id.to_string(),
+                format!("{}:semantic-{}", pc.metadata.source_file, j + 1),
+            );
+            entry.metadata = corvia_common::types::EntryMetadata {
+                source_file: Some(pc.metadata.source_file.clone()),
+                language: pc.metadata.language.clone(),
+                chunk_type: Some("semantic_subchunk".to_string()),
+                start_line: Some(pc.start_line),
+                end_line: Some(pc.end_line),
+                content_role: None,
+                source_origin: None,
+            };
+            entry.embedding = Some(embedding);
+
+            match store.insert(&entry).await {
+                Ok(_) => {
+                    // Wire "split_from" edge: sub-chunk -> original
+                    if let Err(e) = graph
+                        .relate(&entry.id, "split_from", &original_id, None)
+                        .await
+                    {
+                        tracing::warn!(error = %e, "semantic_subsplit: failed to wire split_from edge");
+                    }
+                    sub_chunks_created += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "semantic_subsplit: failed to store sub-chunk");
+                }
+            }
+        }
+
+        tracing::debug!(
+            source_file = %pc.metadata.source_file,
+            original_tokens = pc.token_estimate,
+            sub_chunks = groups.len(),
+            "semantic_subsplit: split oversized heading section"
+        );
+    }
+
+    sub_chunks_created
+}
+
+// ---------------------------------------------------------------------------
 // Resolve repo path (shared with CLI)
 // ---------------------------------------------------------------------------
 
@@ -576,6 +721,21 @@ pub async fn run_workspace_ingest(ctx: WorkspaceIngestCtx<'_>) -> anyhow::Result
                 "0 graph relations stored for {} chunks — check adapter version",
                 processed.len()
             );
+        }
+
+        // Semantic sub-splitting pass (V1: post-ingest with real embeddings)
+        let semantic_split_count = if config.chunking.semantic_splitting {
+            let threshold = config.chunking.semantic_split_threshold
+                .unwrap_or(config.chunking.max_tokens);
+            semantic_subsplit(
+                &processed, &stored_ids, &*engine, &*store, &*graph,
+                &config.project.scope_id, threshold, config.chunking.max_tokens,
+            ).await
+        } else {
+            0
+        };
+        if semantic_split_count > 0 {
+            progress.log(&format!("  semantic sub-split: {semantic_split_count} sub-chunks created"));
         }
 
         // Shutdown adapter
