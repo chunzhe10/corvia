@@ -243,11 +243,13 @@ pub async fn wire_pipeline_relations(
     }
 
     // Build source index for O(1) source chunk lookup: (source_file, start_line) -> chunk_index
-    let source_index: HashMap<(&str, u32), usize> = processed
-        .iter()
-        .enumerate()
-        .map(|(i, pc)| ((pc.metadata.source_file.as_str(), pc.start_line), i))
-        .collect();
+    // Uses or_insert to match first-match semantics of the old Iterator::position() scan.
+    let mut source_index: HashMap<(&str, u32), usize> = HashMap::with_capacity(processed.len());
+    for (i, pc) in processed.iter().enumerate() {
+        source_index
+            .entry((pc.metadata.source_file.as_str(), pc.start_line))
+            .or_insert(i);
+    }
 
     let mut relations_stored = 0;
     let mut source_miss = 0u64;
