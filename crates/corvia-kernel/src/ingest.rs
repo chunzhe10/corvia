@@ -232,9 +232,9 @@ pub async fn wire_pipeline_relations(
     stored_ids: &[uuid::Uuid],
     graph: &dyn GraphStore,
 ) -> usize {
-    // Build a file index for fast lookup: source_file -> Vec<(chunk_index, &ProcessedChunk)>
-    let mut file_index: std::collections::HashMap<&str, Vec<(usize, &ProcessedChunk)>> =
-        std::collections::HashMap::new();
+    // Build file index for fast lookup: source_file -> Vec<(chunk_index, &ProcessedChunk)>
+    let mut file_index: HashMap<&str, Vec<(usize, &ProcessedChunk)>> =
+        HashMap::with_capacity(processed.len());
     for (i, pc) in processed.iter().enumerate() {
         file_index
             .entry(pc.metadata.source_file.as_str())
@@ -242,15 +242,20 @@ pub async fn wire_pipeline_relations(
             .push((i, pc));
     }
 
+    // Build source index for O(1) source chunk lookup: (source_file, start_line) -> chunk_index
+    let source_index: HashMap<(&str, u32), usize> = processed
+        .iter()
+        .enumerate()
+        .map(|(i, pc)| ((pc.metadata.source_file.as_str(), pc.start_line), i))
+        .collect();
+
     let mut relations_stored = 0;
     let mut source_miss = 0u64;
     let mut target_miss = 0u64;
     for rel in relations {
-        let from_idx = processed.iter().position(|pc| {
-            pc.metadata.source_file == rel.from_source_file && pc.start_line == rel.from_start_line
-        });
-        let from_uuid = match from_idx {
-            Some(idx) if idx < stored_ids.len() => stored_ids[idx],
+        // O(1) source resolution via composite key index
+        let from_uuid = match source_index.get(&(rel.from_source_file.as_str(), rel.from_start_line)) {
+            Some(&idx) if idx < stored_ids.len() => stored_ids[idx],
             _ => {
                 source_miss += 1;
                 tracing::debug!(
@@ -328,7 +333,7 @@ pub async fn wire_pipeline_relations(
 /// Uses the file_index for O(1) file lookup, then content-based name matching
 /// within matching chunks.
 fn resolve_target(
-    file_index: &std::collections::HashMap<&str, Vec<(usize, &ProcessedChunk)>>,
+    file_index: &HashMap<&str, Vec<(usize, &ProcessedChunk)>>,
     stored_ids: &[uuid::Uuid],
     target_file: &str,
     target_name: &Option<String>,
@@ -1311,8 +1316,8 @@ mod tests {
             make_processed_chunk("src/utils.ts", 1, "export function helper() {}"),
         ];
         let ids = vec![uuid::Uuid::now_v7()];
-        let mut file_index: std::collections::HashMap<&str, Vec<(usize, &ProcessedChunk)>> =
-            std::collections::HashMap::new();
+        let mut file_index: HashMap<&str, Vec<(usize, &ProcessedChunk)>> =
+            HashMap::new();
         for (i, pc) in chunks.iter().enumerate() {
             file_index.entry(pc.metadata.source_file.as_str()).or_default().push((i, pc));
         }
@@ -1327,8 +1332,8 @@ mod tests {
             make_processed_chunk("src/components/index.ts", 1, "export { Button } from './Button';"),
         ];
         let ids = vec![uuid::Uuid::now_v7()];
-        let mut file_index: std::collections::HashMap<&str, Vec<(usize, &ProcessedChunk)>> =
-            std::collections::HashMap::new();
+        let mut file_index: HashMap<&str, Vec<(usize, &ProcessedChunk)>> =
+            HashMap::new();
         for (i, pc) in chunks.iter().enumerate() {
             file_index.entry(pc.metadata.source_file.as_str()).or_default().push((i, pc));
         }
@@ -1355,8 +1360,8 @@ mod tests {
             make_processed_chunk("package/submodule/__init__.py", 1, "from .core import Engine"),
         ];
         let ids = vec![uuid::Uuid::now_v7()];
-        let mut file_index: std::collections::HashMap<&str, Vec<(usize, &ProcessedChunk)>> =
-            std::collections::HashMap::new();
+        let mut file_index: HashMap<&str, Vec<(usize, &ProcessedChunk)>> =
+            HashMap::new();
         for (i, pc) in chunks.iter().enumerate() {
             file_index.entry(pc.metadata.source_file.as_str()).or_default().push((i, pc));
         }
@@ -1379,8 +1384,8 @@ mod tests {
             make_processed_chunk("lib/index.ts", 1, "export default {}"),
         ];
         let ids = vec![uuid::Uuid::now_v7(), uuid::Uuid::now_v7()];
-        let mut file_index: std::collections::HashMap<&str, Vec<(usize, &ProcessedChunk)>> =
-            std::collections::HashMap::new();
+        let mut file_index: HashMap<&str, Vec<(usize, &ProcessedChunk)>> =
+            HashMap::new();
         for (i, pc) in chunks.iter().enumerate() {
             file_index.entry(pc.metadata.source_file.as_str()).or_default().push((i, pc));
         }
@@ -1403,8 +1408,8 @@ mod tests {
             make_processed_chunk("CRATE_REF:src:foo", 1, "pub fn process() {}"),
         ];
         let ids = vec![uuid::Uuid::now_v7()];
-        let mut file_index: std::collections::HashMap<&str, Vec<(usize, &ProcessedChunk)>> =
-            std::collections::HashMap::new();
+        let mut file_index: HashMap<&str, Vec<(usize, &ProcessedChunk)>> =
+            HashMap::new();
         for (i, pc) in chunks.iter().enumerate() {
             file_index.entry(pc.metadata.source_file.as_str()).or_default().push((i, pc));
         }
@@ -1419,8 +1424,8 @@ mod tests {
             make_processed_chunk("src/app.ts", 1, "const x = 1;"),
         ];
         let ids = vec![uuid::Uuid::now_v7()];
-        let mut file_index: std::collections::HashMap<&str, Vec<(usize, &ProcessedChunk)>> =
-            std::collections::HashMap::new();
+        let mut file_index: HashMap<&str, Vec<(usize, &ProcessedChunk)>> =
+            HashMap::new();
         for (i, pc) in chunks.iter().enumerate() {
             file_index.entry(pc.metadata.source_file.as_str()).or_default().push((i, pc));
         }
@@ -1439,5 +1444,62 @@ mod tests {
             }
         }
         assert!(resolved.is_none(), "Nonexistent paths should not match any fallback");
+    }
+
+    // -----------------------------------------------------------------------
+    // P5: Source index HashMap optimization tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_source_index_lookup() {
+        let chunks = vec![
+            make_processed_chunk("src/main.rs", 1, "fn main() {}"),
+            make_processed_chunk("src/main.rs", 15, "fn helper() {}"),
+            make_processed_chunk("src/utils.rs", 1, "fn util() {}"),
+        ];
+        let source_index: HashMap<(&str, u32), usize> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, pc)| ((pc.metadata.source_file.as_str(), pc.start_line), i))
+            .collect();
+
+        // Exact match
+        assert_eq!(source_index.get(&("src/main.rs", 1)), Some(&0));
+        assert_eq!(source_index.get(&("src/main.rs", 15)), Some(&1));
+        assert_eq!(source_index.get(&("src/utils.rs", 1)), Some(&2));
+
+        // Miss
+        assert_eq!(source_index.get(&("src/main.rs", 99)), None);
+        assert_eq!(source_index.get(&("nonexistent.rs", 1)), None);
+    }
+
+    #[test]
+    fn test_source_index_consistency_with_linear_scan() {
+        // Verify HashMap produces same result as the old linear scan
+        let chunks = vec![
+            make_processed_chunk("a.rs", 1, "fn a() {}"),
+            make_processed_chunk("b.rs", 5, "fn b() {}"),
+            make_processed_chunk("a.rs", 20, "fn c() {}"),
+        ];
+
+        let source_index: HashMap<(&str, u32), usize> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, pc)| ((pc.metadata.source_file.as_str(), pc.start_line), i))
+            .collect();
+
+        // Compare with linear scan for each chunk
+        for (expected_idx, pc) in chunks.iter().enumerate() {
+            let linear_idx = chunks.iter().position(|c| {
+                c.metadata.source_file == pc.metadata.source_file && c.start_line == pc.start_line
+            });
+            let hash_idx = source_index.get(&(pc.metadata.source_file.as_str(), pc.start_line)).copied();
+            assert_eq!(
+                linear_idx, hash_idx,
+                "Source index should match linear scan for {}:{}",
+                pc.metadata.source_file, pc.start_line
+            );
+            assert_eq!(hash_idx, Some(expected_idx));
+        }
     }
 }

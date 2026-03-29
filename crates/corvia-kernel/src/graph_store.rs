@@ -253,14 +253,19 @@ impl crate::traits::GraphStore for LiteGraphStore {
         write_txn.commit()
             .map_err(|e| CorviaError::Storage(format!("Failed to commit edge: {e}")))?;
 
-        // Update in-memory graph
+        // Update in-memory graph (deduplicate: skip if edge already exists)
         let mut graph = self.graph.lock()
             .map_err(|e| CorviaError::Storage(format!("Lock: {e}")))?;
         let mut node_map = self.node_map.lock()
             .map_err(|e| CorviaError::Storage(format!("Lock: {e}")))?;
         let from_idx = *node_map.entry(*from).or_insert_with(|| graph.add_node(*from));
         let to_idx = *node_map.entry(*to).or_insert_with(|| graph.add_node(*to));
-        graph.add_edge(from_idx, to_idx, relation.to_string());
+        let already_exists = graph
+            .edges_connecting(from_idx, to_idx)
+            .any(|e| e.weight() == relation);
+        if !already_exists {
+            graph.add_edge(from_idx, to_idx, relation.to_string());
+        }
 
         Ok(())
     }
