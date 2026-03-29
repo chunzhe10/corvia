@@ -108,7 +108,7 @@ impl MemoryType {
             "design" | "decision" | "plan" => Some(Self::Decisional),
             "memory" | "learning" => Some(Self::Episodic),
             "finding" => Some(Self::Analytical),
-            "instruction" => Some(Self::Procedural),
+            "instruction" | "task" => Some(Self::Procedural),
             _ => None,
         }
     }
@@ -509,6 +509,7 @@ mod tests {
     fn test_is_mapped_content_role() {
         assert!(is_mapped_content_role("code"));
         assert!(is_mapped_content_role("design"));
+        assert!(is_mapped_content_role("task"));
         assert!(!is_mapped_content_role("unknown"));
         assert!(!is_mapped_content_role(""));
     }
@@ -596,8 +597,10 @@ mod tests {
     fn test_memory_type_from_content_role() {
         assert_eq!(MemoryType::from_content_role(Some("code")), MemoryType::Structural);
         assert_eq!(MemoryType::from_content_role(Some("design")), MemoryType::Decisional);
+        assert_eq!(MemoryType::from_content_role(Some("task")), MemoryType::Procedural);
         assert_eq!(MemoryType::from_content_role(None), MemoryType::Episodic);
         assert!(MemoryType::is_known_content_role("code"));
+        assert!(MemoryType::is_known_content_role("task"));
         assert!(!MemoryType::is_known_content_role("unknown"));
     }
 
