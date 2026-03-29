@@ -806,6 +806,7 @@ fn ingest_agent_teams_from<W: Write>(
     team_dirs.sort_by_key(|e| e.file_name());
 
     let scope_id_owned = scope_id.to_string();
+    let mut classify_entries: Vec<String> = Vec::new();
 
     for entry in &team_dirs {
         let team_name = entry.file_name().to_string_lossy().to_string();
@@ -956,6 +957,9 @@ fn ingest_agent_teams_from<W: Write>(
                         group_key.replace(' ', "-").to_lowercase()
                     );
 
+                    // E1: Queue message group entries for LLM extraction
+                    classify_entries.push(source_version.clone());
+
                     // G5: discusses edge (messages -> task)
                     let mut msg_edge_hints = Vec::new();
                     if let Some(task_id) = group_key.strip_prefix("task-") {
@@ -997,6 +1001,12 @@ fn ingest_agent_teams_from<W: Write>(
             // Config missing or unparseable — do NOT mark as ingested so it retries
             eprintln!("Warning: team {team_name} has no valid config.json, will retry next run");
         }
+    }
+
+    // E1: Append message group source_versions to .classify-queue for LLM extraction
+    if !classify_entries.is_empty() {
+        let queue_path = staging_root.join(".classify-queue");
+        append_lines(&queue_path, &classify_entries);
     }
 
     // A7: Clean up old staging directories
@@ -2739,5 +2749,144 @@ mod tests {
             total_discusses += hints.iter().filter(|(r, _)| r == "discusses").count();
         }
         assert!(total_discusses >= 2, "expected at least 2 discusses edges, got {total_discusses}");
+    }
+
+    // ===================================================================
+    // Phase 4 tests: .classify-queue for LLM extraction (E1)
+    // ===================================================================
+
+    /// E1: Message group source_versions are appended to .classify-queue after ingestion.
+    #[test]
+    fn e1_classify_queue_written_for_message_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        let config = serde_json::json!({
+            "leadSessionId": "ses-lead-e1",
+            "createdAt": "2026-03-28T10:00:00Z",
+            "members": [
+                {"name": "researcher", "model": "opus", "joinedAt": "2026-03-28T10:00:01Z"},
+            ]
+        });
+
+        let tasks = "{\"event\":\"created\",\"task_id\":\"1\",\"subject\":\"research\",\"description\":\"do research\",\"owner\":\"researcher\",\"timestamp\":\"2026-03-28T10:00:02Z\"}\n";
+
+        let inbox_msg = serde_json::json!([
+            {"sender": "researcher", "recipient": "lead", "content": "Found a key insight about storage", "timestamp": "2026-03-28T10:00:03Z", "task_assignment": "task-1"}
+        ]);
+
+        setup_team_staging(
+            &staging,
+            "e1-team",
+            &config,
+            tasks,
+            &[("researcher", &inbox_msg.to_string())],
+        );
+
+        let mut output = Vec::new();
+        ingest_agent_teams_from("user-history", &staging, &sessions, &mut output);
+
+        // Verify .classify-queue was written
+        let queue_path = staging.join(".classify-queue");
+        assert!(queue_path.exists(), ".classify-queue should be created");
+
+        let queue_content = std::fs::read_to_string(&queue_path).unwrap();
+        let queue_lines: Vec<&str> = queue_content.lines().filter(|l| !l.is_empty()).collect();
+
+        // Should contain the message group source_version
+        assert!(!queue_lines.is_empty(), "classify queue should have entries");
+        assert!(
+            queue_lines.iter().any(|l| l.contains("e1-team:messages:")),
+            "queue should contain message source_versions, got: {:?}",
+            queue_lines
+        );
+    }
+
+    /// E1 idempotency: re-ingesting a team does not duplicate queue entries.
+    #[test]
+    fn e1_classify_queue_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        let config = serde_json::json!({
+            "leadSessionId": "ses-lead-idem",
+            "createdAt": "2026-03-28T10:00:00Z",
+            "members": [
+                {"name": "worker", "model": "opus", "joinedAt": "2026-03-28T10:00:01Z"},
+            ]
+        });
+
+        let inbox_msg = serde_json::json!([
+            {"sender": "worker", "recipient": "lead", "content": "Done with task", "timestamp": "2026-03-28T10:00:03Z"}
+        ]);
+
+        setup_team_staging(
+            &staging,
+            "idem-team",
+            &config,
+            "",
+            &[("worker", &inbox_msg.to_string())],
+        );
+
+        // First ingestion
+        let mut output1 = Vec::new();
+        ingest_agent_teams_from("user-history", &staging, &sessions, &mut output1);
+
+        let queue_after_first = std::fs::read_to_string(staging.join(".classify-queue"))
+            .unwrap_or_default();
+        let count_first = queue_after_first.lines().filter(|l| !l.is_empty()).count();
+
+        // Second ingestion (same team, already in .ingested)
+        let mut output2 = Vec::new();
+        ingest_agent_teams_from("user-history", &staging, &sessions, &mut output2);
+
+        let queue_after_second = std::fs::read_to_string(staging.join(".classify-queue"))
+            .unwrap_or_default();
+        let count_second = queue_after_second.lines().filter(|l| !l.is_empty()).count();
+
+        assert_eq!(
+            count_first, count_second,
+            "re-ingesting should not add duplicate queue entries"
+        );
+    }
+
+    /// E1: Teams with no messages produce no .classify-queue entries.
+    #[test]
+    fn e1_no_messages_no_classify_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        let config = serde_json::json!({
+            "leadSessionId": "ses-lead-nomsg",
+            "createdAt": "2026-03-28T10:00:00Z",
+            "members": [
+                {"name": "worker", "model": "opus", "joinedAt": "2026-03-28T10:00:01Z"},
+            ]
+        });
+
+        setup_team_staging(
+            &staging,
+            "nomsg-team",
+            &config,
+            "",
+            &[], // no inboxes
+        );
+
+        let mut output = Vec::new();
+        ingest_agent_teams_from("user-history", &staging, &sessions, &mut output);
+
+        // .classify-queue should not exist or be empty
+        let queue_path = staging.join(".classify-queue");
+        let queue_content = std::fs::read_to_string(&queue_path).unwrap_or_default();
+        assert!(
+            queue_content.trim().is_empty(),
+            "no messages should produce no queue entries"
+        );
     }
 }

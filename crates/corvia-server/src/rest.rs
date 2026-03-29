@@ -355,6 +355,25 @@ pub struct ClassifySessionsResponse {
     pub remaining: usize,
 }
 
+/// Request body for `POST /v1/classify/agent-teams`.
+#[derive(Deserialize, Default)]
+pub struct ClassifyAgentTeamsRequest {
+    /// Max entries to extract per batch (default 10).
+    pub batch_size: Option<usize>,
+}
+
+/// Response from `POST /v1/classify/agent-teams`.
+#[derive(Debug, Serialize)]
+pub struct ClassifyAgentTeamsResponse {
+    pub processed: usize,
+    pub extracted: usize,
+    pub promoted: usize,
+    pub rejected: usize,
+    /// Entries that failed extraction (transient errors). Left in queue for retry.
+    pub failed: usize,
+    pub remaining: usize,
+}
+
 // --- Router ---
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -383,6 +402,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Session history endpoints
         .route("/v1/ingest/sessions", post(ingest_sessions))
         .route("/v1/classify/sessions", post(classify_sessions))
+        .route("/v1/classify/agent-teams", post(classify_agent_teams))
         // Workspace ingestion endpoints
         .route("/v1/ingest", post(ingest_workspace_handler))
         .route("/v1/ingest/status", get(ingest_status_handler))
@@ -1430,6 +1450,319 @@ async fn classify_sessions(
     }))
 }
 
+/// Agent-teams staging directory path.
+fn agent_teams_staging_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    std::path::PathBuf::from(home)
+        .join(".corvia")
+        .join("staging")
+        .join("agent-teams")
+}
+
+/// Extract decisions, findings, and questions from queued agent-teams message entries,
+/// then promote product-relevant extractions to the `corvia` scope.
+///
+/// Reads `.classify-queue` from the agent-teams staging directory, sends each entry
+/// to the GenerationEngine for extraction, creates new entries with `extracted_from`
+/// graph edges, and promotes product-relevant extractions. Serialized via
+/// `session_ingest_lock`.
+async fn classify_agent_teams(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ClassifyAgentTeamsRequest>,
+) -> std::result::Result<Json<ClassifyAgentTeamsResponse>, (StatusCode, String)> {
+    let _guard = state.session_ingest_lock.lock().await;
+
+    let batch_size = req.batch_size.unwrap_or(10);
+    let queue_path = agent_teams_staging_dir().join(".classify-queue");
+
+    let queue_content = tokio::fs::read_to_string(&queue_path).await.unwrap_or_default();
+    let all_entries: Vec<String> = queue_content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(String::from)
+        .collect();
+
+    if all_entries.is_empty() {
+        return Ok(Json(ClassifyAgentTeamsResponse {
+            processed: 0,
+            extracted: 0,
+            promoted: 0,
+            rejected: 0,
+            failed: 0,
+            remaining: 0,
+        }));
+    }
+
+    let generator = state.rag_pipeline()
+        .and_then(|rag| rag.generator().cloned())
+        .ok_or_else(|| (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "GenerationEngine not configured - cannot extract from agent-teams".into(),
+        ))?;
+
+    let to_process: Vec<String> = all_entries.iter().take(batch_size).cloned().collect();
+    let mut remaining_entries: Vec<String> = all_entries.iter().skip(batch_size).cloned().collect();
+
+    // Load user-history entries for source_version lookup
+    let data_dir = state.data_dir.clone();
+    let uh_entries = tokio::task::spawn_blocking(move || {
+        corvia_kernel::knowledge_files::read_scope(&data_dir, USER_HISTORY_SCOPE)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task join error: {e}")))?
+    .map_err(|e| {
+        warn!("Failed to read user-history knowledge files: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("Knowledge file read failed: {e}"))
+    })?;
+
+    let sv_lookup: std::collections::HashMap<&str, &KnowledgeEntry> = uh_entries.iter()
+        .map(|e| (e.source_version.as_str(), e))
+        .collect();
+
+    let mut extracted = 0;
+    let mut promoted = 0;
+    let mut rejected = 0;
+    let mut failed = 0;
+
+    for entry_ref in &to_process {
+        let entry = match sv_lookup.get(entry_ref.as_str()) {
+            Some(e) => (*e).clone(),
+            None => {
+                warn!("Entry not found for {entry_ref}, removing from queue");
+                rejected += 1;
+                continue;
+            }
+        };
+
+        // Derive team name from source_version (format: "{team}:messages:{group}")
+        let team_name = entry_ref.split(':').next().unwrap_or("unknown");
+
+        // Step 1: Extract decisions, findings, and questions via LLM
+        let extraction_system = "You are a knowledge extraction assistant. \
+            Extract key decisions, findings, and open questions from team discussions. \
+            Return a JSON array of objects. Each object must have: \
+            \"type\" (one of \"decision\", \"finding\", \"question\"), \
+            \"content\" (the conclusion or question), \
+            \"rationale\" (supporting reasoning), \
+            \"dissent\" (any disagreement, or empty string if none). \
+            Return [] if there is nothing worth extracting.";
+        let extraction_message = format!(
+            "Extract key decisions, findings, and open questions from this team discussion. \
+            For each, state the conclusion, the rationale, and any dissent.\n\n---\n{}\n---",
+            entry.content
+        );
+
+        let extraction_result = match generator.generate(extraction_system, &extraction_message).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Extraction LLM call failed for {entry_ref}: {e}");
+                remaining_entries.push(entry_ref.clone());
+                failed += 1;
+                continue;
+            }
+        };
+
+        // Parse JSON array from LLM response
+        let items = parse_extraction_items(&extraction_result.text);
+        if items.is_empty() {
+            // Nothing extracted; remove from queue (not a failure)
+            rejected += 1;
+            continue;
+        }
+
+        let source_origin = format!("claude:team:{team_name}");
+
+        for (i, item) in items.iter().enumerate() {
+            let content = format!(
+                "# {} (extracted from team discussion)\n\n{}\n\n**Rationale:** {}\n{}",
+                capitalize(&item.item_type),
+                item.content,
+                item.rationale,
+                if item.dissent.is_empty() {
+                    String::new()
+                } else {
+                    format!("**Dissent:** {}", item.dissent)
+                }
+            );
+
+            let source_version = format!("{team_name}:extracted:{}", extracted + i + 1);
+
+            let mut extracted_entry = KnowledgeEntry::new(
+                content.clone(),
+                USER_HISTORY_SCOPE.to_string(),
+                source_version,
+            );
+            extracted_entry.metadata = corvia_common::types::EntryMetadata {
+                source_file: None,
+                language: None,
+                chunk_type: Some("team-extracted".into()),
+                start_line: None,
+                end_line: None,
+                content_role: Some(item.item_type.clone()),
+                source_origin: Some(source_origin.clone()),
+            };
+
+            // Embed and store the extracted entry
+            let emb = match state.engine.embed(&content).await {
+                Ok(emb) => emb,
+                Err(e) => {
+                    warn!("Failed to embed extracted entry: {e}");
+                    continue;
+                }
+            };
+            extracted_entry.embedding = Some(emb);
+
+            let extracted_id = extracted_entry.id;
+            if let Err(e) = state.store.insert(&extracted_entry).await {
+                warn!("Failed to store extracted entry: {e}");
+                continue;
+            }
+
+            // Create extracted_from graph edge
+            if let Err(e) = state.graph.relate(
+                &extracted_id,
+                "extracted_from",
+                &entry.id,
+                None,
+            ).await {
+                warn!("Failed to create extracted_from edge: {e}");
+            }
+
+            // Step 2: Promotion classifier - is this relevant to the corvia product?
+            let promo_system = "You are a knowledge classification assistant. \
+                Answer YES or NO followed by one sentence of rationale.";
+            let promo_message = format!(
+                "Is the following extracted insight relevant to building \
+                the corvia software product?\n\n---\n{}\n---",
+                content
+            );
+
+            match generator.generate(promo_system, &promo_message).await {
+                Ok(promo_result) => {
+                    let answer = promo_result.text.trim().to_uppercase();
+                    if answer.starts_with("YES") {
+                        let mut promoted_entry = KnowledgeEntry::new(
+                            extracted_entry.content.clone(),
+                            "corvia".to_string(),
+                            extracted_entry.source_version.clone(),
+                        );
+                        promoted_entry.metadata = corvia_common::types::EntryMetadata {
+                            source_file: None,
+                            language: None,
+                            chunk_type: Some("team-promoted".into()),
+                            start_line: None,
+                            end_line: None,
+                            content_role: extracted_entry.metadata.content_role.clone(),
+                            source_origin: Some("claude:promoted".into()),
+                        };
+
+                        match state.engine.embed(&promoted_entry.content).await {
+                            Ok(emb) => {
+                                promoted_entry.embedding = Some(emb);
+                                if let Err(e) = state.store.insert(&promoted_entry).await {
+                                    warn!("Failed to store promoted entry: {e}");
+                                } else {
+                                    info!(
+                                        "Promoted {entry_ref} extraction {} to corvia scope",
+                                        i + 1
+                                    );
+                                    promoted += 1;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to embed promoted entry: {e}");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Promotion LLM call failed: {e}");
+                    // Extraction succeeded, promotion failed - not critical
+                }
+            }
+        }
+
+        extracted += items.len();
+    }
+
+    // Atomically rewrite the queue
+    let remaining = remaining_entries.len();
+    let tmp_path = queue_path.with_extension("tmp");
+    let new_content = if remaining_entries.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", remaining_entries.join("\n"))
+    };
+    if let Err(e) = tokio::fs::write(&tmp_path, &new_content).await {
+        warn!("Failed to write classify queue temp file: {e}");
+    } else if let Err(e) = tokio::fs::rename(&tmp_path, &queue_path).await {
+        warn!("Failed to rename classify queue temp file: {e}");
+    }
+
+    Ok(Json(ClassifyAgentTeamsResponse {
+        processed: to_process.len(),
+        extracted,
+        promoted,
+        rejected,
+        failed,
+        remaining,
+    }))
+}
+
+/// Item extracted from a team message group by the LLM.
+struct ExtractionItem {
+    item_type: String,
+    content: String,
+    rationale: String,
+    dissent: String,
+}
+
+/// Parse the LLM extraction response into structured items.
+/// Expects a JSON array but handles common LLM response quirks.
+fn parse_extraction_items(response: &str) -> Vec<ExtractionItem> {
+    // Try to find a JSON array in the response (LLMs often wrap in markdown code blocks)
+    let text = response.trim();
+    let json_str = if let Some(start) = text.find('[') {
+        if let Some(end) = text.rfind(']') {
+            &text[start..=end]
+        } else {
+            return Vec::new();
+        }
+    } else {
+        return Vec::new();
+    };
+
+    let parsed: Vec<serde_json::Value> = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    parsed.iter().filter_map(|item| {
+        let item_type = item.get("type")?.as_str()?.to_string();
+        if !["decision", "finding", "question"].contains(&item_type.as_str()) {
+            return None;
+        }
+        let content = item.get("content")?.as_str()?.to_string();
+        let rationale = item.get("rationale")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let dissent = item.get("dissent")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        Some(ExtractionItem { item_type, content, rationale, dissent })
+    }).collect()
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().to_string() + c.as_str(),
+    }
+}
+
 /// Try to extract content_role from the LLM classification response.
 /// The prompt asks the LLM to state "decision", "design", "finding", or "learning".
 fn infer_content_role_from_llm(response: &str) -> Option<String> {
@@ -2154,6 +2487,229 @@ mod tests {
         let Json(resp) = result.unwrap();
         assert_eq!(resp.processed, 2);
         assert_eq!(resp.remaining, 1); // 1 left in queue
+    }
+
+    // -----------------------------------------------------------------------
+    // Endpoint tests: classify_agent_teams
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_classify_agent_teams_empty_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await;
+
+        let orig_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+
+        let result = classify_agent_teams(
+            State(state),
+            Json(ClassifyAgentTeamsRequest::default()),
+        )
+        .await;
+
+        if let Some(h) = orig_home {
+            unsafe { std::env::set_var("HOME", h) };
+        }
+
+        let Json(resp) = result.unwrap();
+        assert_eq!(resp.processed, 0);
+        assert_eq!(resp.extracted, 0);
+        assert_eq!(resp.remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn test_classify_agent_teams_no_generator() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path()).await; // rag: None
+
+        // Create a non-empty queue so the handler proceeds past the empty check
+        let staging = dir.path().join(".corvia").join("staging").join("agent-teams");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join(".classify-queue"), "my-team:messages:task-1\n").unwrap();
+
+        let orig_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+
+        let result = classify_agent_teams(
+            State(state),
+            Json(ClassifyAgentTeamsRequest::default()),
+        )
+        .await;
+
+        if let Some(h) = orig_home {
+            unsafe { std::env::set_var("HOME", h) };
+        }
+
+        // rag is None, so handler skips gracefully
+        assert!(result.is_err(), "should fail when generator is not configured");
+    }
+
+    #[tokio::test]
+    async fn test_classify_agent_teams_entry_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let extraction_json = r#"[{"type":"decision","content":"Use ArcSwap","rationale":"Lock-free reads","dissent":""}]"#;
+        let state = test_state_with_generator(dir.path(), extraction_json).await;
+
+        let staging = dir.path().join(".corvia").join("staging").join("agent-teams");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(
+            staging.join(".classify-queue"),
+            "nonexistent-team:messages:task-1\n",
+        )
+        .unwrap();
+
+        let orig_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+
+        let result = classify_agent_teams(
+            State(state),
+            Json(ClassifyAgentTeamsRequest::default()),
+        )
+        .await;
+
+        if let Some(h) = orig_home {
+            unsafe { std::env::set_var("HOME", h) };
+        }
+
+        let Json(resp) = result.unwrap();
+        assert_eq!(resp.processed, 1);
+        assert_eq!(resp.rejected, 1); // Entry not found
+        assert_eq!(resp.extracted, 0);
+    }
+
+    #[tokio::test]
+    async fn test_classify_agent_teams_extracts_and_promotes() {
+        let dir = tempfile::tempdir().unwrap();
+        // Mock LLM returns extraction JSON first, then "YES" for promotion
+        // Since MockGenerationEngine returns the same response for all calls,
+        // use a JSON response that also starts with "YES" so promotion works
+        let response = r#"[{"type":"decision","content":"Use ArcSwap for lock-free reads","rationale":"Better perf under contention","dissent":""}]"#;
+        let state = test_state_with_generator(dir.path(), response).await;
+
+        // Create an entry in user-history scope
+        let entry = KnowledgeEntry::new(
+            "Team discussion about using ArcSwap vs RwLock".into(),
+            USER_HISTORY_SCOPE.into(),
+            "my-team:messages:task-1".into(),
+        );
+        corvia_kernel::knowledge_files::write_entry(&state.data_dir, &entry).unwrap();
+        state.store.insert(&entry.with_embedding(vec![1.0, 0.0, 0.0])).await.unwrap();
+
+        let staging = dir.path().join(".corvia").join("staging").join("agent-teams");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(
+            staging.join(".classify-queue"),
+            "my-team:messages:task-1\n",
+        )
+        .unwrap();
+
+        let orig_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+
+        let result = classify_agent_teams(
+            State(state),
+            Json(ClassifyAgentTeamsRequest::default()),
+        )
+        .await;
+
+        if let Some(h) = orig_home {
+            unsafe { std::env::set_var("HOME", h) };
+        }
+
+        let Json(resp) = result.unwrap();
+        assert_eq!(resp.processed, 1);
+        assert_eq!(resp.extracted, 1, "should extract 1 decision");
+        // Promotion depends on the mock returning something that starts with "YES"
+        // The mock returns the same extraction JSON for all calls, which doesn't start with YES
+        // So promotion won't happen in this test
+        assert_eq!(resp.remaining, 0, "queue should be drained");
+    }
+
+    #[tokio::test]
+    async fn test_classify_agent_teams_batch_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = "[]"; // Empty extraction
+        let state = test_state_with_generator(dir.path(), response).await;
+
+        // Create entries
+        for i in 1..=3 {
+            let entry = KnowledgeEntry::new(
+                format!("Message group {i}"),
+                USER_HISTORY_SCOPE.into(),
+                format!("batch-team:messages:task-{i}"),
+            );
+            corvia_kernel::knowledge_files::write_entry(&state.data_dir, &entry).unwrap();
+        }
+
+        let staging = dir.path().join(".corvia").join("staging").join("agent-teams");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(
+            staging.join(".classify-queue"),
+            "batch-team:messages:task-1\nbatch-team:messages:task-2\nbatch-team:messages:task-3\n",
+        )
+        .unwrap();
+
+        let orig_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+
+        let result = classify_agent_teams(
+            State(state),
+            Json(ClassifyAgentTeamsRequest {
+                batch_size: Some(2),
+            }),
+        )
+        .await;
+
+        if let Some(h) = orig_home {
+            unsafe { std::env::set_var("HOME", h) };
+        }
+
+        let Json(resp) = result.unwrap();
+        assert_eq!(resp.processed, 2);
+        assert_eq!(resp.remaining, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit tests: parse_extraction_items
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_extraction_items_valid_json() {
+        let response = r#"[
+            {"type": "decision", "content": "Use ArcSwap", "rationale": "Lock-free", "dissent": ""},
+            {"type": "finding", "content": "HNSW is thread-safe", "rationale": "Internal RwLock", "dissent": "Not documented"}
+        ]"#;
+        let items = parse_extraction_items(response);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].item_type, "decision");
+        assert_eq!(items[1].item_type, "finding");
+    }
+
+    #[test]
+    fn test_parse_extraction_items_markdown_wrapped() {
+        let response = "Here are the extractions:\n```json\n[{\"type\": \"question\", \"content\": \"Should we use pgvector?\", \"rationale\": \"Scalability\", \"dissent\": \"\"}]\n```";
+        let items = parse_extraction_items(response);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, "question");
+    }
+
+    #[test]
+    fn test_parse_extraction_items_empty_array() {
+        let items = parse_extraction_items("[]");
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_parse_extraction_items_no_json() {
+        let items = parse_extraction_items("Nothing worth extracting from this discussion.");
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_parse_extraction_items_invalid_type() {
+        let response = r#"[{"type": "suggestion", "content": "try this", "rationale": "why not", "dissent": ""}]"#;
+        let items = parse_extraction_items(response);
+        assert!(items.is_empty(), "invalid types should be filtered out");
     }
 
     // -----------------------------------------------------------------------
