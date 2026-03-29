@@ -967,8 +967,33 @@ fn collect_js_import_names(names: &mut Vec<String>, source: &str, node: &Node) {
 // Python relation extraction
 // ---------------------------------------------------------------------------
 
+/// Python deny-list: common builtins and methods that would create edge explosion.
+const PYTHON_CALL_DENY_LIST: &[&str] = &[
+    "print", "len", "str", "int", "float", "bool", "list", "dict",
+    "set", "tuple", "range", "enumerate", "zip", "map", "filter",
+    "sorted", "reversed", "isinstance", "issubclass", "hasattr",
+    "getattr", "setattr", "super", "type", "id", "repr", "hash",
+    "next", "iter", "open", "format", "input", "vars", "dir",
+    "append", "extend", "insert", "remove", "pop", "get", "keys",
+    "values", "items", "update", "join", "split", "strip",
+    "replace", "startswith", "endswith", "lower", "upper",
+];
+
+/// Python dunder methods that are noise (common protocol methods).
+/// Structurally meaningful dunders like __enter__/__exit__ are NOT denied.
+const PYTHON_DUNDER_DENY_LIST: &[&str] = &[
+    "__init__", "__str__", "__repr__", "__eq__", "__hash__", "__len__",
+    "__getitem__", "__setitem__", "__delitem__", "__contains__",
+];
+
+/// Python base classes that add noise (common builtins/ABCs).
+const PYTHON_BASE_CLASS_DENY_LIST: &[&str] = &[
+    "object", "ABC", "Exception", "BaseException", "type",
+    "dict", "list", "tuple", "set",
+];
+
 fn extract_python_relations(
-    _file_path: &str,
+    file_path: &str,
     source: &str,
     chunks: &[CodeChunk],
 ) -> Vec<CodeRelation> {
@@ -985,6 +1010,7 @@ fn extract_python_relations(
     let root = tree.root_node();
     let mut cursor = root.walk();
 
+    // Pass 1: Walk top-level children for imports and class definitions
     if cursor.goto_first_child() {
         loop {
             let node = cursor.node();
@@ -995,19 +1021,18 @@ fn extract_python_relations(
                 continue;
             }
 
-            let owner_idx = find_owning_chunk(chunks, node.start_position().row as u32 + 1);
+            let owner_idx = find_chunk_by_line(chunks, node.start_position().row as u32 + 1);
 
             match node.kind() {
                 "import_statement" => {
-                    // `import os` / `import sys`
-                    // name field(s) are dotted_name children
                     for i in 0..node.child_count() {
                         let Some(child) = node.child(i as u32) else {
                             continue;
                         };
-                        if child.is_named() && (child.kind() == "dotted_name" || child.kind() == "aliased_import") {
+                        if child.is_named()
+                            && (child.kind() == "dotted_name" || child.kind() == "aliased_import")
+                        {
                             let module_text = source[child.byte_range()].to_string();
-                            // For aliased_import, extract the module part
                             let module_name = if child.kind() == "aliased_import" {
                                 child
                                     .child_by_field_name("name")
@@ -1026,13 +1051,11 @@ fn extract_python_relations(
                     }
                 }
                 "import_from_statement" => {
-                    // `from pathlib import Path`
                     let module_path = node
                         .child_by_field_name("module_name")
                         .map(|m| source[m.byte_range()].to_string())
                         .unwrap_or_default();
 
-                    // Collect imported names
                     let mut imported_names = Vec::new();
                     for i in 0..node.child_count() {
                         let Some(child) = node.child(i as u32) else {
@@ -1072,6 +1095,20 @@ fn extract_python_relations(
                         }
                     }
                 }
+                "class_definition" | "decorated_definition" => {
+                    // Handle decorated classes: unwrap to the inner class_definition
+                    let class_node = if node.kind() == "decorated_definition" {
+                        node.child_by_field_name("definition")
+                            .filter(|d| d.kind() == "class_definition")
+                    } else {
+                        Some(node)
+                    };
+                    if let Some(cls) = class_node {
+                        extract_python_class_bases(
+                            &mut relations, source, &cls, file_path, chunks,
+                        );
+                    }
+                }
                 _ => {}
             }
 
@@ -1081,7 +1118,156 @@ fn extract_python_relations(
         }
     }
 
+    // Pass 2: Recursive walk for call expressions (catches nested/method calls)
+    extract_python_calls(&mut relations, source, &root, file_path, chunks);
+
     relations
+}
+
+/// Extract `extends` relations from a Python class_definition's superclass list.
+///
+/// `class Foo(Bar, Baz):` -> two extends relations.
+/// Skips keyword arguments like `metaclass=ABCMeta`.
+/// Skips noise base classes: object, ABC, Exception, etc.
+fn extract_python_class_bases(
+    relations: &mut Vec<CodeRelation>,
+    source: &str,
+    node: &Node,
+    file_path: &str,
+    chunks: &[CodeChunk],
+) {
+    let owner_idx = find_chunk_by_line(chunks, node.start_position().row as u32 + 1);
+
+    // superclasses field returns an argument_list node
+    let Some(superclasses) = node.child_by_field_name("superclasses") else {
+        return;
+    };
+
+    for i in 0..superclasses.child_count() {
+        let Some(child) = superclasses.child(i as u32) else {
+            continue;
+        };
+        if !child.is_named() {
+            continue;
+        }
+        // Skip keyword arguments: `metaclass=ABCMeta`
+        if child.kind() == "keyword_argument" {
+            continue;
+        }
+
+        let base_name = match child.kind() {
+            "identifier" => source[child.byte_range()].to_string(),
+            "attribute" => {
+                // e.g., `module.ClassName` -> extract "ClassName" (last segment)
+                child
+                    .child_by_field_name("attribute")
+                    .map(|a| source[a.byte_range()].to_string())
+                    .unwrap_or_else(|| {
+                        let text = source[child.byte_range()].to_string();
+                        text.rsplit('.').next().unwrap_or(&text).to_string()
+                    })
+            }
+            _ => continue,
+        };
+
+        // Skip noise base classes
+        if PYTHON_BASE_CLASS_DENY_LIST.contains(&base_name.as_str()) {
+            continue;
+        }
+
+        relations.push(CodeRelation {
+            from_chunk_index: owner_idx,
+            relation: "extends".to_string(),
+            to_file: file_path.to_string(),
+            to_name: Some(base_name),
+        });
+    }
+}
+
+/// Extract "calls" relations from Python code via recursive AST walk.
+///
+/// Python uses `call` node kind (not `call_expression`).
+/// Handles `self.method()`, `super().__init__()`, deny-listed builtins and dunders.
+fn extract_python_calls(
+    relations: &mut Vec<CodeRelation>,
+    source: &str,
+    root: &Node,
+    file_path: &str,
+    chunks: &[CodeChunk],
+) {
+    let mut call_nodes = Vec::new();
+    collect_python_calls(root, &mut call_nodes, 0);
+
+    for call_node in &call_nodes {
+        let Some(func_node) = call_node.child_by_field_name("function") else {
+            continue;
+        };
+
+        let fn_name = extract_python_call_name(source, &func_node);
+
+        // Skip deny-listed builtins
+        if PYTHON_CALL_DENY_LIST.contains(&fn_name.as_str()) {
+            continue;
+        }
+        // Skip deny-listed dunders
+        if PYTHON_DUNDER_DENY_LIST.contains(&fn_name.as_str()) {
+            continue;
+        }
+        // Skip single-char or empty names
+        if fn_name.len() <= 1 {
+            continue;
+        }
+
+        let owner_idx = find_chunk_by_line(chunks, call_node.start_position().row as u32 + 1);
+
+        relations.push(CodeRelation {
+            from_chunk_index: owner_idx,
+            relation: "calls".to_string(),
+            to_file: file_path.to_string(),
+            to_name: Some(fn_name),
+        });
+    }
+}
+
+/// Recursively collect `call` nodes from the Python AST, with depth limit.
+/// Python uses `call` not `call_expression`.
+fn collect_python_calls<'a>(node: &Node<'a>, results: &mut Vec<Node<'a>>, depth: usize) {
+    if depth > 20 {
+        return;
+    }
+    if node.kind() == "call" {
+        results.push(*node);
+    }
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            collect_python_calls(&cursor.node(), results, depth + 1);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+
+/// Extract the function/method name from a Python call's function node.
+/// Handles: identifiers, attribute access (`self.foo`, `obj.bar.baz`).
+fn extract_python_call_name(source: &str, node: &Node) -> String {
+    match node.kind() {
+        "identifier" => source[node.byte_range()].to_string(),
+        "attribute" => {
+            // `self.foo` -> "foo", `a.b.c` -> "c"
+            node.child_by_field_name("attribute")
+                .map(|a| source[a.byte_range()].to_string())
+                .unwrap_or_else(|| {
+                    let text = source[node.byte_range()].to_string();
+                    text.rsplit('.').next().unwrap_or(&text).to_string()
+                })
+        }
+        _ => {
+            let text = source[node.byte_range()].to_string();
+            text.rsplit('.').next().unwrap_or(&text).to_string()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2050,5 +2236,246 @@ fn main() {
             .filter(|r| r.relation == "calls")
             .collect();
         assert!(!calls.is_empty(), "Rust calls should still work");
+    }
+
+    // -----------------------------------------------------------------------
+    // P2: Python class inheritance and function call tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_python_class_extends_single() {
+        let source = r#"
+class Animal:
+    def speak(self):
+        pass
+
+class Dog(Animal):
+    def speak(self):
+        return "woof"
+"#;
+        let result = chunk_file_with_relations("app.py", source, "py");
+        let extends: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "extends")
+            .collect();
+        assert_eq!(extends.len(), 1, "Expected 1 extends relation, got {}", extends.len());
+        assert_eq!(extends[0].to_name.as_deref(), Some("Animal"));
+    }
+
+    #[test]
+    fn test_python_class_multiple_superclasses() {
+        let source = r#"
+class Mixin1:
+    pass
+
+class Mixin2:
+    pass
+
+class Combined(Mixin1, Mixin2):
+    def run(self):
+        pass
+"#;
+        let result = chunk_file_with_relations("app.py", source, "py");
+        let extends: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "extends")
+            .collect();
+        assert_eq!(extends.len(), 2, "Expected 2 extends relations for multiple inheritance");
+        let names: Vec<&str> = extends.iter().filter_map(|r| r.to_name.as_deref()).collect();
+        assert!(names.contains(&"Mixin1"));
+        assert!(names.contains(&"Mixin2"));
+    }
+
+    #[test]
+    fn test_python_class_skips_object_and_abc() {
+        let source = r#"
+from abc import ABC
+
+class Foo(object):
+    def run(self):
+        pass
+
+class Bar(ABC):
+    def run(self):
+        pass
+"#;
+        let result = chunk_file_with_relations("app.py", source, "py");
+        let extends: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "extends")
+            .collect();
+        assert!(
+            extends.is_empty(),
+            "object and ABC should be skipped, got: {:?}",
+            extends.iter().map(|r| r.to_name.as_deref()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_python_self_method_call() {
+        let source = r#"
+class MyClass:
+    def helper(self):
+        return 42
+
+    def process(self):
+        result = self.helper()
+        return result
+"#;
+        let result = chunk_file_with_relations("app.py", source, "py");
+        let calls: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "calls")
+            .collect();
+        let names: Vec<&str> = calls.iter().filter_map(|r| r.to_name.as_deref()).collect();
+        assert!(
+            names.contains(&"helper"),
+            "Should extract 'helper' from self.helper(), got: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_python_deny_listed_builtins() {
+        let source = r#"
+def process():
+    print("hello")
+    x = len([1, 2, 3])
+    y = str(42)
+    items = sorted([3, 1, 2])
+    d = dict()
+    return True
+"#;
+        let result = chunk_file_with_relations("app.py", source, "py");
+        let calls: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "calls")
+            .collect();
+        for call in &calls {
+            let name = call.to_name.as_deref().unwrap_or("");
+            assert!(
+                !["print", "len", "str", "sorted", "dict"].contains(&name),
+                "Deny-listed builtin '{name}' should have been filtered"
+            );
+        }
+    }
+
+    #[test]
+    fn test_python_super_init_denied() {
+        let source = r#"
+class Child(Parent):
+    def __init__(self):
+        super().__init__()
+        self.value = 42
+"#;
+        let result = chunk_file_with_relations("app.py", source, "py");
+        let calls: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "calls")
+            .collect();
+        let names: Vec<&str> = calls.iter().filter_map(|r| r.to_name.as_deref()).collect();
+        // super is in PYTHON_CALL_DENY_LIST, __init__ is in PYTHON_DUNDER_DENY_LIST
+        assert!(
+            !names.contains(&"super"),
+            "super() should be deny-listed"
+        );
+        assert!(
+            !names.contains(&"__init__"),
+            "__init__ should be deny-listed"
+        );
+    }
+
+    #[test]
+    fn test_python_private_helper_not_skipped() {
+        let source = r#"
+def _private_helper():
+    return 42
+
+def public_fn():
+    result = _private_helper()
+    return result
+"#;
+        let result = chunk_file_with_relations("app.py", source, "py");
+        let calls: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "calls")
+            .collect();
+        let names: Vec<&str> = calls.iter().filter_map(|r| r.to_name.as_deref()).collect();
+        assert!(
+            names.contains(&"_private_helper"),
+            "_private_helper should NOT be skipped (only specific dunders are denied), got: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_python_decorated_class() {
+        let source = r#"
+from dataclasses import dataclass
+
+class Base:
+    pass
+
+@dataclass
+class Derived(Base):
+    name: str
+    value: int
+"#;
+        let result = chunk_file_with_relations("app.py", source, "py");
+        let extends: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "extends")
+            .collect();
+        assert_eq!(extends.len(), 1, "Decorated class should have extends relation");
+        assert_eq!(extends[0].to_name.as_deref(), Some("Base"));
+    }
+
+    #[test]
+    fn test_python_metaclass_keyword_skipped() {
+        let source = r#"
+from abc import ABCMeta
+
+class MyAbstract(SomeBase, metaclass=ABCMeta):
+    def run(self):
+        pass
+"#;
+        let result = chunk_file_with_relations("app.py", source, "py");
+        let extends: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "extends")
+            .collect();
+        assert_eq!(extends.len(), 1, "Should extract SomeBase but not metaclass=ABCMeta");
+        assert_eq!(extends[0].to_name.as_deref(), Some("SomeBase"));
+    }
+
+    #[test]
+    fn test_python_existing_imports_unchanged() {
+        // Regression: existing Python import extraction must still work
+        let source = r#"
+import os
+from pathlib import Path
+
+class MyClass:
+    def method(self):
+        pass
+"#;
+        let result = chunk_file_with_relations("app.py", source, "py");
+        let imports: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "imports")
+            .collect();
+        assert!(imports.len() >= 2, "Python imports should still work");
+        assert!(imports.iter().any(|r| r.to_name.as_deref() == Some("os")));
+        assert!(imports.iter().any(|r| r.to_name.as_deref() == Some("Path")));
     }
 }
