@@ -372,6 +372,41 @@ pub fn visibility_filter(
 /// 3. Deduplicate and blend scores: `final = (1-α)*cosine + α*(1/(hop+1))`.
 ///
 /// When `expand_graph` is false in the opts, behaves identically to
+/// Maximum edges to expand per node. When a node has more edges than this,
+/// only the top edges (sorted by relation_weight * direction_bias) are expanded.
+const MAX_EDGES_PER_NODE: usize = 50;
+
+/// Return a weight for a graph relation type. Higher = more structurally significant.
+/// These are initial values subject to tuning based on retrieval quality benchmarks.
+pub fn relation_weight(relation: &str) -> f32 {
+    match relation {
+        "implements" => 0.9,
+        "extends" => 0.85,
+        "calls" => 0.7,
+        "imports" => 0.5,
+        "uses" => 0.4,
+        "contains" => 0.3,
+        "references" => 0.2,
+        _ => 0.5, // unknown relations get neutral weight
+    }
+}
+
+/// Return a direction bias for a relation type.
+/// Some relations are more valuable when followed in a specific direction.
+pub fn direction_bias(relation: &str, is_outgoing: bool) -> f32 {
+    match relation {
+        "calls" | "imports" => {
+            if is_outgoing { 1.0 } else { 0.8 }
+        }
+        "references" => {
+            // Incoming references are more valuable (docs/tests pointing at code)
+            if is_outgoing { 0.8 } else { 1.0 }
+        }
+        // implements, extends, contains, uses: symmetric
+        _ => 1.0,
+    }
+}
+
 /// [`VectorRetriever`] (graph_expanded == 0).
 ///
 /// **Deprecated:** Use [`pipeline::GraphExpander`](crate::pipeline::expander::GraphExpander)
@@ -469,25 +504,38 @@ impl Retriever for GraphExpandRetriever {
         if opts.expand_graph {
             // Hop 1: follow edges from each vector result.
             for sr in &raw_results {
-                let edges = self
+                let mut edges = self
                     .graph
                     .edges(&sr.entry.id, EdgeDirection::Both)
                     .await?;
+
+                // Max-edges-per-node guard: when a node has many edges, expand only
+                // the top MAX_EDGES_PER_NODE sorted by relation_weight * direction_bias.
+                if edges.len() > MAX_EDGES_PER_NODE {
+                    edges.sort_unstable_by(|a, b| {
+                        let score_a = relation_weight(&a.relation)
+                            * direction_bias(&a.relation, a.from == sr.entry.id);
+                        let score_b = relation_weight(&b.relation)
+                            * direction_bias(&b.relation, b.from == sr.entry.id);
+                        score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    edges.truncate(MAX_EDGES_PER_NODE);
+                }
+
                 for edge in &edges {
-                    // Determine the neighbor ID (the other end of the edge).
-                    let neighbor_id = if edge.from == sr.entry.id {
-                        edge.to
-                    } else {
-                        edge.from
-                    };
+                    // Determine the neighbor ID and direction.
+                    let is_outgoing = edge.from == sr.entry.id;
+                    let neighbor_id = if is_outgoing { edge.to } else { edge.from };
+
+                    let rel_weight = relation_weight(&edge.relation);
+                    let dir_bias = direction_bias(&edge.relation, is_outgoing);
+                    let edge_score = rel_weight * dir_bias;
 
                     if seen.contains(&neighbor_id) {
-                        // Reinforce with diminishing returns: each hit gives 50% less than previous.
-                        // Hit 1: alpha*0.25, Hit 2: alpha*0.125, Hit 3: alpha*0.0625, ...
-                        // Converges to alpha*0.5 total, preventing runaway but rewarding connectivity.
+                        // Reinforce with diminishing returns, scaled by relation weight.
                         let count = reinforcement_counts.entry(neighbor_id).or_insert(0);
                         let decay = 0.5_f32.powi(*count as i32);
-                        let bonus = self.alpha * 0.25 * decay;
+                        let bonus = self.alpha * 0.25 * decay * rel_weight;
                         if bonus > 0.001 {
                             if let Some(existing) = scored.iter_mut().find(|(_, sr)| sr.entry.id == neighbor_id) {
                                 existing.0 += bonus;
@@ -508,14 +556,15 @@ impl Retriever for GraphExpandRetriever {
                             continue;
                         }
                         seen.insert(neighbor_id);
-                        // Blend cosine similarity with graph proximity, apply tier_weight:
-                        // final = ((1-α)*cosine + α*0.5) * tier_weight
+                        // Blend cosine with relation-weighted graph proximity:
+                        // final = ((1-α)*cosine + α*edge_score) * tier_weight
                         let cosine = neighbor_entry
                             .embedding
                             .as_ref()
                             .map(|emb| cosine_similarity(&embedding, emb))
                             .unwrap_or(0.0);
-                        let blended = ((1.0 - self.alpha) * cosine + self.alpha * 0.5) * tier_weight(neighbor_entry.tier);
+                        let blended = ((1.0 - self.alpha) * cosine + self.alpha * edge_score)
+                            * tier_weight(neighbor_entry.tier);
                         scored.push((
                             blended,
                             SearchResult {
@@ -531,6 +580,7 @@ impl Retriever for GraphExpandRetriever {
             }
 
             // Deeper hops (graph_depth > 1): use traverse for each vector result.
+            // Hop 2+ scores decay by 0.67 per hop relative to hop 1.
             if opts.graph_depth > 1 {
                 for sr in &raw_results {
                     let deep_entries = self
@@ -545,9 +595,10 @@ impl Retriever for GraphExpandRetriever {
                     for entry in deep_entries {
                         if seen.contains(&entry.id) {
                             // Reinforce with diminishing returns for deeper hops.
+                            // Use neutral weight (0.5) since traverse doesn't expose relation types.
                             let count = reinforcement_counts.entry(entry.id).or_insert(0);
                             let decay = 0.5_f32.powi(*count as i32);
-                            let bonus = self.alpha * 0.15 * decay;
+                            let bonus = self.alpha * 0.15 * decay * 0.5;
                             if bonus > 0.001 {
                                 if let Some(existing) = scored.iter_mut().find(|(_, sr)| sr.entry.id == entry.id) {
                                     existing.0 += bonus;
@@ -565,14 +616,15 @@ impl Retriever for GraphExpandRetriever {
                             continue;
                         }
                         seen.insert(entry.id);
-                        // Blend cosine similarity with graph proximity (hop 2+), apply tier_weight:
-                        // final = ((1-α)*cosine + α*(1/3)) * tier_weight
+                        // Hop 2+ proximity decays: base * 0.67
+                        // final = ((1-α)*cosine + α*(0.5 * 0.67)) * tier_weight
                         let cosine = entry
                             .embedding
                             .as_ref()
                             .map(|emb| cosine_similarity(&embedding, emb))
                             .unwrap_or(0.0);
-                        let blended = ((1.0 - self.alpha) * cosine + self.alpha * (1.0 / 3.0)) * tier_weight(entry.tier);
+                        let blended = ((1.0 - self.alpha) * cosine + self.alpha * (0.5 * 0.67))
+                            * tier_weight(entry.tier);
                         scored.push((
                             blended,
                             SearchResult {
@@ -2011,5 +2063,111 @@ mod tests {
         let result = &results[0];
         assert_eq!(result.tier, Tier::Warm, "SearchResult should carry tier from entry");
         assert_eq!(result.retention_score, Some(0.45), "SearchResult should carry retention_score from entry");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P4: Edge weight scoring and direction bias tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod edge_weight_tests {
+    use super::*;
+
+    #[test]
+    fn test_relation_weight_known_types() {
+        assert_eq!(relation_weight("implements"), 0.9);
+        assert_eq!(relation_weight("extends"), 0.85);
+        assert_eq!(relation_weight("calls"), 0.7);
+        assert_eq!(relation_weight("imports"), 0.5);
+        assert_eq!(relation_weight("uses"), 0.4);
+        assert_eq!(relation_weight("contains"), 0.3);
+        assert_eq!(relation_weight("references"), 0.2);
+    }
+
+    #[test]
+    fn test_relation_weight_unknown_fallback() {
+        assert_eq!(relation_weight("custom_edge"), 0.5);
+        assert_eq!(relation_weight(""), 0.5);
+    }
+
+    #[test]
+    fn test_implements_scores_higher_than_imports() {
+        // Same cosine, different relation -> implements should score higher
+        let alpha = 0.3;
+        let cosine = 0.6;
+        let implements_score = (1.0 - alpha) * cosine + alpha * relation_weight("implements");
+        let imports_score = (1.0 - alpha) * cosine + alpha * relation_weight("imports");
+        assert!(
+            implements_score > imports_score,
+            "implements ({}) should score higher than imports ({})",
+            implements_score,
+            imports_score
+        );
+    }
+
+    #[test]
+    fn test_direction_bias_calls_outgoing_higher() {
+        let outgoing = direction_bias("calls", true);
+        let incoming = direction_bias("calls", false);
+        assert!(
+            outgoing > incoming,
+            "Outgoing calls ({}) should score higher than incoming ({})",
+            outgoing,
+            incoming
+        );
+    }
+
+    #[test]
+    fn test_direction_bias_references_incoming_higher() {
+        let outgoing = direction_bias("references", true);
+        let incoming = direction_bias("references", false);
+        assert!(
+            incoming > outgoing,
+            "Incoming references ({}) should score higher than outgoing ({})",
+            incoming,
+            outgoing
+        );
+    }
+
+    #[test]
+    fn test_direction_bias_symmetric_types() {
+        for rel in &["implements", "extends", "contains", "uses"] {
+            let outgoing = direction_bias(rel, true);
+            let incoming = direction_bias(rel, false);
+            assert_eq!(
+                outgoing, incoming,
+                "{rel} should be symmetric (outgoing={outgoing}, incoming={incoming})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reinforcement_scaled_by_relation_weight() {
+        let alpha = 0.3;
+        let decay = 1.0; // first hit
+        let implements_bonus = alpha * 0.25 * decay * relation_weight("implements");
+        let imports_bonus = alpha * 0.25 * decay * relation_weight("imports");
+        assert!(
+            implements_bonus > imports_bonus,
+            "implements reinforcement ({}) should be higher than imports ({})",
+            implements_bonus,
+            imports_bonus
+        );
+    }
+
+    #[test]
+    fn test_edge_score_combines_weight_and_direction() {
+        let rel = "calls";
+        let outgoing_score = relation_weight(rel) * direction_bias(rel, true);
+        let incoming_score = relation_weight(rel) * direction_bias(rel, false);
+        assert_eq!(outgoing_score, 0.7 * 1.0);
+        assert_eq!(incoming_score, 0.7 * 0.8);
+        assert!(outgoing_score > incoming_score);
+    }
+
+    #[test]
+    fn test_max_edges_per_node_constant() {
+        assert_eq!(MAX_EDGES_PER_NODE, 50);
     }
 }
