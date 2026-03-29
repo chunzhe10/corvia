@@ -76,6 +76,7 @@ struct SourceMetadata {
 }
 
 /// A graph edge hint for the kernel to create after storing entries.
+/// Mirrors `corvia_kernel::chunking_strategy::EdgeHint` (canonical definition).
 #[derive(Debug, Clone, Serialize)]
 struct EdgeHint {
     relation: String,

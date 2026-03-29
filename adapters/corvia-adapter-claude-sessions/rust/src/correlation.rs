@@ -272,7 +272,7 @@ fn match_by_temporal(
     for (session_id, _summary) in unmatched_transcripts {
         if let Some(first_ts) = get_first_message_timestamp(session_id, sessions_dir) {
             let diff = timestamp_diff_ms(joined_at, &first_ts).unwrap_or(i64::MAX);
-            let abs_diff = diff.unsigned_abs() as i64;
+            let abs_diff = i64::try_from(diff.unsigned_abs()).unwrap_or(i64::MAX);
 
             if abs_diff < best_match.as_ref().map(|(_, d)| *d).unwrap_or(i64::MAX) {
                 best_match = Some((session_id.to_string(), abs_diff));
@@ -308,41 +308,32 @@ fn get_first_message_timestamp(session_id: &str, sessions_dir: &Path) -> Option<
 }
 
 /// Compute approximate millisecond difference between two ISO 8601 timestamps.
-/// Returns None if parsing fails.
+/// Returns None if parsing fails. Includes date component to handle midnight crossings.
 fn timestamp_diff_ms(a: &str, b: &str) -> Option<i64> {
-    // Simple lexicographic comparison for ISO 8601 strings.
-    // For precise ms diff, we'd need chrono, but for correlation within 30s
-    // window, lexicographic ordering of ISO timestamps is sufficient.
-    // We compare the first 23 chars (YYYY-MM-DDTHH:MM:SS.mmm) as a proxy.
-    let a_norm = normalize_timestamp(a);
-    let b_norm = normalize_timestamp(b);
-
-    if a_norm.len() < 19 || b_norm.len() < 19 {
-        return None;
-    }
-
-    // Parse hours, minutes, seconds from the timestamp
-    let a_secs = parse_total_seconds(&a_norm)?;
-    let b_secs = parse_total_seconds(&b_norm)?;
-
+    let a_secs = parse_epoch_seconds(a)?;
+    let b_secs = parse_epoch_seconds(b)?;
     Some((a_secs - b_secs) * 1000)
 }
 
-fn normalize_timestamp(ts: &str) -> String {
-    ts.replace('Z', "+00:00")
-}
-
-fn parse_total_seconds(ts: &str) -> Option<i64> {
-    // Assumes ISO 8601: YYYY-MM-DDTHH:MM:SS...
-    let t_pos = ts.find('T')?;
-    let time_part = &ts[t_pos + 1..];
-    if time_part.len() < 8 {
+/// Parse an ISO 8601 timestamp into approximate seconds since epoch.
+/// Handles YYYY-MM-DDTHH:MM:SS format with day-level precision for dates.
+fn parse_epoch_seconds(ts: &str) -> Option<i64> {
+    let ts = ts.trim_end_matches('Z');
+    if ts.len() < 19 {
         return None;
     }
-    let hours: i64 = time_part[0..2].parse().ok()?;
-    let minutes: i64 = time_part[3..5].parse().ok()?;
-    let seconds: i64 = time_part[6..8].parse().ok()?;
-    Some(hours * 3600 + minutes * 60 + seconds)
+    // Parse date: YYYY-MM-DD
+    let year: i64 = ts[0..4].parse().ok()?;
+    let month: i64 = ts[5..7].parse().ok()?;
+    let day: i64 = ts[8..10].parse().ok()?;
+    // Parse time: HH:MM:SS
+    let hours: i64 = ts[11..13].parse().ok()?;
+    let minutes: i64 = ts[14..16].parse().ok()?;
+    let seconds: i64 = ts[17..19].parse().ok()?;
+    // Approximate day-of-year (sufficient for diff within a few days)
+    let day_of_year = (month - 1) * 30 + day; // Approximate, sufficient for diff
+    let total = (year * 365 + day_of_year) * 86400 + hours * 3600 + minutes * 60 + seconds;
+    Some(total)
 }
 
 // ---------------------------------------------------------------------------

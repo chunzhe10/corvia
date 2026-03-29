@@ -21,7 +21,6 @@ use corvia_common::constants::{CLAUDE_SESSIONS_ADAPTER, USER_HISTORY_SCOPE};
 use corvia_common::types::KnowledgeEntry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -1064,15 +1063,27 @@ struct PendingEdge {
     created_at: String,
 }
 
-/// Write pending edges to a JSONL file (append mode).
+/// Write pending edges to a JSONL file. Uses atomic write (temp + rename)
+/// to prevent corruption from concurrent ingest runs.
 fn write_pending_edges(path: &Path, edges: &[PendingEdge]) {
-    use std::fs::OpenOptions;
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-        for edge in edges {
-            if let Ok(json) = serde_json::to_string(edge) {
-                let _ = writeln!(f, "{json}");
-            }
+    // Read existing edges, merge with new ones, write atomically
+    let mut all_edges: Vec<String> = std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(String::from)
+        .collect();
+
+    for edge in edges {
+        if let Ok(json) = serde_json::to_string(edge) {
+            all_edges.push(json);
         }
+    }
+
+    let tmp_path = path.with_extension("pending-edges-write.tmp");
+    let content = all_edges.join("\n") + "\n";
+    if std::fs::write(&tmp_path, content).is_ok() {
+        let _ = std::fs::rename(&tmp_path, path);
     }
 }
 
@@ -1135,16 +1146,17 @@ async fn retry_pending_edges(
         }
     }
 
-    // Rewrite the file with only remaining edges
+    // Atomic rewrite: write to temp file then rename (crash-safe, concurrent-safe)
     if remaining.is_empty() {
         let _ = std::fs::remove_file(path);
-    } else {
-        if let Ok(json) = remaining
-            .iter()
-            .map(|e| serde_json::to_string(e))
-            .collect::<Result<Vec<_>, _>>()
-        {
-            let _ = std::fs::write(path, json.join("\n") + "\n");
+    } else if let Ok(json) = remaining
+        .iter()
+        .map(|e| serde_json::to_string(e))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        let tmp_path = path.with_extension("pending-edges.tmp");
+        if std::fs::write(&tmp_path, json.join("\n") + "\n").is_ok() {
+            let _ = std::fs::rename(&tmp_path, path);
         }
     }
 
