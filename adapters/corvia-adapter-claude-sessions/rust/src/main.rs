@@ -806,7 +806,7 @@ fn ingest_agent_teams_from<W: Write>(
     team_dirs.sort_by_key(|e| e.file_name());
 
     let scope_id_owned = scope_id.to_string();
-    let mut classify_entries: Vec<String> = Vec::new();
+    let queue_path = staging_root.join(".classify-queue");
 
     for entry in &team_dirs {
         let team_name = entry.file_name().to_string_lossy().to_string();
@@ -817,6 +817,7 @@ fn ingest_agent_teams_from<W: Write>(
         let team_dir = entry.path();
         let source_origin = format!("claude:team:{team_name}");
         let mut team_entries = 0;
+        let mut team_classify_entries: Vec<String> = Vec::new();
 
         // A3: Parse config.json -> team structure entry
         let config = parse_team_config(&team_dir);
@@ -958,7 +959,7 @@ fn ingest_agent_teams_from<W: Write>(
                     );
 
                     // E1: Queue message group entries for LLM extraction
-                    classify_entries.push(source_version.clone());
+                    team_classify_entries.push(source_version.clone());
 
                     // G5: discusses edge (messages -> task)
                     let mut msg_edge_hints = Vec::new();
@@ -995,18 +996,16 @@ fn ingest_agent_teams_from<W: Write>(
             if team_entries > 0 {
                 total_files += 1;
             }
+            // E1: Append to .classify-queue per-team (crash-safe, matches .ingested pattern)
+            if !team_classify_entries.is_empty() {
+                append_lines(&queue_path, &team_classify_entries);
+            }
             append_lines(&ingested_path, std::slice::from_ref(&team_name));
             ingested.insert(team_name);
         } else {
             // Config missing or unparseable — do NOT mark as ingested so it retries
             eprintln!("Warning: team {team_name} has no valid config.json, will retry next run");
         }
-    }
-
-    // E1: Append message group source_versions to .classify-queue for LLM extraction
-    if !classify_entries.is_empty() {
-        let queue_path = staging_root.join(".classify-queue");
-        append_lines(&queue_path, &classify_entries);
     }
 
     // A7: Clean up old staging directories

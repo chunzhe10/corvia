@@ -356,7 +356,7 @@ pub struct ClassifySessionsResponse {
 }
 
 /// Request body for `POST /v1/classify/agent-teams`.
-#[derive(Deserialize, Default)]
+#[derive(Debug, Deserialize, Default)]
 pub struct ClassifyAgentTeamsRequest {
     /// Max entries to extract per batch (default 10).
     pub batch_size: Option<usize>,
@@ -368,8 +368,11 @@ pub struct ClassifyAgentTeamsResponse {
     pub processed: usize,
     pub extracted: usize,
     pub promoted: usize,
+    /// Entries not found in store (data integrity issue).
     pub rejected: usize,
-    /// Entries that failed extraction (transient errors). Left in queue for retry.
+    /// Entries where LLM found nothing to extract (legitimate empty result).
+    pub skipped: usize,
+    /// Entries/items that failed (transient errors). Entries left in queue for retry.
     pub failed: usize,
     pub remaining: usize,
 }
@@ -1488,6 +1491,7 @@ async fn classify_agent_teams(
             extracted: 0,
             promoted: 0,
             rejected: 0,
+            skipped: 0,
             failed: 0,
             remaining: 0,
         }));
@@ -1519,23 +1523,21 @@ async fn classify_agent_teams(
         .map(|e| (e.source_version.as_str(), e))
         .collect();
 
-    let mut extracted = 0;
-    let mut promoted = 0;
-    let mut rejected = 0;
-    let mut failed = 0;
+    let mut extracted = 0usize;
+    let mut promoted = 0usize;
+    let mut rejected = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
 
     for entry_ref in &to_process {
         let entry = match sv_lookup.get(entry_ref.as_str()) {
-            Some(e) => (*e).clone(),
+            Some(e) => *e,
             None => {
                 warn!("Entry not found for {entry_ref}, removing from queue");
                 rejected += 1;
                 continue;
             }
         };
-
-        // Derive team name from source_version (format: "{team}:messages:{group}")
-        let team_name = entry_ref.split(':').next().unwrap_or("unknown");
 
         // Step 1: Extract decisions, findings, and questions via LLM
         let extraction_system = "You are a knowledge extraction assistant. \
@@ -1566,26 +1568,32 @@ async fn classify_agent_teams(
         let items = parse_extraction_items(&extraction_result.text);
         if items.is_empty() {
             // Nothing extracted; remove from queue (not a failure)
-            rejected += 1;
+            skipped += 1;
             continue;
         }
 
-        let source_origin = format!("claude:team:{team_name}");
+        // Derive source_origin from entry's existing source_origin or from source_version
+        let source_origin = entry.metadata.source_origin.clone()
+            .unwrap_or_else(|| {
+                let team_name = entry_ref.split(':').next().unwrap_or("unknown");
+                format!("claude:team:{team_name}")
+            });
 
         for (i, item) in items.iter().enumerate() {
             let content = format!(
-                "# {} (extracted from team discussion)\n\n{}\n\n**Rationale:** {}\n{}",
+                "# {} (extracted from team discussion)\n\n{}\n\n**Rationale:** {}{}",
                 capitalize(&item.item_type),
                 item.content,
                 item.rationale,
                 if item.dissent.is_empty() {
                     String::new()
                 } else {
-                    format!("**Dissent:** {}", item.dissent)
+                    format!("\n\n**Dissent:** {}", item.dissent)
                 }
             );
 
-            let source_version = format!("{team_name}:extracted:{}", extracted + i + 1);
+            // Use source message group's source_version as prefix to avoid cross-batch collisions
+            let source_version = format!("{}:extracted:{}", entry_ref, i + 1);
 
             let mut extracted_entry = KnowledgeEntry::new(
                 content.clone(),
@@ -1607,6 +1615,7 @@ async fn classify_agent_teams(
                 Ok(emb) => emb,
                 Err(e) => {
                     warn!("Failed to embed extracted entry: {e}");
+                    failed += 1;
                     continue;
                 }
             };
@@ -1615,8 +1624,11 @@ async fn classify_agent_teams(
             let extracted_id = extracted_entry.id;
             if let Err(e) = state.store.insert(&extracted_entry).await {
                 warn!("Failed to store extracted entry: {e}");
+                failed += 1;
                 continue;
             }
+
+            extracted += 1;
 
             // Create extracted_from graph edge
             if let Err(e) = state.graph.relate(
@@ -1655,23 +1667,17 @@ async fn classify_agent_teams(
                             content_role: extracted_entry.metadata.content_role.clone(),
                             source_origin: Some("claude:promoted".into()),
                         };
+                        // Reuse embedding from extracted entry (identical content)
+                        promoted_entry.embedding = extracted_entry.embedding.clone();
 
-                        match state.engine.embed(&promoted_entry.content).await {
-                            Ok(emb) => {
-                                promoted_entry.embedding = Some(emb);
-                                if let Err(e) = state.store.insert(&promoted_entry).await {
-                                    warn!("Failed to store promoted entry: {e}");
-                                } else {
-                                    info!(
-                                        "Promoted {entry_ref} extraction {} to corvia scope",
-                                        i + 1
-                                    );
-                                    promoted += 1;
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to embed promoted entry: {e}");
-                            }
+                        if let Err(e) = state.store.insert(&promoted_entry).await {
+                            warn!("Failed to store promoted entry: {e}");
+                        } else {
+                            info!(
+                                "Promoted {entry_ref} extraction {} to corvia scope",
+                                i + 1
+                            );
+                            promoted += 1;
                         }
                     }
                 }
@@ -1681,8 +1687,6 @@ async fn classify_agent_teams(
                 }
             }
         }
-
-        extracted += items.len();
     }
 
     // Atomically rewrite the queue
@@ -1704,12 +1708,14 @@ async fn classify_agent_teams(
         extracted,
         promoted,
         rejected,
+        skipped,
         failed,
         remaining,
     }))
 }
 
 /// Item extracted from a team message group by the LLM.
+#[derive(Debug)]
 struct ExtractionItem {
     item_type: String,
     content: String,
@@ -2578,11 +2584,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_classify_agent_teams_extracts_and_promotes() {
+    async fn test_classify_agent_teams_extracts_decision() {
         let dir = tempfile::tempdir().unwrap();
-        // Mock LLM returns extraction JSON first, then "YES" for promotion
-        // Since MockGenerationEngine returns the same response for all calls,
-        // use a JSON response that also starts with "YES" so promotion works
         let response = r#"[{"type":"decision","content":"Use ArcSwap for lock-free reads","rationale":"Better perf under contention","dissent":""}]"#;
         let state = test_state_with_generator(dir.path(), response).await;
 
@@ -2619,10 +2622,55 @@ mod tests {
         let Json(resp) = result.unwrap();
         assert_eq!(resp.processed, 1);
         assert_eq!(resp.extracted, 1, "should extract 1 decision");
-        // Promotion depends on the mock returning something that starts with "YES"
-        // The mock returns the same extraction JSON for all calls, which doesn't start with YES
-        // So promotion won't happen in this test
+        // Mock returns extraction JSON for all calls (including promotion check).
+        // That JSON does not start with "YES", so promotion does not fire.
+        assert_eq!(resp.promoted, 0);
         assert_eq!(resp.remaining, 0, "queue should be drained");
+    }
+
+    #[tokio::test]
+    async fn test_classify_agent_teams_promotes_to_corvia() {
+        let dir = tempfile::tempdir().unwrap();
+        // Mock LLM returns "YES" for all calls. The extraction parser will find no
+        // JSON array in "YES", so we need a response that works for both extraction
+        // AND promotion. We use a response that starts with "YES" and contains JSON.
+        let response = r#"YES. [{"type":"finding","content":"HNSW is thread-safe","rationale":"Internal RwLock","dissent":""}]"#;
+        let state = test_state_with_generator(dir.path(), response).await;
+
+        let entry = KnowledgeEntry::new(
+            "Team discovered HNSW internals".into(),
+            USER_HISTORY_SCOPE.into(),
+            "promo-team:messages:task-1".into(),
+        );
+        corvia_kernel::knowledge_files::write_entry(&state.data_dir, &entry).unwrap();
+        state.store.insert(&entry.with_embedding(vec![1.0, 0.0, 0.0])).await.unwrap();
+
+        let staging = dir.path().join(".corvia").join("staging").join("agent-teams");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(
+            staging.join(".classify-queue"),
+            "promo-team:messages:task-1\n",
+        )
+        .unwrap();
+
+        let orig_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+
+        let result = classify_agent_teams(
+            State(state),
+            Json(ClassifyAgentTeamsRequest::default()),
+        )
+        .await;
+
+        if let Some(h) = orig_home {
+            unsafe { std::env::set_var("HOME", h) };
+        }
+
+        let Json(resp) = result.unwrap();
+        assert_eq!(resp.processed, 1);
+        assert_eq!(resp.extracted, 1, "should extract 1 finding");
+        assert_eq!(resp.promoted, 1, "YES response should promote to corvia scope");
+        assert_eq!(resp.remaining, 0);
     }
 
     #[tokio::test]
@@ -2666,6 +2714,7 @@ mod tests {
 
         let Json(resp) = result.unwrap();
         assert_eq!(resp.processed, 2);
+        assert_eq!(resp.skipped, 2, "empty extraction counts as skipped");
         assert_eq!(resp.remaining, 1);
     }
 
