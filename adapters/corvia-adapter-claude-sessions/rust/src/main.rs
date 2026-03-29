@@ -4,12 +4,14 @@
 //! 1. Sessions: Reads gzipped JSONL session logs from `~/.claude/sessions/`,
 //!    groups events by turn, produces structured text chunks (one entry per turn).
 //! 2. Agent Teams: Reads staging data from `~/.corvia/staging/agent-teams/`,
-//!    produces team structure, task, and message entries.
+//!    produces team structure, task, and message entries with graph edge hints.
 //!
 //! Domain dispatch: `source_path` containing "agent-teams" triggers teams path.
 //!
 //! Protocol: D75 (JSONL over stdin/stdout)
 //! Design: Session History RFC (2026-03-14), Agent Teams RFC (2026-03-28)
+
+mod correlation;
 
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
