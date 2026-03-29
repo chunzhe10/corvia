@@ -2381,4 +2381,365 @@ mod tests {
         let deduped = dedup_broadcasts(messages);
         assert_eq!(deduped.len(), 2, "different senders should not be deduped");
     }
+
+    // ===================================================================
+    // Phase 3 tests: Graph edge hints (T7, T9, T12, T15 from RFC)
+    // ===================================================================
+
+    /// Helper to extract edge_hints from parsed output entries.
+    fn get_edge_hints(entry: &serde_json::Value) -> Vec<(String, String)> {
+        entry["source_file"]["metadata"]["edge_hints"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .map(|h| {
+                (
+                    h["relation"].as_str().unwrap_or("").to_string(),
+                    h["target_source_version"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    // T7: Graph edges wired correctly (ran_during, has_member, assigned_to, depends_on, discusses)
+    #[test]
+    fn t7_edge_hints_wired_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        let config = serde_json::json!({
+            "leadSessionId": "ses-lead-t7",
+            "createdAt": "2026-03-28T10:00:00Z",
+            "members": [
+                {"name": "researcher", "model": "haiku", "joinedAt": "2026-03-28T10:00:01Z"},
+                {"name": "reviewer", "model": "sonnet", "joinedAt": "2026-03-28T10:00:02Z"}
+            ]
+        });
+
+        // Create lead transcript with Agent tool calls
+        let lead_jsonl = concat!(
+            r#"{"type":"session_start","session_id":"ses-lead-t7","timestamp":"2026-03-28T10:00:00Z","workspace":"/tmp","git_branch":"main","agent_type":"main","parent_session_id":null}"#, "\n",
+            r#"{"type":"tool_start","session_id":"ses-lead-t7","turn":1,"timestamp":"2026-03-28T10:00:01Z","tool":"Agent","input":{"name":"researcher","description":"Research auth patterns","prompt":"..."}}"#, "\n",
+            r#"{"type":"tool_start","session_id":"ses-lead-t7","turn":1,"timestamp":"2026-03-28T10:00:02Z","tool":"Agent","input":{"name":"reviewer","description":"Review code quality","prompt":"..."}}"#, "\n"
+        );
+        let lead_gz = sessions.join("ses-lead-t7.jsonl.gz");
+        let file = std::fs::File::create(&lead_gz).unwrap();
+        let mut enc = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        use std::io::Write as IoWrite2;
+        enc.write_all(lead_jsonl.as_bytes()).unwrap();
+        enc.finish().unwrap();
+
+        // Create subagent transcripts
+        let sub_dir = sessions.join("ses-lead-t7").join("subagents");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+
+        std::fs::write(sub_dir.join("agent-aaa.jsonl"), concat!(
+            r#"{"type":"session_start","session_id":"ses-sub-researcher","timestamp":"2026-03-28T10:00:01Z","workspace":"/tmp","git_branch":"main","agent_type":"subagent","parent_session_id":"ses-lead-t7"}"#, "\n",
+            r#"{"type":"user_prompt","session_id":"ses-sub-researcher","turn":1,"timestamp":"2026-03-28T10:00:01Z","content":"<teammate-message teammate_id=\"team-lead\" summary=\"Research auth patterns\">prompt</teammate-message>"}"#, "\n"
+        )).unwrap();
+
+        std::fs::write(sub_dir.join("agent-bbb.jsonl"), concat!(
+            r#"{"type":"session_start","session_id":"ses-sub-reviewer","timestamp":"2026-03-28T10:00:02Z","workspace":"/tmp","git_branch":"main","agent_type":"subagent","parent_session_id":"ses-lead-t7"}"#, "\n",
+            r#"{"type":"user_prompt","session_id":"ses-sub-reviewer","turn":1,"timestamp":"2026-03-28T10:00:02Z","content":"<teammate-message teammate_id=\"team-lead\" summary=\"Review code quality\">prompt</teammate-message>"}"#, "\n"
+        )).unwrap();
+
+        // Tasks with dependencies
+        let tasks = concat!(
+            r#"{"v":1,"event":"created","task_id":"1","subject":"Research","description":"Research auth","owner":"researcher","timestamp":"2026-03-28T10:01:00Z"}"#, "\n",
+            r#"{"v":1,"event":"created","task_id":"2","subject":"Review","description":"Review findings","owner":"reviewer","timestamp":"2026-03-28T10:02:00Z","full_task":{"status":"pending","owner":"reviewer","blockedBy":["1"]}}"#, "\n",
+            r#"{"v":1,"event":"completed","task_id":"1","subject":"Research","owner":"researcher","timestamp":"2026-03-28T10:15:00Z","full_task":{"status":"completed","owner":"researcher","blockedBy":[]}}"#, "\n"
+        );
+
+        let inboxes: Vec<(&str, &str)> = vec![
+            ("researcher", r#"[{"from":"reviewer","body":"Found issue","timestamp":"2026-03-28T10:05:00Z","task_assignment":"1"}]"#),
+        ];
+
+        setup_team_staging(&staging, "t7-team", &config, tasks, &inboxes);
+
+        let mut output = Vec::new();
+        ingest_agent_teams_from(DEFAULT_SCOPE, &staging, &sessions, &mut output);
+
+        let (entries, done) = parse_output_entries(&output);
+        assert!(done["done"].as_bool().unwrap());
+        assert!(entries.len() >= 4, "expected at least 4 entries, got {}", entries.len());
+
+        // Find entries by source_version
+        let find_entry = |sv: &str| -> &serde_json::Value {
+            entries.iter().find(|e| {
+                e["source_file"]["metadata"]["source_version"].as_str().unwrap_or("") == sv
+            }).unwrap_or_else(|| panic!("entry with source_version={sv} not found"))
+        };
+
+        // Team entry: should have ran_during + 2 has_member edges
+        let team = find_entry("t7-team:config");
+        let team_hints = get_edge_hints(team);
+        assert!(
+            team_hints.iter().any(|(r, t)| r == "ran_during" && t == "ses-lead-t7:turn-1"),
+            "missing ran_during edge, got: {:?}", team_hints
+        );
+        assert!(
+            team_hints.iter().any(|(r, t)| r == "has_member" && t == "ses-sub-researcher:turn-1"),
+            "missing has_member for researcher, got: {:?}", team_hints
+        );
+        assert!(
+            team_hints.iter().any(|(r, t)| r == "has_member" && t == "ses-sub-reviewer:turn-1"),
+            "missing has_member for reviewer, got: {:?}", team_hints
+        );
+
+        // Task 1: should have assigned_to (researcher)
+        let task1 = find_entry("t7-team:task:1");
+        let task1_hints = get_edge_hints(task1);
+        assert!(
+            task1_hints.iter().any(|(r, t)| r == "assigned_to" && t == "ses-sub-researcher:turn-1"),
+            "task 1 missing assigned_to, got: {:?}", task1_hints
+        );
+
+        // Task 2: should have assigned_to (reviewer) + depends_on (task 1)
+        let task2 = find_entry("t7-team:task:2");
+        let task2_hints = get_edge_hints(task2);
+        assert!(
+            task2_hints.iter().any(|(r, t)| r == "assigned_to" && t == "ses-sub-reviewer:turn-1"),
+            "task 2 missing assigned_to, got: {:?}", task2_hints
+        );
+        assert!(
+            task2_hints.iter().any(|(r, t)| r == "depends_on" && t == "t7-team:task:1"),
+            "task 2 missing depends_on, got: {:?}", task2_hints
+        );
+
+        // Message entry: should have discusses edge to task 1
+        let msg_entries: Vec<_> = entries.iter().filter(|e| {
+            let sv = e["source_file"]["metadata"]["source_version"].as_str().unwrap_or("");
+            sv.contains("messages:task-1")
+        }).collect();
+        assert!(!msg_entries.is_empty(), "missing message entry for task-1");
+        let msg_hints = get_edge_hints(msg_entries[0]);
+        assert!(
+            msg_hints.iter().any(|(r, t)| r == "discusses" && t == "t7-team:task:1"),
+            "message missing discusses edge, got: {:?}", msg_hints
+        );
+    }
+
+    // T9: Late-joiner teammate appears in entries and graph
+    #[test]
+    fn t9_late_joiner_teammate() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        // Team with a late-joiner (worker-beta joined 26 seconds after alpha)
+        let config = serde_json::json!({
+            "leadSessionId": "ses-lead-t9",
+            "createdAt": "2026-03-28T10:00:00Z",
+            "members": [
+                {"name": "worker-alpha", "model": "haiku", "joinedAt": "2026-03-28T10:00:01Z"},
+                {"name": "worker-beta", "model": "haiku", "joinedAt": "2026-03-28T10:00:27Z"}
+            ]
+        });
+
+        // Create lead transcript
+        let lead_jsonl = concat!(
+            r#"{"type":"session_start","session_id":"ses-lead-t9","timestamp":"2026-03-28T10:00:00Z","workspace":"/tmp","git_branch":"main","agent_type":"main","parent_session_id":null}"#, "\n",
+            r#"{"type":"tool_start","session_id":"ses-lead-t9","turn":1,"timestamp":"2026-03-28T10:00:01Z","tool":"Agent","input":{"name":"worker-alpha","description":"Handle task A","prompt":"..."}}"#, "\n",
+            r#"{"type":"tool_start","session_id":"ses-lead-t9","turn":2,"timestamp":"2026-03-28T10:00:27Z","tool":"Agent","input":{"name":"worker-beta","description":"Handle task B","prompt":"..."}}"#, "\n"
+        );
+        let lead_gz = sessions.join("ses-lead-t9.jsonl.gz");
+        let file = std::fs::File::create(&lead_gz).unwrap();
+        let mut enc = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        use std::io::Write as IoWrite3;
+        enc.write_all(lead_jsonl.as_bytes()).unwrap();
+        enc.finish().unwrap();
+
+        // Subagent transcripts
+        let sub_dir = sessions.join("ses-lead-t9").join("subagents");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+
+        std::fs::write(sub_dir.join("agent-111.jsonl"), concat!(
+            r#"{"type":"session_start","session_id":"ses-alpha","timestamp":"2026-03-28T10:00:01Z","workspace":"/tmp","git_branch":"main","agent_type":"subagent","parent_session_id":"ses-lead-t9"}"#, "\n",
+            r#"{"type":"user_prompt","session_id":"ses-alpha","turn":1,"timestamp":"2026-03-28T10:00:01Z","content":"<teammate-message teammate_id=\"team-lead\" summary=\"Handle task A\">prompt</teammate-message>"}"#, "\n"
+        )).unwrap();
+
+        std::fs::write(sub_dir.join("agent-222.jsonl"), concat!(
+            r#"{"type":"session_start","session_id":"ses-beta","timestamp":"2026-03-28T10:00:27Z","workspace":"/tmp","git_branch":"main","agent_type":"subagent","parent_session_id":"ses-lead-t9"}"#, "\n",
+            r#"{"type":"user_prompt","session_id":"ses-beta","turn":1,"timestamp":"2026-03-28T10:00:27Z","content":"<teammate-message teammate_id=\"team-lead\" summary=\"Handle task B\">prompt</teammate-message>"}"#, "\n"
+        )).unwrap();
+
+        setup_team_staging(&staging, "t9-team", &config, "", &[]);
+
+        let mut output = Vec::new();
+        ingest_agent_teams_from(DEFAULT_SCOPE, &staging, &sessions, &mut output);
+
+        let (entries, _) = parse_output_entries(&output);
+        let team = &entries[0];
+        let hints = get_edge_hints(team);
+
+        // Both members should have has_member edges (including late-joiner)
+        assert!(
+            hints.iter().any(|(r, t)| r == "has_member" && t == "ses-alpha:turn-1"),
+            "missing has_member for worker-alpha, got: {:?}", hints
+        );
+        assert!(
+            hints.iter().any(|(r, t)| r == "has_member" && t == "ses-beta:turn-1"),
+            "missing has_member for late-joiner worker-beta, got: {:?}", hints
+        );
+
+        // Team content should mention both members
+        let content = team["source_file"]["content"].as_str().unwrap();
+        assert!(content.contains("worker-alpha"), "alpha missing from team content");
+        assert!(content.contains("worker-beta"), "late-joiner beta missing from team content");
+    }
+
+    // T12: Deferred edges - missing session entries produce no edge hints (graceful)
+    #[test]
+    fn t12_deferred_edges_graceful() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        // No lead transcript or subagent transcripts exist
+
+        let config = serde_json::json!({
+            "leadSessionId": "ses-nonexistent",
+            "createdAt": "2026-03-28T10:00:00Z",
+            "members": [
+                {"name": "ghost-worker", "model": "haiku", "joinedAt": "2026-03-28T10:00:01Z"}
+            ]
+        });
+
+        let tasks = r#"{"v":1,"event":"created","task_id":"1","subject":"Task A","description":"do stuff","owner":"ghost-worker","timestamp":"2026-03-28T10:01:00Z"}"#;
+        setup_team_staging(&staging, "t12-team", &config, tasks, &[]);
+
+        let mut output = Vec::new();
+        ingest_agent_teams_from(DEFAULT_SCOPE, &staging, &sessions, &mut output);
+
+        let (entries, done) = parse_output_entries(&output);
+        assert!(done["done"].as_bool().unwrap());
+        assert_eq!(entries.len(), 2, "should produce team + task entries");
+
+        // Team entry: should have ran_during but NO has_member (correlation failed)
+        let team = &entries[0];
+        let team_hints = get_edge_hints(team);
+        assert!(
+            team_hints.iter().any(|(r, _)| r == "ran_during"),
+            "ran_during should still be emitted (target resolution is kernel's job)"
+        );
+        assert!(
+            !team_hints.iter().any(|(r, _)| r == "has_member"),
+            "has_member should NOT be emitted when correlation finds no match"
+        );
+
+        // Task entry: should NOT have assigned_to (owner not correlated)
+        let task = &entries[1];
+        let task_hints = get_edge_hints(task);
+        assert!(
+            !task_hints.iter().any(|(r, _)| r == "assigned_to"),
+            "assigned_to should not be emitted when correlation fails"
+        );
+    }
+
+    // T15: Large team - 10 members, 20 tasks, correct entry count and edge count
+    #[test]
+    fn t15_large_team_correct_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        // 10 members
+        let members: Vec<serde_json::Value> = (0..10)
+            .map(|i| serde_json::json!({
+                "name": format!("worker-{i}"),
+                "model": "haiku",
+                "joinedAt": format!("2026-03-28T10:00:{:02}Z", i)
+            }))
+            .collect();
+
+        let config = serde_json::json!({
+            "leadSessionId": "ses-lead-t15",
+            "createdAt": "2026-03-28T10:00:00Z",
+            "members": members
+        });
+
+        // 20 tasks, with dependencies forming a chain: task N depends on task N-1
+        let mut tasks_jsonl = String::new();
+        for i in 1..=20 {
+            let owner = format!("worker-{}", i % 10);
+            let blocked_by = if i > 1 {
+                format!(r#","full_task":{{"status":"pending","owner":"{owner}","blockedBy":["{}"]}}"#, i - 1)
+            } else {
+                format!(r#","full_task":{{"status":"pending","owner":"{owner}","blockedBy":[]}}"#)
+            };
+            tasks_jsonl.push_str(&format!(
+                r#"{{"v":1,"event":"created","task_id":"{i}","subject":"Task {i}","description":"work","owner":"{owner}","timestamp":"2026-03-28T10:{:02}:00Z"{blocked_by}}}"#,
+                i
+            ));
+            tasks_jsonl.push('\n');
+        }
+
+        // Messages referencing tasks
+        let inbox = serde_json::json!([
+            {"from":"worker-0","body":"msg for task 1","timestamp":"2026-03-28T10:05:00Z","task_assignment":"1"},
+            {"from":"worker-1","body":"msg for task 2","timestamp":"2026-03-28T10:06:00Z","task_assignment":"2"},
+            {"from":"worker-2","body":"general update","timestamp":"2026-03-28T10:07:00Z"}
+        ]);
+
+        setup_team_staging(&staging, "large-team", &config, &tasks_jsonl, &[
+            ("team-lead", &serde_json::to_string(&inbox).unwrap()),
+        ]);
+
+        let mut output = Vec::new();
+        ingest_agent_teams_from(DEFAULT_SCOPE, &staging, &sessions, &mut output);
+
+        let (entries, done) = parse_output_entries(&output);
+        assert!(done["done"].as_bool().unwrap());
+
+        // Count entry types
+        let team_entries: Vec<_> = entries.iter().filter(|e| {
+            e["source_file"]["metadata"]["source_version"].as_str().unwrap_or("").ends_with(":config")
+        }).collect();
+        let task_entries: Vec<_> = entries.iter().filter(|e| {
+            e["source_file"]["metadata"]["content_role"].as_str().unwrap_or("") == "task"
+        }).collect();
+        let msg_entries: Vec<_> = entries.iter().filter(|e| {
+            e["source_file"]["metadata"]["content_role"].as_str().unwrap_or("") == "finding"
+        }).collect();
+
+        assert_eq!(team_entries.len(), 1, "expected 1 team entry");
+        assert_eq!(task_entries.len(), 20, "expected 20 task entries, got {}", task_entries.len());
+        assert!(msg_entries.len() >= 2, "expected at least 2 message groups (task-1, task-2), got {}", msg_entries.len());
+
+        // Verify total entries: 1 team + 20 tasks + message groups
+        let total = entries.len();
+        assert!(total >= 23, "expected at least 23 entries (1 + 20 + 2+), got {total}");
+
+        // Verify edge hint counts
+        // Team: 1 ran_during + 0 has_member (no transcripts) = 1
+        let team_hints = get_edge_hints(team_entries[0]);
+        assert_eq!(
+            team_hints.iter().filter(|(r, _)| r == "ran_during").count(), 1,
+            "expected 1 ran_during"
+        );
+
+        // Tasks: each task >=1 has depends_on (task 2..20), except task 1
+        let mut total_depends_on = 0;
+        for task_entry in &task_entries {
+            let hints = get_edge_hints(task_entry);
+            total_depends_on += hints.iter().filter(|(r, _)| r == "depends_on").count();
+        }
+        assert_eq!(total_depends_on, 19, "expected 19 depends_on edges (task chain), got {total_depends_on}");
+
+        // Messages: task-grouped messages should have discusses edges
+        let mut total_discusses = 0;
+        for msg in &msg_entries {
+            let hints = get_edge_hints(msg);
+            total_discusses += hints.iter().filter(|(r, _)| r == "discusses").count();
+        }
+        assert!(total_discusses >= 2, "expected at least 2 discusses edges, got {total_discusses}");
+    }
 }
