@@ -587,6 +587,7 @@ const JS_TS_CALL_DENY_LIST: &[&str] = &[
     "createElement",                                            // React DOM
     "resolve", "reject",                                        // Promise
     "require",                                                  // CJS
+    "super",                                                    // constructor delegation
 ];
 
 fn extract_js_ts_relations(
@@ -622,7 +623,7 @@ fn extract_js_ts_relations(
                     "import_statement" => {
                         extract_js_ts_import(&mut relations, source, &node, chunks);
                     }
-                    "class_declaration" => {
+                    "class_declaration" | "abstract_class_declaration" => {
                         extract_js_ts_class_heritage(
                             &mut relations, source, &node, file_path, chunks,
                         );
@@ -630,12 +631,13 @@ fn extract_js_ts_relations(
                     "export_statement" => {
                         // Check for exported class: `export class Foo extends Bar {}`
                         for i in 0..node.child_count() {
-                            if let Some(child) = node.child(i as u32) {
-                                if child.kind() == "class_declaration" || child.kind() == "class" {
-                                    extract_js_ts_class_heritage(
-                                        &mut relations, source, &child, file_path, chunks,
-                                    );
-                                }
+                            if let Some(child) = node.child(i as u32)
+                                && matches!(child.kind(),
+                                    "class_declaration" | "abstract_class_declaration" | "class")
+                            {
+                                extract_js_ts_class_heritage(
+                                    &mut relations, source, &child, file_path, chunks,
+                                );
                             }
                         }
                     }
@@ -661,7 +663,7 @@ fn extract_js_ts_import(
     node: &Node,
     chunks: &[CodeChunk],
 ) {
-    let owner_idx = find_owning_chunk(chunks, node.start_position().row as u32 + 1);
+    let owner_idx = find_chunk_by_line(chunks, node.start_position().row as u32 + 1);
     if let Some(source_node) = node.child_by_field_name("source") {
         let raw = source[source_node.byte_range()].to_string();
         let import_path = raw.trim_matches(|c| c == '\'' || c == '"').to_string();
@@ -708,7 +710,7 @@ fn extract_js_ts_class_heritage(
     file_path: &str,
     chunks: &[CodeChunk],
 ) {
-    let owner_idx = find_owning_chunk(chunks, node.start_position().row as u32 + 1);
+    let owner_idx = find_chunk_by_line(chunks, node.start_position().row as u32 + 1);
 
     // Walk children to find `class_heritage` node (it's a node kind, not a field)
     for i in 0..node.child_count() {
@@ -789,7 +791,9 @@ fn extract_js_ts_class_heritage(
 /// Handles generics: `extends Bar<T>` -> "Bar".
 fn extract_extends_type_name(source: &str, clause: &Node) -> Option<String> {
     for i in 0..clause.child_count() {
-        let child = clause.child(i as u32)?;
+        let Some(child) = clause.child(i as u32) else {
+            continue;
+        };
         if !child.is_named() {
             continue;
         }
@@ -855,22 +859,22 @@ fn extract_js_ts_calls(
         if func_text == "import" {
             if let Some(args) = call_node.child_by_field_name("arguments") {
                 for i in 0..args.child_count() {
-                    if let Some(arg) = args.child(i as u32) {
-                        if arg.kind() == "string" || arg.kind() == "template_string" {
-                            let raw = source[arg.byte_range()].to_string();
-                            let path = raw.trim_matches(|c| c == '\'' || c == '"' || c == '`');
-                            let owner_idx = find_owning_chunk(
-                                chunks,
-                                call_node.start_position().row as u32 + 1,
-                            );
-                            relations.push(CodeRelation {
-                                from_chunk_index: owner_idx,
-                                relation: "imports".to_string(),
-                                to_file: path.to_string(),
-                                to_name: None,
-                            });
-                            break;
-                        }
+                    if let Some(arg) = args.child(i as u32)
+                        && (arg.kind() == "string" || arg.kind() == "template_string")
+                    {
+                        let raw = source[arg.byte_range()].to_string();
+                        let path = raw.trim_matches(|c| c == '\'' || c == '"' || c == '`');
+                        let owner_idx = find_chunk_by_line(
+                            chunks,
+                            call_node.start_position().row as u32 + 1,
+                        );
+                        relations.push(CodeRelation {
+                            from_chunk_index: owner_idx,
+                            relation: "imports".to_string(),
+                            to_file: path.to_string(),
+                            to_name: None,
+                        });
+                        break;
                     }
                 }
             }
@@ -889,7 +893,7 @@ fn extract_js_ts_calls(
             continue;
         }
 
-        let owner_idx = find_owning_chunk(chunks, call_node.start_position().row as u32 + 1);
+        let owner_idx = find_chunk_by_line(chunks, call_node.start_position().row as u32 + 1);
 
         relations.push(CodeRelation {
             from_chunk_index: owner_idx,
@@ -906,8 +910,9 @@ fn extract_js_ts_calls(
 fn extract_js_call_name(source: &str, node: &Node) -> String {
     match node.kind() {
         "identifier" => source[node.byte_range()].to_string(),
-        "member_expression" | "optional_chain_expression" => {
+        "member_expression" => {
             // Extract the last property: `this.foo` -> "foo", `a.b.c` -> "c"
+            // Also handles optional chaining (`obj?.method`) -- same AST structure.
             node.child_by_field_name("property")
                 .map(|p| source[p.byte_range()].to_string())
                 .unwrap_or_else(|| {
@@ -1951,6 +1956,57 @@ export class Controller extends BaseController {
             .collect();
         assert_eq!(extends.len(), 1, "Exported class should have extends relation");
         assert_eq!(extends[0].to_name.as_deref(), Some("BaseController"));
+    }
+
+    #[test]
+    fn test_ts_extends_and_implements_combined() {
+        let source = r#"
+interface ILogger {
+    log(msg: string): void;
+}
+
+interface IDisposable {
+    dispose(): void;
+}
+
+class BaseService {
+    protected name: string;
+    constructor(name: string) {
+        this.name = name;
+    }
+}
+
+class MyService extends BaseService implements ILogger, IDisposable {
+    log(msg: string): void {
+        console.log(msg);
+    }
+    dispose(): void {
+        return;
+    }
+}
+"#;
+        let result = chunk_file_with_relations("service.ts", source, "ts");
+        let extends: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "extends")
+            .collect();
+        assert_eq!(extends.len(), 1, "Expected 1 extends relation");
+        assert_eq!(extends[0].to_name.as_deref(), Some("BaseService"));
+
+        let implements: Vec<&CodeRelation> = result
+            .relations
+            .iter()
+            .filter(|r| r.relation == "implements")
+            .collect();
+        assert!(
+            implements.len() >= 2,
+            "Expected at least 2 implements relations, got {}",
+            implements.len()
+        );
+        let names: Vec<&str> = implements.iter().filter_map(|r| r.to_name.as_deref()).collect();
+        assert!(names.contains(&"ILogger"), "Missing ILogger");
+        assert!(names.contains(&"IDisposable"), "Missing IDisposable");
     }
 
     #[test]
