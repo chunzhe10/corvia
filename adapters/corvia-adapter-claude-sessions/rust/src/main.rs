@@ -892,14 +892,13 @@ fn ingest_agent_teams_from<W: Write>(
                                 .map(String::from)
                         })
                     });
-                if let Some(ref owner_name) = owner {
-                    if let Some(session_id) = correlation.get(owner_name) {
+                if let Some(ref owner_name) = owner
+                    && let Some(session_id) = correlation.get(owner_name) {
                         task_edge_hints.push(EdgeHint {
                             relation: "assigned_to".into(),
                             target_source_version: format!("{session_id}:turn-1"),
                         });
                     }
-                }
 
                 // G4: depends_on edges (task -> blocking tasks within same team)
                 let best = task_events
@@ -910,9 +909,9 @@ fn ingest_agent_teams_from<W: Write>(
                         "created" => 1,
                         _ => 0,
                     });
-                if let Some(best_event) = best {
-                    if let Some(ref ft) = best_event.full_task {
-                        if let Some(blocked_by) = ft.get("blockedBy").and_then(|v| v.as_array()) {
+                if let Some(best_event) = best
+                    && let Some(ref ft) = best_event.full_task
+                        && let Some(blocked_by) = ft.get("blockedBy").and_then(|v| v.as_array()) {
                             for dep_id in blocked_by.iter().filter_map(|v| v.as_str()) {
                                 task_edge_hints.push(EdgeHint {
                                     relation: "depends_on".into(),
@@ -922,8 +921,6 @@ fn ingest_agent_teams_from<W: Write>(
                                 });
                             }
                         }
-                    }
-                }
 
                 let msg = SourceFileMsg {
                     source_file: SourceFilePayload {

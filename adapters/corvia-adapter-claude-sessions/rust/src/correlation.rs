@@ -91,13 +91,11 @@ fn extract_agent_tool_calls(lead_session_id: &str, sessions_dir: &Path) -> Vec<A
     let mut calls = Vec::new();
 
     // Try both .jsonl.gz and .jsonl, also check archive/
-    let candidates = vec![
-        sessions_dir.join(format!("{lead_session_id}.jsonl.gz")),
+    let candidates = [sessions_dir.join(format!("{lead_session_id}.jsonl.gz")),
         sessions_dir.join(format!("{lead_session_id}.jsonl")),
         sessions_dir
             .join("archive")
-            .join(format!("{lead_session_id}.jsonl.gz")),
-    ];
+            .join(format!("{lead_session_id}.jsonl.gz"))];
 
     let transcript_path = match candidates.iter().find(|p| p.exists()) {
         Some(p) => p.clone(),
@@ -120,8 +118,8 @@ fn extract_agent_tool_calls(lead_session_id: &str, sessions_dir: &Path) -> Vec<A
         let event_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let tool = val.get("tool").and_then(|v| v.as_str()).unwrap_or("");
 
-        if (event_type == "tool_start" || event_type == "tool_end") && tool == "Agent" {
-            if let Some(input) = val.get("input") {
+        if (event_type == "tool_start" || event_type == "tool_end") && tool == "Agent"
+            && let Some(input) = val.get("input") {
                 let name = input
                     .get("name")
                     .and_then(|v| v.as_str())
@@ -140,7 +138,6 @@ fn extract_agent_tool_calls(lead_session_id: &str, sessions_dir: &Path) -> Vec<A
                     }
                 }
             }
-        }
     }
 
     calls
@@ -195,13 +192,11 @@ fn enumerate_subagent_transcripts(subagent_dir: &Path) -> Vec<(String, String)> 
                 }
 
                 // Look for teammate-message summary in user_prompt content
-                if event_type == "user_prompt" {
-                    if let Some(content) = val.get("content").and_then(|v| v.as_str()) {
-                        if let Some(s) = extract_teammate_message_summary(content) {
+                if event_type == "user_prompt"
+                    && let Some(content) = val.get("content").and_then(|v| v.as_str())
+                        && let Some(s) = extract_teammate_message_summary(content) {
                             summary = s;
                         }
-                    }
-                }
             }
 
             // We have what we need after session_start + first user_prompt
@@ -293,25 +288,21 @@ fn match_by_temporal(
 
 /// Get the timestamp of the first message in a session transcript.
 fn get_first_message_timestamp(session_id: &str, sessions_dir: &Path) -> Option<String> {
-    let candidates = vec![
-        sessions_dir.join(format!("{session_id}.jsonl.gz")),
+    let candidates = [sessions_dir.join(format!("{session_id}.jsonl.gz")),
         sessions_dir.join(format!("{session_id}.jsonl")),
         sessions_dir
             .join("archive")
-            .join(format!("{session_id}.jsonl.gz")),
-    ];
+            .join(format!("{session_id}.jsonl.gz"))];
 
     let path = candidates.iter().find(|p| p.exists())?;
     let content = read_transcript(path);
 
     for line in content.lines() {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line.trim()) {
-            if let Some(ts) = val.get("timestamp").and_then(|v| v.as_str()) {
-                if !ts.is_empty() {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line.trim())
+            && let Some(ts) = val.get("timestamp").and_then(|v| v.as_str())
+                && !ts.is_empty() {
                     return Some(ts.to_string());
                 }
-            }
-        }
     }
     None
 }
