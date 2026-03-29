@@ -630,6 +630,16 @@ pub struct ChunkingConfig {
     pub overlap_tokens: usize,
     #[serde(default = "default_chunking_strategy")]
     pub strategy: String,
+    /// Enable semantic sub-splitting for oversized Markdown heading sections.
+    /// When true, oversized heading_section chunks are sub-split using the Max-Min
+    /// algorithm with real embeddings during ingest.
+    #[serde(default)]
+    pub semantic_splitting: bool,
+    /// Token threshold for semantic sub-splitting. Chunks above this size are candidates.
+    /// Defaults to max_tokens (only split chunks that are already oversized).
+    /// Set to 0 to disable the threshold (split all heading sections).
+    #[serde(default)]
+    pub semantic_split_threshold: Option<usize>,
 }
 
 fn default_max_chunk_tokens() -> usize { 512 }
@@ -644,6 +654,8 @@ impl Default for ChunkingConfig {
             min_tokens: default_min_chunk_tokens(),
             overlap_tokens: default_overlap_tokens(),
             strategy: default_chunking_strategy(),
+            semantic_splitting: false,
+            semantic_split_threshold: None,
         }
     }
 }

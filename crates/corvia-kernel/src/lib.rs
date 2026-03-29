@@ -85,6 +85,7 @@ pub mod chunking_pipeline;
 pub mod chunking_markdown;
 pub mod chunking_config_fmt;
 pub mod chunking_pdf;
+pub mod semantic_split;
 pub mod adapter_protocol;
 pub mod adapter_discovery;
 pub mod process_adapter;

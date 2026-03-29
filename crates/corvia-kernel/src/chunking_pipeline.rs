@@ -833,6 +833,7 @@ mod tests {
             min_tokens: 32,
             overlap_tokens: 0,
             strategy: "auto".into(),
+            ..Default::default()
         };
         let pipeline = make_pipeline_with_line_chunker(config);
         let source = "Hello, world! This is a small test file.";
@@ -856,6 +857,7 @@ mod tests {
             min_tokens: 2,
             overlap_tokens: 0,
             strategy: "auto".into(),
+            ..Default::default()
         };
         let pipeline = make_pipeline(config);
 
@@ -896,6 +898,7 @@ mod tests {
             min_tokens: 10,
             overlap_tokens: 0,
             strategy: "auto".into(),
+            ..Default::default()
         };
         let pipeline = make_pipeline_with_line_chunker(config);
         let source = "one\ntwo\nthree\nfour\nfive\nsix";
@@ -924,6 +927,7 @@ mod tests {
             min_tokens: 32,
             overlap_tokens: 0,
             strategy: "auto".into(),
+            ..Default::default()
         };
         let pipeline = make_pipeline_with_line_chunker(config);
 
@@ -954,6 +958,7 @@ mod tests {
             min_tokens: 2,
             overlap_tokens: 4, // 4 overlap tokens -> ~16 chars from prev chunk
             strategy: "auto".into(),
+            ..Default::default()
         };
         let pipeline = make_pipeline_with_line_chunker(config);
         let source = "First line here with content.\nSecond line here with content.";
@@ -986,6 +991,7 @@ mod tests {
             min_tokens: 2,
             overlap_tokens: 0,
             strategy: "auto".into(),
+            ..Default::default()
         };
         let pipeline = make_pipeline_with_line_chunker(config);
         let source = "Simple content.";
@@ -1009,6 +1015,7 @@ mod tests {
             min_tokens: 32,
             overlap_tokens: 0,
             strategy: "auto".into(),
+            ..Default::default()
         }
     }
 
@@ -1060,6 +1067,7 @@ mod tests {
             min_tokens: 5,
             overlap_tokens: 4,
             strategy: "auto".into(),
+            ..Default::default()
         };
         let pipeline = ChunkingPipeline::with_kernel_defaults(config);
 
