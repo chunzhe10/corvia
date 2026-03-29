@@ -766,23 +766,28 @@ fn ingest_agent_teams_from<W: Write>(scope_id: &str, staging_root: &Path, out: &
 
     // Read already-ingested team names
     let ingested_path = staging_root.join(".ingested");
-    let ingested: HashSet<String> = read_lines_to_set(&ingested_path);
+    let mut ingested: HashSet<String> = read_lines_to_set(&ingested_path);
 
     let mut total_files = 0;
-    let mut newly_ingested: Vec<String> = Vec::new();
 
-    // Scan for team directories
-    let mut team_dirs: Vec<_> = std::fs::read_dir(staging_root)
-        .into_iter()
+    // Scan for team directories (read_dir errors logged, not silently swallowed)
+    let rd = match std::fs::read_dir(staging_root) {
+        Ok(rd) => rd,
+        Err(e) => {
+            eprintln!("Warning: cannot read staging dir {}: {e}", staging_root.display());
+            let done = DoneMsg { done: true, total_files: 0 };
+            writeln!(out, "{}", serde_json::to_string(&done).unwrap()).ok();
+            out.flush().ok();
+            return;
+        }
+    };
+    let mut team_dirs: Vec<_> = rd
         .flatten()
-        .flatten()
-        .filter(|e| {
-            e.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
-                && e.file_name().to_string_lossy() != "."
-                && e.file_name().to_string_lossy() != ".."
-        })
+        .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
         .collect();
     team_dirs.sort_by_key(|e| e.file_name());
+
+    let scope_id_owned = scope_id.to_string();
 
     for entry in &team_dirs {
         let team_name = entry.file_name().to_string_lossy().to_string();
@@ -791,6 +796,7 @@ fn ingest_agent_teams_from<W: Write>(scope_id: &str, staging_root: &Path, out: &
         }
 
         let team_dir = entry.path();
+        let source_origin = format!("claude:team:{team_name}");
         let mut team_entries = 0;
 
         // A3: Parse config.json -> team structure entry
@@ -808,11 +814,11 @@ fn ingest_agent_teams_from<W: Write>(scope_id: &str, staging_root: &Path, out: &
                         file_path: team_name.clone(),
                         extension: "json".into(),
                         language: None,
-                        scope_id: scope_id.to_string(),
+                        scope_id: scope_id_owned.clone(),
                         source_version: format!("{team_name}:config"),
                         workstream: None,
                         content_role: Some("memory".into()),
-                        source_origin: Some(format!("claude:team:{team_name}")),
+                        source_origin: Some(source_origin.clone()),
                         parent_session_id: None,
                     },
                 },
@@ -831,11 +837,11 @@ fn ingest_agent_teams_from<W: Write>(scope_id: &str, staging_root: &Path, out: &
                             file_path: team_name.clone(),
                             extension: "json".into(),
                             language: None,
-                            scope_id: scope_id.to_string(),
+                            scope_id: scope_id_owned.clone(),
                             source_version: format!("{team_name}:task:{task_id}"),
                             workstream: None,
                             content_role: Some("task".into()),
-                            source_origin: Some(format!("claude:team:{team_name}")),
+                            source_origin: Some(source_origin.clone()),
                             parent_session_id: None,
                         },
                     },
@@ -862,11 +868,11 @@ fn ingest_agent_teams_from<W: Write>(scope_id: &str, staging_root: &Path, out: &
                                 file_path: team_name.clone(),
                                 extension: "json".into(),
                                 language: None,
-                                scope_id: scope_id.to_string(),
+                                scope_id: scope_id_owned.clone(),
                                 source_version,
                                 workstream: None,
                                 content_role: Some("finding".into()),
-                                source_origin: Some(format!("claude:team:{team_name}")),
+                                source_origin: Some(source_origin.clone()),
                                 parent_session_id: None,
                             },
                         },
@@ -875,24 +881,21 @@ fn ingest_agent_teams_from<W: Write>(scope_id: &str, staging_root: &Path, out: &
                     team_entries += 1;
                 }
             }
+
+            // A7: Mark team as ingested immediately (crash-safe per-team state)
+            if team_entries > 0 {
+                total_files += 1;
+            }
+            append_lines(&ingested_path, std::slice::from_ref(&team_name));
+            ingested.insert(team_name);
         } else {
-            // Empty team: config missing or unparseable, still mark as ingested
-            eprintln!("Warning: team {team_name} has no valid config.json, skipping entries");
+            // Config missing or unparseable — do NOT mark as ingested so it retries
+            eprintln!("Warning: team {team_name} has no valid config.json, will retry next run");
         }
-
-        if team_entries > 0 {
-            total_files += 1;
-        }
-        newly_ingested.push(team_name);
-    }
-
-    // A7: Update .ingested state
-    if !newly_ingested.is_empty() {
-        append_lines(&ingested_path, &newly_ingested);
     }
 
     // A7: Clean up old staging directories
-    cleanup_old_staging(staging_root, &read_lines_to_set(&ingested_path));
+    cleanup_old_staging(staging_root, &ingested);
 
     let done = DoneMsg { done: true, total_files };
     writeln!(out, "{}", serde_json::to_string(&done).unwrap()).ok();
@@ -1038,11 +1041,12 @@ fn parse_inbox_messages(team_dir: &Path) -> Vec<InboxMessage> {
 
     let mut messages = Vec::new();
 
-    let entries: Vec<_> = std::fs::read_dir(&inboxes_dir)
+    let mut entries: Vec<_> = std::fs::read_dir(&inboxes_dir)
         .into_iter()
         .flatten()
         .flatten()
         .collect();
+    entries.sort_by_key(|e| e.file_name());
 
     for entry in entries {
         let path = entry.path();
@@ -1384,26 +1388,24 @@ fn infer_team_status(tasks: &[TaskEvent]) -> String {
         return "unknown".to_string();
     }
 
-    // Build map of task_id -> latest event
-    let mut task_status: HashMap<&str, &str> = HashMap::new();
+    // Build map of task_id -> (latest_event, timestamp), using timestamps for ordering
+    let mut task_status: HashMap<&str, (&str, &str)> = HashMap::new();
     for event in tasks {
-        task_status.insert(&event.task_id, &event.event);
+        let entry = task_status.entry(&event.task_id).or_insert((&event.event, &event.timestamp));
+        if event.timestamp.as_str() >= entry.1 {
+            *entry = (&event.event, &event.timestamp);
+        }
     }
 
-    let all_done = task_status.values().all(|status| {
+    let all_done = task_status.values().all(|(status, _)| {
         matches!(*status, "completed" | "deleted")
     });
 
     if all_done {
         "completed".to_string()
     } else {
-        // Check if there are any completed events at all (mixed state = abandoned)
-        let any_completed = task_status.values().any(|s| *s == "completed");
-        if any_completed {
-            "abandoned".to_string()
-        } else {
-            "unknown".to_string()
-        }
+        // Tasks exist but not all completed — team was abandoned
+        "abandoned".to_string()
     }
 }
 
@@ -1460,17 +1462,15 @@ fn cleanup_old_staging(staging_root: &Path, ingested: &HashSet<String>) {
 
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
 
         // Clean up .lock files in team directories
-        if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+        if is_dir {
             cleanup_lock_files(&entry.path());
         }
 
         // Only clean up ingested team directories
-        if !ingested.contains(&name) {
-            continue;
-        }
-        if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+        if !ingested.contains(&name) || !is_dir {
             continue;
         }
 
@@ -2146,18 +2146,18 @@ mod tests {
     #[test]
     fn test_team_status_completed() {
         let tasks = vec![
-            TaskEvent { event: "created".into(), task_id: "1".into(), subject: "".into(), description: "".into(), owner: "".into(), timestamp: "".into(), full_task: None },
-            TaskEvent { event: "completed".into(), task_id: "1".into(), subject: "".into(), description: "".into(), owner: "".into(), timestamp: "".into(), full_task: None },
+            TaskEvent { event: "created".into(), task_id: "1".into(), subject: "".into(), description: "".into(), owner: "".into(), timestamp: "2026-03-28T10:01:00Z".into(), full_task: None },
+            TaskEvent { event: "completed".into(), task_id: "1".into(), subject: "".into(), description: "".into(), owner: "".into(), timestamp: "2026-03-28T10:15:00Z".into(), full_task: None },
         ];
         assert_eq!(infer_team_status(&tasks), "completed");
     }
 
     #[test]
-    fn test_team_status_abandoned() {
+    fn test_team_status_abandoned_mixed() {
         let tasks = vec![
-            TaskEvent { event: "created".into(), task_id: "1".into(), subject: "".into(), description: "".into(), owner: "".into(), timestamp: "".into(), full_task: None },
-            TaskEvent { event: "completed".into(), task_id: "1".into(), subject: "".into(), description: "".into(), owner: "".into(), timestamp: "".into(), full_task: None },
-            TaskEvent { event: "created".into(), task_id: "2".into(), subject: "".into(), description: "".into(), owner: "".into(), timestamp: "".into(), full_task: None },
+            TaskEvent { event: "created".into(), task_id: "1".into(), subject: "".into(), description: "".into(), owner: "".into(), timestamp: "2026-03-28T10:01:00Z".into(), full_task: None },
+            TaskEvent { event: "completed".into(), task_id: "1".into(), subject: "".into(), description: "".into(), owner: "".into(), timestamp: "2026-03-28T10:15:00Z".into(), full_task: None },
+            TaskEvent { event: "created".into(), task_id: "2".into(), subject: "".into(), description: "".into(), owner: "".into(), timestamp: "2026-03-28T10:02:00Z".into(), full_task: None },
         ];
         assert_eq!(infer_team_status(&tasks), "abandoned");
     }
@@ -2169,10 +2169,91 @@ mod tests {
     }
 
     #[test]
+    fn test_team_status_abandoned_all_created() {
+        // Tasks exist but none completed — team was abandoned
+        let tasks = vec![
+            TaskEvent { event: "created".into(), task_id: "1".into(), subject: "".into(), description: "".into(), owner: "".into(), timestamp: "2026-03-28T10:01:00Z".into(), full_task: None },
+            TaskEvent { event: "created".into(), task_id: "2".into(), subject: "".into(), description: "".into(), owner: "".into(), timestamp: "2026-03-28T10:02:00Z".into(), full_task: None },
+        ];
+        assert_eq!(infer_team_status(&tasks), "abandoned");
+    }
+
+    #[test]
+    fn test_team_status_timestamp_ordering() {
+        // Out-of-order events: completed written before created (flock race)
+        let tasks = vec![
+            TaskEvent { event: "completed".into(), task_id: "1".into(), subject: "".into(), description: "".into(), owner: "".into(), timestamp: "2026-03-28T10:15:00Z".into(), full_task: None },
+            TaskEvent { event: "created".into(), task_id: "1".into(), subject: "".into(), description: "".into(), owner: "".into(), timestamp: "2026-03-28T10:01:00Z".into(), full_task: None },
+        ];
+        // Should use timestamp to determine completed is the latest event
+        assert_eq!(infer_team_status(&tasks), "completed");
+    }
+
+    #[test]
     fn test_extract_time() {
         assert_eq!(extract_time("2026-03-28T10:05:00Z"), "10:05");
         assert_eq!(extract_time("2026-03-28T10:05:00.123Z"), "10:05");
         assert_eq!(extract_time("no-t-here"), "no-t-here");
+    }
+
+    // D75 protocol-level dispatch test
+    #[test]
+    fn test_d75_dispatch_routes_agent_teams() {
+        // Verify that the Request deserialization + source_path check works
+        let request_json = r#"{"method":"ingest","params":{"source_path":"agent-teams","scope_id":"user-history"}}"#;
+        let req: Request = serde_json::from_str(request_json).unwrap();
+        match req {
+            Request::Ingest { source_path, scope_id } => {
+                assert!(source_path.contains("agent-teams"));
+                assert_eq!(scope_id, "user-history");
+            }
+            _ => panic!("expected Ingest request"),
+        }
+
+        // Verify sessions path does NOT match
+        let sessions_json = r#"{"method":"ingest","params":{"source_path":"~/.claude/sessions","scope_id":"user-history"}}"#;
+        let req: Request = serde_json::from_str(sessions_json).unwrap();
+        match req {
+            Request::Ingest { source_path, .. } => {
+                assert!(!source_path.contains("agent-teams"));
+            }
+            _ => panic!("expected Ingest request"),
+        }
+    }
+
+    // Failed config retry test
+    #[test]
+    fn test_failed_config_retries_next_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path();
+
+        // Create team dir with invalid config
+        let team_dir = staging.join("bad-config-team");
+        std::fs::create_dir_all(&team_dir).unwrap();
+        std::fs::write(team_dir.join("config.json"), "INVALID JSON{{{").unwrap();
+
+        // First run: should skip but NOT add to .ingested
+        let mut output1 = Vec::new();
+        ingest_agent_teams_from(DEFAULT_SCOPE, staging, &mut output1);
+
+        let ingested = std::fs::read_to_string(staging.join(".ingested")).unwrap_or_default();
+        assert!(!ingested.contains("bad-config-team"), "failed config should not be marked ingested");
+
+        // Fix the config
+        let config = serde_json::json!({
+            "leadSessionId": "sess-001",
+            "createdAt": "2026-03-28T10:00:00Z",
+            "members": [{"name": "a", "model": "haiku", "joinedAt": ""}]
+        });
+        std::fs::write(team_dir.join("config.json"), serde_json::to_string(&config).unwrap()).unwrap();
+
+        // Second run: should now process the team
+        let mut output2 = Vec::new();
+        ingest_agent_teams_from(DEFAULT_SCOPE, staging, &mut output2);
+
+        let (entries, done) = parse_output_entries(&output2);
+        assert_eq!(done["total_files"].as_u64().unwrap(), 1);
+        assert_eq!(entries.len(), 1); // team structure entry
     }
 
     #[test]
