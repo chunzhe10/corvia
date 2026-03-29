@@ -1049,6 +1049,7 @@ async fn cmd_ingest(path: Option<&str>, incremental: bool, files: &[String]) -> 
                 content_role: None,
                 source_origin: None,
                     parent_session_id: None,
+                    edge_hints: vec![],
             };
             let (chunks, pipeline_relations) = pipeline.process(&content, &meta)?;
             println!("    Chunked into {} pieces", chunks.len());

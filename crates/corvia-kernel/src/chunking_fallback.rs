@@ -197,6 +197,7 @@ mod tests {
             content_role: None,
             source_origin: None,
                     parent_session_id: None,
+                    edge_hints: vec![],
         }
     }
 

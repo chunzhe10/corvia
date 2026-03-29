@@ -43,6 +43,21 @@ pub struct SourceMetadata {
     /// to the parent session's first turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    /// Optional graph edge hints. Each hint specifies a relation and a target
+    /// entry by `source_version`. The ingest pipeline resolves targets and
+    /// creates edges; unresolved targets are deferred to `.pending-edges`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edge_hints: Vec<EdgeHint>,
+}
+
+/// A graph edge hint emitted by an adapter. The ingest pipeline resolves the
+/// `target_source_version` to an entry UUID and creates the edge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeHint {
+    /// Relation type (e.g., "ran_during", "has_member", "depends_on").
+    pub relation: String,
+    /// Source version of the target entry (e.g., "ses-abc123:turn-1").
+    pub target_source_version: String,
 }
 
 /// A raw chunk produced by a [`ChunkingStrategy`] before pipeline processing.
@@ -226,6 +241,7 @@ mod tests {
             content_role: None,
             source_origin: None,
                     parent_session_id: None,
+                    edge_hints: vec![],
         };
         assert_eq!(meta.file_path, "src/main.rs");
         assert_eq!(meta.extension, "rs");
@@ -326,6 +342,7 @@ mod tests {
             content_role: None,
             source_origin: None,
                     parent_session_id: None,
+                    edge_hints: vec![],
         }
     }
 
@@ -378,6 +395,7 @@ mod tests {
                 content_role: None,
                 source_origin: None,
                     parent_session_id: None,
+                    edge_hints: vec![],
             },
         };
         let json = serde_json::to_string(&sf).unwrap();

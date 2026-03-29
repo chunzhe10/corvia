@@ -760,6 +760,7 @@ mod tests {
             content_role: None,
             source_origin: None,
                     parent_session_id: None,
+                    edge_hints: vec![],
         }
     }
 
@@ -1075,6 +1076,7 @@ mod tests {
                     content_role: None,
                     source_origin: None,
                     parent_session_id: None,
+                    edge_hints: vec![],
                 },
             },
             SourceFile {
@@ -1089,6 +1091,7 @@ mod tests {
                     content_role: None,
                     source_origin: None,
                     parent_session_id: None,
+                    edge_hints: vec![],
                 },
             },
             SourceFile {
@@ -1103,6 +1106,7 @@ mod tests {
                     content_role: None,
                     source_origin: None,
                     parent_session_id: None,
+                    edge_hints: vec![],
                 },
             },
         ];

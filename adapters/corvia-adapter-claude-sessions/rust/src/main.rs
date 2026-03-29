@@ -69,6 +69,15 @@ struct SourceMetadata {
     source_origin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    edge_hints: Vec<EdgeHint>,
+}
+
+/// A graph edge hint for the kernel to create after storing entries.
+#[derive(Debug, Clone, Serialize)]
+struct EdgeHint {
+    relation: String,
+    target_source_version: String,
 }
 
 #[derive(Serialize)]
@@ -407,6 +416,7 @@ fn ingest_sessions_from<W: Write>(scope_id: &str, dir: &Path, out: &mut W) {
                                 content_role: Some(content_role),
                                 source_origin: Some(source_origin),
                                 parent_session_id: parent_for_edge,
+                                edge_hints: vec![],
                             },
                         },
                     };
@@ -820,6 +830,7 @@ fn ingest_agent_teams_from<W: Write>(scope_id: &str, staging_root: &Path, out: &
                         content_role: Some("memory".into()),
                         source_origin: Some(source_origin.clone()),
                         parent_session_id: None,
+                                edge_hints: vec![],
                     },
                 },
             };
@@ -843,6 +854,7 @@ fn ingest_agent_teams_from<W: Write>(scope_id: &str, staging_root: &Path, out: &
                             content_role: Some("task".into()),
                             source_origin: Some(source_origin.clone()),
                             parent_session_id: None,
+                                edge_hints: vec![],
                         },
                     },
                 };
@@ -874,6 +886,7 @@ fn ingest_agent_teams_from<W: Write>(scope_id: &str, staging_root: &Path, out: &
                                 content_role: Some("finding".into()),
                                 source_origin: Some(source_origin.clone()),
                                 parent_session_id: None,
+                                edge_hints: vec![],
                             },
                         },
                     };

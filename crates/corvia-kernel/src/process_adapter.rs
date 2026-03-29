@@ -275,6 +275,7 @@ for line in sys.stdin:
             content_role: None,
             source_origin: None,
                     parent_session_id: None,
+                    edge_hints: vec![],
         };
         let (chunks, relations) = adapter.chunk("fn main() {}", &meta).unwrap();
         assert_eq!(chunks.len(), 1);
@@ -306,6 +307,7 @@ for line in sys.stdin:
             content_role: None,
             source_origin: None,
                     parent_session_id: None,
+                    edge_hints: vec![],
         };
         let (chunks, _) = adapter.chunk("test content", &meta).unwrap();
         assert_eq!(chunks.len(), 1);
