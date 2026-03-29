@@ -365,20 +365,13 @@ pub fn visibility_filter(
     }
 }
 
-/// Vector + graph expansion retriever. Corvia's differentiator.
-///
-/// 1. Vector search for initial top-k (2x oversample).
-/// 2. For each result, follow graph edges up to `graph_depth` hops.
-/// 3. Deduplicate and blend scores: `final = (1-α)*cosine + α*(1/(hop+1))`.
-///
-/// When `expand_graph` is false in the opts, behaves identically to
 /// Maximum edges to expand per node. When a node has more edges than this,
 /// only the top edges (sorted by relation_weight * direction_bias) are expanded.
 const MAX_EDGES_PER_NODE: usize = 50;
 
 /// Return a weight for a graph relation type. Higher = more structurally significant.
 /// These are initial values subject to tuning based on retrieval quality benchmarks.
-pub fn relation_weight(relation: &str) -> f32 {
+pub(crate) fn relation_weight(relation: &str) -> f32 {
     match relation {
         "implements" => 0.9,
         "extends" => 0.85,
@@ -393,7 +386,7 @@ pub fn relation_weight(relation: &str) -> f32 {
 
 /// Return a direction bias for a relation type.
 /// Some relations are more valuable when followed in a specific direction.
-pub fn direction_bias(relation: &str, is_outgoing: bool) -> f32 {
+pub(crate) fn direction_bias(relation: &str, is_outgoing: bool) -> f32 {
     match relation {
         "calls" | "imports" => {
             if is_outgoing { 1.0 } else { 0.8 }
@@ -407,7 +400,18 @@ pub fn direction_bias(relation: &str, is_outgoing: bool) -> f32 {
     }
 }
 
+/// Vector + graph expansion retriever. Corvia's differentiator.
+///
+/// 1. Vector search for initial top-k (2x oversample).
+/// 2. For each result, follow graph edges up to `graph_depth` hops.
+/// 3. Deduplicate and blend scores: `final = (1-α)*cosine + α*edge_score`.
+/// 4. Edge score = `relation_weight * direction_bias` (relation-type-aware).
+///
+/// When `expand_graph` is false in the opts, behaves identically to
 /// [`VectorRetriever`] (graph_expanded == 0).
+///
+/// **Note:** `pipeline::GraphExpander` does not yet have relation-weight scoring.
+/// Port these improvements there as a follow-up.
 ///
 /// **Deprecated:** Use [`pipeline::GraphExpander`](crate::pipeline::expander::GraphExpander)
 /// with [`RetrievalPipeline`](crate::pipeline::RetrievalPipeline) instead.
