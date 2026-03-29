@@ -19,8 +19,9 @@ use crate::traits::{GraphStore, InferenceEngine, QueryableStore};
 use corvia_common::config::CorviaConfig;
 use corvia_common::constants::{CLAUDE_SESSIONS_ADAPTER, USER_HISTORY_SCOPE};
 use corvia_common::types::KnowledgeEntry;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -849,8 +850,305 @@ pub async fn run_workspace_ingest(ctx: WorkspaceIngestCtx<'_>) -> anyhow::Result
         }
     }
 
+    // --- Phase 4: Agent Teams entries + graph edge wiring ---
+    if repo_filter.is_none() {
+        let session_scope = config
+            .scope
+            .as_ref()
+            .and_then(|scopes| scopes.iter().find(|s| s.id == USER_HISTORY_SCOPE));
+
+        if session_scope.is_some() {
+            let adapter_info = discovered.iter().find(|a| a.metadata.domain == CLAUDE_SESSIONS_ADAPTER);
+            if let Some(adapter_info) = adapter_info {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+                let staging_root = PathBuf::from(&home)
+                    .join(".corvia")
+                    .join("staging")
+                    .join("agent-teams");
+
+                if staging_root.is_dir() {
+                    progress.log("\nIngesting Agent Teams entries...");
+
+                    let mut process = ProcessAdapter::new(
+                        adapter_info.binary_path.clone(),
+                        adapter_info.metadata.clone(),
+                    );
+                    process.spawn().map_err(|e| anyhow::anyhow!(e))?;
+
+                    let source_files = process
+                        .ingest("agent-teams", USER_HISTORY_SCOPE)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+
+                    if source_files.is_empty() {
+                        progress.log("  No new agent teams to ingest.");
+                    } else {
+                        progress.log(&format!("  {} team entries to store", source_files.len()));
+
+                        // Collect edge hints before consuming source_files
+                        let edge_hints_by_idx: Vec<Vec<crate::chunking_strategy::EdgeHint>> =
+                            source_files
+                                .iter()
+                                .map(|sf| sf.metadata.edge_hints.clone())
+                                .collect();
+
+                        let entries: Vec<KnowledgeEntry> = source_files
+                            .iter()
+                            .map(|sf| {
+                                let mut entry = KnowledgeEntry::new(
+                                    sf.content.clone(),
+                                    USER_HISTORY_SCOPE.to_string(),
+                                    sf.metadata.source_version.clone(),
+                                );
+                                entry.workstream =
+                                    sf.metadata.workstream.clone().unwrap_or_default();
+                                entry.metadata = corvia_common::types::EntryMetadata {
+                                    source_file: Some(sf.metadata.file_path.clone()),
+                                    language: sf.metadata.language.clone(),
+                                    chunk_type: Some("team-entry".into()),
+                                    start_line: None,
+                                    end_line: None,
+                                    content_role: sf.metadata.content_role.clone(),
+                                    source_origin: sf.metadata.source_origin.clone(),
+                                };
+                                entry
+                            })
+                            .collect();
+
+                        // Build source_version -> index lookup for same-batch resolution
+                        let sv_to_idx: HashMap<String, usize> = source_files
+                            .iter()
+                            .enumerate()
+                            .map(|(i, sf)| (sf.metadata.source_version.clone(), i))
+                            .collect();
+
+                        let total = entries.len();
+                        let mut stored_ids: Vec<uuid::Uuid> = Vec::with_capacity(total);
+                        let mut stored = 0;
+                        for batch in entries.chunks(EMBED_BATCH_SIZE) {
+                            let texts: Vec<String> =
+                                batch.iter().map(|e| e.content.clone()).collect();
+                            let embeddings = engine.embed_batch(&texts).await?;
+                            for (entry, embedding) in batch.iter().zip(embeddings) {
+                                let mut entry = entry.clone();
+                                entry.embedding = Some(embedding);
+                                store.insert(&entry).await?;
+                                stored_ids.push(entry.id);
+                                stored += 1;
+                            }
+                            progress.log(&format!("  embedded and stored {}/{}", stored, total));
+                        }
+
+                        // Wire graph edges from edge hints
+                        let mut edges_created = 0u32;
+                        let mut pending_edges: Vec<PendingEdge> = Vec::new();
+
+                        for (i, hints) in edge_hints_by_idx.iter().enumerate() {
+                            if hints.is_empty() || i >= stored_ids.len() {
+                                continue;
+                            }
+                            let from_id = stored_ids[i];
+
+                            for hint in hints {
+                                // Try same-batch resolution first
+                                if let Some(&target_idx) = sv_to_idx.get(&hint.target_source_version) {
+                                    if target_idx < stored_ids.len() {
+                                        let to_id = stored_ids[target_idx];
+                                        if graph
+                                            .relate(&from_id, &hint.relation, &to_id, None)
+                                            .await
+                                            .is_ok()
+                                        {
+                                            edges_created += 1;
+                                            continue;
+                                        }
+                                    }
+                                }
+
+                                // Try cross-batch resolution via store lookup
+                                match store
+                                    .get_by_source_version(
+                                        USER_HISTORY_SCOPE,
+                                        &hint.target_source_version,
+                                    )
+                                    .await
+                                {
+                                    Ok(Some(target_entry)) => {
+                                        if graph
+                                            .relate(
+                                                &from_id,
+                                                &hint.relation,
+                                                &target_entry.id,
+                                                None,
+                                            )
+                                            .await
+                                            .is_ok()
+                                        {
+                                            edges_created += 1;
+                                        }
+                                    }
+                                    _ => {
+                                        // Defer: target not found yet
+                                        let from_sv = source_files
+                                            .get(i)
+                                            .map(|sf| sf.metadata.source_version.clone())
+                                            .unwrap_or_default();
+                                        pending_edges.push(PendingEdge {
+                                            from_source_version: from_sv,
+                                            relation: hint.relation.clone(),
+                                            to_source_version: hint
+                                                .target_source_version
+                                                .clone(),
+                                            created_at: chrono::Utc::now()
+                                                .to_rfc3339(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+
+                        if edges_created > 0 {
+                            progress.log(&format!(
+                                "  {edges_created} graph edges created"
+                            ));
+                        }
+
+                        // Write pending edges to staging dir
+                        if !pending_edges.is_empty() {
+                            let pending_path = staging_root.join(".pending-edges");
+                            write_pending_edges(&pending_path, &pending_edges);
+                            progress.log(&format!(
+                                "  {} edges deferred (target not yet ingested)",
+                                pending_edges.len()
+                            ));
+                        }
+
+                        // Retry previously pending edges
+                        let pending_path = staging_root.join(".pending-edges");
+                        let resolved = retry_pending_edges(
+                            &pending_path,
+                            &*store,
+                            &*graph,
+                            USER_HISTORY_SCOPE,
+                        )
+                        .await;
+                        if resolved > 0 {
+                            progress.log(&format!(
+                                "  {resolved} previously deferred edges resolved"
+                            ));
+                        }
+
+                        progress.log(&format!("  {} team entries stored", stored));
+                        report.total_chunks += stored;
+                    }
+
+                    process.shutdown().map_err(|e| anyhow::anyhow!(e))?;
+                }
+            }
+        }
+    }
+
     progress.log("\nWorkspace ingest complete.");
     Ok(report)
+}
+
+// ---------------------------------------------------------------------------
+// Deferred edge wiring (G7)
+// ---------------------------------------------------------------------------
+
+/// A pending graph edge that could not be resolved during ingestion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingEdge {
+    from_source_version: String,
+    relation: String,
+    to_source_version: String,
+    created_at: String,
+}
+
+/// Write pending edges to a JSONL file (append mode).
+fn write_pending_edges(path: &Path, edges: &[PendingEdge]) {
+    use std::fs::OpenOptions;
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+        for edge in edges {
+            if let Ok(json) = serde_json::to_string(edge) {
+                let _ = writeln!(f, "{json}");
+            }
+        }
+    }
+}
+
+/// Retry pending edges from a JSONL file. Resolved edges are removed;
+/// edges older than 7 days are logged and removed.
+async fn retry_pending_edges(
+    path: &Path,
+    store: &dyn QueryableStore,
+    graph: &dyn GraphStore,
+    scope_id: &str,
+) -> usize {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) if !c.is_empty() => c,
+        _ => return 0,
+    };
+
+    let now = chrono::Utc::now();
+    let max_age = chrono::Duration::days(7);
+    let mut resolved = 0usize;
+    let mut remaining: Vec<PendingEdge> = Vec::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let edge: PendingEdge = match serde_json::from_str(line) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        // Check age: drop edges older than 7 days
+        if let Ok(created) = chrono::DateTime::parse_from_rfc3339(&edge.created_at) {
+            let age = now.signed_duration_since(created);
+            if age > max_age {
+                tracing::debug!(
+                    from = %edge.from_source_version,
+                    to = %edge.to_source_version,
+                    "dropping pending edge older than 7 days"
+                );
+                continue;
+            }
+        }
+
+        // Try to resolve both ends
+        let from_entry = store.get_by_source_version(scope_id, &edge.from_source_version).await;
+        let to_entry = store.get_by_source_version(scope_id, &edge.to_source_version).await;
+
+        match (from_entry, to_entry) {
+            (Ok(Some(from)), Ok(Some(to))) => {
+                if graph.relate(&from.id, &edge.relation, &to.id, None).await.is_ok() {
+                    resolved += 1;
+                } else {
+                    remaining.push(edge);
+                }
+            }
+            _ => {
+                remaining.push(edge);
+            }
+        }
+    }
+
+    // Rewrite the file with only remaining edges
+    if remaining.is_empty() {
+        let _ = std::fs::remove_file(path);
+    } else {
+        if let Ok(json) = remaining
+            .iter()
+            .map(|e| serde_json::to_string(e))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            let _ = std::fs::write(path, json.join("\n") + "\n");
+        }
+    }
+
+    resolved
 }
 
 #[cfg(test)]
