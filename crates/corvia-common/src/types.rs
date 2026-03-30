@@ -161,6 +161,8 @@ pub struct KnowledgeEntry {
     pub valid_from: DateTime<Utc>,
     pub valid_to: Option<DateTime<Utc>>,
     pub superseded_by: Option<Uuid>,
+    #[serde(skip_serializing)]
+    #[serde(default)]
     pub embedding: Option<Vec<f32>>,
     pub metadata: EntryMetadata,
     #[serde(default)]
@@ -697,6 +699,37 @@ mod tests {
         assert!("Structural".parse::<MemoryType>().is_err());
         assert!("HOT".parse::<Tier>().is_err());
         assert!("Warm".parse::<Tier>().is_err());
+    }
+
+    #[test]
+    fn test_embedding_skip_serializing() {
+        // Embedding is skip_serializing: set in memory but NOT written to JSON
+        let entry = KnowledgeEntry::new("test".into(), "scope".into(), "v1".into())
+            .with_embedding(vec![0.1, 0.2, 0.3]);
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("embedding"), "embedding should not appear in serialized JSON");
+        let deserialized: KnowledgeEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.embedding, None);
+    }
+
+    #[test]
+    fn test_old_json_with_embedding_still_deserializes() {
+        // Backward compat: old JSON files that contain embedding should still parse
+        let json = r#"{
+            "id": "01960000-0000-7000-8000-000000000001",
+            "content": "old entry with embedding",
+            "source_version": "v1",
+            "scope_id": "test",
+            "workstream": "main",
+            "recorded_at": "2026-01-01T00:00:00Z",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_to": null,
+            "superseded_by": null,
+            "embedding": [0.1, 0.2, 0.3],
+            "metadata": {}
+        }"#;
+        let entry: KnowledgeEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.embedding, Some(vec![0.1, 0.2, 0.3]));
     }
 
     #[test]

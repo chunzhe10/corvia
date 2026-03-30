@@ -33,6 +33,18 @@ pub trait QueryableStore: Send + Sync {
         source_version: &str,
     ) -> Result<Option<KnowledgeEntry>>;
 
+    /// Get the embedding vector for an entry by UUID.
+    /// Returns None if no embedding is stored.
+    /// LiteStore reads from the VECTORS table; other backends may read from entry fields.
+    async fn get_embedding(&self, id: &uuid::Uuid) -> Result<Option<Vec<f32>>> {
+        // Default: try to read from the entry's embedding field (backward compat)
+        if let Some(entry) = self.get(id).await? {
+            Ok(entry.embedding)
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Record access for a batch of entries (updates last_accessed and access_count).
     /// All updates are batched into a single write transaction.
     /// Failures are non-fatal — implementations should log warnings, not propagate errors.

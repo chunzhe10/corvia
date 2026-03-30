@@ -61,6 +61,12 @@ impl MergeWorker {
             // Update entry status to Rejected in store
             if let Ok(Some(mut entry)) = self.store.get(&queue_entry.entry_id).await {
                 entry.entry_status = EntryStatus::Rejected;
+                // Restore embedding from VECTORS table (not in ENTRIES after skip_serializing)
+                if entry.embedding.is_none()
+                    && let Ok(Some(emb)) = self.store.get_embedding(&queue_entry.entry_id).await
+                {
+                    entry.embedding = Some(emb);
+                }
                 if let Err(e) = self.store.insert(&entry).await {
                     warn!(entry_id = %queue_entry.entry_id, error = %e, "failed to update rejected entry status in store");
                 }
@@ -69,11 +75,18 @@ impl MergeWorker {
             return Ok(());
         }
 
-        // Get the entry from the store
-        let entry = self.store.get(&queue_entry.entry_id).await?
+        // Get the entry from the store (embedding is in VECTORS table, not ENTRIES)
+        let mut entry = self.store.get(&queue_entry.entry_id).await?
             .ok_or_else(|| CorviaError::NotFound(
                 format!("Entry {} not found in store", queue_entry.entry_id)
             ))?;
+
+        // Restore embedding from VECTORS table for conflict detection and re-insert
+        if entry.embedding.is_none()
+            && let Ok(Some(emb)) = self.store.get_embedding(&queue_entry.entry_id).await
+        {
+            entry.embedding = Some(emb);
+        }
 
         // Detect conflict
         match self.detect_conflict(&entry).await? {
@@ -124,7 +137,10 @@ impl MergeWorker {
         &self,
         entry: &KnowledgeEntry,
     ) -> Result<Option<KnowledgeEntry>> {
-        let embedding = entry.embedding.as_ref()
+        // Read embedding from VECTORS table (primary) or entry field (legacy fallback)
+        let stored_embedding = self.store.get_embedding(&entry.id).await?;
+        let embedding = stored_embedding.as_deref()
+            .or(entry.embedding.as_deref())
             .ok_or_else(|| CorviaError::Agent("Entry has no embedding for conflict detection".into()))?;
 
         // Search for similar entries in the same scope

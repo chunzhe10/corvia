@@ -30,6 +30,12 @@ const TEMPORAL_INDEX: TableDefinition<&str, &[u8]> = TableDefinition::new("tempo
 const SOURCE_VERSION_INDEX: TableDefinition<&str, &str> =
     TableDefinition::new("source_version_index");
 
+/// Dedicated vector storage: UUID (16 raw bytes) → embedding (raw f32 native-endian).
+/// Replaces embedding storage in JSON files (92% of file size) and the ENTRIES table.
+/// Value size = dimensions × 4 bytes (e.g., 768 × 4 = 3072 bytes for nomic-embed-text).
+/// Uses bytemuck for zero-copy &[f32] ↔ &[u8] casting.
+const VECTORS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("vectors");
+
 /// HNSW tuning constants
 const MAX_NB_CONNECTION: usize = 16;
 const MAX_LAYER: usize = 16;
@@ -212,7 +218,8 @@ impl LiteStore {
     }
 
     /// Fetch all knowledge entries from the Redb ENTRIES table in a single pass.
-    /// Used for migration export — avoids re-reading JSON files from disk.
+    /// Merges embeddings from the VECTORS table (since ENTRIES no longer stores them).
+    /// Used for migration export -- avoids re-reading JSON files from disk.
     pub fn fetch_all_entries(&self) -> Result<Vec<KnowledgeEntry>> {
         let read_txn = self
             .db
@@ -222,6 +229,7 @@ impl LiteStore {
             Ok(t) => t,
             Err(_) => return Ok(Vec::new()),
         };
+        let vectors_table = read_txn.open_table(VECTORS).ok();
 
         let mut entries = Vec::new();
         for item in entries_table
@@ -231,7 +239,17 @@ impl LiteStore {
             let (_key, value) = item
                 .map_err(|e| CorviaError::Storage(format!("Failed to read entry: {e}")))?;
             match serde_json::from_slice::<KnowledgeEntry>(value.value()) {
-                Ok(entry) => entries.push(entry),
+                Ok(mut entry) => {
+                    // Merge embedding from VECTORS table if not present in entry
+                    if entry.embedding.is_none()
+                        && let Some(ref vtable) = vectors_table
+                        && let Ok(Some(val)) = vtable.get(entry.id.as_bytes())
+                        && let Ok(floats) = bytemuck::try_cast_slice::<u8, f32>(val.value())
+                    {
+                        entry.embedding = Some(floats.to_vec());
+                    }
+                    entries.push(entry);
+                }
                 Err(e) => {
                     tracing::warn!("Skipping malformed entry in Redb: {e}");
                 }
@@ -574,6 +592,16 @@ impl LiteStore {
                     .insert(sv_key.as_str(), uuid_str.as_str())
                     .map_err(|e| CorviaError::Storage(format!("Failed to insert source_version index: {e}")))?;
             }
+
+            // Store embedding as raw binary in VECTORS table
+            let uuid_bytes: &[u8; 16] = entry.id.as_bytes();
+            let vec_bytes: &[u8] = bytemuck::cast_slice(embedding);
+            let mut vectors_table = write_txn
+                .open_table(VECTORS)
+                .map_err(|e| CorviaError::Storage(format!("Failed to open VECTORS: {e}")))?;
+            vectors_table
+                .insert(uuid_bytes, vec_bytes)
+                .map_err(|e| CorviaError::Storage(format!("Failed to insert vector: {e}")))?;
         }
         write_txn
             .commit()
@@ -616,11 +644,87 @@ impl LiteStore {
             .map_err(|e| CorviaError::Storage(format!("Failed to count HNSW_TO_UUID: {e}")))
     }
 
+    /// Read a single embedding from the VECTORS table by UUID.
+    /// Returns None if no vector is stored for this entry.
+    pub fn read_vector(&self, uuid: &uuid::Uuid) -> Result<Option<Vec<f32>>> {
+        let uuid_bytes: &[u8; 16] = uuid.as_bytes();
+        let read_txn = self.db.begin_read()
+            .map_err(|e| CorviaError::Storage(format!("Failed to begin read txn: {e}")))?;
+        let table = match read_txn.open_table(VECTORS) {
+            Ok(t) => t,
+            Err(_) => return Ok(None), // Table doesn't exist yet
+        };
+        match table.get(uuid_bytes) {
+            Ok(Some(val)) => {
+                let bytes = val.value();
+                let floats: &[f32] = bytemuck::try_cast_slice(bytes)
+                    .map_err(|e| CorviaError::Storage(format!("Failed to cast vector bytes: {e}")))?;
+                Ok(Some(floats.to_vec()))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(CorviaError::Storage(format!("Failed to read vector: {e}"))),
+        }
+    }
+
+    /// Read all embeddings from the VECTORS table.
+    /// Returns a map of UUID -> embedding. Used during rebuild.
+    pub fn read_all_vectors(&self) -> Result<std::collections::HashMap<uuid::Uuid, Vec<f32>>> {
+        let read_txn = self.db.begin_read()
+            .map_err(|e| CorviaError::Storage(format!("Failed to begin read txn: {e}")))?;
+        let table = match read_txn.open_table(VECTORS) {
+            Ok(t) => t,
+            Err(_) => return Ok(std::collections::HashMap::new()),
+        };
+
+        let mut vectors = std::collections::HashMap::new();
+        for item in table.iter()
+            .map_err(|e| CorviaError::Storage(format!("Failed to iterate VECTORS: {e}")))?
+        {
+            let (key, value) = item
+                .map_err(|e| CorviaError::Storage(format!("Failed to read vector entry: {e}")))?;
+            let uuid = uuid::Uuid::from_bytes(*key.value());
+            let floats: &[f32] = bytemuck::try_cast_slice(value.value())
+                .map_err(|e| CorviaError::Storage(format!("Failed to cast vector bytes: {e}")))?;
+            vectors.insert(uuid, floats.to_vec());
+        }
+        Ok(vectors)
+    }
+
+    /// Count entries in the VECTORS table.
+    pub fn vectors_count(&self) -> Result<u64> {
+        let read_txn = self.db.begin_read()
+            .map_err(|e| CorviaError::Storage(format!("Failed to begin read txn: {e}")))?;
+        let table = match read_txn.open_table(VECTORS) {
+            Ok(t) => t,
+            Err(_) => return Ok(0),
+        };
+        table.len()
+            .map_err(|e| CorviaError::Storage(format!("Failed to count VECTORS: {e}")))
+    }
+
+    /// Write a single vector to the VECTORS table.
+    /// Used by migrate-vectors and lazy fallback.
+    pub fn write_vector(&self, uuid: &uuid::Uuid, embedding: &[f32]) -> Result<()> {
+        let uuid_bytes: &[u8; 16] = uuid.as_bytes();
+        let vec_bytes: &[u8] = bytemuck::cast_slice(embedding);
+        let write_txn = self.db.begin_write()
+            .map_err(|e| CorviaError::Storage(format!("Failed to begin write txn: {e}")))?;
+        {
+            let mut table = write_txn.open_table(VECTORS)
+                .map_err(|e| CorviaError::Storage(format!("Failed to open VECTORS: {e}")))?;
+            table.insert(uuid_bytes, vec_bytes)
+                .map_err(|e| CorviaError::Storage(format!("Failed to insert vector: {e}")))?;
+        }
+        write_txn.commit()
+            .map_err(|e| CorviaError::Storage(format!("Failed to commit vector write: {e}")))?;
+        Ok(())
+    }
+
     /// Brute-force cosine scan over Cold-tier entries in Redb.
     ///
     /// Iterates all entries in the scope, filters for `Tier::Cold` with preserved
-    /// embeddings, computes cosine similarity against the query embedding, and
-    /// returns the top-K results sorted by score descending.
+    /// embeddings in the VECTORS table, computes cosine similarity against the query
+    /// embedding, and returns the top-K results sorted by score descending.
     ///
     /// Uses `rayon::par_iter()` when cold entry count exceeds 1,000 for parallel
     /// cosine computation.
@@ -641,7 +745,7 @@ impl LiteStore {
         let prefix_start = format!("{scope_id}:");
         let prefix_end = format!("{scope_id};");
 
-        // Single read transaction: scope scan + entry reads.
+        // Single read transaction: scope scan + entry reads + vector reads.
         let read_txn = self
             .db
             .begin_read()
@@ -652,6 +756,9 @@ impl LiteStore {
         let entries_table = read_txn
             .open_table(ENTRIES)
             .map_err(|e| CorviaError::Storage(format!("Failed to open ENTRIES: {e}")))?;
+        let vectors_table = read_txn
+            .open_table(VECTORS)
+            .map_err(|e| CorviaError::Storage(format!("Failed to open VECTORS: {e}")))?;
 
         // Collect UUIDs in scope via prefix range scan.
         let uuids: Vec<String> = scope_table
@@ -662,16 +769,27 @@ impl LiteStore {
 
         let query_dims = query_embedding.len();
 
-        // Batch-read all entries and filter to Cold tier with embeddings.
+        // Batch-read Cold-tier entries with embeddings from VECTORS table.
         let cold_entries: Vec<(KnowledgeEntry, Vec<f32>)> = uuids
             .iter()
             .filter_map(|uuid_str| {
                 let bytes = entries_table.get(uuid_str.as_str()).ok()??;
-                let mut entry: KnowledgeEntry = serde_json::from_slice(bytes.value()).ok()?;
+                let entry: KnowledgeEntry = serde_json::from_slice(bytes.value()).ok()?;
                 if entry.tier != Tier::Cold {
                     return None;
                 }
-                let emb = entry.embedding.take()?;
+                // Read embedding from VECTORS table (primary) or entry field (legacy fallback)
+                let emb = {
+                    let uuid_bytes: &[u8; 16] = entry.id.as_bytes();
+                    if let Ok(Some(val)) = vectors_table.get(uuid_bytes) {
+                        bytemuck::try_cast_slice::<u8, f32>(val.value())
+                            .ok()
+                            .map(|s| s.to_vec())
+                    } else {
+                        entry.embedding.clone()
+                    }
+                };
+                let emb = emb?;
                 // Skip entries with mismatched embedding dimensions (e.g., model change).
                 if emb.len() != query_dims {
                     return None;
@@ -783,14 +901,25 @@ impl LiteStore {
         Ok(())
     }
 
-    /// Rebuild the HNSW index, Redb metadata, and temporal index from knowledge JSON files.
-    /// Graph edges in Redb are preserved — petgraph is rebuilt from Redb during open().
-    /// Safe to call while the server is handling queries — uses blue-green swap so
+    /// Rebuild the HNSW index, Redb metadata, and temporal index from knowledge JSON files
+    /// and the VECTORS table. Embeddings are sourced from the VECTORS table first (fast,
+    /// binary), falling back to JSON for pre-migration entries.
+    /// Graph edges in Redb are preserved -- petgraph is rebuilt from Redb during open().
+    /// Safe to call while the server is handling queries -- uses blue-green swap so
     /// searches continue against the old index until the new one is fully populated.
     /// Returns the number of entries re-indexed.
     pub fn rebuild_from_files(&self) -> Result<usize> {
         let all_entries = knowledge_files::read_all(&self.data_dir)?;
         let count = all_entries.len();
+
+        // Load all vectors from the VECTORS table (fast binary read).
+        // For post-migration entries, this is the only source of embeddings.
+        // For pre-migration entries, JSON may still have embeddings as fallback.
+        let stored_vectors = self.read_all_vectors()?;
+        let vectors_found = stored_vectors.len();
+        if vectors_found > 0 {
+            info!("Loaded {} vectors from VECTORS table for rebuild", vectors_found);
+        }
 
         // Blue-green rebuild: build the new index fully before swapping.
         // Searches continue using the old index throughout this phase.
@@ -811,8 +940,13 @@ impl LiteStore {
 
         // Populate the new HNSW index and Redb metadata.
         // Inserts go into new_hnsw (not self.hnsw), so searches are unaffected.
+        // Embedding source priority: VECTORS table > JSON field (legacy fallback).
         for entry in &all_entries {
-            if let Some(ref embedding) = entry.embedding {
+            let embedding = stored_vectors.get(&entry.id)
+                .map(|v| v.as_slice())
+                .or(entry.embedding.as_deref());
+
+            if let Some(embedding) = embedding {
                 self.index_entry_into(entry, embedding, &new_hnsw)?;
             } else {
                 // For entries without embeddings, still populate source_version index
@@ -900,6 +1034,61 @@ impl LiteStore {
 
         Ok(())
     }
+
+    /// Migrate embeddings from JSON knowledge files to the VECTORS table.
+    /// Two-phase, idempotent, resumable:
+    ///   Phase 1: Populate VECTORS table from JSON files that have embeddings
+    ///   Phase 2: Re-write JSON files (embedding is now skip_serializing)
+    /// Returns (vectors_migrated, files_rewritten).
+    pub fn migrate_vectors(&self) -> Result<(usize, usize)> {
+        let all_entries = knowledge_files::read_all(&self.data_dir)?;
+
+        // Phase 1: Populate VECTORS table from entries that have embeddings in JSON
+        let mut vectors_migrated = 0usize;
+        for entry in &all_entries {
+            if let Some(ref embedding) = entry.embedding {
+                // Check if already in VECTORS (idempotent)
+                let uuid_bytes: &[u8; 16] = entry.id.as_bytes();
+                let already_exists = {
+                    let read_txn = self.db.begin_read()
+                        .map_err(|e| CorviaError::Storage(format!("begin_read: {e}")))?;
+                    match read_txn.open_table(VECTORS) {
+                        Ok(table) => matches!(table.get(uuid_bytes), Ok(Some(_))),
+                        Err(_) => false,
+                    }
+                };
+                if !already_exists {
+                    self.write_vector(&entry.id, embedding)?;
+                    vectors_migrated += 1;
+                }
+            }
+        }
+        info!("Phase 1 complete: {} vectors migrated to VECTORS table", vectors_migrated);
+
+        // Verify VECTORS count before proceeding to Phase 2
+        let vectors_count = self.vectors_count()?;
+        let entries_with_embeddings = all_entries.iter().filter(|e| e.embedding.is_some()).count() as u64;
+        if vectors_count < entries_with_embeddings {
+            return Err(CorviaError::Storage(format!(
+                "VECTORS count ({}) < entries with embeddings ({}). Phase 2 aborted.",
+                vectors_count, entries_with_embeddings
+            )));
+        }
+
+        // Phase 2: Re-write JSON files (embedding field is now skip_serializing)
+        // This strips embeddings from the JSON files, reducing size by ~92%.
+        let mut files_rewritten = 0usize;
+        for entry in &all_entries {
+            if entry.embedding.is_some() {
+                // Re-serialize writes JSON without embedding (skip_serializing)
+                knowledge_files::write_entry(&self.data_dir, entry)?;
+                files_rewritten += 1;
+            }
+        }
+        info!("Phase 2 complete: {} JSON files rewritten without embeddings", files_rewritten);
+
+        Ok((vectors_migrated, files_rewritten))
+    }
 }
 
 impl Drop for LiteStore {
@@ -946,6 +1135,9 @@ impl super::traits::QueryableStore for LiteStore {
             let _ = write_txn
                 .open_table(SOURCE_VERSION_INDEX)
                 .map_err(|e| CorviaError::Storage(format!("Failed to create SOURCE_VERSION_INDEX: {e}")))?;
+            let _ = write_txn
+                .open_table(VECTORS)
+                .map_err(|e| CorviaError::Storage(format!("Failed to create VECTORS: {e}")))?;
             let _ = write_txn
                 .open_table(crate::graph_store::GRAPH_EDGES)
                 .map_err(|e| CorviaError::Storage(format!("Failed to create GRAPH_EDGES: {e}")))?;
@@ -1116,6 +1308,10 @@ impl super::traits::QueryableStore for LiteStore {
         }
     }
 
+    async fn get_embedding(&self, id: &uuid::Uuid) -> Result<Option<Vec<f32>>> {
+        self.read_vector(id)
+    }
+
     async fn count(&self, scope_id: &str) -> Result<u64> {
         let prefix_start = format!("{scope_id}:");
         // Use the character after ':' as the exclusive upper bound for the range scan.
@@ -1195,6 +1391,10 @@ impl super::traits::QueryableStore for LiteStore {
                     let _ = sv_table.remove(key.as_str());
                 }
 
+                let mut vectors_table = write_txn
+                    .open_table(VECTORS)
+                    .map_err(|e| CorviaError::Storage(format!("Failed to open VECTORS: {e}")))?;
+
                 for uuid_str in &uuids_to_delete {
                     // Remove entry
                     let _ = entries_table.remove(uuid_str.as_str());
@@ -1206,6 +1406,11 @@ impl super::traits::QueryableStore for LiteStore {
                     // Remove HNSW ID mappings
                     if let Ok(Some(hnsw_id_val)) = u2h_table.remove(uuid_str.as_str()) {
                         let _ = h2u_table.remove(hnsw_id_val.value());
+                    }
+
+                    // Remove vector embedding
+                    if let Ok(uuid) = uuid::Uuid::parse_str(uuid_str) {
+                        let _ = vectors_table.remove(uuid.as_bytes());
                     }
                 }
             }
