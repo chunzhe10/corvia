@@ -285,6 +285,39 @@ mod tests {
     }
 
     #[test]
+    fn test_staging_vec_file_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = test_staging_in(dir.path());
+        let staging_dir = staging.create_staging_dir("test::agent", "sess-vec").unwrap();
+
+        // Write entry WITH embedding
+        let embedding = vec![0.1, 0.2, 0.3, 0.4];
+        let entry = KnowledgeEntry::new("vec test".into(), "scope".into(), "v1".into())
+            .with_embedding(embedding.clone());
+        let entry_id = entry.id;
+        staging.write_staging_file(&staging_dir, &entry).unwrap();
+
+        // Verify .vec companion file exists
+        let vec_path = staging_dir.join(format!("{entry_id}.vec"));
+        assert!(vec_path.exists(), ".vec file should be created for entries with embeddings");
+
+        // Read back and verify embedding is restored
+        let loaded = staging.read_staging_file(&staging_dir, &entry_id).unwrap();
+        assert_eq!(loaded.embedding, Some(embedding), "embedding should roundtrip via .vec file");
+
+        // Entry without embedding should NOT create .vec file
+        let no_emb = KnowledgeEntry::new("no vec".into(), "scope".into(), "v1".into());
+        let no_emb_id = no_emb.id;
+        staging.write_staging_file(&staging_dir, &no_emb).unwrap();
+        let no_vec_path = staging_dir.join(format!("{no_emb_id}.vec"));
+        assert!(!no_vec_path.exists(), ".vec file should not exist for entries without embeddings");
+
+        // move_to_knowledge cleans up .vec file
+        staging.move_to_knowledge(&staging_dir, &entry_id, "scope").unwrap();
+        assert!(!vec_path.exists(), ".vec file should be removed after move_to_knowledge");
+    }
+
+    #[test]
     fn test_git_branch_lifecycle() {
         let dir = tempfile::tempdir().unwrap();
         // Initialize a git repo with a valid initial commit

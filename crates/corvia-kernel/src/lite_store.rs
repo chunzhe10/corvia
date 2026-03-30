@@ -2564,4 +2564,75 @@ mod tests {
         assert_eq!(entry.access_count, 1, "Drop should have flushed pending access events");
         assert!(entry.last_accessed.is_some());
     }
+
+    #[tokio::test]
+    async fn test_vectors_table_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LiteStore::open(dir.path(), 3).unwrap();
+        store.init_schema().await.unwrap();
+
+        // Insert entry with embedding
+        let embedding = vec![0.1, 0.2, 0.3];
+        let entry = KnowledgeEntry::new("vec test".into(), "scope".into(), "v1".into())
+            .with_embedding(embedding.clone());
+        let entry_id = entry.id;
+        store.insert(&entry).await.unwrap();
+
+        // read_vector returns correct data
+        let vec = store.read_vector(&entry_id).unwrap();
+        assert!(vec.is_some(), "read_vector should find the entry");
+        assert_eq!(vec.unwrap(), embedding);
+
+        // get_embedding (trait method) also works
+        let emb = store.get_embedding(&entry_id).await.unwrap();
+        assert_eq!(emb, Some(embedding));
+
+        // vectors_count is accurate
+        assert_eq!(store.vectors_count().unwrap(), 1);
+
+        // Nonexistent UUID returns None
+        let missing = store.read_vector(&uuid::Uuid::now_v7()).unwrap();
+        assert!(missing.is_none());
+
+        // delete_scope cleans up VECTORS
+        store.delete_scope("scope").await.unwrap();
+        assert_eq!(store.vectors_count().unwrap(), 0);
+        assert!(store.read_vector(&entry_id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_migrate_vectors_happy_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LiteStore::open(dir.path(), 3).unwrap();
+        store.init_schema().await.unwrap();
+
+        // Insert entries (simulating pre-migration: embeddings in both JSON and HNSW)
+        let emb1 = vec![1.0, 0.0, 0.0];
+        let emb2 = vec![0.0, 1.0, 0.0];
+        let e1 = KnowledgeEntry::new("entry one".into(), "scope".into(), "v1".into())
+            .with_embedding(emb1.clone());
+        let e2 = KnowledgeEntry::new("entry two".into(), "scope".into(), "v1".into())
+            .with_embedding(emb2.clone());
+        let id1 = e1.id;
+        let id2 = e2.id;
+        store.insert(&e1).await.unwrap();
+        store.insert(&e2).await.unwrap();
+
+        // Vectors should already be in VECTORS table from insert
+        assert_eq!(store.vectors_count().unwrap(), 2);
+
+        // Run migration (should be a no-op for vectors, but rewrites JSON)
+        let (migrated, rewritten) = store.migrate_vectors().unwrap();
+        assert_eq!(migrated, 0, "vectors already in table from insert");
+        // Rewritten count depends on whether JSON files still had embeddings
+        // (they don't post-skip_serializing, so entries read back have embedding: None)
+
+        // Vectors still accessible
+        assert_eq!(store.read_vector(&id1).unwrap().unwrap(), emb1);
+        assert_eq!(store.read_vector(&id2).unwrap().unwrap(), emb2);
+
+        // Run migration again (idempotent)
+        let (migrated2, _) = store.migrate_vectors().unwrap();
+        assert_eq!(migrated2, 0);
+    }
 }
