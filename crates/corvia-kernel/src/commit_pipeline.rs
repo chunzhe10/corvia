@@ -84,6 +84,12 @@ impl CommitPipeline {
                 if let Ok(Some(mut entry)) = self.store.get(entry_id).await
                     && entry.entry_status == EntryStatus::Pending {
                         entry.entry_status = EntryStatus::Committed;
+                        // Restore embedding from VECTORS table for re-insert
+                        if entry.embedding.is_none()
+                            && let Ok(Some(emb)) = self.store.get_embedding(entry_id).await
+                        {
+                            entry.embedding = Some(emb);
+                        }
                         if let Err(e) = self.store.insert(&entry).await {
                             warn!(entry_id = %entry_id, error = %e, "commit_step3: failed to update entry status");
                         }

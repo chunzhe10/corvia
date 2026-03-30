@@ -42,22 +42,43 @@ impl StagingManager {
     }
 
     /// Write a knowledge entry to a staging file as `{entry_id}.json`.
+    /// Also writes a companion `.vec` file with raw embedding bytes,
+    /// since the embedding field is skip_serializing in JSON.
     pub fn write_staging_file(&self, staging_dir: &Path, entry: &KnowledgeEntry) -> Result<()> {
         let path = staging_dir.join(format!("{}.json", entry.id));
         let json = serde_json::to_string_pretty(entry)
             .map_err(|e| CorviaError::Agent(format!("Failed to serialize entry: {e}")))?;
         std::fs::write(&path, json)
             .map_err(|e| CorviaError::Agent(format!("Failed to write staging file: {e}")))?;
+
+        // Write companion .vec file with raw embedding bytes
+        if let Some(ref embedding) = entry.embedding {
+            let vec_path = staging_dir.join(format!("{}.vec", entry.id));
+            let vec_bytes: &[u8] = bytemuck::cast_slice(embedding);
+            std::fs::write(&vec_path, vec_bytes)
+                .map_err(|e| CorviaError::Agent(format!("Failed to write staging vec file: {e}")))?;
+        }
         Ok(())
     }
 
     /// Read a knowledge entry from a staging file.
+    /// Also reads the companion `.vec` file to restore the embedding,
+    /// since the embedding field is skip_serializing in JSON.
     pub fn read_staging_file(&self, staging_dir: &Path, entry_id: &Uuid) -> Result<KnowledgeEntry> {
         let path = staging_dir.join(format!("{entry_id}.json"));
         let content = std::fs::read_to_string(&path)
             .map_err(|e| CorviaError::Agent(format!("Failed to read staging file: {e}")))?;
-        serde_json::from_str(&content)
-            .map_err(|e| CorviaError::Agent(format!("Failed to deserialize staging entry: {e}")))
+        let mut entry: KnowledgeEntry = serde_json::from_str(&content)
+            .map_err(|e| CorviaError::Agent(format!("Failed to deserialize staging entry: {e}")))?;
+
+        // Restore embedding from companion .vec file
+        let vec_path = staging_dir.join(format!("{entry_id}.vec"));
+        if let Ok(bytes) = std::fs::read(&vec_path)
+            && let Ok(floats) = bytemuck::try_cast_slice::<u8, f32>(&bytes)
+        {
+            entry.embedding = Some(floats.to_vec());
+        }
+        Ok(entry)
     }
 
     /// List all entry IDs in a staging directory (from `*.json` filenames).
@@ -84,6 +105,7 @@ impl StagingManager {
     /// Move a staging file to the main knowledge directory.
     /// From: `{staging_dir}/{entry_id}.json`
     /// To:   `{data_dir}/knowledge/{scope_id}/{entry_id}.json`
+    /// Also cleans up the companion `.vec` file (embeddings are in VECTORS table).
     pub fn move_to_knowledge(
         &self,
         staging_dir: &Path,
@@ -97,6 +119,10 @@ impl StagingManager {
         let dest = dest_dir.join(format!("{entry_id}.json"));
         std::fs::rename(&src, &dest)
             .map_err(|e| CorviaError::Agent(format!("Failed to move staging file to knowledge: {e}")))?;
+
+        // Clean up companion .vec file (embedding is now in VECTORS table)
+        let vec_src = staging_dir.join(format!("{entry_id}.vec"));
+        let _ = std::fs::remove_file(vec_src);
         Ok(())
     }
 

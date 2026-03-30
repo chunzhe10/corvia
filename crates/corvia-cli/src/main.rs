@@ -116,6 +116,9 @@ enum Commands {
     /// Rebuild LiteStore indexes from knowledge files
     Rebuild,
 
+    /// Migrate embeddings from JSON files to Redb VECTORS table
+    MigrateVectors,
+
     /// Manage registered agents
     Agent {
         #[command(subcommand)]
@@ -564,6 +567,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::Test { check_only, keep, ci } => cmd_test(check_only, keep, ci).await?,
         Commands::Demo { keep } => cmd_demo(keep).await?,
         Commands::Rebuild => cmd_rebuild().await?,
+        Commands::MigrateVectors => cmd_migrate_vectors().await?,
         Commands::Agent { command } => cmd_agent(command).await?,
         Commands::Workspace { command } => cmd_workspace(command).await?,
         Commands::History { entry_id } => cmd_history(&entry_id).await?,
@@ -1415,6 +1419,30 @@ async fn cmd_rebuild() -> Result<()> {
         }
         corvia_common::config::StoreType::Postgres => {
             println!("Rebuild is only needed for LiteStore. PostgreSQL manages its own indexes.");
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_migrate_vectors() -> Result<()> {
+    let config = load_config()?;
+
+    match config.storage.store_type {
+        corvia_common::config::StoreType::Lite => {
+            println!("Migrating embeddings from JSON files to Redb VECTORS table...");
+            let data_dir = std::path::Path::new(&config.storage.data_dir);
+            let store = corvia_kernel::lite_store::LiteStore::open(data_dir, config.embedding.dimensions)?;
+            store.init_schema().await?;
+            let (vectors_migrated, files_rewritten) = store.migrate_vectors()?;
+            println!("Migration complete:");
+            println!("  Vectors migrated: {vectors_migrated}");
+            println!("  JSON files rewritten: {files_rewritten}");
+            let vectors_count = store.vectors_count()?;
+            println!("  Total vectors in VECTORS table: {vectors_count}");
+        }
+        corvia_common::config::StoreType::Postgres => {
+            println!("migrate-vectors is only needed for LiteStore. PostgreSQL stores vectors in pgvector columns.");
         }
     }
 

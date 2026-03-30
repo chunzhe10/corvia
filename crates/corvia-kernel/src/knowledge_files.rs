@@ -135,7 +135,9 @@ mod tests {
         write_entry(dir.path(), &entry).unwrap();
         let loaded = read_entry(dir.path(), "test-scope", &entry.id).unwrap();
         assert_eq!(loaded.content, entry.content);
-        assert_eq!(loaded.embedding, entry.embedding);
+        // Embedding is skip_serializing — not persisted in JSON files.
+        // Embeddings are stored in the Redb VECTORS table instead.
+        assert_eq!(loaded.embedding, None);
     }
 
     #[test]
