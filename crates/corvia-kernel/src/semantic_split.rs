@@ -61,9 +61,9 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Maximum number of sentences to process per chunk.
+/// Maximum number of segments to process per chunk.
 /// Beyond this, fall back to naive splitting (N^2 similarity is too expensive).
-const MAX_SENTENCES_PER_CHUNK: usize = 50;
+pub const MAX_SEGMENTS_PER_CHUNK: usize = 50;
 
 /// Split sentences into semantically coherent groups using the Max-Min algorithm.
 ///
@@ -134,11 +134,10 @@ pub fn max_min_split(
 /// Segments are Markdown-structure-aware:
 /// - Fenced code blocks (``` or ~~~) are atomic units
 /// - Lines within a code block are never split
-/// - Prose paragraphs are split at blank-line boundaries first
-/// - Within a paragraph, sentences are split at `. ` / `! ` / `? ` boundaries
+/// - Prose is split at blank-line (paragraph) boundaries
+/// - Each paragraph becomes one segment (no intra-paragraph sentence splitting)
 ///
-/// Returns a Vec of segments (each segment is a Vec of line indices from the
-/// original content).
+/// Returns a Vec of segment strings.
 pub fn split_into_segments(content: &str) -> Vec<String> {
     let lines: Vec<&str> = content.lines().collect();
     let mut segments: Vec<String> = Vec::new();
@@ -225,36 +224,43 @@ pub fn reassemble_groups(segments: &[String], groups: &[Vec<usize>]) -> Vec<Stri
 
 /// Check if any sub-chunk exceeds the token budget and split further if needed.
 /// Uses simple chars/4 token estimation (matching the pipeline's CharDivFourEstimator).
+/// Recursion is depth-limited to prevent infinite loops on pathological input
+/// (e.g., single very long line with no newlines).
 pub fn enforce_token_budget(sub_chunks: Vec<String>, max_tokens: usize) -> Vec<String> {
     let mut result = Vec::new();
     for chunk in sub_chunks {
-        let tokens = chunk.len() / 4;
-        if tokens <= max_tokens {
-            result.push(chunk);
-        } else {
-            // Split at the nearest paragraph boundary to midpoint
-            let mid = chunk.len() / 2;
-            // Find the nearest blank line to midpoint
-            let split_point = chunk[..mid]
-                .rfind("\n\n")
-                .map(|p| p + 2) // after the blank line
-                .or_else(|| chunk[..mid].rfind('\n').map(|p| p + 1))
-                .unwrap_or(mid);
-
-            let (first, second) = chunk.split_at(split_point);
-            let first = first.trim().to_string();
-            let second = second.trim().to_string();
-
-            if !first.is_empty() {
-                // Recursively enforce budget on the halves
-                result.extend(enforce_token_budget(vec![first], max_tokens));
-            }
-            if !second.is_empty() {
-                result.extend(enforce_token_budget(vec![second], max_tokens));
-            }
-        }
+        enforce_single(&mut result, chunk, max_tokens, 0);
     }
     result
+}
+
+/// Maximum recursion depth for budget enforcement splitting.
+const MAX_BUDGET_SPLIT_DEPTH: usize = 10;
+
+fn enforce_single(result: &mut Vec<String>, chunk: String, max_tokens: usize, depth: usize) {
+    let tokens = chunk.len() / 4;
+    if tokens <= max_tokens || max_tokens == 0 || depth >= MAX_BUDGET_SPLIT_DEPTH {
+        result.push(chunk);
+        return;
+    }
+
+    let mid = chunk.len() / 2;
+    let split_point = chunk[..mid]
+        .rfind("\n\n")
+        .map(|p| p + 2)
+        .or_else(|| chunk[..mid].rfind('\n').map(|p| p + 1))
+        .unwrap_or(mid);
+
+    let (first, second) = chunk.split_at(split_point);
+    let first = first.trim().to_string();
+    let second = second.trim().to_string();
+
+    if !first.is_empty() {
+        enforce_single(result, first, max_tokens, depth + 1);
+    }
+    if !second.is_empty() {
+        enforce_single(result, second, max_tokens, depth + 1);
+    }
 }
 
 #[cfg(test)]
@@ -435,6 +441,15 @@ mod tests {
     fn test_split_single_line() {
         let segments = split_into_segments("Just one line.");
         assert_eq!(segments.len(), 1);
+    }
+
+    #[test]
+    fn test_split_preserves_tilde_code_blocks() {
+        let content = "Some intro.\n\n~~~python\ndef hello():\n    print('hi')\n~~~\n\nAfter code.";
+        let segments = split_into_segments(content);
+        assert_eq!(segments.len(), 3, "Should have intro, tilde code block, and outro");
+        assert!(segments[1].contains("def hello()"), "Tilde code block should be atomic");
+        assert!(segments[1].contains("~~~"), "Tilde code block should include fences");
     }
 
     #[test]

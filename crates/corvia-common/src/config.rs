@@ -633,6 +633,8 @@ pub struct ChunkingConfig {
     /// Enable semantic sub-splitting for oversized Markdown heading sections.
     /// When true, oversized heading_section chunks are sub-split using the Max-Min
     /// algorithm with real embeddings during ingest.
+    /// Only applies to Markdown files (chunk_type "heading_section").
+    /// Requires `--fresh` re-ingest for best results on existing workspaces.
     #[serde(default)]
     pub semantic_splitting: bool,
     /// Token threshold for semantic sub-splitting. Chunks above this size are candidates.

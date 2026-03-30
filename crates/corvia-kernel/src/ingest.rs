@@ -367,6 +367,10 @@ fn resolve_target(
 /// The original entries are NOT deleted or superseded in V1. This is additive:
 /// sub-chunks coexist with the original chunk. The sub-chunks have higher
 /// embedding precision and will rank higher in retrieval when relevant.
+///
+/// TODO: V2 should supersede originals so retrieval returns only sub-chunks.
+/// This requires the temporal supersession chain (valid_to + superseded_by)
+/// to be wired, and a re-ingest cleanup pass to remove stale sub-chunks.
 async fn semantic_subsplit(
     processed: &[ProcessedChunk],
     stored_ids: &[uuid::Uuid],
@@ -379,7 +383,7 @@ async fn semantic_subsplit(
 ) -> usize {
     use crate::semantic_split::{
         split_into_segments, max_min_split, EmbeddingSimilarity,
-        reassemble_groups, enforce_token_budget,
+        reassemble_groups, enforce_token_budget, MAX_SEGMENTS_PER_CHUNK,
     };
 
     let mut sub_chunks_created = 0usize;
@@ -405,7 +409,7 @@ async fn semantic_subsplit(
         }
 
         // Bail if too many segments (N^2 similarity is too expensive)
-        if segments.len() > 50 {
+        if segments.len() > MAX_SEGMENTS_PER_CHUNK {
             tracing::debug!(
                 source_file = %pc.metadata.source_file,
                 segments = segments.len(),
@@ -415,7 +419,7 @@ async fn semantic_subsplit(
         }
 
         // Embed all segments
-        let texts: Vec<String> = segments.iter().cloned().collect();
+        let texts: Vec<String> = segments.to_vec();
         let embeddings = match engine.embed_batch(&texts).await {
             Ok(embs) => embs,
             Err(e) => {
@@ -447,7 +451,7 @@ async fn semantic_subsplit(
         }
 
         // Embed and store each sub-chunk
-        let sub_texts: Vec<String> = sub_contents.iter().cloned().collect();
+        let sub_texts: Vec<String> = sub_contents.to_vec();
         let sub_embeddings = match engine.embed_batch(&sub_texts).await {
             Ok(embs) => embs,
             Err(e) => {
