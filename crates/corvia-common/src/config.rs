@@ -395,6 +395,9 @@ pub struct AgentLifecycleConfig {
     pub gc_closed_session_after_secs: u64,
     #[serde(default = "default_gc_inactive_agent_after_secs")]
     pub gc_inactive_agent_after_secs: u64,
+    /// Capacity of the kernel event bus broadcast channel (default 256).
+    #[serde(default = "default_event_bus_capacity")]
+    pub event_bus_capacity: usize,
 }
 
 fn default_heartbeat_interval_secs() -> u64 { 30 }
@@ -403,6 +406,7 @@ fn default_orphan_grace_secs() -> u64 { 1200 }      // 20 min
 fn default_gc_orphan_after_secs() -> u64 { 86400 }  // 24 hr
 fn default_gc_closed_session_after_secs() -> u64 { 604800 } // 7 days
 fn default_gc_inactive_agent_after_secs() -> u64 { 2592000 } // 30 days
+fn default_event_bus_capacity() -> usize { 256 }
 
 impl Default for AgentLifecycleConfig {
     fn default() -> Self {
@@ -413,6 +417,7 @@ impl Default for AgentLifecycleConfig {
             gc_orphan_after_secs: default_gc_orphan_after_secs(),
             gc_closed_session_after_secs: default_gc_closed_session_after_secs(),
             gc_inactive_agent_after_secs: default_gc_inactive_agent_after_secs(),
+            event_bus_capacity: default_event_bus_capacity(),
         }
     }
 }

@@ -19,6 +19,12 @@ pub enum EventType {
     SearchPerformed,
     IngestionStarted,
     IngestionCompleted,
+    MergeCompleted,
+    MergeFailed,
+    EntryCommitted,
+    SessionOpened,
+    SessionClosed,
+    GcCompleted,
 }
 
 impl Event {

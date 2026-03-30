@@ -10,6 +10,7 @@ use crate::agent_registry::AgentRegistry;
 use crate::agent_writer::AgentWriter;
 use crate::commit_pipeline::CommitPipeline;
 use crate::context_builder::ContextBuilder;
+use crate::event_bus::EventBus;
 use crate::merge_queue::MergeQueue;
 use crate::merge_worker::MergeWorker;
 use crate::session_manager::SessionManager;
@@ -50,6 +51,7 @@ pub struct AgentCoordinator {
     pub merge_queue: Arc<MergeQueue>,
     pub staging: Arc<StagingManager>,
     pub config: AgentLifecycleConfig,
+    pub event_bus: Arc<EventBus>,
 }
 
 impl AgentCoordinator {
@@ -70,6 +72,8 @@ impl AgentCoordinator {
         let merge_queue = Arc::new(MergeQueue::from_db(db)?);
         let staging = Arc::new(StagingManager::new(data_dir));
 
+        let event_bus = Arc::new(EventBus::new(lifecycle_config.event_bus_capacity));
+
         let writer = Arc::new(AgentWriter::new(
             store.clone(),
             engine.clone(),
@@ -81,6 +85,7 @@ impl AgentCoordinator {
             merge_queue.clone(),
             staging.clone(),
             store.clone(),
+            event_bus.clone(),
         ));
 
         let merge_worker = Arc::new(MergeWorker::new(
@@ -91,6 +96,7 @@ impl AgentCoordinator {
             sessions.clone(),
             merge_config,
             gen_engine,
+            event_bus.clone(),
         ));
 
         let context = Arc::new(ContextBuilder::new(store, engine));
@@ -106,7 +112,13 @@ impl AgentCoordinator {
             merge_queue,
             staging,
             config: lifecycle_config,
+            event_bus,
         })
+    }
+
+    /// Access the kernel event bus for subscribing or publishing.
+    pub fn event_bus(&self) -> &Arc<EventBus> {
+        &self.event_bus
     }
 
     /// Register an agent from an identity.

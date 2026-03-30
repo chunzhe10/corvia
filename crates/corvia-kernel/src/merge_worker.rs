@@ -5,6 +5,7 @@ use corvia_common::types::KnowledgeEntry;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use crate::event_bus::{EventBus, KernelEvent};
 use crate::merge_queue::MergeQueue;
 use crate::session_manager::SessionManager;
 use crate::staging::StagingManager;
@@ -25,9 +26,11 @@ pub struct MergeWorker {
     session_mgr: Arc<SessionManager>,
     merge_config: MergeConfig,
     gen_engine: Arc<dyn GenerationEngine>,
+    event_bus: Arc<EventBus>,
 }
 
 impl MergeWorker {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<dyn QueryableStore>,
         engine: Arc<dyn InferenceEngine>,
@@ -36,6 +39,7 @@ impl MergeWorker {
         session_mgr: Arc<SessionManager>,
         merge_config: MergeConfig,
         gen_engine: Arc<dyn GenerationEngine>,
+        event_bus: Arc<EventBus>,
     ) -> Self {
         Self {
             store,
@@ -45,6 +49,7 @@ impl MergeWorker {
             session_mgr,
             merge_config,
             gen_engine,
+            event_bus,
         }
     }
 
@@ -96,6 +101,12 @@ impl MergeWorker {
                 self.queue.mark_complete(&queue_entry.entry_id)?;
                 self.session_mgr.increment_merged(&queue_entry.session_id).ok();
                 info!(entry_id = %queue_entry.entry_id, "auto_merged");
+                // Publish AFTER direct call succeeds (D4)
+                self.event_bus.publish(KernelEvent::MergeCompleted {
+                    entry_id: queue_entry.entry_id,
+                    session_id: queue_entry.session_id.clone(),
+                    scope_id: entry.scope_id.clone(),
+                });
             }
             Some(conflict) => {
                 // Conflict detected — attempt LLM merge
@@ -114,6 +125,12 @@ impl MergeWorker {
                             conflict_id = %conflict.id,
                             "llm_merged"
                         );
+                        // Publish AFTER direct call succeeds (D4)
+                        self.event_bus.publish(KernelEvent::MergeCompleted {
+                            entry_id: queue_entry.entry_id,
+                            session_id: queue_entry.session_id.clone(),
+                            scope_id: entry.scope_id.clone(),
+                        });
                     }
                     Err(e) => {
                         warn!(
@@ -123,6 +140,11 @@ impl MergeWorker {
                             "llm_merge_failed"
                         );
                         self.queue.mark_failed(&queue_entry.entry_id, &e.to_string())?;
+                        // Publish MergeFailed AFTER mark_failed succeeds (D4)
+                        self.event_bus.publish(KernelEvent::MergeFailed {
+                            entry_id: queue_entry.entry_id,
+                            scope_id: entry.scope_id.clone(),
+                        });
                     }
                 }
             }
@@ -227,14 +249,30 @@ impl MergeWorker {
     }
 
     /// Run the merge worker loop: dequeue batch, process each, sleep if empty.
+    ///
+    /// Checks the `CancellationToken` each iteration for clean shutdown.
     pub async fn run(&self) {
+        let cancel = self.event_bus.cancel_token();
         loop {
+            if cancel.is_cancelled() {
+                info!("merge_worker: shutdown via cancellation token");
+                break;
+            }
             match self.queue.list(10) {
                 Ok(entries) if entries.is_empty() => {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                        _ = cancel.cancelled() => {
+                            info!("merge_worker: shutdown via cancellation token");
+                            break;
+                        }
+                    }
                 }
                 Ok(entries) => {
                     for entry in &entries {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
                         if let Err(e) = self.process_one(entry).await {
                             warn!(entry_id = %entry.entry_id, error = %e, "merge_worker_error");
                         }
@@ -242,7 +280,13 @@ impl MergeWorker {
                 }
                 Err(e) => {
                     warn!(error = %e, "merge_worker_dequeue_error");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                        _ = cancel.cancelled() => {
+                            info!("merge_worker: shutdown via cancellation token");
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -306,6 +350,7 @@ mod tests {
         let session_mgr = Arc::new(SessionManager::from_db(db).unwrap());
         let config = MergeConfig::default();
         let gen_engine = Arc::new(MockGenerationEngine) as Arc<dyn GenerationEngine>;
+        let event_bus = Arc::new(crate::event_bus::EventBus::new(64));
 
         let worker = MergeWorker::new(
             store.clone(),
@@ -315,6 +360,7 @@ mod tests {
             session_mgr.clone(),
             config,
             gen_engine,
+            event_bus,
         );
 
         (worker, store, queue, session_mgr)
@@ -394,10 +440,12 @@ mod tests {
         let config = MergeConfig::default();
         let gen_engine = Arc::new(FailingGenerationEngine) as Arc<dyn GenerationEngine>;
 
+        let event_bus = Arc::new(crate::event_bus::EventBus::new(64));
         let worker = MergeWorker::new(
             store.clone(), engine, queue.clone(), staging, session_mgr.clone(),
             config,
             gen_engine,
+            event_bus,
         );
         store.init_schema().await.unwrap();
 

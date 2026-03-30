@@ -3,6 +3,7 @@ use corvia_common::errors::{CorviaError, Result};
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use crate::event_bus::{EventBus, KernelEvent};
 use crate::merge_queue::MergeQueue;
 use crate::session_manager::SessionManager;
 use crate::staging::StagingManager;
@@ -21,6 +22,7 @@ pub struct CommitPipeline {
     merge_queue: Arc<MergeQueue>,
     staging: Arc<StagingManager>,
     store: Arc<dyn QueryableStore>,
+    event_bus: Arc<EventBus>,
 }
 
 impl CommitPipeline {
@@ -29,12 +31,14 @@ impl CommitPipeline {
         merge_queue: Arc<MergeQueue>,
         staging: Arc<StagingManager>,
         store: Arc<dyn QueryableStore>,
+        event_bus: Arc<EventBus>,
     ) -> Self {
         Self {
             session_mgr,
             merge_queue,
             staging,
             store,
+            event_bus,
         }
     }
 
@@ -94,6 +98,16 @@ impl CommitPipeline {
                             warn!(entry_id = %entry_id, error = %e, "commit_step3: failed to update entry status");
                         }
                     }
+            }
+            // Publish EntryCommitted events AFTER direct calls succeed (D4)
+            for entry_id in &entry_ids {
+                if let Ok(Some(entry)) = self.store.get(entry_id).await {
+                    self.event_bus.publish(KernelEvent::EntryCommitted {
+                        entry_id: *entry_id,
+                        session_id: session_id.to_string(),
+                        scope_id: entry.scope_id.clone(),
+                    });
+                }
             }
             info!(session_id, count = entry_ids.len(), "commit_step3: entries → Committed");
         }
@@ -172,11 +186,13 @@ mod tests {
         store.insert(&entry1).await.unwrap();
         store.insert(&entry2).await.unwrap();
 
+        let event_bus = Arc::new(crate::event_bus::EventBus::new(64));
         let pipeline = CommitPipeline::new(
             session_mgr.clone(),
             merge_queue.clone(),
             staging,
             store.clone(),
+            event_bus,
         );
 
         // Commit
@@ -221,11 +237,13 @@ mod tests {
         staging.write_staging_file(&staging_dir, &entry).unwrap();
         store.insert(&entry).await.unwrap();
 
+        let event_bus = Arc::new(crate::event_bus::EventBus::new(64));
         let pipeline = CommitPipeline::new(
             session_mgr.clone(),
             merge_queue.clone(),
             staging,
             store,
+            event_bus,
         );
 
         // First commit

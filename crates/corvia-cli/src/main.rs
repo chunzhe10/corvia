@@ -244,6 +244,16 @@ enum Commands {
         #[command(subcommand)]
         command: HooksCommands,
     },
+
+    /// Watch kernel events in real-time (tails events.jsonl)
+    Watch {
+        /// Filter events by scope ID
+        #[arg(long)]
+        scope: Option<String>,
+        /// Output raw JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -608,6 +618,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 hooks::session::sweep_stale_sessions(max_age_hours);
             }
         },
+        Commands::Watch { scope, json } => cmd_watch(scope.as_deref(), json).await?,
     }
 
     Ok(())
@@ -914,6 +925,12 @@ async fn cmd_serve() -> Result<()> {
         let gc_data_dir = state.data_dir.clone();
         let gc_counter = Some(state.forgotten_access_counter.clone());
         corvia_kernel::gc_worker::spawn_gc_worker(gc_store, gc_graph, gc_config, gc_data_dir, gc_counter);
+    }
+
+    // Spawn EventLogger: subscribes to kernel event bus, writes to events.jsonl
+    {
+        let events_path = state.data_dir.join("events.jsonl");
+        corvia_kernel::event_bus::EventLogger::spawn(state.coordinator.event_bus(), events_path);
     }
 
     let has_docker = state.docker_available;
@@ -2724,6 +2741,157 @@ async fn cmd_gc_run() -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&result)?);
 
     Ok(())
+}
+
+/// Watch kernel events by tailing events.jsonl.
+///
+/// Polls the events file and prints new lines as they appear.
+/// Supports --scope filtering and --json raw output.
+async fn cmd_watch(scope_filter: Option<&str>, json_output: bool) -> Result<()> {
+    let config = load_config()?;
+    let data_dir = std::path::Path::new(&config.storage.data_dir);
+    let events_path = data_dir.join("events.jsonl");
+
+    if !events_path.exists() {
+        println!("Waiting for events... ({})", events_path.display());
+        println!("Tip: events appear when the server processes writes, merges, or GC.");
+    } else {
+        println!("Watching events from {}", events_path.display());
+    }
+    println!("Press Ctrl+C to stop.\n");
+
+    // Seek to end of existing file (only show new events)
+    let mut offset: u64 = if events_path.exists() {
+        std::fs::metadata(&events_path)
+            .map(|m| m.len())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    loop {
+        // Check if file exists and has new content
+        if events_path.exists() {
+            let file_len = std::fs::metadata(&events_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+
+            if file_len > offset {
+                // Read new content from offset
+                let file = std::fs::File::open(&events_path)?;
+                let mut reader = std::io::BufReader::new(file);
+                std::io::Seek::seek(&mut reader, std::io::SeekFrom::Start(offset))?;
+
+                use std::io::BufRead;
+                let mut new_offset = offset;
+                for line in reader.lines() {
+                    match line {
+                        Ok(line) if !line.trim().is_empty() => {
+                            new_offset += line.len() as u64 + 1; // +1 for newline
+
+                            // Parse and optionally filter
+                            if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+                                // Apply scope filter
+                                if let Some(scope) = scope_filter {
+                                    let event_scope = event.get("scope_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if event_scope != scope {
+                                        continue;
+                                    }
+                                }
+
+                                if json_output {
+                                    println!("{line}");
+                                } else {
+                                    print_event_human(&event);
+                                }
+                            } else if json_output {
+                                // Pass through unparseable lines in JSON mode
+                                println!("{line}");
+                            }
+                        }
+                        Ok(line) => {
+                            new_offset += line.len() as u64 + 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                offset = new_offset;
+            } else if file_len < offset {
+                // File was truncated/rotated — reset
+                offset = 0;
+            }
+        }
+
+        // Poll interval
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+/// Format an event JSON object as a human-readable line.
+fn print_event_human(event: &serde_json::Value) {
+    let ts = event.get("ts")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let event_type = event.get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown");
+    let scope = event.get("scope_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Format timestamp: show only HH:MM:SS from ISO8601
+    let short_ts = if ts.len() > 19 {
+        &ts[11..19]
+    } else {
+        ts
+    };
+
+    // Build detail string from relevant fields
+    let details = match event_type {
+        "MergeCompleted" => {
+            let entry_id = event.get("entry_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let session_id = event.get("session_id").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("entry={} session={}", short_id(entry_id), short_id(session_id))
+        }
+        "MergeFailed" => {
+            let entry_id = event.get("entry_id").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("entry={}", short_id(entry_id))
+        }
+        "EntryCommitted" => {
+            let entry_id = event.get("entry_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let session_id = event.get("session_id").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("entry={} session={}", short_id(entry_id), short_id(session_id))
+        }
+        "SessionOpened" => {
+            let agent_id = event.get("agent_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let session_id = event.get("session_id").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("agent={} session={}", agent_id, short_id(session_id))
+        }
+        "SessionClosed" => {
+            let session_id = event.get("session_id").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("session={}", short_id(session_id))
+        }
+        "GcCompleted" => {
+            let removed = event.get("entries_removed").and_then(|v| v.as_u64()).unwrap_or(0);
+            format!("removed={removed}")
+        }
+        "IngestionCompleted" => {
+            let added = event.get("entries_added").and_then(|v| v.as_u64()).unwrap_or(0);
+            let ms = event.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+            format!("added={added} duration={ms}ms")
+        }
+        _ => String::new(),
+    };
+
+    let scope_str = if scope.is_empty() { String::new() } else { format!(" [{scope}]") };
+    println!("{short_ts}{scope_str} {event_type} {details}");
+}
+
+/// Truncate a UUID or long ID to the first 8 chars for readability.
+fn short_id(id: &str) -> &str {
+    if id.len() > 8 { &id[..8] } else { id }
 }
 
 async fn cmd_gc_history() -> Result<()> {
