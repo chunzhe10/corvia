@@ -34,6 +34,11 @@ const SOURCE_VERSION_INDEX: TableDefinition<&str, &str> =
 /// Replaces embedding storage in JSON files (92% of file size) and the ENTRIES table.
 /// Value size = dimensions × 4 bytes (e.g., 768 × 4 = 3072 bytes for nomic-embed-text).
 /// Uses bytemuck for zero-copy &[f32] ↔ &[u8] casting.
+///
+/// **Endianness:** Values are stored in native byte order (little-endian on x86/ARM).
+/// The Redb file is NOT portable across architectures with different endianness.
+/// This is acceptable because corvia targets single-machine workloads and
+/// `corvia rebuild` can regenerate VECTORS from re-embedding if needed.
 const VECTORS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("vectors");
 
 /// HNSW tuning constants
@@ -398,6 +403,7 @@ impl LiteStore {
             }
 
             // Phase 3: Commit to Redb (entries consistent with JSON after this)
+            // Also clean up VECTORS for entries demoted to Forgotten tier.
             let write_txn = self
                 .db
                 .begin_write()
@@ -413,6 +419,16 @@ impl LiteStore {
                     table
                         .insert(uuid_str.as_str(), entry_json.as_slice())
                         .map_err(|e| CorviaError::Storage(format!("Failed to update: {e}")))?;
+                }
+
+                // Remove VECTORS entries for Forgotten-tier entries (embedding discarded)
+                let mut vectors_table = write_txn
+                    .open_table(VECTORS)
+                    .map_err(|e| CorviaError::Storage(format!("Failed to open VECTORS: {e}")))?;
+                for update in chunk {
+                    if update.new_tier == Some(corvia_common::types::Tier::Forgotten) {
+                        let _ = vectors_table.remove(update.entry_id.as_bytes());
+                    }
                 }
             }
             write_txn
@@ -531,6 +547,9 @@ impl LiteStore {
 
     /// Index an entry into a specific HNSW instance + Redb.
     /// Used by `index_entry` (live path) and `rebuild_from_files` (blue-green path).
+    /// Note: The entry's `embedding` field is `skip_serializing`, so `serde_json::to_vec(entry)`
+    /// intentionally excludes it from the ENTRIES table. The embedding is stored separately
+    /// in the VECTORS table within this same transaction.
     fn index_entry_into(
         &self,
         entry: &KnowledgeEntry,
