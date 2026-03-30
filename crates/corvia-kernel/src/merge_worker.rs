@@ -77,6 +77,11 @@ impl MergeWorker {
                 }
             }
             self.queue.mark_complete(&queue_entry.entry_id)?;
+            // Publish MergeFailed for the rejected entry (D4: after mark_complete succeeds)
+            self.event_bus.publish(KernelEvent::MergeFailed {
+                entry_id: queue_entry.entry_id,
+                scope_id: queue_entry.scope_id.clone(),
+            });
             return Ok(());
         }
 
@@ -339,7 +344,7 @@ mod tests {
         fn context_window(&self) -> usize { 4096 }
     }
 
-    fn setup(dir: &std::path::Path) -> (MergeWorker, Arc<dyn QueryableStore>, Arc<MergeQueue>, Arc<SessionManager>) {
+    fn setup(dir: &std::path::Path) -> (MergeWorker, Arc<dyn QueryableStore>, Arc<MergeQueue>, Arc<SessionManager>, Arc<crate::event_bus::EventBus>) {
         let db = std::sync::Arc::new(
             redb::Database::create(dir.join("coordination.redb")).unwrap()
         );
@@ -360,16 +365,16 @@ mod tests {
             session_mgr.clone(),
             config,
             gen_engine,
-            event_bus,
+            event_bus.clone(),
         );
 
-        (worker, store, queue, session_mgr)
+        (worker, store, queue, session_mgr, event_bus)
     }
 
     #[tokio::test]
     async fn test_no_conflict_auto_merges() {
         let dir = tempfile::tempdir().unwrap();
-        let (worker, store, queue, session_mgr) = setup(dir.path());
+        let (worker, store, queue, session_mgr, _event_bus) = setup(dir.path());
         store.init_schema().await.unwrap();
 
         // Insert entry A as Merged (different embedding direction)
@@ -404,7 +409,7 @@ mod tests {
     #[tokio::test]
     async fn test_conflict_detected_above_threshold() {
         let dir = tempfile::tempdir().unwrap();
-        let (worker, store, _queue, _session_mgr) = setup(dir.path());
+        let (worker, store, _queue, _session_mgr, _event_bus) = setup(dir.path());
         store.init_schema().await.unwrap();
 
         // Insert entry A as Merged
@@ -477,7 +482,7 @@ mod tests {
     #[tokio::test]
     async fn test_max_retries_exhausted() {
         let dir = tempfile::tempdir().unwrap();
-        let (worker, store, queue, _session_mgr) = setup(dir.path());
+        let (worker, store, queue, _session_mgr, _event_bus) = setup(dir.path());
         store.init_schema().await.unwrap();
 
         // Create an entry in the store
@@ -504,5 +509,99 @@ mod tests {
         // Entry should be Rejected in store
         let updated = store.get(&entry.id).await.unwrap().unwrap();
         assert_eq!(updated.entry_status, EntryStatus::Rejected);
+    }
+
+    #[tokio::test]
+    async fn test_auto_merge_publishes_merge_completed_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let (worker, store, queue, session_mgr, event_bus) = setup(dir.path());
+        store.init_schema().await.unwrap();
+
+        // Subscribe BEFORE the action
+        let mut rx = event_bus.subscribe();
+
+        // Insert entry A as Merged (different embedding direction)
+        let mut entry_a = KnowledgeEntry::new("auth system design".into(), "scope-a".into(), "v1".into())
+            .with_embedding(vec![1.0, 0.0, 0.0]);
+        entry_a.entry_status = EntryStatus::Merged;
+        store.insert(&entry_a).await.unwrap();
+
+        // Create a session and write entry B (very different embedding)
+        let session = session_mgr.create("test::agent", true).unwrap();
+        session_mgr.transition(&session.session_id, SessionState::Active).unwrap();
+
+        let entry_b = KnowledgeEntry::new("database schema".into(), "scope-a".into(), "v1".into())
+            .with_embedding(vec![0.0, 1.0, 0.0])
+            .with_agent("test::agent".into(), session.session_id.clone());
+        store.insert(&entry_b).await.unwrap();
+
+        queue.enqueue(entry_b.id, "test::agent", &session.session_id, "scope-a").unwrap();
+
+        let queue_entry = queue.list(1).unwrap().into_iter().next().unwrap();
+        worker.process_one(&queue_entry).await.unwrap();
+
+        // Verify MergeCompleted event was published
+        let event = rx.try_recv().unwrap();
+        match event {
+            KernelEvent::MergeCompleted { entry_id, session_id, scope_id } => {
+                assert_eq!(entry_id, entry_b.id);
+                assert_eq!(session_id, session.session_id);
+                assert_eq!(scope_id, "scope-a");
+            }
+            other => panic!("expected MergeCompleted, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_failed_merge_publishes_merge_failed_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(
+            redb::Database::create(dir.path().join("coordination.redb")).unwrap()
+        );
+        let store = Arc::new(LiteStore::open(dir.path(), 3).unwrap()) as Arc<dyn QueryableStore>;
+        let engine = Arc::new(MockEngine) as Arc<dyn InferenceEngine>;
+        let queue = Arc::new(MergeQueue::from_db(db.clone()).unwrap());
+        let staging = Arc::new(StagingManager::new(dir.path()));
+        let session_mgr = Arc::new(SessionManager::from_db(db).unwrap());
+        let config = MergeConfig::default();
+        let gen_engine = Arc::new(FailingGenerationEngine) as Arc<dyn GenerationEngine>;
+        let event_bus = Arc::new(crate::event_bus::EventBus::new(64));
+
+        let worker = MergeWorker::new(
+            store.clone(), engine, queue.clone(), staging, session_mgr.clone(),
+            config, gen_engine, event_bus.clone(),
+        );
+        store.init_schema().await.unwrap();
+
+        // Subscribe BEFORE the action
+        let mut rx = event_bus.subscribe();
+
+        // Insert entry A as Merged
+        let mut entry_a = KnowledgeEntry::new("auth system".into(), "scope-a".into(), "v1".into())
+            .with_embedding(vec![1.0, 0.0, 0.0]);
+        entry_a.entry_status = EntryStatus::Merged;
+        store.insert(&entry_a).await.unwrap();
+
+        // Create session and entry B (similar — triggers conflict → LLM merge → fail)
+        let session = session_mgr.create("test::agent", false).unwrap();
+        let entry_b = KnowledgeEntry::new("auth updated".into(), "scope-a".into(), "v1".into())
+            .with_embedding(vec![0.95, 0.05, 0.0])
+            .with_agent("test::agent".into(), session.session_id.clone());
+        store.insert(&entry_b).await.unwrap();
+
+        queue.enqueue(entry_b.id, "test::agent", &session.session_id, "scope-a").unwrap();
+
+        let queue_entry = queue.list(1).unwrap().into_iter().next().unwrap();
+        worker.process_one(&queue_entry).await.unwrap();
+
+        // Verify MergeFailed event was published
+        let event = rx.try_recv().unwrap();
+        match event {
+            KernelEvent::MergeFailed { entry_id, scope_id } => {
+                assert_eq!(entry_id, entry_b.id);
+                assert_eq!(scope_id, "scope-a");
+            }
+            other => panic!("expected MergeFailed, got {:?}", other),
+        }
     }
 }

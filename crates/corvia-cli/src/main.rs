@@ -927,11 +927,12 @@ async fn cmd_serve() -> Result<()> {
         corvia_kernel::gc_worker::spawn_gc_worker(gc_store, gc_graph, gc_config, gc_data_dir, gc_counter);
     }
 
-    // Spawn EventLogger: subscribes to kernel event bus, writes to events.jsonl
-    {
+    // Spawn EventLogger: subscribes to kernel event bus, writes to events.jsonl.
+    // JoinHandle stored to detect panics; logger exits via CancellationToken on shutdown.
+    let _event_logger_handle = {
         let events_path = state.data_dir.join("events.jsonl");
-        corvia_kernel::event_bus::EventLogger::spawn(state.coordinator.event_bus(), events_path);
-    }
+        corvia_kernel::event_bus::EventLogger::spawn(state.coordinator.event_bus(), events_path)
+    };
 
     let has_docker = state.docker_available;
     let mut app = corvia_server::rest::router(state.clone());

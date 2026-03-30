@@ -85,7 +85,7 @@ impl EventBus {
     ///
     /// Default capacity is 256 (see `AgentLifecycleConfig::event_bus_capacity`).
     pub fn new(capacity: usize) -> Self {
-        let (tx, _rx) = broadcast::channel(capacity);
+        let (tx, _rx) = broadcast::channel(capacity.max(1));
         Self {
             tx,
             cancel: CancellationToken::new(),
@@ -226,11 +226,14 @@ impl EventLogger {
                     "duration_ms": duration_ms,
                 }),
             ),
-            // Non-exhaustive: future variants are logged as unknown.
+            // Non-exhaustive: future variants logged as unhandled.
             // Within this crate the compiler sees all variants; the arm is needed
             // for when new variants are added (non_exhaustive guarantee).
             #[allow(unreachable_patterns)]
-            _ => return,
+            _ => {
+                debug!(event = ?event, "event_logger: unhandled event variant");
+                return;
+            }
         };
 
         let common_event = Event::new(event_type, data);

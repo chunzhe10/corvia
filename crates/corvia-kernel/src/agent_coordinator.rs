@@ -364,6 +364,13 @@ impl AgentCoordinator {
         }
 
         info!(?report, "gc_sweep_complete");
+
+        // Publish GcCompleted event (D4: after GC succeeds)
+        self.event_bus.publish(crate::event_bus::KernelEvent::GcCompleted {
+            scope_id: String::new(), // GC sweeps all scopes
+            entries_removed: report.orphans_rolled_back,
+        });
+
         Ok(report)
     }
 
@@ -388,6 +395,11 @@ impl AgentCoordinator {
                 {
                     self.sessions.transition(session_id, SessionState::Closed).ok();
                     info!(session_id, "session_closed_all_merged");
+                    // Publish SessionClosed event (D4: after transition succeeds)
+                    self.event_bus.publish(crate::event_bus::KernelEvent::SessionClosed {
+                        session_id: session_id.clone(),
+                        scope_id: String::new(), // Sessions span multiple scopes
+                    });
                 }
         }
 

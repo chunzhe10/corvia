@@ -84,6 +84,8 @@ impl CommitPipeline {
         if let Some(ref staging_dir_str) = session.staging_dir {
             let staging_dir = self.staging.resolve_staging_path(staging_dir_str);
             let entry_ids = self.staging.list_staging_files(&staging_dir)?;
+            // Track which entries were actually transitioned (for event publishing)
+            let mut committed_entries: Vec<(uuid::Uuid, String)> = Vec::new();
             for entry_id in &entry_ids {
                 if let Ok(Some(mut entry)) = self.store.get(entry_id).await
                     && entry.entry_status == EntryStatus::Pending {
@@ -96,18 +98,19 @@ impl CommitPipeline {
                         }
                         if let Err(e) = self.store.insert(&entry).await {
                             warn!(entry_id = %entry_id, error = %e, "commit_step3: failed to update entry status");
+                        } else {
+                            committed_entries.push((*entry_id, entry.scope_id.clone()));
                         }
                     }
             }
-            // Publish EntryCommitted events AFTER direct calls succeed (D4)
-            for entry_id in &entry_ids {
-                if let Ok(Some(entry)) = self.store.get(entry_id).await {
-                    self.event_bus.publish(KernelEvent::EntryCommitted {
-                        entry_id: *entry_id,
-                        session_id: session_id.to_string(),
-                        scope_id: entry.scope_id.clone(),
-                    });
-                }
+            // Publish EntryCommitted events only for entries that actually transitioned (D4).
+            // Prevents duplicate events on idempotent retry.
+            for (entry_id, scope_id) in &committed_entries {
+                self.event_bus.publish(KernelEvent::EntryCommitted {
+                    entry_id: *entry_id,
+                    session_id: session_id.to_string(),
+                    scope_id: scope_id.clone(),
+                });
             }
             info!(session_id, count = entry_ids.len(), "commit_step3: entries → Committed");
         }
