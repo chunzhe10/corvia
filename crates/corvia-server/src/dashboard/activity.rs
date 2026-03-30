@@ -77,6 +77,15 @@ pub async fn activity_feed_handler(
         Vec::new()
     });
 
+    // Restore embeddings from VECTORS table (not in JSON after skip_serializing)
+    for entry in &mut entries {
+        if entry.embedding.is_none() {
+            if let Ok(Some(emb)) = state.store.get_embedding(&entry.id).await {
+                entry.embedding = Some(emb);
+            }
+        }
+    }
+
     // Sort by recorded_at descending (newest first)
     entries.sort_by_key(|e| std::cmp::Reverse(e.recorded_at));
 

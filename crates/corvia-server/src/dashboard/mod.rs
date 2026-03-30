@@ -42,6 +42,24 @@ async fn load_scope_entries(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load entries: {e}")))
 }
 
+/// Load scope entries with embeddings restored from the VECTORS table.
+/// Used by dashboard endpoints that need embeddings (clustering, activity).
+async fn load_scope_entries_with_embeddings(
+    data_dir: &std::path::Path,
+    scope_id: &str,
+    store: &dyn corvia_kernel::traits::QueryableStore,
+) -> Result<Vec<corvia_common::types::KnowledgeEntry>, (StatusCode, String)> {
+    let mut entries = load_scope_entries(data_dir, scope_id).await?;
+    for entry in &mut entries {
+        if entry.embedding.is_none() {
+            if let Ok(Some(emb)) = store.get_embedding(&entry.id).await {
+                entry.embedding = Some(emb);
+            }
+        }
+    }
+    Ok(entries)
+}
+
 fn gc_report_to_dto(r: GcReport) -> corvia_common::dashboard::GcReportDto {
     corvia_common::dashboard::GcReportDto {
         orphans_rolled_back: r.orphans_rolled_back,
@@ -525,7 +543,7 @@ async fn clustered_graph_handler(
             // Degraded mode: cluster store not yet computed.
             // Try an immediate computation.
             let scope_id = state.default_scope_id.as_deref().unwrap_or(DEFAULT_SCOPE_ID);
-            let entries = load_scope_entries(&state.data_dir, scope_id).await?;
+            let entries = load_scope_entries_with_embeddings(&state.data_dir, scope_id, &*state.store).await?;
             let pairs: Vec<(String, Vec<f32>)> = entries
                 .iter()
                 .filter_map(|e| e.embedding.as_ref().map(|emb| (e.id.to_string(), emb.clone())))
@@ -949,7 +967,7 @@ async fn refresh_summary_handler(
 
     // Load entries from knowledge files and compute topic tags
     let scope_id = state.default_scope_id.as_deref().unwrap_or(DEFAULT_SCOPE_ID);
-    let entries = load_scope_entries(&state.data_dir, scope_id).await?;
+    let entries = load_scope_entries_with_embeddings(&state.data_dir, scope_id, &*state.store).await?;
 
     // Get embeddings for entries (all entries for now — filtering by agent would require metadata)
     let pairs: Vec<(String, Vec<f32>)> = entries.iter()
