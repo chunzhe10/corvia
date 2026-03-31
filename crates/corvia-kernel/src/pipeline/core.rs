@@ -218,6 +218,7 @@ impl Retriever for RetrievalPipeline {
         let expanded = self.expander.expand(&ctx, fused).await?;
         let graph_latency_ms = expanded.metrics.latency_ms;
         let graph_expanded = expanded.metrics.output_count.saturating_sub(expanded.metrics.input_count);
+        stages.push(expanded.metrics.clone());
 
         // Step 5: Rerank.
         let reranked = self.reranker.rerank(&ctx, expanded).await?;
