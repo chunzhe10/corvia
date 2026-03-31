@@ -282,6 +282,154 @@ impl Searcher for BM25Searcher {
 }
 
 // ---------------------------------------------------------------------------
+// MultiChannelSearcher — per-memory-type retrieval with RRF fusion
+// ---------------------------------------------------------------------------
+
+/// Multi-channel searcher that runs per-memory-type retrieval strategies in
+/// parallel and fuses results via Reciprocal Rank Fusion (RRF).
+///
+/// Each of the 5 memory types is assigned a strategy ("vector" or "bm25") via
+/// [`ChannelsConfig`]. Channels run concurrently with a per-channel timeout.
+/// If a channel times out or errors, it is skipped and a warning is logged.
+///
+/// Graph expansion is handled by the pipeline's Expander stage (post-fusion),
+/// not per-channel. This preserves the pipeline's single-responsibility design.
+///
+/// **Pipeline integration:** When using MultiChannelSearcher as the sole searcher,
+/// set `fusion = "passthrough"` in pipeline config since MultiChannelSearcher
+/// performs its own internal RRF fusion.
+pub struct MultiChannelSearcher {
+    store: Arc<dyn QueryableStore>,
+    fts: Option<Arc<dyn FullTextSearchable>>,
+    channels: corvia_common::config::ChannelsConfig,
+    timeout_ms: u64,
+    rrf_k: usize,
+}
+
+impl MultiChannelSearcher {
+    pub fn new(
+        store: Arc<dyn QueryableStore>,
+        fts: Option<Arc<dyn FullTextSearchable>>,
+        channels: corvia_common::config::ChannelsConfig,
+        timeout_ms: u64,
+        rrf_k: usize,
+    ) -> Self {
+        Self { store, fts, channels, timeout_ms, rrf_k }
+    }
+}
+
+#[async_trait]
+impl Searcher for MultiChannelSearcher {
+    fn name(&self) -> &str {
+        "multichannel"
+    }
+
+    fn needs_embedding(&self) -> bool {
+        true
+    }
+
+    async fn search(&self, ctx: &SearchContext) -> Result<RankedSet> {
+        use corvia_common::types::MemoryType;
+        use super::fusion::RRFusion;
+        use super::Fusion;
+
+        let start = Instant::now();
+        let limit = fetch_limit(ctx);
+        let timeout = std::time::Duration::from_millis(self.timeout_ms);
+
+        // Launch per-type channels concurrently.
+        let mut handles = Vec::new();
+        let mut warnings = Vec::new();
+
+        for mt in MemoryType::ALL {
+            let strategy = self.channels.strategy_for(mt).to_string();
+            let embedding = Arc::clone(&ctx.query_embedding);
+            let scope_id = ctx.scope_id.clone();
+            let query = ctx.query.clone();
+
+            match strategy.as_str() {
+                "vector" => {
+                    let store = Arc::clone(&self.store);
+                    handles.push((mt, tokio::spawn(async move {
+                        store.search_by_memory_type(&embedding, &scope_id, limit, mt).await
+                    })));
+                }
+                "bm25" => {
+                    if let Some(fts) = self.fts.clone() {
+                        handles.push((mt, tokio::spawn(async move {
+                            let results = fts.search_text(&query, &scope_id, limit).await?;
+                            // Post-filter by memory type
+                            Ok(results.into_iter()
+                                .filter(|r| r.entry.memory_type == mt)
+                                .collect::<Vec<_>>())
+                        })));
+                    } else {
+                        warnings.push(format!("{mt} channel: BM25 requested but no FTS available, skipping"));
+                    }
+                }
+                other => {
+                    warnings.push(format!("{mt} channel: unknown strategy '{other}', skipping"));
+                }
+            }
+        }
+
+        // Collect results with timeout. Channels that timeout or error are skipped.
+        let mut channel_sets: Vec<RankedSet> = Vec::new();
+
+        for (mt, handle) in handles {
+            match tokio::time::timeout(timeout, handle).await {
+                Ok(Ok(Ok(results))) => {
+                    let candidates = VectorSearcher::to_candidates(results, &mt.to_string());
+                    channel_sets.push(RankedSet {
+                        candidates,
+                        metrics: StageMetrics {
+                            stage_name: format!("channel:{mt}"),
+                            latency_ms: 0,
+                            input_count: 0,
+                            output_count: 0,
+                            warnings: Vec::new(),
+                        },
+                    });
+                }
+                Ok(Ok(Err(e))) => {
+                    warnings.push(format!("{mt} channel error: {e}"));
+                }
+                Ok(Err(e)) => {
+                    warnings.push(format!("{mt} channel join error: {e}"));
+                }
+                Err(_) => {
+                    warnings.push(format!("{mt} channel timed out after {}ms", self.timeout_ms));
+                }
+            }
+        }
+
+        // Fuse via RRF
+        let fusion = RRFusion::new(self.rrf_k);
+        let mut fused = fusion.fuse(channel_sets).await?;
+
+        let output_count = fused.candidates.len();
+        let latency_ms = start.elapsed().as_millis() as u64;
+
+        fused.metrics = StageMetrics {
+            stage_name: self.name().to_string(),
+            latency_ms,
+            input_count: 0,
+            output_count,
+            warnings,
+        };
+
+        info!(
+            searcher = self.name(),
+            output_count,
+            latency_ms,
+            "multichannel search complete"
+        );
+
+        Ok(fused)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

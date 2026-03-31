@@ -11,7 +11,7 @@ use corvia_common::errors::{CorviaError, Result};
 
 use super::expander::{Expander, NoOpExpander};
 use super::fusion::{Fusion, PassThrough, RRFusion};
-use super::searcher::{BM25Searcher, Searcher, VectorSearcher};
+use super::searcher::{BM25Searcher, MultiChannelSearcher, Searcher, VectorSearcher};
 use super::{IdentityReranker, Reranker};
 use crate::traits::{FullTextSearchable, GraphStore, InferenceEngine, QueryableStore};
 
@@ -25,6 +25,10 @@ pub struct ComponentDeps {
     pub fts: Option<Arc<dyn FullTextSearchable>>,
     /// RRF smoothing constant k. Read from `[rag.pipeline.rrf]` config.
     pub rrf_k: usize,
+    /// Per-memory-type channel strategies. Read from `[rag.pipeline.channels]`.
+    pub channels: corvia_common::config::ChannelsConfig,
+    /// Per-searcher timeout in milliseconds.
+    pub searcher_timeout_ms: u64,
 }
 
 /// Error variants for pipeline component operations.
@@ -219,6 +223,20 @@ impl PipelineRegistry {
             Ok(Arc::new(BM25Searcher::new(fts)) as Arc<dyn Searcher>)
         });
 
+        searchers.register("multichannel", |deps: &ComponentDeps| {
+            let store = deps.store.clone().ok_or_else(|| {
+                CorviaError::Config("MultiChannelSearcher requires a store".into())
+            })?;
+            let fts = deps.fts.clone(); // Optional: BM25 channel degrades gracefully without FTS
+            Ok(Arc::new(MultiChannelSearcher::new(
+                store,
+                fts,
+                deps.channels.clone(),
+                deps.searcher_timeout_ms,
+                deps.rrf_k,
+            )) as Arc<dyn Searcher>)
+        });
+
         let mut fusions = ComponentRegistry::new();
         fusions.register("passthrough", |_deps: &ComponentDeps| {
             Ok(Arc::new(PassThrough) as Arc<dyn Fusion>)
@@ -265,6 +283,8 @@ mod tests {
             graph: None,
             fts: None,
             rrf_k: 60,
+            channels: Default::default(),
+            searcher_timeout_ms: 5000,
         };
         let result = registry.create("nonexistent", &deps);
         assert!(result.is_err());
@@ -279,6 +299,8 @@ mod tests {
             graph: None,
             fts: None,
             rrf_k: 60,
+            channels: Default::default(),
+            searcher_timeout_ms: 5000,
         };
         // VectorSearcher requires store + engine.
         let result = reg.searchers.create("vector", &deps);
@@ -290,6 +312,7 @@ mod tests {
         let reg = PipelineRegistry::with_defaults();
         assert!(reg.searchers.contains("vector"));
         assert!(reg.searchers.contains("bm25"));
+        assert!(reg.searchers.contains("multichannel"));
         assert!(reg.fusions.contains("passthrough"));
         assert!(reg.fusions.contains("rrf"));
         // "graph" expander is NOT in the registry; it requires config-driven alpha
@@ -308,6 +331,8 @@ mod tests {
             graph: None,
             fts: None,
             rrf_k: 60,
+            channels: Default::default(),
+            searcher_timeout_ms: 5000,
         };
         let fusion = reg.fusions.create("passthrough", &deps);
         assert!(fusion.is_ok());
@@ -322,6 +347,8 @@ mod tests {
             graph: None,
             fts: None,
             rrf_k: 60,
+            channels: Default::default(),
+            searcher_timeout_ms: 5000,
         };
         let reranker = reg.rerankers.create("identity", &deps);
         assert!(reranker.is_ok());
@@ -356,6 +383,8 @@ mod tests {
             graph: None,
             fts: None,
             rrf_k: 60,
+            channels: Default::default(),
+            searcher_timeout_ms: 5000,
         };
 
         let result = PipelineRegistry::validate_and_build(&config, &deps, None, 0.3);
@@ -375,6 +404,8 @@ mod tests {
             graph: None,
             fts: None,
             rrf_k: 60,
+            channels: Default::default(),
+            searcher_timeout_ms: 5000,
         };
 
         let result = PipelineRegistry::validate_and_build(&config, &deps, None, 0.3);
@@ -414,6 +445,8 @@ mod tests {
             graph: None,
             fts: None,
             rrf_k: 60,
+            channels: Default::default(),
+            searcher_timeout_ms: 5000,
         };
 
         let result = PipelineRegistry::validate_and_build(&config, &deps, None, 0.3);

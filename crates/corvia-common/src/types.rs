@@ -22,6 +22,17 @@ pub enum MemoryType {
     Procedural,
 }
 
+impl MemoryType {
+    /// All memory type variants, in a fixed order for deterministic iteration.
+    pub const ALL: [MemoryType; 5] = [
+        MemoryType::Structural,
+        MemoryType::Decisional,
+        MemoryType::Episodic,
+        MemoryType::Analytical,
+        MemoryType::Procedural,
+    ];
+}
+
 impl fmt::Display for MemoryType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

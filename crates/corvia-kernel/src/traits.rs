@@ -54,6 +54,27 @@ pub trait QueryableStore: Send + Sync {
     /// intentional — access tracking is operational telemetry, not source-of-truth data.
     async fn record_access(&self, entry_ids: &[uuid::Uuid]) -> Result<()>;
 
+    /// Semantic search by embedding vector, filtered to a single memory type.
+    ///
+    /// Default implementation searches all types and post-filters. LiteStore overrides
+    /// with efficient per-type HNSW index search. The default is best-effort: it
+    /// over-fetches by 3x but may still return fewer results than `limit` if the
+    /// requested type is rare.
+    async fn search_by_memory_type(
+        &self,
+        embedding: &[f32],
+        scope_id: &str,
+        limit: usize,
+        memory_type: corvia_common::types::MemoryType,
+    ) -> Result<Vec<SearchResult>> {
+        let results = self.search(embedding, scope_id, limit * 3).await?;
+        Ok(results
+            .into_iter()
+            .filter(|r| r.entry.memory_type == memory_type)
+            .take(limit)
+            .collect())
+    }
+
     /// Downcast support for store-specific operations (e.g., LiteStore::rebuild_from_files).
     fn as_any(&self) -> &dyn Any;
 }

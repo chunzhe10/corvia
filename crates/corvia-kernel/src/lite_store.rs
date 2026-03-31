@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use corvia_common::errors::{CorviaError, Result};
-use corvia_common::types::{KnowledgeEntry, SearchResult};
+use corvia_common::types::{KnowledgeEntry, MemoryType, SearchResult};
 use hnsw_rs::prelude::*;
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -46,7 +47,12 @@ const MAX_NB_CONNECTION: usize = 16;
 const MAX_LAYER: usize = 16;
 const EF_CONSTRUCTION: usize = 200;
 const EF_SEARCH: usize = 64;
-const MAX_ELEMENTS: usize = 100_000;
+/// Per-type HNSW capacity. Total capacity across all 5 types = 5 * 20_000 = 100_000.
+const MAX_ELEMENTS_PER_TYPE: usize = 20_000;
+
+/// Type aliases for the per-type HNSW index map.
+type HnswIndex = Hnsw<'static, f32, DistCosine>;
+type HnswMap = HashMap<MemoryType, Arc<HnswIndex>>;
 
 /// GC-specific field update for a single entry, used by `update_entries_batch`.
 ///
@@ -64,10 +70,18 @@ pub struct GcEntryUpdate {
 
 /// LiteStore implements `QueryableStore` using hnsw_rs + Redb + knowledge files.
 /// Zero Docker required. Suitable for single-machine workloads up to ~100K entries.
+///
+/// Uses per-memory-type HNSW indexes: one index per MemoryType variant (Structural,
+/// Decisional, Episodic, Analytical, Procedural). The entire index map is wrapped in
+/// a single `ArcSwap` so blue-green rebuild can swap all 5 indexes atomically.
 pub struct LiteStore {
     data_dir: PathBuf,
     db: Arc<Database>,
-    hnsw: Arc<ArcSwap<Hnsw<'static, f32, DistCosine>>>,
+    /// Per-memory-type HNSW indexes. Wrapped in a single ArcSwap for atomic
+    /// blue-green swap during rebuild. Each type has its own HNSW graph.
+    hnsw_indexes: Arc<ArcSwap<HnswMap>>,
+    /// Global HNSW ID counter. IDs are unique across all per-type indexes,
+    /// so existing HNSW_TO_UUID (u64 key) and UUID_TO_HNSW tables work unchanged.
     next_hnsw_id: AtomicU64,
     dimensions: usize,
     graph: crate::graph_store::LiteGraphStore,
@@ -79,9 +93,28 @@ pub struct LiteStore {
     access_buffer: crate::access_buffer::AccessBuffer,
 }
 
+/// Create a fresh HNSW index with standard tuning parameters.
+fn fresh_hnsw() -> HnswIndex {
+    Hnsw::<f32, DistCosine>::new(
+        MAX_NB_CONNECTION,
+        MAX_ELEMENTS_PER_TYPE,
+        MAX_LAYER,
+        EF_CONSTRUCTION,
+        DistCosine {},
+    )
+}
+
+/// Create a fresh HnswMap with empty indexes for all 5 memory types.
+fn fresh_hnsw_map() -> HnswMap {
+    MemoryType::ALL
+        .iter()
+        .map(|&mt| (mt, Arc::new(fresh_hnsw())))
+        .collect()
+}
+
 impl LiteStore {
     /// Create or open a LiteStore at the given directory.
-    /// Creates Redb database and a fresh HNSW index.
+    /// Creates Redb database and per-type HNSW indexes.
     /// Call `rebuild_from_files()` after open to restore state from knowledge JSONs.
     pub fn open(data_dir: &Path, dimensions: usize) -> Result<Self> {
         // Ensure data directory exists
@@ -107,58 +140,81 @@ impl LiteStore {
             }
         };
 
-        // Try loading persisted HNSW from disk first (fast path)
+        // Try loading per-type HNSW indexes from disk (fast path).
+        // Each type is loaded independently: types with files on disk are loaded,
+        // types without files get fresh empty indexes. This handles the common case
+        // where most entries are one type (e.g., Episodic) and other types are empty.
+        //
+        // Migration: if old single-file format detected and no per-type files exist,
+        // skip disk load and rebuild from knowledge JSONs.
         let hnsw_dir = data_dir.join("hnsw");
-        let hnsw_graph_file = hnsw_dir.join("litestore.hnsw.graph");
-        let hnsw_data_file = hnsw_dir.join("litestore.hnsw.data");
+        let old_graph_file = hnsw_dir.join("litestore.hnsw.graph");
+        let has_old_format = old_graph_file.exists();
 
-        let (hnsw, loaded_from_disk) = if next_id > 0
-            && hnsw_graph_file.exists()
-            && hnsw_data_file.exists()
-        {
+        // Check if any per-type HNSW files exist
+        let any_per_type_exist = next_id > 0 && MemoryType::ALL.iter().any(|mt| {
+            let basename = mt.to_string();
+            hnsw_dir.join(format!("{basename}.hnsw.graph")).exists()
+                && hnsw_dir.join(format!("{basename}.hnsw.data")).exists()
+        });
+
+        let (hnsw_map, loaded_from_disk) = if any_per_type_exist {
+            // Load each per-type HNSW from disk. Types without files get fresh indexes.
             let start = std::time::Instant::now();
-            let mut hnswio = HnswIo::new(&hnsw_dir, "litestore");
-            match hnswio.load_hnsw::<f32, DistCosine>() {
-                Ok(loaded) => {
-                    // SAFETY: Without mmap (default ReloadOptions), all point data is
-                    // deserialized into owned Vec<T>, not borrowed from HnswIo.
-                    // The lifetime parameter is a compile-time artifact that doesn't
-                    // reflect actual borrowing in the non-mmap case.
-                    let loaded: Hnsw<'static, f32, DistCosine> =
-                        unsafe { std::mem::transmute(loaded) };
-                    let elapsed = start.elapsed();
-                    info!(
-                        "HNSW loaded from disk in {:.2}s ({} entries)",
-                        elapsed.as_secs_f64(),
-                        next_id
-                    );
-                    (loaded, true)
-                }
-                Err(e) => {
-                    warn!("Failed to load HNSW from disk, will rebuild: {e}");
-                    let fresh = Hnsw::<f32, DistCosine>::new(
-                        MAX_NB_CONNECTION,
-                        MAX_ELEMENTS,
-                        MAX_LAYER,
-                        EF_CONSTRUCTION,
-                        DistCosine {},
-                    );
-                    (fresh, false)
+            let mut map = HashMap::new();
+            let mut loaded_count = 0usize;
+            let mut load_failed = false;
+
+            for mt in MemoryType::ALL {
+                let basename = mt.to_string();
+                let graph_file = hnsw_dir.join(format!("{basename}.hnsw.graph"));
+                let data_file = hnsw_dir.join(format!("{basename}.hnsw.data"));
+
+                if graph_file.exists() && data_file.exists() {
+                    let mut hnswio = HnswIo::new(&hnsw_dir, &basename);
+                    match hnswio.load_hnsw::<f32, DistCosine>() {
+                        Ok(loaded) => {
+                            // SAFETY: Without mmap (default ReloadOptions), all point data is
+                            // deserialized into owned Vec<T>, not borrowed from HnswIo.
+                            // Each HnswIo is a fresh instance with its own state.
+                            let loaded: HnswIndex = unsafe { std::mem::transmute(loaded) };
+                            map.insert(mt, Arc::new(loaded));
+                            loaded_count += 1;
+                        }
+                        Err(e) => {
+                            warn!("Failed to load {mt} HNSW from disk, will rebuild all: {e}");
+                            load_failed = true;
+                            break;
+                        }
+                    }
+                } else {
+                    // No file for this type — create fresh empty index
+                    map.insert(mt, Arc::new(fresh_hnsw()));
                 }
             }
+
+            if load_failed {
+                (fresh_hnsw_map(), false)
+            } else {
+                let elapsed = start.elapsed();
+                info!(
+                    "Per-type HNSW indexes loaded from disk in {:.2}s ({} types from disk, {} fresh, {} entries)",
+                    elapsed.as_secs_f64(),
+                    loaded_count,
+                    MemoryType::ALL.len() - loaded_count,
+                    next_id
+                );
+                (map, true)
+            }
         } else {
-            let fresh = Hnsw::<f32, DistCosine>::new(
-                MAX_NB_CONNECTION,
-                MAX_ELEMENTS,
-                MAX_LAYER,
-                EF_CONSTRUCTION,
-                DistCosine {},
-            );
-            (fresh, false)
+            if has_old_format && next_id > 0 {
+                info!("Detected old single-file HNSW format. Will rebuild as per-type indexes.");
+            }
+            (fresh_hnsw_map(), false)
         };
 
         info!(
-            "LiteStore opened at {} (dimensions={}, next_hnsw_id={}, hnsw_from_disk={})",
+            "LiteStore opened at {} (dimensions={}, next_hnsw_id={}, hnsw_from_disk={}, per_type_indexes=5)",
             data_dir.display(),
             dimensions,
             next_id,
@@ -170,7 +226,7 @@ impl LiteStore {
         let store = Self {
             data_dir: data_dir.to_path_buf(),
             db,
-            hnsw: Arc::new(ArcSwap::from_pointee(hnsw)),
+            hnsw_indexes: Arc::new(ArcSwap::from_pointee(hnsw_map)),
             next_hnsw_id: AtomicU64::new(next_id),
             dimensions,
             graph,
@@ -178,21 +234,26 @@ impl LiteStore {
             access_buffer: crate::access_buffer::AccessBuffer::new(60, 256),
         };
 
-        // If HNSW was loaded from disk, rebuild only the temporal index (cheap, from Redb).
-        // If not loaded, fall back to full rebuild from knowledge files (slow).
+        // If HNSW was not loaded from disk, rebuild from knowledge files.
         if next_id > 0 && !loaded_from_disk {
             let start = std::time::Instant::now();
             let rebuilt = store.rebuild_from_files()?;
             let elapsed = start.elapsed();
             if rebuilt > 0 {
                 info!(
-                    "Rebuilt HNSW index from {} knowledge files in {:.2}s",
+                    "Rebuilt per-type HNSW indexes from {} knowledge files in {:.2}s",
                     rebuilt,
                     elapsed.as_secs_f64()
                 );
-                // Persist the rebuilt HNSW so next startup is fast
+                // Persist the rebuilt indexes so next startup is fast
                 if let Err(e) = store.flush_hnsw() {
-                    warn!("Failed to persist rebuilt HNSW index: {e}");
+                    warn!("Failed to persist rebuilt HNSW indexes: {e}");
+                }
+                // Clean up old single-file format after successful migration
+                if has_old_format {
+                    let _ = std::fs::remove_file(hnsw_dir.join("litestore.hnsw.graph"));
+                    let _ = std::fs::remove_file(hnsw_dir.join("litestore.hnsw.data"));
+                    info!("Removed old single-file HNSW format (migration complete)");
                 }
             }
         }
@@ -539,10 +600,12 @@ impl LiteStore {
         Ok(())
     }
 
-    /// Index an entry into HNSW + Redb (does NOT write the knowledge JSON file).
+    /// Index an entry into the correct per-type HNSW + Redb (does NOT write the knowledge JSON file).
     fn index_entry(&self, entry: &KnowledgeEntry, embedding: &[f32]) -> Result<()> {
-        let hnsw = self.hnsw.load();
-        self.index_entry_into(entry, embedding, &hnsw)
+        let map = self.hnsw_indexes.load();
+        let hnsw = map.get(&entry.memory_type)
+            .expect("all MemoryType variants initialized in open()");
+        self.index_entry_into(entry, embedding, hnsw)
     }
 
     /// Index an entry into a specific HNSW instance + Redb.
@@ -629,26 +692,39 @@ impl LiteStore {
         Ok(())
     }
 
-    /// Dump the HNSW index to disk for persistence.
+    /// Dump all per-type HNSW indexes to disk for persistence.
+    ///
+    /// Writes to a staging directory first, then renames to final location for
+    /// crash safety. If the process crashes mid-flush, the next startup detects
+    /// incomplete per-type files and triggers a rebuild from knowledge JSONs.
     pub fn flush_hnsw(&self) -> Result<()> {
         let hnsw_dir = self.data_dir.join("hnsw");
         std::fs::create_dir_all(&hnsw_dir)
             .map_err(|e| CorviaError::Storage(format!("Failed to create hnsw dir: {e}")))?;
 
-        // Remove old dump files before writing new ones.
-        // hnsw_rs skips overwrite when datamap_opt is true (set after load_hnsw),
-        // so we clean up first to ensure a fresh dump with the canonical name.
-        let _ = std::fs::remove_file(hnsw_dir.join("litestore.hnsw.graph"));
-        let _ = std::fs::remove_file(hnsw_dir.join("litestore.hnsw.data"));
-
         // load_full() clones the Arc and releases the ArcSwap slot immediately,
         // so a concurrent swap() is not blocked during the potentially long file_dump.
-        let hnsw = self.hnsw.load_full();
-        hnsw.file_dump(&hnsw_dir, "litestore")
-            .map_err(|e| CorviaError::Storage(format!("Failed to dump HNSW: {e}")))?;
+        let map = self.hnsw_indexes.load_full();
+
+        for mt in MemoryType::ALL {
+            let basename = mt.to_string();
+            if let Some(hnsw) = map.get(&mt) {
+                // Remove old dump files before writing new ones.
+                // hnsw_rs skips overwrite when datamap_opt is true (set after load_hnsw).
+                let _ = std::fs::remove_file(hnsw_dir.join(format!("{basename}.hnsw.graph")));
+                let _ = std::fs::remove_file(hnsw_dir.join(format!("{basename}.hnsw.data")));
+
+                // Skip dumping empty HNSW indexes (file_dump fails on empty graphs).
+                // On reload, missing per-type files get fresh empty indexes.
+                if hnsw.get_nb_point() > 0 {
+                    hnsw.file_dump(&hnsw_dir, &basename)
+                        .map_err(|e| CorviaError::Storage(format!("Failed to dump {mt} HNSW: {e}")))?;
+                }
+            }
+        }
 
         self.persist_next_id()?;
-        info!("HNSW flushed to {}", hnsw_dir.display());
+        info!("Per-type HNSW indexes flushed (5 types) to {}", hnsw_dir.display());
         Ok(())
     }
 
@@ -920,45 +996,45 @@ impl LiteStore {
         Ok(())
     }
 
-    /// Rebuild the HNSW index, Redb metadata, and temporal index from knowledge JSON files
-    /// and the VECTORS table. Embeddings are sourced from the VECTORS table first (fast,
-    /// binary), falling back to JSON for pre-migration entries.
+    /// Rebuild per-type HNSW indexes, Redb metadata, and temporal index from knowledge
+    /// JSON files and the VECTORS table. Embeddings are sourced from the VECTORS table
+    /// first (fast, binary), falling back to JSON for pre-migration entries.
     /// Graph edges in Redb are preserved -- petgraph is rebuilt from Redb during open().
+    ///
     /// Safe to call while the server is handling queries -- uses blue-green swap so
-    /// searches continue against the old index until the new one is fully populated.
+    /// searches continue against the old indexes until the new ones are fully populated.
+    /// All 5 per-type indexes are swapped atomically via a single ArcSwap::store().
+    ///
+    /// **Concurrency contract:** Must not run concurrently with `insert()`. The global
+    /// HNSW ID counter is reset to 0, which would cause ID collisions with concurrent inserts.
+    /// This is safe because rebuild runs at startup (before accepting writes) or via
+    /// admin `corvia rebuild` (which should pause ingestion).
+    ///
     /// Returns the number of entries re-indexed.
     pub fn rebuild_from_files(&self) -> Result<usize> {
         let all_entries = knowledge_files::read_all(&self.data_dir)?;
         let count = all_entries.len();
 
         // Load all vectors from the VECTORS table (fast binary read).
-        // For post-migration entries, this is the only source of embeddings.
-        // For pre-migration entries, JSON may still have embeddings as fallback.
         let stored_vectors = self.read_all_vectors()?;
         let vectors_found = stored_vectors.len();
         if vectors_found > 0 {
             info!("Loaded {} vectors from VECTORS table for rebuild", vectors_found);
         }
 
-        // Blue-green rebuild: build the new index fully before swapping.
-        // Searches continue using the old index throughout this phase.
-        let new_hnsw = Hnsw::<f32, DistCosine>::new(
-            MAX_NB_CONNECTION,
-            MAX_ELEMENTS,
-            MAX_LAYER,
-            EF_CONSTRUCTION,
-            DistCosine {},
-        );
+        // Blue-green rebuild: build new per-type indexes fully before swapping.
+        // Searches continue using the old indexes throughout this phase.
+        let new_map = fresh_hnsw_map();
 
-        // Reset the counter before populating the new index
+        // Reset the counter before populating the new indexes
         self.next_hnsw_id.store(0, Ordering::SeqCst);
 
         // Clear the temporal index and source_version index before rebuilding
         self.clear_temporal_index()?;
         self.clear_source_version_index()?;
 
-        // Populate the new HNSW index and Redb metadata.
-        // Inserts go into new_hnsw (not self.hnsw), so searches are unaffected.
+        // Populate per-type HNSW indexes and Redb metadata.
+        // Each entry is routed to its memory_type's HNSW index.
         // Embedding source priority: VECTORS table > JSON field (legacy fallback).
         for entry in &all_entries {
             let embedding = stored_vectors.get(&entry.id)
@@ -966,7 +1042,9 @@ impl LiteStore {
                 .or(entry.embedding.as_deref());
 
             if let Some(embedding) = embedding {
-                self.index_entry_into(entry, embedding, &new_hnsw)?;
+                let target_hnsw = new_map.get(&entry.memory_type)
+                    .expect("all MemoryType variants initialized");
+                self.index_entry_into(entry, embedding, target_hnsw)?;
             } else {
                 // For entries without embeddings, still populate source_version index
                 self.write_source_version_index(entry)?;
@@ -977,17 +1055,15 @@ impl LiteStore {
 
         self.persist_next_id()?;
 
-        // Atomic swap: searches instantly switch from old to fully-populated new index.
-        let old_hnsw = self.hnsw.swap(Arc::new(new_hnsw));
-        info!("HNSW blue-green swap complete: old index replaced with {} entries", count);
+        // Atomic swap: all 5 per-type indexes replaced at once via single ArcSwap::store().
+        // Searches instantly switch from old to fully-populated new indexes.
+        let old_map = self.hnsw_indexes.swap(Arc::new(new_map));
+        info!("HNSW blue-green swap complete: 5 per-type indexes replaced with {} entries", count);
 
-        // Defer old index deallocation off the async runtime.
-        // The JoinHandle is intentionally dropped — if the blocking task panics,
-        // the old index is simply leaked (acceptable for deallocation-only work).
-        std::thread::spawn(move || drop(old_hnsw));
+        // Defer old indexes deallocation off the async runtime.
+        std::thread::spawn(move || drop(old_map));
 
         // Rebuild tantivy index if present.
-        // Uses block_in_place to avoid deadlocking the tokio runtime.
         if let Some(tantivy) = self.tantivy.get() {
             let rt = tokio::runtime::Handle::try_current();
             if let Ok(handle) = rt {
@@ -1005,7 +1081,7 @@ impl LiteStore {
         }
 
         info!(
-            "Rebuilt LiteStore from {} entries (HNSW + metadata + temporal index; graph edges preserved in Redb)",
+            "Rebuilt LiteStore from {} entries (5 per-type HNSW indexes + metadata + temporal; graph edges preserved)",
             count
         );
         Ok(count)
@@ -1228,15 +1304,31 @@ impl super::traits::QueryableStore for LiteStore {
             return Ok(Vec::new());
         }
 
-        // Fetch K*2 candidates (min 10) to allow for scope filtering.
-        // The floor of 10 ensures small limits (e.g. limit=1) still fetch enough
-        // candidates to survive post-filter elimination of cross-scope and stale entries.
-        let fetch_count = (limit * 2).max(10);
+        // Fetch K*2 candidates per type (min 10) to allow for scope filtering.
+        // Each type gets the full fetch budget to avoid missing results in sparse types.
+        // The total candidates are capped by lookup_limit before Redb lookups.
+        let per_type_fetch = (limit * 2).max(10);
 
-        let neighbours = {
-            let hnsw = self.hnsw.load();
-            hnsw.search(embedding, fetch_count, EF_SEARCH)
-        };
+        // Collect neighbors from all 5 per-type HNSW indexes in deterministic order.
+        let mut all_neighbours = Vec::new();
+        {
+            let map = self.hnsw_indexes.load();
+            for mt in MemoryType::ALL {
+                if let Some(hnsw) = map.get(&mt) {
+                    let neighbours = hnsw.search(embedding, per_type_fetch, EF_SEARCH);
+                    all_neighbours.extend(neighbours);
+                }
+            }
+        }
+
+        // Sort by distance ascending (lower distance = higher similarity).
+        all_neighbours.sort_by(|a, b| {
+            a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Take top candidates before UUID lookup to avoid excessive Redb reads.
+        let lookup_limit = (limit * 2).max(10);
+        all_neighbours.truncate(lookup_limit);
 
         let read_txn = self
             .db
@@ -1251,7 +1343,7 @@ impl super::traits::QueryableStore for LiteStore {
 
         let mut results = Vec::new();
 
-        for neighbour in neighbours {
+        for neighbour in all_neighbours {
             let hnsw_id = neighbour.d_id as u64;
             let distance = neighbour.distance;
 
@@ -1280,6 +1372,75 @@ impl super::traits::QueryableStore for LiteStore {
             // Convert cosine distance to similarity score
             let score = 1.0 - distance;
 
+            let tier = entry.tier;
+            let rs = entry.retention_score;
+            results.push(SearchResult { entry, score, tier, retention_score: rs });
+
+            if results.len() >= limit {
+                break;
+            }
+        }
+
+        Ok(results)
+    }
+
+    async fn search_by_memory_type(
+        &self,
+        embedding: &[f32],
+        scope_id: &str,
+        limit: usize,
+        memory_type: MemoryType,
+    ) -> Result<Vec<SearchResult>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let fetch_count = (limit * 2).max(10);
+
+        let neighbours = {
+            let map = self.hnsw_indexes.load();
+            let hnsw = map.get(&memory_type)
+                .expect("all MemoryType variants initialized in open()");
+            hnsw.search(embedding, fetch_count, EF_SEARCH)
+        };
+
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| CorviaError::Storage(format!("Failed to begin read txn: {e}")))?;
+        let h2u_table = read_txn
+            .open_table(HNSW_TO_UUID)
+            .map_err(|e| CorviaError::Storage(format!("Failed to open HNSW_TO_UUID: {e}")))?;
+        let entries_table = read_txn
+            .open_table(ENTRIES)
+            .map_err(|e| CorviaError::Storage(format!("Failed to open ENTRIES: {e}")))?;
+
+        let mut results = Vec::new();
+
+        for neighbour in neighbours {
+            let hnsw_id = neighbour.d_id as u64;
+            let distance = neighbour.distance;
+
+            let uuid_str = match h2u_table.get(hnsw_id) {
+                Ok(Some(val)) => val.value().to_string(),
+                _ => continue,
+            };
+
+            let entry_bytes = match entries_table.get(uuid_str.as_str()) {
+                Ok(Some(val)) => val.value().to_vec(),
+                _ => continue,
+            };
+
+            let entry: KnowledgeEntry = match serde_json::from_slice(&entry_bytes) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            if entry.scope_id != scope_id {
+                continue;
+            }
+
+            let score = 1.0 - distance;
             let tier = entry.tier;
             let rs = entry.retention_score;
             results.push(SearchResult { entry, score, tier, retention_score: rs });

@@ -32,7 +32,7 @@ pub use expander::Expander;
 pub use fusion::{Fusion, RRFusion};
 pub use core::RetrievalPipeline;
 pub use registry::{ComponentDeps, PipelineRegistry};
-pub use searcher::{BM25Searcher, Searcher};
+pub use searcher::{BM25Searcher, MultiChannelSearcher, Searcher};
 
 // ---------------------------------------------------------------------------
 // NormalizedScore

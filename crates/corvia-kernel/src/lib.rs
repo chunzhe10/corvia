@@ -454,6 +454,8 @@ pub fn rebuild_pipeline_retriever(
         graph: graph.clone(),
         fts,
         rrf_k: pipeline_cfg.rrf.k,
+        channels: pipeline_cfg.channels.clone(),
+        searcher_timeout_ms: pipeline_cfg.searcher_timeout_ms,
     };
 
     let retriever = pipeline::PipelineRegistry::validate_and_build(
@@ -493,9 +495,10 @@ fn build_pipeline_retriever(
 ) -> Arc<dyn retriever::Retriever> {
     use pipeline::{ComponentDeps, PipelineRegistry};
 
-    // Initialize tantivy if "bm25" is in the searchers list and store is LiteStore.
+    // Initialize tantivy if "bm25" or "multichannel" is in the searchers list and store is LiteStore.
+    // MultiChannelSearcher may use BM25 for the structural channel.
     let fts: Option<Arc<dyn traits::FullTextSearchable>> =
-        if pipeline_cfg.searchers.iter().any(|s| s == "bm25") {
+        if pipeline_cfg.searchers.iter().any(|s| s == "bm25" || s == "multichannel") {
             if let Some(ls) = store.as_any().downcast_ref::<lite_store::LiteStore>() {
                 let cache_dir = std::path::Path::new(&config.storage.data_dir)
                     .join("cache")
@@ -540,6 +543,8 @@ fn build_pipeline_retriever(
         graph: graph.clone(),
         fts,
         rrf_k: pipeline_cfg.rrf.k,
+        channels: pipeline_cfg.channels.clone(),
+        searcher_timeout_ms: pipeline_cfg.searcher_timeout_ms,
     };
 
     // Build searchers.

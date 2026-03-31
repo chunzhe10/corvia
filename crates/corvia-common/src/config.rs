@@ -542,6 +542,10 @@ pub struct PipelineConfig {
     /// BM25 parameters (for Phase 2a). Default: all defaults.
     #[serde(default)]
     pub bm25: Bm25Config,
+    /// Per-memory-type channel strategies for MultiChannelSearcher.
+    /// Maps to `[rag.pipeline.channels]` in TOML.
+    #[serde(default)]
+    pub channels: ChannelsConfig,
 }
 
 fn default_pipeline_searchers() -> Vec<String> { vec!["vector".into()] }
@@ -559,6 +563,7 @@ impl Default for PipelineConfig {
             searcher_timeout_ms: default_searcher_timeout_ms(),
             rrf: RrfConfig::default(),
             bm25: Bm25Config::default(),
+            channels: ChannelsConfig::default(),
         }
     }
 }
@@ -598,6 +603,63 @@ impl Default for Bm25Config {
         Self {
             k1: default_bm25_k1(),
             b: default_bm25_b(),
+        }
+    }
+}
+
+/// Per-memory-type channel strategies for MultiChannelSearcher.
+///
+/// Each field maps a memory type to a searcher strategy name:
+/// - `"vector"` — semantic search via HNSW index for that type
+/// - `"bm25"` — keyword/exact match via tantivy full-text index
+///
+/// Graph expansion is handled by the pipeline's Expander stage (post-fusion),
+/// not per-channel. Recency weighting is handled via tier weights in the vector
+/// searcher. Access-frequency boost is a future enhancement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelsConfig {
+    /// Strategy for Structural entries (code, API shapes). Default: "bm25".
+    #[serde(default = "default_bm25_strategy")]
+    pub structural: String,
+    /// Strategy for Decisional entries (design, architecture). Default: "vector".
+    #[serde(default = "default_vector_strategy")]
+    pub decisional: String,
+    /// Strategy for Episodic entries (sessions, discoveries). Default: "vector".
+    #[serde(default = "default_vector_strategy")]
+    pub episodic: String,
+    /// Strategy for Analytical entries (findings, health checks). Default: "vector".
+    #[serde(default = "default_vector_strategy")]
+    pub analytical: String,
+    /// Strategy for Procedural entries (instructions, workflows). Default: "vector".
+    #[serde(default = "default_vector_strategy")]
+    pub procedural: String,
+}
+
+fn default_bm25_strategy() -> String { "bm25".into() }
+fn default_vector_strategy() -> String { "vector".into() }
+
+impl ChannelsConfig {
+    /// Get the strategy for a given memory type.
+    pub fn strategy_for(&self, mt: crate::types::MemoryType) -> &str {
+        use crate::types::MemoryType;
+        match mt {
+            MemoryType::Structural => &self.structural,
+            MemoryType::Decisional => &self.decisional,
+            MemoryType::Episodic => &self.episodic,
+            MemoryType::Analytical => &self.analytical,
+            MemoryType::Procedural => &self.procedural,
+        }
+    }
+}
+
+impl Default for ChannelsConfig {
+    fn default() -> Self {
+        Self {
+            structural: default_bm25_strategy(),
+            decisional: default_vector_strategy(),
+            episodic: default_vector_strategy(),
+            analytical: default_vector_strategy(),
+            procedural: default_vector_strategy(),
         }
     }
 }
