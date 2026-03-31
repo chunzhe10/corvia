@@ -160,7 +160,8 @@ fn tool_definitions() -> Vec<Value> {
                     "content_role": { "type": "string", "description": "Filter by content role: design, decision, plan, code, memory, finding, instruction, learning" },
                     "source_origin": { "type": "string", "description": "Filter by source origin: repo:<name>, workspace, memory" },
                     "workstream": { "type": "string", "description": "Filter by workstream (e.g. git branch name)" },
-                    "include_cold": { "type": "boolean", "description": "Include Cold-tier entries via brute-force cosine scan (default false)" }
+                    "include_cold": { "type": "boolean", "description": "Include Cold-tier entries via brute-force cosine scan (default false)" },
+                    "min_score": { "type": "number", "description": "Minimum score threshold — results below this are filtered out" }
                 },
                 "required": ["query"]
             }
@@ -176,7 +177,8 @@ fn tool_definitions() -> Vec<Value> {
                     "source_version": { "type": "string", "description": "Source version reference" },
                     "agent_id": { "type": "string", "description": "Agent identity for attribution (e.g. 'claude-code')" },
                     "content_role": { "type": "string", "description": "Content role: design, decision, plan, code, memory, finding, instruction, learning" },
-                    "source_origin": { "type": "string", "description": "Source origin: repo:<name>, workspace, memory" }
+                    "source_origin": { "type": "string", "description": "Source origin: repo:<name>, workspace, memory" },
+                    "force_write": { "type": "boolean", "description": "Bypass semantic deduplication check (default false)" }
                 },
                 "required": ["content"]
             }
@@ -237,7 +239,9 @@ fn tool_definitions() -> Vec<Value> {
                     "content_role": { "type": "string", "description": "Filter by content role: design, decision, plan, code, memory, finding, instruction, learning" },
                     "source_origin": { "type": "string", "description": "Filter by source origin: repo:<name>, workspace, memory" },
                     "workstream": { "type": "string", "description": "Filter by workstream (e.g. git branch name)" },
-                    "include_cold": { "type": "boolean", "description": "Include Cold-tier entries via brute-force cosine scan (default false)" }
+                    "include_cold": { "type": "boolean", "description": "Include Cold-tier entries via brute-force cosine scan (default false)" },
+                    "max_tokens": { "type": "integer", "description": "Override token budget for context assembly (hard cap: 4000). Recommended: 2000-3000 for subagent injection." },
+                    "format": { "type": "string", "description": "Output format: 'default' (full context with citations) or 'compact' (relevance-ranked blocks with entry IDs, no system prompt)" }
                 },
                 "required": ["query"]
             }
@@ -734,6 +738,7 @@ async fn tool_corvia_search(
     let source_origin = args.get("source_origin").and_then(|v| v.as_str()).map(String::from);
     let workstream = args.get("workstream").and_then(|v| v.as_str()).map(String::from);
     let include_cold = args.get("include_cold").and_then(|v| v.as_bool()).unwrap_or(false);
+    let min_score = args.get("min_score").and_then(|v| v.as_f64()).map(|v| v as f32);
 
     // Route through RAG pipeline if available (fixes ContextBuilder bypass)
     if let Some(rag) = state.rag_pipeline() {
@@ -749,7 +754,19 @@ async fn tool_corvia_search(
         let response = rag.context(query, scope_id, Some(opts)).await
             .map_err(|e| (INTERNAL_ERROR, format!("Search failed: {e}")))?;
 
-        let items: Vec<Value> = response.context.sources.iter().map(|r| {
+        let all_sources = &response.context.sources;
+
+        // Apply min_score filter if requested.
+        let (filtered_sources, below_threshold_count) = if let Some(threshold) = min_score {
+            let before = all_sources.len();
+            let filtered: Vec<_> = all_sources.iter().filter(|r| r.score >= threshold).collect();
+            let below = before - filtered.len();
+            (filtered, below)
+        } else {
+            (all_sources.iter().collect(), 0usize)
+        };
+
+        let items: Vec<Value> = filtered_sources.iter().map(|r| {
             let mut item = json!({
                 "content": r.entry.content,
                 "score": r.score,
@@ -765,12 +782,32 @@ async fn tool_corvia_search(
             item
         }).collect();
 
+        // Compute quality signal from filtered results.
+        let mut quality_signal = corvia_kernel::rag_types::QualitySignal::from_results(
+            &filtered_sources.iter().cloned().cloned().collect::<Vec<_>>(),
+            query,
+            limit,
+        );
+        quality_signal.below_threshold_count = below_threshold_count;
+
+        // Record gap signal if confidence is low.
+        if quality_signal.confidence == corvia_kernel::rag_types::ConfidenceLevel::Low {
+            state.gap_detector.record(corvia_kernel::gap_detector::GapSignal {
+                query: query.to_string(),
+                top_score: quality_signal.top_score,
+                result_count: quality_signal.result_count,
+                timestamp: chrono::Utc::now(),
+                scope_id: scope_id.to_string(),
+            });
+        }
+
         return Ok(json!({
             "content": [{
                 "type": "text",
                 "text": serde_json::to_string_pretty(&json!({
                     "results": items,
-                    "count": items.len()
+                    "count": items.len(),
+                    "quality_signal": quality_signal
                 })).unwrap()
             }]
         }));
@@ -796,6 +833,16 @@ async fn tool_corvia_search(
     );
     let results: Vec<_> = results.into_iter().take(limit).collect();
 
+    // Apply min_score filter.
+    let (results, below_threshold_count) = if let Some(threshold) = min_score {
+        let before = results.len();
+        let filtered: Vec<_> = results.into_iter().filter(|r| r.score >= threshold).collect();
+        let below = before - filtered.len();
+        (filtered, below)
+    } else {
+        (results, 0usize)
+    };
+
     let items: Vec<Value> = results.iter().map(|r| {
         let mut item = json!({
             "content": r.entry.content,
@@ -812,12 +859,30 @@ async fn tool_corvia_search(
         item
     }).collect();
 
+    // Compute quality signal.
+    let mut quality_signal = corvia_kernel::rag_types::QualitySignal::from_results(
+        &results, query, limit,
+    );
+    quality_signal.below_threshold_count = below_threshold_count;
+
+    // Record gap signal if confidence is low.
+    if quality_signal.confidence == corvia_kernel::rag_types::ConfidenceLevel::Low {
+        state.gap_detector.record(corvia_kernel::gap_detector::GapSignal {
+            query: query.to_string(),
+            top_score: quality_signal.top_score,
+            result_count: quality_signal.result_count,
+            timestamp: chrono::Utc::now(),
+            scope_id: scope_id.to_string(),
+        });
+    }
+
     Ok(json!({
         "content": [{
             "type": "text",
             "text": serde_json::to_string_pretty(&json!({
                 "results": items,
-                "count": items.len()
+                "count": items.len(),
+                "quality_signal": quality_signal
             })).unwrap()
         }]
     }))
@@ -839,6 +904,7 @@ async fn tool_corvia_write(
     let content_role = args.get("content_role").and_then(|v| v.as_str()).map(String::from);
     let source_origin = args.get("source_origin").and_then(|v| v.as_str()).map(String::from)
         .or(Some("workspace".into())); // default per spec
+    let force_write = args.get("force_write").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let coord = &state.coordinator;
 
@@ -872,15 +938,44 @@ async fn tool_corvia_write(
         .map(|s| s.session_id.as_str())
         .ok_or((INTERNAL_ERROR, "No active session".into()))?;
 
-    let entry = coord.write_entry(session_id, content, scope_id, source_version, content_role, source_origin).await
+    let result = coord.write_entry_with_dedup(
+        session_id, content, scope_id, source_version,
+        content_role, source_origin, force_write,
+    ).await
         .map_err(|e| (INTERNAL_ERROR, format!("Write failed: {e}")))?;
 
-    Ok(json!({
-        "content": [{
-            "type": "text",
-            "text": format!("Entry {} written (status: {:?})", entry.id, entry.entry_status)
-        }]
-    }))
+    use corvia_kernel::agent_writer::WriteResult;
+    match result {
+        WriteResult::Written(entry) => {
+            Ok(json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Entry {} written (status: {:?})", entry.id, entry.entry_status)
+                }]
+            }))
+        }
+        WriteResult::WrittenWithWarning { entry, similar_id, similarity } => {
+            Ok(json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "Entry {} written (status: {:?}). Warning: similar entry {} exists (similarity: {:.2}). Consider checking for overlap.",
+                        entry.id, entry.entry_status, similar_id, similarity
+                    )
+                }]
+            }))
+        }
+        WriteResult::Blocked { existing_id, similarity, existing_preview } => {
+            Ok(json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "Near-duplicate detected (similarity: {similarity:.2}). Existing entry: {existing_id}. Preview: {existing_preview}. Entry NOT written. To force write, use force_write: true."
+                    )
+                }]
+            }))
+        }
+    }
 }
 
 async fn tool_corvia_history(
@@ -1094,6 +1189,8 @@ async fn tool_corvia_context(
     let source_origin = args.get("source_origin").and_then(|v| v.as_str()).map(String::from);
     let workstream = args.get("workstream").and_then(|v| v.as_str()).map(String::from);
     let include_cold = args.get("include_cold").and_then(|v| v.as_bool()).unwrap_or(false);
+    let max_tokens = args.get("max_tokens").and_then(|v| v.as_u64()).map(|v| v.min(4000) as usize);
+    let format = args.get("format").and_then(|v| v.as_str()).unwrap_or("default");
 
     let rag = state.rag_pipeline()
         .ok_or((SERVICE_UNAVAILABLE, "RAG pipeline not configured".into()))?;
@@ -1108,8 +1205,55 @@ async fn tool_corvia_context(
         ..Default::default()
     };
 
-    let response = rag.context(query, scope_id, Some(opts)).await
-        .map_err(|e| (INTERNAL_ERROR, format!("RAG failed: {e}")))?;
+    // For compact format with max_tokens, we retrieve first then assemble with custom budget.
+    if format == "compact" {
+        // Use the RAG pipeline for retrieval only, then compact augmentation.
+        let response = rag.context(query, scope_id, Some(opts)).await
+            .map_err(|e| (INTERNAL_ERROR, format!("RAG failed: {e}")))?;
+
+        let budget = corvia_kernel::rag_types::TokenBudget {
+            max_context_tokens: max_tokens.or(Some(4000)),
+            reserve_for_answer: 0.0, // No answer generation in compact mode.
+            ..Default::default()
+        };
+
+        let compact = corvia_kernel::augmenter::augment_compact(
+            &response.context.sources, &budget,
+        ).map_err(|e| (INTERNAL_ERROR, format!("Compact augmentation failed: {e}")))?;
+
+        let sources: Vec<Value> = compact.sources.iter().map(|r| {
+            json!({
+                "entry_id": r.entry.id.to_string(),
+                "content": r.entry.content,
+                "score": r.score,
+                "source_file": r.entry.metadata.source_file,
+            })
+        }).collect();
+
+        return Ok(json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::to_string_pretty(&json!({
+                    "context": compact.context,
+                    "sources": sources,
+                    "token_estimate": compact.metrics.token_estimate,
+                    "token_budget": compact.metrics.token_budget,
+                    "sources_included": compact.metrics.sources_included,
+                    "sources_truncated": compact.metrics.sources_truncated,
+                })).unwrap()
+            }]
+        }));
+    }
+
+    // Default format: use standard RAG pipeline context assembly.
+    // If max_tokens is specified, override the pipeline's token budget.
+    let response = if let Some(tokens) = max_tokens {
+        rag.context_with_token_override(query, scope_id, Some(opts), tokens).await
+            .map_err(|e| (INTERNAL_ERROR, format!("RAG failed: {e}")))?
+    } else {
+        rag.context(query, scope_id, Some(opts)).await
+            .map_err(|e| (INTERNAL_ERROR, format!("RAG failed: {e}")))?
+    };
 
     let sources: Vec<Value> = response.context.sources.iter().map(|r| {
         json!({
@@ -1714,6 +1858,7 @@ mod tests {
             gc_knowledge_history: std::sync::Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
             mcp_token: None,
             docker_available: false,
+            gap_detector: Arc::new(corvia_kernel::gap_detector::GapDetector::new()),
         })
     }
 
@@ -2034,6 +2179,7 @@ mod tests {
             gc_knowledge_history: std::sync::Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
             mcp_token: None,
             docker_available: false,
+            gap_detector: Arc::new(corvia_kernel::gap_detector::GapDetector::new()),
         });
 
         let args = json!({ "query": "rag-routed", "scope_id": "rag-scope", "limit": 5 });
@@ -2460,6 +2606,7 @@ mod tests {
             gc_knowledge_history: std::sync::Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
             mcp_token: Some(token.to_string()),
             docker_available: false,
+            gap_detector: Arc::new(corvia_kernel::gap_detector::GapDetector::new()),
         })
     }
 

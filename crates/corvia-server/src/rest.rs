@@ -78,6 +78,8 @@ pub struct AppState {
     /// The actual Docker client is created on-demand inside `tokio::spawn` to
     /// avoid bollard's axum 0.7 types leaking into handler futures.
     pub docker_available: bool,
+    /// Knowledge gap detector: accumulates low-confidence search signals.
+    pub gap_detector: Arc<corvia_kernel::gap_detector::GapDetector>,
 }
 
 impl AppState {
@@ -1932,6 +1934,7 @@ mod tests {
             gc_knowledge_history: Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
             mcp_token: None,
             docker_available: false,
+            gap_detector: Arc::new(corvia_kernel::gap_detector::GapDetector::new()),
         })
     }
 
@@ -2000,6 +2003,7 @@ mod tests {
             gc_knowledge_history: Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
             mcp_token: None,
             docker_available: false,
+            gap_detector: Arc::new(corvia_kernel::gap_detector::GapDetector::new()),
         })
     }
 

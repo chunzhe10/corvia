@@ -122,6 +122,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/dashboard/gpu", get(gpu_status_handler))
         .route("/api/dashboard/spokes", get(spokes_handler))
         .route("/api/dashboard/status/refresh-coverage", post(refresh_coverage_handler))
+        .route("/api/dashboard/gaps", get(gaps_handler))
         .with_state(state)
 }
 
@@ -229,6 +230,20 @@ async fn refresh_coverage_handler(
         .await;
 
     Json(snapshot.into())
+}
+
+/// GET /api/dashboard/gaps
+/// Returns aggregated knowledge gap topics from search query analysis.
+async fn gaps_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let limit = 20;
+    let gaps = state.gap_detector.top_gaps(limit);
+    let total_signals = state.gap_detector.len();
+    Json(serde_json::json!({
+        "gaps": gaps,
+        "total_signals": total_signals,
+    }))
 }
 
 /// GET /api/dashboard/traces
@@ -1805,6 +1820,7 @@ mod tests {
             gc_knowledge_history: std::sync::Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(10)),
             mcp_token: None,
             docker_available: false,
+            gap_detector: std::sync::Arc::new(corvia_kernel::gap_detector::GapDetector::new()),
         })
     }
 

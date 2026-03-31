@@ -228,6 +228,60 @@ impl AgentCoordinator {
         Ok(entry)
     }
 
+    /// Write a knowledge entry with semantic deduplication check.
+    /// Returns `WriteResult` which may be Written, WrittenWithWarning, or Blocked.
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(name = "corvia.entry.write_dedup", skip(self, content, scope_id, source_version), fields(session_id))]
+    pub async fn write_entry_with_dedup(
+        &self,
+        session_id: &str,
+        content: &str,
+        scope_id: &str,
+        source_version: &str,
+        content_role: Option<String>,
+        source_origin: Option<String>,
+        force_write: bool,
+    ) -> Result<crate::agent_writer::WriteResult> {
+        let session = self.sessions.get(session_id)?
+            .ok_or_else(|| CorviaError::NotFound(format!("Session {session_id} not found")))?;
+
+        // RBAC check
+        if let Some(agent) = self.registry.get(&session.agent_id)?
+            && !agent.permissions.can_write_scope(scope_id) {
+                return Err(CorviaError::Agent(format!(
+                    "Agent '{}' does not have write permission for scope '{scope_id}'",
+                    session.agent_id
+                )));
+            }
+
+        let staging_dir = session.staging_dir.as_ref().map(|s| {
+            self.staging.resolve_staging_path(s)
+        });
+
+        let result = self.writer.write_with_dedup(
+            content,
+            scope_id,
+            source_version,
+            &session.agent_id,
+            session_id,
+            staging_dir.as_deref(),
+            content_role,
+            source_origin,
+            force_write,
+        ).await?;
+
+        // Increment written count only if entry was actually written.
+        match &result {
+            crate::agent_writer::WriteResult::Written(_)
+            | crate::agent_writer::WriteResult::WrittenWithWarning { .. } => {
+                self.sessions.increment_written(session_id)?;
+            }
+            crate::agent_writer::WriteResult::Blocked { .. } => {}
+        }
+
+        Ok(result)
+    }
+
     /// Commit a session — transitions through the commit pipeline.
     #[tracing::instrument(name = "corvia.session.commit", skip(self), fields(session_id))]
     pub async fn commit_session(&self, session_id: &str) -> Result<()> {

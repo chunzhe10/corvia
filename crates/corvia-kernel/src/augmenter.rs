@@ -243,6 +243,73 @@ impl Augmenter for StructuredAugmenter {
     }
 }
 
+/// Compact augmentation: returns relevance-ranked content blocks with entry IDs.
+/// No system prompt, no citation headers, no footer. Designed for subagent context injection.
+pub fn augment_compact(
+    results: &[SearchResult],
+    budget: &TokenBudget,
+) -> Result<AugmentedContext> {
+    let start = Instant::now();
+    let effective_budget = budget.max_context_tokens.unwrap_or(DEFAULT_TOKEN_BUDGET);
+    // In compact mode, use the full budget (no answer/skill reserves).
+    let context_budget = effective_budget;
+
+    if results.is_empty() {
+        return Ok(AugmentedContext {
+            system_prompt: String::new(),
+            context: "No relevant knowledge found.".to_string(),
+            sources: Vec::new(),
+            metrics: AugmentationMetrics {
+                latency_ms: start.elapsed().as_millis() as u64,
+                token_estimate: 0,
+                token_budget: context_budget,
+                sources_included: 0,
+                sources_truncated: 0,
+                augmenter_name: "compact".to_string(),
+                skills_used: Vec::new(),
+            },
+        });
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut included: Vec<SearchResult> = Vec::new();
+    let mut tokens_used: usize = 0;
+    let mut truncated: usize = 0;
+
+    for sr in results {
+        let source = sr.entry.metadata.source_file.as_deref().unwrap_or("unknown");
+        let block = format!(
+            "[{}] ({source})\n{}\n",
+            sr.entry.id, sr.entry.content
+        );
+        let block_tokens = estimate_tokens(&block);
+
+        if tokens_used + block_tokens > context_budget {
+            truncated += 1;
+            continue;
+        }
+
+        parts.push(block);
+        included.push(sr.clone());
+        tokens_used += block_tokens;
+    }
+
+    Ok(AugmentedContext {
+        system_prompt: String::new(),
+        context: parts.join("\n"),
+        sources: included,
+        metrics: AugmentationMetrics {
+            latency_ms: start.elapsed().as_millis() as u64,
+            token_estimate: tokens_used,
+            token_budget: context_budget,
+            sources_included: results.len() - truncated,
+            sources_truncated: truncated,
+            augmenter_name: "compact".to_string(),
+            skills_used: Vec::new(),
+        },
+    })
+}
+
 /// Estimate token count using the chars/4 heuristic.
 ///
 /// This matches [`CharDivFourEstimator`](crate::token_estimator::CharDivFourEstimator)
@@ -374,5 +441,54 @@ mod tests {
         assert_eq!(ctx.metrics.sources_included, 0);
         assert_eq!(ctx.metrics.sources_truncated, 0);
         assert!(ctx.sources.is_empty());
+    }
+
+    #[test]
+    fn test_compact_augmenter_format() {
+        let results = vec![
+            mock_result("fn authenticate() { /* ... */ }", 0.94, Some("src/auth.rs")),
+            mock_result("fn connect_db() { /* ... */ }", 0.87, Some("src/db.rs")),
+        ];
+        let budget = TokenBudget {
+            max_context_tokens: Some(4096),
+            ..Default::default()
+        };
+
+        let ctx = augment_compact(&results, &budget).unwrap();
+
+        // Compact format should include entry IDs and content.
+        assert!(ctx.context.contains("src/auth.rs"), "should include source file");
+        assert!(ctx.context.contains("fn authenticate"), "should include content");
+        // No citation brackets like [1], [2] — uses entry IDs instead.
+        assert!(!ctx.context.contains("[1]"), "should not use numbered citations");
+        // No system prompt.
+        assert!(ctx.system_prompt.is_empty(), "compact mode has no system prompt");
+        // Metrics.
+        assert_eq!(ctx.metrics.sources_included, 2);
+        assert_eq!(ctx.metrics.augmenter_name, "compact");
+    }
+
+    #[test]
+    fn test_compact_augmenter_empty() {
+        let budget = TokenBudget::default();
+        let ctx = augment_compact(&[], &budget).unwrap();
+        assert!(ctx.context.contains("No relevant knowledge found"));
+        assert_eq!(ctx.metrics.sources_included, 0);
+    }
+
+    #[test]
+    fn test_compact_augmenter_respects_budget() {
+        let long_content = "x".repeat(20000);
+        let results = vec![
+            mock_result(&long_content, 0.95, Some("src/big.rs")),
+            mock_result("fn small() {}", 0.80, Some("src/small.rs")),
+        ];
+        let budget = TokenBudget {
+            max_context_tokens: Some(100),
+            ..Default::default()
+        };
+
+        let ctx = augment_compact(&results, &budget).unwrap();
+        assert!(ctx.metrics.sources_truncated >= 1);
     }
 }

@@ -70,6 +70,19 @@ impl RagPipeline {
         self.run_pipeline(query, scope_id, opts, false).await
     }
 
+    /// Context-only mode with a caller-specified token budget override.
+    /// Used when MCP clients pass `max_tokens` to control context size.
+    #[tracing::instrument(name = "corvia.rag.context_override", skip(self, query, opts), fields(scope_id))]
+    pub async fn context_with_token_override(
+        &self,
+        query: &str,
+        scope_id: &str,
+        opts: Option<RetrievalOpts>,
+        max_tokens: usize,
+    ) -> Result<RagResponse> {
+        self.run_pipeline_with_budget(query, scope_id, opts, false, Some(max_tokens)).await
+    }
+
     /// Full RAG: retrieve + augment + generate.
     #[tracing::instrument(name = "corvia.rag.ask", skip(self, query, opts), fields(scope_id))]
     pub async fn ask(
@@ -94,6 +107,18 @@ impl RagPipeline {
         scope_id: &str,
         opts: Option<RetrievalOpts>,
         generate: bool,
+    ) -> Result<RagResponse> {
+        self.run_pipeline_with_budget(query, scope_id, opts, generate, None).await
+    }
+
+    /// Internal pipeline executor with optional token budget override.
+    async fn run_pipeline_with_budget(
+        &self,
+        query: &str,
+        scope_id: &str,
+        opts: Option<RetrievalOpts>,
+        generate: bool,
+        token_override: Option<usize>,
     ) -> Result<RagResponse> {
         let trace_id = Uuid::now_v7();
         let pipeline_start = Instant::now();
@@ -124,8 +149,10 @@ impl RagPipeline {
 
         // --- Stage 2: Augmentation ---
 
-        // Build token budget: explicit config > model-aware auto-sizing > default.
-        let max_context_tokens = if self.config.max_context_tokens > 0 {
+        // Build token budget: caller override > explicit config > model-aware auto-sizing > default.
+        let max_context_tokens = if let Some(override_tokens) = token_override {
+            Some(override_tokens)
+        } else if self.config.max_context_tokens > 0 {
             Some(self.config.max_context_tokens)
         } else if let Some(ref generator_ref) = self.generator {
             // Model-aware auto-sizing: context_window * (1 - reserve_for_answer).

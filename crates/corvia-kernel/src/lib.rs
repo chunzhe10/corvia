@@ -102,6 +102,7 @@ pub mod scoring;
 pub mod gc_worker;
 pub mod spoke;
 pub(crate) mod access_buffer;
+pub mod gap_detector;
 #[cfg(feature = "postgres")]
 pub mod postgres_store;
 

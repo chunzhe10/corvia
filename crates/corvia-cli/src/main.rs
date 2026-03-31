@@ -856,6 +856,7 @@ async fn cmd_serve() -> Result<()> {
         gc_knowledge_history: Arc::new(corvia_kernel::ops::GcKnowledgeHistory::new(50)),
         mcp_token,
         docker_available: corvia_kernel::spoke::SpokeProvisioner::new().is_ok(),
+        gap_detector: Arc::new(corvia_kernel::gap_detector::GapDetector::new()),
     });
     // Initial coverage cache population + background refresh.
     // NOTE: ttl_secs is captured once at startup. While `dashboard` is in
