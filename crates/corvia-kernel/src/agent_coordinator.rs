@@ -140,6 +140,11 @@ impl AgentCoordinator {
         self.registry.register(&agent_id, display_name, identity_type, permissions)
     }
 
+    /// Grant an agent write access to an additional scope.
+    pub fn grant_scope(&self, agent_id: &str, scope_id: &str) -> Result<()> {
+        self.registry.grant_scope(agent_id, scope_id)
+    }
+
     /// Connect an agent — returns active sessions and any recoverable (orphaned) sessions.
     pub fn connect(&self, agent_id: &str) -> Result<ConnectResponse> {
         // Touch last_seen

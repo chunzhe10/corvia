@@ -122,6 +122,24 @@ impl AgentRegistry {
         self.put(&record)
     }
 
+    /// Grant write access to an additional scope.
+    /// No-op if the agent already has access (or has Admin/wildcard permissions).
+    pub fn grant_scope(&self, agent_id: &str, scope_id: &str) -> Result<()> {
+        let mut record = self.get(agent_id)?
+            .ok_or_else(|| CorviaError::NotFound(format!("Agent {agent_id} not found")))?;
+        match &mut record.permissions {
+            AgentPermission::ReadWrite { scopes } => {
+                if !scopes.iter().any(|s| s == scope_id || s == "*") {
+                    scopes.push(scope_id.to_string());
+                    self.put(&record)?;
+                }
+            }
+            // Admin and ReadOnly don't need scope grants
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Update agent status.
     pub fn set_status(&self, agent_id: &str, status: AgentStatus) -> Result<()> {
         let mut record = self.get(agent_id)?
@@ -290,5 +308,50 @@ mod tests {
         let summary = agent.activity_summary.as_ref().expect("activity_summary should be set");
         assert_eq!(summary.entry_count, 12);
         assert_eq!(summary.topic_tags.len(), 2);
+    }
+
+    #[test]
+    fn test_grant_scope_adds_new_scope() {
+        let reg = test_registry();
+        reg.register("test::agent", "Agent", IdentityType::McpClient,
+            AgentPermission::ReadWrite { scopes: vec!["corvia".into()] }).unwrap();
+
+        // Initially can only write to "corvia"
+        let agent = reg.get("test::agent").unwrap().unwrap();
+        assert!(agent.permissions.can_write_scope("corvia"));
+        assert!(!agent.permissions.can_write_scope("telemetry"));
+
+        // Grant "telemetry" scope
+        reg.grant_scope("test::agent", "telemetry").unwrap();
+        let agent = reg.get("test::agent").unwrap().unwrap();
+        assert!(agent.permissions.can_write_scope("corvia"));
+        assert!(agent.permissions.can_write_scope("telemetry"));
+    }
+
+    #[test]
+    fn test_grant_scope_noop_if_already_granted() {
+        let reg = test_registry();
+        reg.register("test::agent", "Agent", IdentityType::McpClient,
+            AgentPermission::ReadWrite { scopes: vec!["corvia".into()] }).unwrap();
+
+        reg.grant_scope("test::agent", "corvia").unwrap();
+        let agent = reg.get("test::agent").unwrap().unwrap();
+        if let AgentPermission::ReadWrite { scopes } = &agent.permissions {
+            assert_eq!(scopes.len(), 1); // no duplicate
+        } else {
+            panic!("expected ReadWrite");
+        }
+    }
+
+    #[test]
+    fn test_grant_scope_noop_for_admin() {
+        let reg = test_registry();
+        reg.register("test::admin", "Admin", IdentityType::Registered,
+            AgentPermission::Admin).unwrap();
+
+        // Admin already has access to everything — grant_scope is a no-op
+        reg.grant_scope("test::admin", "anything").unwrap();
+        let agent = reg.get("test::admin").unwrap().unwrap();
+        assert!(matches!(agent.permissions, AgentPermission::Admin));
     }
 }
