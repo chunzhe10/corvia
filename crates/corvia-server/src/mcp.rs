@@ -926,14 +926,17 @@ async fn tool_corvia_write(
             agent_id,
             AgentPermission::ReadWrite { scopes: vec![scope_id.to_string()] },
         );
-        // If agent already existed, register_agent returned the old record
-        // without updating permissions. Grant the target scope so agents
-        // that write to multiple scopes don't get permission errors.
-        let _ = coord.grant_scope(agent_id, scope_id);
         coord.create_session(agent_id, false)
             .map_err(|e| (INTERNAL_ERROR, format!("Session creation failed: {e}")))?;
         connect = coord.connect(agent_id)
             .map_err(|e| (INTERNAL_ERROR, format!("Agent setup failed: {e}")))?;
+    }
+
+    // Always grant the target scope — the agent may have been registered
+    // in a previous session with a different scope (e.g. "corvia" vs
+    // "devcontainer-telemetry"). grant_scope is a no-op if already present.
+    if let Err(e) = coord.grant_scope(agent_id, scope_id) {
+        tracing::warn!(agent_id, scope_id, error = %e, "grant_scope failed");
     }
 
     let session_id = connect.active_sessions.first()

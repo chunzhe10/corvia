@@ -1,4 +1,4 @@
-.PHONY: build test test-postgres \
+.PHONY: build test test-postgres test-e2e-docker test-e2e-docker-extended \
        postgres-up postgres-down postgres-restart clean
 
 # Default: build the workspace
@@ -13,6 +13,15 @@ test:
 test-postgres: postgres-up
 	@echo "--- Running test suite with PostgreSQL active ---"
 	cargo test --workspace --features postgres; status=$$?; $(MAKE) postgres-down; exit $$status
+
+# Tier 4: Docker-based E2E test (real HTTP MCP transport + real ONNX embeddings)
+test-e2e-docker:
+	@echo "--- Running Docker E2E MCP integration test ---"
+	cargo test --test docker_mcp_e2e_test -- --nocapture
+
+test-e2e-docker-extended:
+	@echo "--- Running Docker E2E MCP integration test (extended) ---"
+	CORVIA_E2E_EXTENDED=1 cargo test --test docker_mcp_e2e_test -- --nocapture
 
 # --- PostgreSQL container management ---
 
