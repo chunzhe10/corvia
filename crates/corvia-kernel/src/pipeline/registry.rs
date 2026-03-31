@@ -198,7 +198,7 @@ impl PipelineRegistry {
     /// Create a registry pre-loaded with built-in components.
     ///
     /// Registers:
-    /// - Searchers: `"vector"`, `"bm25"`
+    /// - Searchers: `"vector"`, `"bm25"`, `"multichannel"`
     /// - Fusions: `"passthrough"`
     /// - Expanders: `"graph"`, `"noop"`
     /// - Rerankers: `"identity"`

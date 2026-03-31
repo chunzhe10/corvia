@@ -356,11 +356,14 @@ impl Searcher for MultiChannelSearcher {
                 }
                 "bm25" => {
                     if let Some(fts) = self.fts.clone() {
+                        // Over-fetch by 3x to compensate for post-filter by memory type.
+                        // BM25 search returns all types; post-filter keeps only the target type.
+                        let bm25_fetch = limit * 3;
                         handles.push((mt, tokio::spawn(async move {
-                            let results = fts.search_text(&query, &scope_id, limit).await?;
-                            // Post-filter by memory type
+                            let results = fts.search_text(&query, &scope_id, bm25_fetch).await?;
                             Ok(results.into_iter()
                                 .filter(|r| r.entry.memory_type == mt)
+                                .take(limit)
                                 .collect::<Vec<_>>())
                         })));
                     } else {

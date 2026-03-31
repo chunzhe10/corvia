@@ -694,9 +694,10 @@ impl LiteStore {
 
     /// Dump all per-type HNSW indexes to disk for persistence.
     ///
-    /// Writes to a staging directory first, then renames to final location for
-    /// crash safety. If the process crashes mid-flush, the next startup detects
-    /// incomplete per-type files and triggers a rebuild from knowledge JSONs.
+    /// Writes per-type files in place (delete old, then write new). If the process
+    /// crashes mid-flush, the next startup detects missing per-type files and
+    /// triggers a rebuild from knowledge JSONs. Empty indexes are skipped
+    /// (hnsw_rs file_dump fails on empty graphs).
     pub fn flush_hnsw(&self) -> Result<()> {
         let hnsw_dir = self.data_dir.join("hnsw");
         std::fs::create_dir_all(&hnsw_dir)
@@ -1310,13 +1311,16 @@ impl super::traits::QueryableStore for LiteStore {
         let per_type_fetch = (limit * 2).max(10);
 
         // Collect neighbors from all 5 per-type HNSW indexes in deterministic order.
+        // Skip empty indexes to avoid unnecessary ANN overhead.
         let mut all_neighbours = Vec::new();
         {
             let map = self.hnsw_indexes.load();
             for mt in MemoryType::ALL {
                 if let Some(hnsw) = map.get(&mt) {
-                    let neighbours = hnsw.search(embedding, per_type_fetch, EF_SEARCH);
-                    all_neighbours.extend(neighbours);
+                    if hnsw.get_nb_point() > 0 {
+                        let neighbours = hnsw.search(embedding, per_type_fetch, EF_SEARCH);
+                        all_neighbours.extend(neighbours);
+                    }
                 }
             }
         }
@@ -1327,7 +1331,8 @@ impl super::traits::QueryableStore for LiteStore {
         });
 
         // Take top candidates before UUID lookup to avoid excessive Redb reads.
-        let lookup_limit = (limit * 2).max(10);
+        // Budget is generous (3x limit) to survive scope post-filtering across types.
+        let lookup_limit = (limit * 3).max(20);
         all_neighbours.truncate(lookup_limit);
 
         let read_txn = self
@@ -2795,5 +2800,236 @@ mod tests {
         // Run migration again (idempotent)
         let (migrated2, _) = store.migrate_vectors().unwrap();
         assert_eq!(migrated2, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-type HNSW index tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_per_type_hnsw_insert_routes_by_memory_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LiteStore::open(dir.path(), 3).unwrap();
+        store.init_schema().await.unwrap();
+
+        // Insert entries with different memory types
+        let mut structural = KnowledgeEntry::new("fn main() {}".into(), "scope".into(), "v1".into())
+            .with_embedding(vec![1.0, 0.0, 0.0]);
+        structural.memory_type = MemoryType::Structural;
+
+        let mut decisional = KnowledgeEntry::new("chose RwLock".into(), "scope".into(), "v2".into())
+            .with_embedding(vec![0.0, 1.0, 0.0]);
+        decisional.memory_type = MemoryType::Decisional;
+
+        let episodic = KnowledgeEntry::new("session log".into(), "scope".into(), "v3".into())
+            .with_embedding(vec![0.0, 0.0, 1.0]); // Default: Episodic
+
+        store.insert(&structural).await.unwrap();
+        store.insert(&decisional).await.unwrap();
+        store.insert(&episodic).await.unwrap();
+
+        // Union search returns all types
+        let results = store.search(&[0.5, 0.5, 0.5], "scope", 10).await.unwrap();
+        assert!(results.len() >= 2, "union search should find entries across types");
+    }
+
+    #[tokio::test]
+    async fn test_search_by_memory_type_returns_only_matching() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LiteStore::open(dir.path(), 3).unwrap();
+        store.init_schema().await.unwrap();
+
+        // Insert entries of different types with similar embeddings
+        let mut structural = KnowledgeEntry::new("code entry".into(), "scope".into(), "v1".into())
+            .with_embedding(vec![0.9, 0.1, 0.0]);
+        structural.memory_type = MemoryType::Structural;
+
+        let episodic = KnowledgeEntry::new("session entry".into(), "scope".into(), "v2".into())
+            .with_embedding(vec![0.8, 0.2, 0.0]); // Default: Episodic
+
+        store.insert(&structural).await.unwrap();
+        store.insert(&episodic).await.unwrap();
+
+        // Search by Structural type
+        let results = store.search_by_memory_type(
+            &[1.0, 0.0, 0.0], "scope", 10, MemoryType::Structural
+        ).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entry.memory_type, MemoryType::Structural);
+        assert_eq!(results[0].entry.content, "code entry");
+
+        // Search by Episodic type
+        let results = store.search_by_memory_type(
+            &[1.0, 0.0, 0.0], "scope", 10, MemoryType::Episodic
+        ).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entry.memory_type, MemoryType::Episodic);
+    }
+
+    #[tokio::test]
+    async fn test_search_by_memory_type_empty_type_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LiteStore::open(dir.path(), 3).unwrap();
+        store.init_schema().await.unwrap();
+
+        // Insert only Episodic entries (default)
+        let entry = KnowledgeEntry::new("only episodic".into(), "scope".into(), "v1".into())
+            .with_embedding(vec![1.0, 0.0, 0.0]);
+        store.insert(&entry).await.unwrap();
+
+        // Search by Structural (no entries) should return empty, not panic
+        let results = store.search_by_memory_type(
+            &[1.0, 0.0, 0.0], "scope", 10, MemoryType::Structural
+        ).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_per_type_flush_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Phase 1: Insert entries of 2 types, flush
+        {
+            let store = LiteStore::open(dir.path(), 3).unwrap();
+            store.init_schema().await.unwrap();
+
+            let mut structural = KnowledgeEntry::new("fn foo()".into(), "scope".into(), "v1".into())
+                .with_embedding(vec![1.0, 0.0, 0.0]);
+            structural.memory_type = MemoryType::Structural;
+
+            let episodic = KnowledgeEntry::new("session note".into(), "scope".into(), "v2".into())
+                .with_embedding(vec![0.0, 1.0, 0.0]);
+
+            store.insert(&structural).await.unwrap();
+            store.insert(&episodic).await.unwrap();
+            store.flush_hnsw().unwrap();
+        }
+
+        // Phase 2: Reopen and verify per-type search
+        {
+            let store = LiteStore::open(dir.path(), 3).unwrap();
+
+            // Structural type should find the structural entry
+            let results = store.search_by_memory_type(
+                &[1.0, 0.0, 0.0], "scope", 10, MemoryType::Structural
+            ).await.unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].entry.content, "fn foo()");
+
+            // Episodic type should find the episodic entry
+            let results = store.search_by_memory_type(
+                &[0.0, 1.0, 0.0], "scope", 10, MemoryType::Episodic
+            ).await.unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].entry.content, "session note");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_per_type_rebuild_routes_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LiteStore::open(dir.path(), 3).unwrap();
+        store.init_schema().await.unwrap();
+
+        // Insert entries of different types
+        let mut structural = KnowledgeEntry::new("rebuild code".into(), "scope".into(), "v1".into())
+            .with_embedding(vec![1.0, 0.0, 0.0]);
+        structural.memory_type = MemoryType::Structural;
+
+        let mut decisional = KnowledgeEntry::new("rebuild decision".into(), "scope".into(), "v2".into())
+            .with_embedding(vec![0.0, 1.0, 0.0]);
+        decisional.memory_type = MemoryType::Decisional;
+
+        store.insert(&structural).await.unwrap();
+        store.insert(&decisional).await.unwrap();
+
+        // Rebuild from files
+        let count = store.rebuild_from_files().unwrap();
+        assert_eq!(count, 2);
+
+        // Per-type search should still work after rebuild
+        let results = store.search_by_memory_type(
+            &[1.0, 0.0, 0.0], "scope", 10, MemoryType::Structural
+        ).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entry.content, "rebuild code");
+
+        let results = store.search_by_memory_type(
+            &[0.0, 1.0, 0.0], "scope", 10, MemoryType::Decisional
+        ).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entry.content, "rebuild decision");
+    }
+
+    #[tokio::test]
+    async fn test_flush_skips_empty_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LiteStore::open(dir.path(), 3).unwrap();
+        store.init_schema().await.unwrap();
+
+        // Insert only Episodic entry (default)
+        let entry = KnowledgeEntry::new("only one type".into(), "scope".into(), "v1".into())
+            .with_embedding(vec![1.0, 0.0, 0.0]);
+        store.insert(&entry).await.unwrap();
+
+        // Flush should succeed without errors (empty types skipped)
+        store.flush_hnsw().unwrap();
+
+        // Verify only episodic files exist on disk
+        let hnsw_dir = dir.path().join("hnsw");
+        assert!(hnsw_dir.join("episodic.hnsw.graph").exists());
+        assert!(hnsw_dir.join("episodic.hnsw.data").exists());
+        assert!(!hnsw_dir.join("structural.hnsw.graph").exists());
+        assert!(!hnsw_dir.join("decisional.hnsw.graph").exists());
+    }
+
+    #[tokio::test]
+    async fn test_migration_from_old_single_file_format() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Phase 1: Create store with entries (simulates old format)
+        let entry_id;
+        {
+            let store = LiteStore::open(dir.path(), 3).unwrap();
+            store.init_schema().await.unwrap();
+            let entry = KnowledgeEntry::new("old format".into(), "scope".into(), "v1".into())
+                .with_embedding(vec![0.5, 0.5, 0.5]);
+            entry_id = entry.id;
+            store.insert(&entry).await.unwrap();
+            store.flush_hnsw().unwrap();
+        }
+
+        // Phase 2: Simulate old format by renaming per-type file to old name
+        let hnsw_dir = dir.path().join("hnsw");
+        let old_graph = hnsw_dir.join("litestore.hnsw.graph");
+        let old_data = hnsw_dir.join("litestore.hnsw.data");
+        // Copy the episodic files to old format name
+        std::fs::copy(
+            hnsw_dir.join("episodic.hnsw.graph"),
+            &old_graph,
+        ).unwrap();
+        std::fs::copy(
+            hnsw_dir.join("episodic.hnsw.data"),
+            &old_data,
+        ).unwrap();
+        // Remove per-type files to simulate old format
+        for mt in MemoryType::ALL {
+            let basename = mt.to_string();
+            let _ = std::fs::remove_file(hnsw_dir.join(format!("{basename}.hnsw.graph")));
+            let _ = std::fs::remove_file(hnsw_dir.join(format!("{basename}.hnsw.data")));
+        }
+
+        // Phase 3: Reopen should detect old format, rebuild, and migrate
+        {
+            let store = LiteStore::open(dir.path(), 3).unwrap();
+            // Verify entry is searchable after migration
+            let results = store.search(&[0.5, 0.5, 0.5], "scope", 1).await.unwrap();
+            assert_eq!(results.len(), 1, "entry should be findable after migration");
+            assert_eq!(results[0].entry.id, entry_id);
+
+            // Verify old files were cleaned up
+            assert!(!old_graph.exists(), "old HNSW graph file should be removed after migration");
+            assert!(!old_data.exists(), "old HNSW data file should be removed after migration");
+        }
     }
 }
