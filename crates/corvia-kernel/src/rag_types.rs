@@ -52,7 +52,7 @@ impl QualitySignal {
             ConfidenceLevel::Low
         };
 
-        let gap_detected = top_score < LOW_SCORE_THRESHOLD && result_count < limit / 2;
+        let gap_detected = top_score < LOW_SCORE_THRESHOLD && result_count < (limit / 2).max(1);
 
         let suggestion = match confidence {
             ConfidenceLevel::High => None,
@@ -209,6 +209,19 @@ mod tests {
         assert_eq!(qs.confidence, ConfidenceLevel::Low);
         assert!(qs.gap_detected);
         assert_eq!(qs.top_score, 0.0);
+    }
+
+    #[test]
+    fn test_quality_signal_gap_detected_with_limit_1() {
+        let results = vec![mock_result(0.20)];
+        let qs = QualitySignal::from_results(&results, "test", 1);
+        // With limit=1, (1/2).max(1) = 1, so result_count(1) < 1 is false.
+        // But top_score < 0.45, so gap not detected (1 result exists).
+        assert!(!qs.gap_detected);
+
+        // With zero results and limit=1, gap IS detected.
+        let qs = QualitySignal::from_results(&[], "test", 1);
+        assert!(qs.gap_detected, "empty results with limit=1 should detect gap");
     }
 
     #[test]

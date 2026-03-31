@@ -285,8 +285,10 @@ pub fn augment_compact(
         let block_tokens = estimate_tokens(&block);
 
         if tokens_used + block_tokens > context_budget {
-            truncated += 1;
-            continue;
+            // Results are relevance-ranked, so once a result doesn't fit,
+            // all remaining are equal or lower relevance. Stop here.
+            truncated = results.len() - included.len();
+            break;
         }
 
         parts.push(block);

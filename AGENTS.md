@@ -69,12 +69,16 @@ The e2e integration tests (`test_ollama_*`) auto-skip when Ollama is unreachable
 Agents interacting with corvia MCP tools should follow these rules:
 
 1. **Check quality signals.** `corvia_search` returns `quality_signal.confidence`
-   (high/medium/low). If `low`, follow the `suggestion` and retry once.
-2. **Inject context into subagents.** Call `corvia_context` with `max_tokens` and
-   `format: "compact"` before spawning subagents. Include result in prompt.
-3. **Write discipline.** Server deduplicates automatically. Use `force_write: true`
+   (high/medium/low). If `low`, follow the `suggestion` field and retry once
+   (max 1 retry).
+2. **Inject context into subagents.** Before spawning subagents for non-trivial work,
+   call `corvia_context` with `max_tokens` (recommended: 2000-3000) and
+   `format: "compact"`. Include the returned context in the subagent prompt.
+3. **Write discipline.** After discovering non-obvious insights, call `corvia_write`
+   immediately. The server handles deduplication automatically. Use `force_write: true`
    to bypass if content is intentionally similar but distinct.
-4. **Use `min_score` for precision.** Filter low-relevance results server-side.
+4. **Use `min_score` for precision.** Pass `min_score` to `corvia_search` to filter
+   low-relevance results at the server level.
 
 ## Architecture Decisions to Respect
 

@@ -738,7 +738,7 @@ async fn tool_corvia_search(
     let source_origin = args.get("source_origin").and_then(|v| v.as_str()).map(String::from);
     let workstream = args.get("workstream").and_then(|v| v.as_str()).map(String::from);
     let include_cold = args.get("include_cold").and_then(|v| v.as_bool()).unwrap_or(false);
-    let min_score = args.get("min_score").and_then(|v| v.as_f64()).map(|v| v as f32);
+    let min_score = args.get("min_score").and_then(|v| v.as_f64()).map(|v| (v as f32).clamp(0.0, 1.0));
 
     // Route through RAG pipeline if available (fixes ContextBuilder bypass)
     if let Some(rag) = state.rag_pipeline() {
@@ -756,6 +756,11 @@ async fn tool_corvia_search(
 
         let all_sources = &response.context.sources;
 
+        // Compute quality signal from ALL results (pre-filter) to reflect true retrieval quality.
+        let mut quality_signal = corvia_kernel::rag_types::QualitySignal::from_results(
+            all_sources, query, limit,
+        );
+
         // Apply min_score filter if requested.
         let (filtered_sources, below_threshold_count) = if let Some(threshold) = min_score {
             let before = all_sources.len();
@@ -765,6 +770,7 @@ async fn tool_corvia_search(
         } else {
             (all_sources.iter().collect(), 0usize)
         };
+        quality_signal.below_threshold_count = below_threshold_count;
 
         let items: Vec<Value> = filtered_sources.iter().map(|r| {
             let mut item = json!({
@@ -781,14 +787,6 @@ async fn tool_corvia_search(
             }
             item
         }).collect();
-
-        // Compute quality signal from filtered results.
-        let mut quality_signal = corvia_kernel::rag_types::QualitySignal::from_results(
-            &filtered_sources.iter().cloned().cloned().collect::<Vec<_>>(),
-            query,
-            limit,
-        );
-        quality_signal.below_threshold_count = below_threshold_count;
 
         // Record gap signal if confidence is low.
         if quality_signal.confidence == corvia_kernel::rag_types::ConfidenceLevel::Low {
@@ -833,6 +831,11 @@ async fn tool_corvia_search(
     );
     let results: Vec<_> = results.into_iter().take(limit).collect();
 
+    // Compute quality signal from ALL results (pre-filter).
+    let mut quality_signal = corvia_kernel::rag_types::QualitySignal::from_results(
+        &results, query, limit,
+    );
+
     // Apply min_score filter.
     let (results, below_threshold_count) = if let Some(threshold) = min_score {
         let before = results.len();
@@ -842,6 +845,7 @@ async fn tool_corvia_search(
     } else {
         (results, 0usize)
     };
+    quality_signal.below_threshold_count = below_threshold_count;
 
     let items: Vec<Value> = results.iter().map(|r| {
         let mut item = json!({
@@ -858,12 +862,6 @@ async fn tool_corvia_search(
         }
         item
     }).collect();
-
-    // Compute quality signal.
-    let mut quality_signal = corvia_kernel::rag_types::QualitySignal::from_results(
-        &results, query, limit,
-    );
-    quality_signal.below_threshold_count = below_threshold_count;
 
     // Record gap signal if confidence is low.
     if quality_signal.confidence == corvia_kernel::rag_types::ConfidenceLevel::Low {
@@ -967,11 +965,16 @@ async fn tool_corvia_write(
         }
         WriteResult::Blocked { existing_id, similarity, existing_preview } => {
             Ok(json!({
+                "isError": true,
                 "content": [{
                     "type": "text",
-                    "text": format!(
-                        "Near-duplicate detected (similarity: {similarity:.2}). Existing entry: {existing_id}. Preview: {existing_preview}. Entry NOT written. To force write, use force_write: true."
-                    )
+                    "text": serde_json::to_string_pretty(&json!({
+                        "status": "blocked",
+                        "existing_id": existing_id.to_string(),
+                        "similarity": similarity,
+                        "existing_preview": existing_preview,
+                        "message": "Near-duplicate detected. Entry NOT written. Use force_write: true to bypass."
+                    })).unwrap()
                 }]
             }))
         }
@@ -1189,8 +1192,11 @@ async fn tool_corvia_context(
     let source_origin = args.get("source_origin").and_then(|v| v.as_str()).map(String::from);
     let workstream = args.get("workstream").and_then(|v| v.as_str()).map(String::from);
     let include_cold = args.get("include_cold").and_then(|v| v.as_bool()).unwrap_or(false);
-    let max_tokens = args.get("max_tokens").and_then(|v| v.as_u64()).map(|v| v.min(4000) as usize);
+    let max_tokens = args.get("max_tokens").and_then(|v| v.as_u64()).map(|v| v.clamp(100, 4000) as usize);
     let format = args.get("format").and_then(|v| v.as_str()).unwrap_or("default");
+    if format != "default" && format != "compact" {
+        return Err((INVALID_PARAMS, format!("Unknown format: '{format}'. Must be 'default' or 'compact'.")));
+    }
 
     let rag = state.rag_pipeline()
         .ok_or((SERVICE_UNAVAILABLE, "RAG pipeline not configured".into()))?;
@@ -1207,8 +1213,10 @@ async fn tool_corvia_context(
 
     // For compact format with max_tokens, we retrieve first then assemble with custom budget.
     if format == "compact" {
-        // Use the RAG pipeline for retrieval only, then compact augmentation.
-        let response = rag.context(query, scope_id, Some(opts)).await
+        // Retrieve with a large token budget to avoid premature truncation by the default
+        // augmenter. The compact augmenter will enforce the actual budget.
+        let compact_budget = max_tokens.unwrap_or(4000);
+        let response = rag.context_with_token_override(query, scope_id, Some(opts), compact_budget * 2).await
             .map_err(|e| (INTERNAL_ERROR, format!("RAG failed: {e}")))?;
 
         let budget = corvia_kernel::rag_types::TokenBudget {
@@ -1227,6 +1235,7 @@ async fn tool_corvia_context(
                 "content": r.entry.content,
                 "score": r.score,
                 "source_file": r.entry.metadata.source_file,
+                "language": r.entry.metadata.language,
             })
         }).collect();
 
@@ -1257,6 +1266,7 @@ async fn tool_corvia_context(
 
     let sources: Vec<Value> = response.context.sources.iter().map(|r| {
         json!({
+            "entry_id": r.entry.id.to_string(),
             "content": r.entry.content,
             "score": r.score,
             "source_file": r.entry.metadata.source_file,
