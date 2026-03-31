@@ -1316,11 +1316,11 @@ impl super::traits::QueryableStore for LiteStore {
         {
             let map = self.hnsw_indexes.load();
             for mt in MemoryType::ALL {
-                if let Some(hnsw) = map.get(&mt) {
-                    if hnsw.get_nb_point() > 0 {
-                        let neighbours = hnsw.search(embedding, per_type_fetch, EF_SEARCH);
-                        all_neighbours.extend(neighbours);
-                    }
+                if let Some(hnsw) = map.get(&mt)
+                    && hnsw.get_nb_point() > 0
+                {
+                    let neighbours = hnsw.search(embedding, per_type_fetch, EF_SEARCH);
+                    all_neighbours.extend(neighbours);
                 }
             }
         }
