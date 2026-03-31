@@ -88,8 +88,8 @@ impl GapDetector {
 
         // Build GapTopic entries.
         let mut topics: Vec<GapTopic> = groups
-            .into_iter()
-            .map(|(_key, signals)| {
+            .into_values()
+            .map(|signals| {
                 let frequency = signals.len();
                 let last_seen = signals.iter().map(|s| s.timestamp).max().unwrap();
                 let avg_score = signals.iter().map(|s| s.top_score).sum::<f32>() / frequency as f32;
