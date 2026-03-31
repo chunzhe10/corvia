@@ -55,6 +55,11 @@ pub mod spans {
     pub const HOOK_AGENT_CHECK: &str = "corvia.hook.agent_check";
     pub const HOOK_ORPHAN_CLEANUP: &str = "corvia.hook.orphan_cleanup";
     pub const HOOK_WRITE_REMINDER: &str = "corvia.hook.write_reminder";
+
+    // Pipeline stage spans (instrumented in corvia-kernel/src/pipeline/)
+    pub const PIPELINE_SEARCH: &str = "corvia.pipeline.search";
+    pub const PIPELINE_CHANNEL: &str = "corvia.pipeline.channel";
+    pub const PIPELINE_FUSION: &str = "corvia.pipeline.fusion";
 }
 
 /// Opaque handle that keeps the telemetry pipeline alive.
@@ -237,6 +242,9 @@ mod tests {
             spans::SPOKE_PRUNE,
             spans::SPOKE_RESTART,
             spans::SPOKE_CHECK,
+            spans::PIPELINE_SEARCH,
+            spans::PIPELINE_CHANNEL,
+            spans::PIPELINE_FUSION,
         ];
         for name in &all {
             assert!(

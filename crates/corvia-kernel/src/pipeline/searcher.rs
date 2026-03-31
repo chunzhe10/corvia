@@ -10,7 +10,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use corvia_common::errors::Result;
 use corvia_common::types::{KnowledgeEntry, SearchResult, Tier};
-use tracing::{info, warn};
+use tracing::{info, info_span, warn, Instrument};
 
 use super::{
     CandidateScores, NormalizedScore, RankedCandidate, RankedSet, SearchContext, StageMetrics,
@@ -328,6 +328,11 @@ impl Searcher for MultiChannelSearcher {
         true
     }
 
+    #[tracing::instrument(
+        name = "corvia.pipeline.search",
+        skip(self, ctx),
+        fields(scope_id = %ctx.scope_id)
+    )]
     async fn search(&self, ctx: &SearchContext) -> Result<RankedSet> {
         use corvia_common::types::MemoryType;
         use super::fusion::RRFusion;
@@ -347,12 +352,23 @@ impl Searcher for MultiChannelSearcher {
             let scope_id = ctx.scope_id.clone();
             let query = ctx.query.clone();
 
+            // Per-channel span: attached to the spawned task via .instrument()
+            // to preserve parent-child hierarchy in OTLP.
+            let span = info_span!(
+                "corvia.pipeline.channel",
+                memory_type = %mt,
+                strategy = %strategy,
+            );
+
             match strategy.as_str() {
                 "vector" => {
                     let store = Arc::clone(&self.store);
                     handles.push((mt, tokio::spawn(async move {
-                        store.search_by_memory_type(&embedding, &scope_id, limit, mt).await
-                    })));
+                        let ch_start = Instant::now();
+                        let result = store.search_by_memory_type(&embedding, &scope_id, limit, mt).await;
+                        let ch_latency_ms = ch_start.elapsed().as_millis() as u64;
+                        result.map(|r| (r, ch_latency_ms))
+                    }.instrument(span))));
                 }
                 "bm25" => {
                     if let Some(fts) = self.fts.clone() {
@@ -360,12 +376,15 @@ impl Searcher for MultiChannelSearcher {
                         // BM25 search returns all types; post-filter keeps only the target type.
                         let bm25_fetch = limit * 3;
                         handles.push((mt, tokio::spawn(async move {
+                            let ch_start = Instant::now();
                             let results = fts.search_text(&query, &scope_id, bm25_fetch).await?;
-                            Ok(results.into_iter()
+                            let filtered: Vec<_> = results.into_iter()
                                 .filter(|r| r.entry.memory_type == mt)
                                 .take(limit)
-                                .collect::<Vec<_>>())
-                        })));
+                                .collect();
+                            let ch_latency_ms = ch_start.elapsed().as_millis() as u64;
+                            Ok((filtered, ch_latency_ms))
+                        }.instrument(span))));
                     } else {
                         warnings.push(format!("{mt} channel: BM25 requested but no FTS available, skipping"));
                     }
@@ -377,19 +396,22 @@ impl Searcher for MultiChannelSearcher {
         }
 
         // Collect results with timeout. Channels that timeout or error are skipped.
+        // Per-channel timing lives inside the spawned task (measures actual work).
+        // The outer collection loop measures wall-clock time including scheduling overhead.
         let mut channel_sets: Vec<RankedSet> = Vec::new();
 
         for (mt, handle) in handles {
             match tokio::time::timeout(timeout, handle).await {
-                Ok(Ok(Ok(results))) => {
+                Ok(Ok(Ok((results, ch_latency_ms)))) => {
+                    let ch_output_count = results.len();
                     let candidates = VectorSearcher::to_candidates(results, &mt.to_string());
                     channel_sets.push(RankedSet {
                         candidates,
                         metrics: StageMetrics {
                             stage_name: format!("channel:{mt}"),
-                            latency_ms: 0,
+                            latency_ms: ch_latency_ms,
                             input_count: 0,
-                            output_count: 0,
+                            output_count: ch_output_count,
                             warnings: Vec::new(),
                         },
                     });
@@ -405,6 +427,20 @@ impl Searcher for MultiChannelSearcher {
                 }
             }
         }
+
+        // Per-channel summary.
+        let channels_completed = channel_sets.len();
+        let channels_timed_out = warnings.iter().filter(|w| w.contains("timed out")).count();
+        let channels_failed = warnings.len().saturating_sub(channels_timed_out);
+        let total_candidates: usize = channel_sets.iter().map(|s| s.candidates.len()).sum();
+
+        info!(
+            channels_completed,
+            channels_timed_out,
+            channels_failed,
+            total_candidates,
+            "multichannel collection complete"
+        );
 
         // Fuse via RRF
         let fusion = RRFusion::new(self.rrf_k);

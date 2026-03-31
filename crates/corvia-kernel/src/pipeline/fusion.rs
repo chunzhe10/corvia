@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use corvia_common::errors::Result;
+use tracing::{debug, info};
 
 use std::sync::Arc;
 
@@ -137,6 +138,11 @@ impl Fusion for RRFusion {
         "rrf"
     }
 
+    #[tracing::instrument(
+        name = "corvia.pipeline.fusion",
+        skip(self, sets),
+        fields(input_sets = sets.len(), k = self.k)
+    )]
     async fn fuse(&self, sets: Vec<RankedSet>) -> Result<RankedSet> {
         let start = Instant::now();
         let input_count: usize = sets.iter().map(|s| s.candidates.len()).sum();
@@ -202,6 +208,17 @@ impl Fusion for RRFusion {
         // Find max RRF score for normalization.
         let max_rrf = accum.values().fold(0.0f64, |mx, a| mx.max(a.rrf_score));
 
+        let unique_entries = accum.len();
+        let duplicates_merged = input_count.saturating_sub(unique_entries);
+
+        info!(
+            total_candidates = input_count,
+            unique_entries,
+            duplicates_merged,
+            max_rrf_score = max_rrf,
+            "rrf fusion complete"
+        );
+
         // Build final candidates with normalized scores.
         let mut candidates: Vec<RankedCandidate> = accum
             .into_values()
@@ -223,6 +240,18 @@ impl Fusion for RRFusion {
 
         // Sort descending by final_score.
         candidates.sort_unstable_by_key(|c| std::cmp::Reverse(c.scores.final_score));
+
+        // Debug: top-10 RRF score breakdown (structured fields, no allocation when disabled).
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            for (i, c) in candidates.iter().take(10).enumerate() {
+                debug!(
+                    rank = i + 1,
+                    score = c.scores.final_score.value(),
+                    entry_id = %c.entry.id,
+                    "rrf rank"
+                );
+            }
+        }
 
         let output_count = candidates.len();
         Ok(RankedSet {

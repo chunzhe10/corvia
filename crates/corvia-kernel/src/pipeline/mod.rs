@@ -130,6 +130,7 @@ pub struct RankedCandidate {
 
 /// Timing and diagnostic metrics from a single pipeline stage.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StageMetrics {
     /// Human-readable stage name (e.g. "vector_searcher", "passthrough_fusion").
     pub stage_name: String,

@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 use super::expander::Expander;
 use super::fusion::Fusion;
 use super::searcher::Searcher;
-use super::{Reranker, SearchContext};
+use super::{Reranker, SearchContext, StageMetrics};
 use crate::rag_types::{RetrievalMetrics, RetrievalOpts, RetrievalResult};
 use crate::retriever::{self, Retriever};
 use crate::traits::InferenceEngine;
@@ -203,9 +203,16 @@ impl Retriever for RetrievalPipeline {
         let hnsw_latency_ms = search_start.elapsed().as_millis() as u64;
         let vector_results: usize = searcher_results.iter().map(|s| s.candidates.len()).sum();
 
+        // Collect per-searcher stage metrics before fusion consumes the sets.
+        let mut stages: Vec<StageMetrics> = searcher_results
+            .iter()
+            .map(|sr| sr.metrics.clone())
+            .collect();
+
         // Step 3: Fuse.
         let fused = self.fusion.fuse(searcher_results).await?;
         let fusion_latency_ms = fused.metrics.latency_ms;
+        stages.push(fused.metrics.clone());
 
         // Step 4: Expand.
         let expanded = self.expander.expand(&ctx, fused).await?;
@@ -296,7 +303,7 @@ impl Retriever for RetrievalPipeline {
                 bm25_results: None,
                 fusion_method: Some(self.fusion.name().to_string()),
                 fusion_latency_ms: Some(fusion_latency_ms),
-                stages: None,
+                stages: Some(stages),
             },
             query_embedding: if embed_failed {
                 None
