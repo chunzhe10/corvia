@@ -204,6 +204,31 @@ pub fn infer_source_origin(repo_name: Option<&str>, source_file: &str) -> Option
     Some("workspace".into())
 }
 
+const MIN_CONTENT_LENGTH: usize = 80;
+
+const INGEST_EXCLUDED_FILES: &[&str] = &[
+    "CHANGELOG.md",
+    "package.json",
+    "package-lock.json",
+];
+
+fn content_passes_min_length(content: &str) -> bool {
+    let stripped: String = content
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    stripped.trim().len() >= MIN_CONTENT_LENGTH
+}
+
+pub fn is_excluded_file(source_file: &str) -> bool {
+    let file_name = std::path::Path::new(source_file)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    INGEST_EXCLUDED_FILES.contains(&file_name)
+}
+
 /// Simple glob matching for blocked paths (supports trailing `*` only).
 pub fn blocked_path_match(pattern: &str, path: &str) -> bool {
     if let Some(prefix) = pattern.strip_suffix('*') {
@@ -475,6 +500,7 @@ async fn semantic_subsplit(
                 content_role: None,
                 source_origin: None,
             };
+            entry.auto_classify();
             entry.embedding = Some(embedding);
 
             match store.insert(&entry).await {
@@ -627,9 +653,12 @@ pub async fn run_workspace_ingest(ctx: WorkspaceIngestCtx<'_>) -> anyhow::Result
         process.spawn().map_err(|e| anyhow::anyhow!(e))?;
 
         // Ingest source files via IPC
-        let source_files = process
+        let source_files: Vec<_> = process
             .ingest(repo_path_str, &config.project.scope_id)
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| anyhow::anyhow!(e))?
+            .into_iter()
+            .filter(|sf| !is_excluded_file(&sf.metadata.file_path))
+            .collect();
 
         // Build chunking pipeline with adapter strategies
         let mut pipeline = crate::create_chunking_pipeline(config);
@@ -687,8 +716,10 @@ pub async fn run_workspace_ingest(ctx: WorkspaceIngestCtx<'_>) -> anyhow::Result
                             &pc.metadata.source_file,
                         )),
                 };
+                entry.auto_classify();
                 entry
             })
+            .filter(|e| content_passes_min_length(&e.content))
             .collect();
 
         let total = entries.len();
@@ -813,7 +844,7 @@ pub async fn run_workspace_ingest(ctx: WorkspaceIngestCtx<'_>) -> anyhow::Result
                         let is_blocked = blocked
                             .iter()
                             .any(|bp| blocked_path_match(bp, path));
-                        in_allowed && !is_blocked
+                        in_allowed && !is_blocked && !is_excluded_file(path)
                     })
                     .collect();
 
@@ -860,8 +891,10 @@ pub async fn run_workspace_ingest(ctx: WorkspaceIngestCtx<'_>) -> anyhow::Result
                                     .and_then(|m| m.source_origin.clone())
                                     .or_else(|| infer_source_origin(None, &pc.metadata.source_file)),
                             };
+                            entry.auto_classify();
                             entry
                         })
+                        .filter(|e| content_passes_min_length(&e.content))
                         .collect();
 
                     let total = entries.len();

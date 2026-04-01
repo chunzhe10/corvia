@@ -333,12 +333,13 @@ pub use corvia_kernel::ingest::infer_source_origin;
 /// Creates its own store/graph/engine for standalone CLI use, then delegates
 /// to [`corvia_kernel::ingest::run_workspace_ingest`] for the actual pipeline.
 ///
-/// The `fresh` parameter is accepted but not yet used (future: delete existing
-/// entries before re-ingest).
+/// When `fresh` is true, all ingested entries are deleted while agent-written
+/// entries (those with `agent_id`) are preserved and re-inserted into the
+/// rebuilt store.
 pub async fn ingest_workspace(
     root: &Path,
     repo_filter: Option<&str>,
-    _fresh: bool,
+    fresh: bool,
 ) -> Result<()> {
     let config_path = root.join("corvia.toml");
     let config = CorviaConfig::load(&config_path)?;
@@ -346,6 +347,36 @@ pub async fn ingest_workspace(
     let data_dir = root.join(&config.storage.data_dir);
     let (store, graph) = corvia_kernel::create_store_at_with_graph(&config, &data_dir).await?;
     let engine = corvia_kernel::create_engine(&config);
+
+    if fresh {
+        let scope_id = &config.project.scope_id;
+
+        // Read agent-written entries before nuking the scope
+        let all_entries = corvia_kernel::knowledge_files::read_scope(&data_dir, scope_id)?;
+        let agent_entries: Vec<_> = all_entries
+            .into_iter()
+            .filter(|e| e.agent_id.is_some())
+            .collect();
+
+        println!(
+            "Fresh mode: preserving {} agent-written entries, deleting scope...",
+            agent_entries.len()
+        );
+
+        store.delete_scope(scope_id).await?;
+
+        // Restore agent entries with fresh embeddings
+        if !agent_entries.is_empty() {
+            let texts: Vec<String> = agent_entries.iter().map(|e| e.content.clone()).collect();
+            let embeddings = engine.embed_batch(&texts).await?;
+            for (mut entry, embedding) in agent_entries.into_iter().zip(embeddings) {
+                entry.auto_classify();
+                entry.embedding = Some(embedding);
+                store.insert(&entry).await?;
+            }
+            println!("  Restored agent entries.");
+        }
+    }
 
     let progress = corvia_kernel::ingest::PrintProgress;
     corvia_kernel::ingest::run_workspace_ingest(corvia_kernel::ingest::WorkspaceIngestCtx {

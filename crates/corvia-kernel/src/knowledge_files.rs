@@ -107,6 +107,41 @@ pub fn delete_entry(data_dir: &Path, scope_id: &str, entry_id: &Uuid) -> Result<
     Ok(())
 }
 
+/// Delete ingested (non-agent-written) entry files in a scope.
+/// Returns (deleted_count, preserved_count).
+pub fn purge_ingested_files(data_dir: &Path, scope_id: &str) -> Result<(usize, usize)> {
+    validate_scope_id(scope_id)?;
+    let dir = scope_dir(data_dir, scope_id);
+    if !dir.exists() {
+        return Ok((0, 0));
+    }
+    let mut deleted = 0;
+    let mut preserved = 0;
+    for file in std::fs::read_dir(&dir)
+        .map_err(|e| CorviaError::Storage(format!("Failed to read dir: {e}")))?
+    {
+        let file = file.map_err(|e| CorviaError::Storage(e.to_string()))?;
+        let path = file.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let json = std::fs::read_to_string(&path).map_err(|e| {
+            CorviaError::Storage(format!("Failed to read {}: {e}", path.display()))
+        })?;
+        if let Ok(entry) = serde_json::from_str::<KnowledgeEntry>(&json) {
+            if entry.agent_id.is_some() {
+                preserved += 1;
+            } else {
+                std::fs::remove_file(&path).map_err(|e| {
+                    CorviaError::Storage(format!("Failed to delete {}: {e}", path.display()))
+                })?;
+                deleted += 1;
+            }
+        }
+    }
+    Ok((deleted, preserved))
+}
+
 /// Delete all entry files in a scope (removes the scope directory).
 pub fn delete_scope_files(data_dir: &Path, scope_id: &str) -> Result<()> {
     validate_scope_id(scope_id)?;
