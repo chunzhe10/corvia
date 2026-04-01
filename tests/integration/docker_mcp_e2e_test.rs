@@ -230,10 +230,17 @@ exec corvia serve
             .trim()
             .to_string();
 
+        // Override compose labels inherited from the devcontainer image so that
+        // VS Code does not mistake E2E containers for the real devcontainer.
+        // Uses the unique container_name so multiple E2E instances never collide.
+        let label_project = format!("com.docker.compose.project={container_name}");
+        let label_service = format!("com.docker.compose.service={container_name}");
         let status = Command::new("docker")
             .args([
                 "run", "-d",
                 "--name", &container_name,
+                "--label", &label_project,
+                "--label", &label_service,
                 &format!("--network=container:{hostname}"),
                 "-v", &format!("{}/repos/corvia/target/debug/corvia:/usr/local/bin/corvia:ro", host_workspace),
                 "-v", &format!("{}/repos/corvia/target/debug/corvia-inference:/usr/local/bin/corvia-inference:ro", host_workspace),
