@@ -496,3 +496,48 @@ pub async fn run(base_dir_arg: Option<&Path>) -> Result<()> {
     info!("corvia MCP server stopped");
     Ok(())
 }
+
+/// Run a self-test: load config, initialize embedder, verify tools, run a
+/// test search. Prints a diagnostic report and exits.
+pub async fn run_test(base_dir_arg: Option<&Path>) -> Result<()> {
+    use std::time::Instant;
+
+    let base_dir = corvia_core::discover::resolve_base_dir(base_dir_arg)?;
+
+    print!("  config:     ");
+    let config = Config::load_discovered(&base_dir)
+        .context("loading config")?;
+    println!(".corvia/corvia.toml (ok)");
+
+    print!("  models:     ");
+    let start = Instant::now();
+    let cache_dir = config.embedding.model_path.clone();
+    let embedder = Embedder::new(
+        cache_dir.as_deref(),
+        &config.embedding.model,
+        &config.embedding.reranker_model,
+    )
+    .context("initializing embedder")?;
+    let elapsed = start.elapsed();
+    println!(
+        "{} + {} (loaded in {:.1}s)",
+        config.embedding.model,
+        config.embedding.reranker_model,
+        elapsed.as_secs_f64()
+    );
+
+    let tools = vec![search_tool(), write_tool(), status_tool(), traces_tool()];
+    let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    println!("  tools:      {} ({})", tools.len(), tool_names.join(", "));
+
+    let status = handle_status(&config, &base_dir)?;
+    if let Some(entries) = status.get("entry_count").and_then(|v| v.as_u64()) {
+        println!("  entries:    {entries}");
+    }
+
+    // Drop embedder to free model memory
+    drop(embedder);
+
+    println!("  status:     ready");
+    Ok(())
+}

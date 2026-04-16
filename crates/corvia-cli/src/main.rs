@@ -84,7 +84,11 @@ enum Command {
         filter: Option<String>,
     },
     /// Start stdio MCP server
-    Mcp,
+    Mcp {
+        /// Run self-test and exit (validates config, models, tools)
+        #[arg(long)]
+        test: bool,
+    },
     /// Initialize corvia in the current directory
     Init {
         /// Auto-accept all prompts
@@ -142,7 +146,13 @@ async fn main() {
         } => cmd_write(cli.base_dir.as_deref(), &content, &kind, tags.as_deref(), supersedes.as_deref()),
         Command::Status => cmd_status(cli.base_dir.as_deref()),
         Command::Traces { limit, filter } => cmd_traces(cli.base_dir.as_deref(), limit, filter.as_deref()),
-        Command::Mcp => mcp::run(cli.base_dir.as_deref()).await,
+        Command::Mcp { test } => {
+            if test {
+                mcp::run_test(cli.base_dir.as_deref()).await
+            } else {
+                mcp::run(cli.base_dir.as_deref()).await
+            }
+        }
         Command::Init { yes, force, model_path, format } => {
             cmd_init(cli.base_dir, yes, force, model_path, format)
         }
