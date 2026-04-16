@@ -1,46 +1,47 @@
 [workspace]
+members = ["crates/*"]
 resolver = "2"
-members = [
-    "crates/corvia-common",
-    "crates/corvia-kernel",
-    "crates/corvia-server",
-    "crates/corvia-cli",
-    "crates/corvia-proto",
-    "crates/corvia-inference",
-    "crates/corvia-telemetry",
-    "adapters/corvia-adapter-basic/rust",
-    "adapters/corvia-adapter-git/rust",
-    "adapters/corvia-adapter-claude-sessions/rust",
-]
 
 [workspace.package]
-version = "0.5.0"
+version = "1.0.0"
 edition = "2024"
 license = "AGPL-3.0-only"
-repository = "https://github.com/corvia/corvia"
-homepage = "https://github.com/corvia/corvia"
-rust-version = "1.91"
+repository = "https://github.com/chunzhe10/corvia"
+rust-version = "1.86"
 
 [workspace.dependencies]
-corvia-common = { path = "crates/corvia-common" }
-corvia-kernel = { path = "crates/corvia-kernel" }
-corvia-server = { path = "crates/corvia-server" }
-corvia-proto = { path = "crates/corvia-proto" }
-tonic = "0.12"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# Retrieval
+tantivy = "0.22"
+fastembed = "4"
+# ID generation
+uuid = { version = "1", features = ["v7"] }
+
+# MCP
+rmcp = { version = "0.1", features = ["server", "transport-io"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Storage
+redb = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Async
 tokio = { version = "1", features = ["full"] }
-uuid = { version = "1", features = ["v7", "serde"] }
+
+# Error handling
 anyhow = "1"
 thiserror = "2"
-corvia-telemetry = { path = "crates/corvia-telemetry" }
+
+# Logging / Observability
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
-tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 opentelemetry = "0.28"
 opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.28", features = ["grpc-tonic"] }
 tracing-opentelemetry = "0.29"
-libc = "0.2"
-flate2 = "1"
-notify = "7"
+futures-util = "0.3"

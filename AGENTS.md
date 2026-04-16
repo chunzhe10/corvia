@@ -1,135 +1,77 @@
 # corvia
 
-> Organizational memory for AI agents. Rust workspace, AGPL-3.0.
+> Organizational memory for AI agents. Local-first, single binary, stdio MCP.
 
-This file follows the [AGENTS.md standard](https://agents.md/) — the cross-platform
-convention for AI agent project instructions, governed by the Agentic AI Foundation
-under the Linux Foundation. Read natively by Codex CLI, Cursor, GitHub Copilot,
-Windsurf, and Goose. Supported via import/config by Claude Code (`@AGENTS.md`
-in CLAUDE.md), Gemini CLI (settings.json), and Aider (`--read AGENTS.md`).
+## Architecture
 
-## Quick Reference
+- **corvia-core**: Storage, retrieval pipeline (tantivy + hnsw_rs + fastembed + redb)
+- **corvia-cli**: CLI (5 commands) + stdio MCP server (3 tools) via rmcp
+
+## Build
 
 ```bash
-cargo build --workspace          # Build everything
-cargo test --workspace           # Run all tests (PG tests auto-skip if unreachable)
-make test-postgres               # Start PostgreSQL + run tests with --features postgres
-
-# Build with embedded dashboard
-cd tools/corvia-dashboard && npm run build
-CORVIA_DASHBOARD_DIR=tools/corvia-dashboard/dist cargo build
+cargo build                  # debug
+cargo build --release        # release
 ```
 
-## Test Tiers
+## CLI Commands
 
-**Tier 1 — No external services (default):**
-```bash
-cargo test --workspace
+| Command | Description |
+|---------|-------------|
+| `corvia ingest [path]` | Ingest documents into knowledge store |
+| `corvia search <query>` | Hybrid search (vector + BM25 + rerank) |
+| `corvia write <content>` | Write a knowledge entry (auto-dedup) |
+| `corvia status` | Show system status |
+| `corvia mcp` | Start stdio MCP server |
+
+## MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `corvia_search` | Semantic + BM25 hybrid search with reranking |
+| `corvia_write` | Write entry (auto-supersedes near-duplicates) |
+| `corvia_status` | System status (entry counts, index health) |
+
+## Key Design Decisions
+
+1. Local-first, no server. Runs as stdio MCP subprocess.
+2. Single binary distribution. No Python, no Docker.
+3. Caller is the LLM. No corvia_ask (no built-in generation).
+4. Auto-dedup on write. Near-duplicate content auto-supersedes.
+5. 4 knowledge kinds: decision, learning, instruction, reference.
+6. Flat files (.corvia/entries/*.md) as source of truth. Redb for indexes only.
+7. Git provides versioning, provenance, and audit trail.
+8. Cross-encoder reranking for improved accuracy over v1.
+9. Brute-force cosine for <10K vectors. HNSW above.
+10. No tiers, no graph, no RBAC, no agent tracking in v1.0.
+
+## Retrieval Pipeline
+
 ```
-Runs 433+ tests. LiteStore tests exercise full functionality. PostgreSQL
-tests auto-skip gracefully when the server is unreachable. No Docker, no Ollama required.
-This is the primary test suite and must always pass.
-
-**Tier 2 — With PostgreSQL (PostgresStore tests fully exercised):**
-```bash
-make test-postgres               # Start PostgreSQL, run tests, stop PostgreSQL
+query -> [BM25 (tantivy)] \
+                            -> RRF fusion (k=30) -> rerank (cross-encoder) -> results
+query -> [vector (cosine)] /
 ```
-Or manually: `make postgres-up && cargo test --workspace --features postgres && make postgres-down`
 
-Requires the `postgres` feature flag. PostgresStore tests use pgvector/pgvector:pg17.
+## Storage Model
 
-**Tier 3 — With Ollama (real embeddings):**
-Requires Ollama running on port 11434 with `nomic-embed-text` model.
-The e2e integration tests (`test_ollama_*`) auto-skip when Ollama is unreachable.
+```
+.corvia/
+  entries/          # git-tracked flat files (TOML frontmatter + markdown)
+    <uuid>.md
+  index/            # gitignored, rebuilt via `corvia ingest`
+    store.redb      # vectors, chunk mappings, supersession state
+    tantivy/        # BM25 full-text index
+```
 
-## Workspace Crates
+## Config Defaults
 
-| Crate | Path | What it does |
-|-------|------|-------------|
-| `corvia-common` | `crates/corvia-common` | Types, config, errors, namespace, events |
-| `corvia-kernel` | `crates/corvia-kernel` | Storage, coordination, reasoning, graph, temporal, RAG, chunking |
-| `corvia-server` | `crates/corvia-server` | Axum REST + MCP protocol server |
-| `corvia-cli` | `crates/corvia-cli` | CLI binary, workspace management |
-| `corvia-inference` | `crates/corvia-inference` | gRPC inference server (ONNX Runtime) |
-| `corvia-proto` | `crates/corvia-proto` | Protocol Buffers for gRPC inference |
-| `corvia-adapter-git` | `adapters/corvia-adapter-git/rust` | Git + tree-sitter code ingestion adapter |
-| `corvia-adapter-basic` | `adapters/corvia-adapter-basic/rust` | Basic filesystem ingestion adapter |
-| `corvia-telemetry` | `crates/corvia-telemetry` | Structured tracing, span contracts, telemetry init |
-
-## Key Traits (extend these, don't modify)
-
-- `QueryableStore` — init_schema, insert, search, get, count, delete_scope, as_any
-- `TemporalStore` — as_of, history, evolution
-- `GraphStore` — relate, edges, traverse, shortest_path, remove_edges
-- `InferenceEngine` — embed (text → vector)
-- `IngestionAdapter` — ingest (path → chunks)
-
-## Agentic Retrieval Protocol
-
-Agents interacting with corvia MCP tools should follow these rules:
-
-1. **Check quality signals.** `corvia_search` returns `quality_signal.confidence`
-   (high/medium/low). If `low`, follow the `suggestion` field and retry once
-   (max 1 retry).
-2. **Inject context into subagents.** Before spawning subagents for non-trivial work,
-   call `corvia_context` with `max_tokens` (recommended: 2000-3000) and
-   `format: "compact"`. Include the returned context in the subagent prompt.
-3. **Write discipline.** After discovering non-obvious insights, call `corvia_write`
-   immediately. The server handles deduplication automatically. Use `force_write: true`
-   to bypass if content is intentionally similar but distinct.
-4. **Use `min_score` for precision.** Pass `min_score` to `corvia_search` to filter
-   low-relevance results at the server level.
-
-## Architecture Decisions to Respect
-
-- **Two-tier storage**: LiteStore is the full product (zero Docker). PostgresStore is an opt-in upgrade.
-  PostgresStore requires `--features postgres` at compile time.
-- **Git as truth**: All knowledge stored as JSON in `.corvia/knowledge/`, tracked by Git.
-- **Local-first**: No API keys required. Ollama provides embeddings.
-- **Trait-bounded**: All storage/inference/ingestion is behind traits. Don't add concrete dependencies.
-
-## PostgreSQL (pgvector) Notes
-
-PostgresStore (`crates/corvia-kernel/src/postgres_store.rs`) is behind the `postgres` feature flag.
-
-- **Dependencies**: `sqlx` (async PostgreSQL driver) + `pgvector` (vector type support)
-- **Docker image**: `pgvector/pgvector:pg17` — PostgreSQL 17 with pgvector pre-installed
-- **Default URL**: `postgres://corvia:corvia@127.0.0.1:5432/corvia`
-- **Env override**: `CORVIA_POSTGRES_URL`
-- **Schema**: Uses `vector(768)` column type, HNSW index with cosine ops, JSONB for metadata
-- **Graph**: Relational `edges` table with composite primary key `(from_id, relation, to_id)`
-- **Temporal**: `valid_from`/`valid_to` TIMESTAMPTZ columns, `superseded_by` UUID chain
-- **Tests**: Each test gets its own database (`corvia_test_{PID}_{suffix}`), dropped on teardown
-
-## Testing Conventions
-
-- Unit tests live in `#[cfg(test)] mod tests` inside each module
-- Integration tests live in `tests/integration/`
-- HNSW approximate recall is unreliable at <10 entries — use `>=` assertions, not `==`
-- Use `tempfile::tempdir()` for test directories (auto-cleanup)
-- Env var config tests (`test_env_override_*`) can be flaky under high parallelism
-  due to process-global env var mutations — known pre-existing issue
-
-## Key Files
-
-- `traits.rs` — All kernel trait definitions (QueryableStore, InferenceEngine, TemporalStore, GraphStore, IngestionAdapter)
-- `lite_store.rs` — LiteStore implementation (default, zero-Docker)
-- `postgres_store.rs` — PostgresStore implementation (feature-gated)
-- `rag_pipeline.rs` — RAG orchestrator (context + ask modes)
-- `retriever.rs` — Vector + graph-expanded retrieval with visibility filtering
-- `chunking_pipeline.rs` — Format-aware chunking orchestrator with FormatRegistry
-- `reasoner.rs` — 5 deterministic health checks + 2 LLM-assisted checks
-- `graph_store.rs` — petgraph-based graph for LiteStore
-- `adapter_discovery.rs` — Runtime adapter discovery via PATH scan
-- `process_adapter.rs` — IPC wrapper for adapter binaries (JSONL protocol)
-- `staging.rs` — Agent write isolation (branch-per-session)
-- `agent_coordinator.rs` — Multi-agent lifecycle orchestration
-- `ops.rs` — Shared kernel operations (system status, config get/set, GC, rebuild)
-- `grpc_engine.rs` — gRPC client for corvia-inference server
-- `crates/corvia-telemetry/src/lib.rs` — Telemetry init, span name constants, exporters
-- `crates/corvia-server/src/dashboard/mod.rs` — Dashboard routes and handlers
-- `crates/corvia-server/src/dashboard/clustering.rs` — K-means ClusterStore, shared embedding vocabulary
-- `crates/corvia-server/src/dashboard/activity.rs` — Activity feed with semantic grouping
-- `crates/corvia-inference/src/backend.rs` — GPU backend resolution (CUDA/OpenVINO/CPU)
-- `crates/corvia-cli/src/hooks.rs` — Doc-placement hook generation from DocsConfig
-- `crates/corvia-common/src/config.rs` — DocsConfig, InferenceConfig, content_role/source_origin filters
+| Parameter | Value | Source |
+|-----------|-------|--------|
+| chunk max_tokens | 512 | FloTorch 2026 benchmark |
+| chunk overlap | 64 (~12.5%) | NVIDIA 15% optimum |
+| RRF k | 30 | Tuned for small corpora |
+| dedup threshold | 0.85 | Cosine similarity |
+| search limit | 5 | Default results |
+| embedding model | nomic-embed-text-v1.5 | 62.4 MTEB, proven in v1 |
+| reranker model | ms-marco-MiniLM-L6-v2 | Smallest, fastest |
