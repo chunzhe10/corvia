@@ -1,0 +1,17 @@
+data_dir = ".corvia"
+
+[chunking]
+max_tokens = 512
+overlap_tokens = 64
+min_tokens = 32
+
+[search]
+rrf_k = 30
+dedup_threshold = 0.85
+reranker_candidates = 50
+brute_force_threshold = 10000
+default_limit = 5
+
+[embedding]
+model = "nomic-embed-text-v1.5"
+reranker_model = "jina-v1-turbo"
