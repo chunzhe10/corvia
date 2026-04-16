@@ -585,16 +585,24 @@ async fn handle_tools_call_http(
             serde_json::json!({ "code": -32602, "message": "Missing tool name in params" })
         })?;
 
+    // Reject unknown tools before entering the anyhow context.
+    match name {
+        "corvia_search" | "corvia_write" | "corvia_status" | "corvia_traces" => {}
+        other => {
+            return Err(serde_json::json!({
+                "code": -32602,
+                "message": format!("Unknown tool: {other}"),
+            }));
+        }
+    }
+
     let args = params
         .get("arguments")
         .cloned()
         .unwrap_or(serde_json::Value::Object(Default::default()));
 
-    // Use an inner async block to capture all tool dispatch in a single
-    // anyhow::Result context, avoiding `?`-propagation type conflicts with
-    // the outer Result<_, serde_json::Value>.
     let tool_result: anyhow::Result<serde_json::Value> = async {
-        let result: anyhow::Result<serde_json::Value> = match name {
+        match name {
             "corvia_search" => {
                 let p: SearchToolParams = serde_json::from_value(args)
                     .map_err(|e| anyhow::anyhow!("invalid search params: {e}"))?;
@@ -618,7 +626,10 @@ async fn handle_tools_call_http(
                     redb,
                     tantivy,
                 )
-                .map(|r| serde_json::to_value(&r).unwrap_or_default())
+                .and_then(|r| {
+                    serde_json::to_value(&r)
+                        .map_err(|e| anyhow::anyhow!("serializing search response: {e}"))
+                })
             }
             "corvia_write" => {
                 let p: WriteToolParams = serde_json::from_value(args)
@@ -640,7 +651,10 @@ async fn handle_tools_call_http(
                     redb,
                     tantivy,
                 )
-                .map(|r| serde_json::to_value(&r).unwrap_or_default())
+                .and_then(|r| {
+                    serde_json::to_value(&r)
+                        .map_err(|e| anyhow::anyhow!("serializing write response: {e}"))
+                })
             }
             "corvia_status" => handle_status_with_handles(
                 &state.config,
@@ -656,12 +670,8 @@ async fn handle_tools_call_http(
                     });
                 handle_traces(&state.config, &state.base_dir, p)
             }
-            other => {
-                // Return a sentinel error; converted to JSON-RPC error below.
-                anyhow::bail!("__unknown_tool__:{other}");
-            }
-        };
-        result
+            _ => unreachable!("tool name validated above"),
+        }
     }
     .await;
 
@@ -669,19 +679,10 @@ async fn handle_tools_call_http(
         Ok(value) => Ok(serde_json::json!({
             "content": [{ "type": "text", "text": value.to_string() }]
         })),
-        Err(e) => {
-            let msg = e.to_string();
-            if let Some(tool_name) = msg.strip_prefix("__unknown_tool__:") {
-                return Err(serde_json::json!({
-                    "code": -32602,
-                    "message": format!("Unknown tool: {tool_name}"),
-                }));
-            }
-            Ok(serde_json::json!({
-                "content": [{ "type": "text", "text": format!("Error: {e:#}") }],
-                "isError": true,
-            }))
-        }
+        Err(e) => Ok(serde_json::json!({
+            "content": [{ "type": "text", "text": format!("Error: {e:#}") }],
+            "isError": true,
+        })),
     }
 }
 
@@ -793,6 +794,7 @@ pub async fn serve_http(base_dir_arg: Option<&std::path::Path>, host: &str, port
 
     let app = Router::new()
         .route("/mcp", post(mcp_post_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .with_state(state);
 
     let addr = format!("{host}:{port}");
