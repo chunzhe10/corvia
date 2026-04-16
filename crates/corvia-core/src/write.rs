@@ -140,40 +140,25 @@ fn validate_supersedes(redb: &RedbIndex, supersedes: &[String]) -> Result<Option
 // Write pipeline
 // ---------------------------------------------------------------------------
 
-/// Write a new knowledge entry with auto-dedup detection.
+/// Write a new knowledge entry using pre-opened index handles.
 ///
-/// This is the primary write path for creating knowledge entries. It handles:
-/// - Automatic near-duplicate detection via cosine similarity
-/// - Explicit supersession when the caller provides `supersedes` IDs
-/// - Atomic file writes
-/// - Index updates (Redb vectors + Tantivy BM25)
-/// - Entry count metadata updates
-#[tracing::instrument(name = "corvia.write", skip(config, base_dir, embedder, params), fields(
+/// Callers must ensure the entries directory and index directory already exist.
+/// For one-shot callers, use [`write`] which creates directories and opens handles.
+#[tracing::instrument(name = "corvia.write", skip(config, base_dir, embedder, params, redb, tantivy), fields(
     kind = %params.kind,
     content_len = params.content.len(),
     action = tracing::field::Empty,
     superseded_count = tracing::field::Empty,
 ))]
-pub fn write(
+pub fn write_with_handles(
     config: &Config,
     base_dir: &Path,
     embedder: &Embedder,
     params: WriteParams,
+    redb: &RedbIndex,
+    tantivy: &TantivyIndex,
 ) -> Result<WriteResponse> {
-    // Step 1: Resolve paths and ensure directories exist.
     let entries_dir = base_dir.join(config.entries_dir());
-    let index_dir = base_dir.join(config.index_dir());
-
-    std::fs::create_dir_all(&entries_dir)
-        .with_context(|| format!("creating entries dir: {}", entries_dir.display()))?;
-    std::fs::create_dir_all(&index_dir)
-        .with_context(|| format!("creating index dir: {}", index_dir.display()))?;
-
-    // Step 2: Open indexes.
-    let redb =
-        RedbIndex::open(&base_dir.join(config.redb_path())).context("opening redb index")?;
-    let tantivy =
-        TantivyIndex::open(&base_dir.join(config.tantivy_dir())).context("opening tantivy index")?;
 
     // Step 3: Determine supersedes list and action.
     let caller_provided_supersedes = !params.supersedes.is_empty();
@@ -182,14 +167,13 @@ pub fn write(
     let mut dedup_similarity: Option<f32> = None;
 
     if !caller_provided_supersedes && !params.content.is_empty() {
-        // Auto-dedup: check for near-duplicate content.
         let _dedup_span = info_span!("corvia.write.dedup",
             threshold = config.search.dedup_threshold,
             matched = tracing::field::Empty,
             similarity = tracing::field::Empty,
         ).entered();
 
-        let dedup = auto_dedup_check(embedder, &redb, &params.content, config.search.dedup_threshold)
+        let dedup = auto_dedup_check(embedder, redb, &params.content, config.search.dedup_threshold)
             .context("auto-dedup check")?;
 
         if let Some(matched_id) = dedup.matched_id {
@@ -216,7 +200,7 @@ pub fn write(
     }
 
     // Step 4: Validate supersedes references.
-    let warning = validate_supersedes(&redb, &supersedes)?;
+    let warning = validate_supersedes(redb, &supersedes)?;
     if let Some(ref w) = warning {
         warn!("{}", w);
     }
@@ -236,7 +220,7 @@ pub fn write(
     info!(id = %entry_id, action = %action, "entry written to disk");
 
     // Step 6: Update indexes.
-    // 6a: Mark all superseded entries in Redb.
+    // 6a: Mark superseded entries in Redb.
     for sup_id in &supersedes {
         redb.set_superseded(sup_id, true)
             .with_context(|| format!("marking {} as superseded", sup_id))?;
@@ -246,7 +230,7 @@ pub fn write(
     redb.set_superseded(&entry_id, false)
         .with_context(|| format!("marking {} as current", entry_id))?;
 
-    // 6b2: Delete superseded entries from Tantivy so they are invisible in BM25 search.
+    // 6b2: Delete superseded entries from Tantivy.
     {
         let mut sup_writer = tantivy.writer().context("creating tantivy writer for supersession cleanup")?;
         for sup_id in &supersedes {
@@ -274,21 +258,16 @@ pub fn write(
 
         for chunk in &chunks {
             let chunk_id = format!("{}:{}", entry_id, chunk.chunk_index);
-
-            // Skip embedding if chunk text is empty.
             if chunk.text.is_empty() {
                 continue;
             }
-
             let vector = embedder
                 .embed(&chunk.text)
                 .with_context(|| format!("embedding chunk {}", chunk_id))?;
-
             redb.put_vector(&chunk_id, &entry_id, &vector)
                 .with_context(|| format!("storing vector for {}", chunk_id))?;
             redb.put_chunk_kind(&chunk_id, &chunk.kind.to_string())
                 .with_context(|| format!("storing kind for {}", chunk_id))?;
-
             tantivy
                 .add_doc(
                     &writer,
@@ -296,7 +275,7 @@ pub fn write(
                     &entry_id,
                     &chunk.text,
                     entry.meta.kind,
-                    false, // new entry is always current
+                    false,
                 )
                 .with_context(|| format!("adding tantivy doc for {}", chunk_id))?;
         }
@@ -307,14 +286,13 @@ pub fn write(
             .context("reloading tantivy reader after write")?;
     }
 
-    // Step 7: Update entry count in Redb meta (based on actual file count for consistency).
+    // Step 7: Update entry count in Redb meta.
     let actual_count = crate::entry::scan_entries(&entries_dir)
         .context("scanning entries for count update")?
         .len();
     redb.set_meta("entry_count", &actual_count.to_string())
         .context("updating entry_count metadata")?;
 
-    // Record on parent span.
     Span::current().record("action", action.as_str());
     Span::current().record("superseded_count", supersedes.len());
 
@@ -325,7 +303,6 @@ pub fn write(
         "write pipeline complete"
     );
 
-    // Step 8: Return response.
     Ok(WriteResponse {
         id: entry_id,
         action,
@@ -333,6 +310,38 @@ pub fn write(
         similarity: dedup_similarity,
         warning,
     })
+}
+
+/// Write a new knowledge entry with auto-dedup detection.
+///
+/// This is the primary write path for creating knowledge entries. It handles:
+/// - Automatic near-duplicate detection via cosine similarity
+/// - Explicit supersession when the caller provides `supersedes` IDs
+/// - Atomic file writes
+/// - Index updates (Redb vectors + Tantivy BM25)
+/// - Entry count metadata updates
+/// Write a new knowledge entry with auto-dedup detection.
+///
+/// Opens index handles internally. For callers that hold persistent handles,
+/// use [`write_with_handles`] directly.
+pub fn write(
+    config: &Config,
+    base_dir: &Path,
+    embedder: &Embedder,
+    params: WriteParams,
+) -> Result<WriteResponse> {
+    // Step 1: Resolve paths and ensure directories exist.
+    let entries_dir = base_dir.join(config.entries_dir());
+    let index_dir = base_dir.join(config.index_dir());
+    std::fs::create_dir_all(&entries_dir)
+        .with_context(|| format!("creating entries dir: {}", entries_dir.display()))?;
+    std::fs::create_dir_all(&index_dir)
+        .with_context(|| format!("creating index dir: {}", index_dir.display()))?;
+
+    // Step 2: Open indexes.
+    let redb = RedbIndex::open(&base_dir.join(config.redb_path())).context("opening redb index")?;
+    let tantivy = TantivyIndex::open(&base_dir.join(config.tantivy_dir())).context("opening tantivy index")?;
+    write_with_handles(config, base_dir, embedder, params, &redb, &tantivy)
 }
 
 // ---------------------------------------------------------------------------
@@ -556,6 +565,19 @@ mod tests {
             !redb.is_superseded(&second.id).unwrap(),
             "second entry should be current"
         );
+    }
+
+    #[test]
+    fn write_with_handles_signature_exists() {
+        let _fn: fn(
+            &crate::config::Config,
+            &std::path::Path,
+            &crate::embed::Embedder,
+            WriteParams,
+            &crate::index::RedbIndex,
+            &crate::tantivy_index::TantivyIndex,
+        ) -> anyhow::Result<crate::types::WriteResponse> = write_with_handles;
+        let _ = _fn;
     }
 
     #[test]
