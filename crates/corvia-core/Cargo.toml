@@ -1,31 +1,27 @@
 [package]
-name = "corvia"
-description = "Organizational memory for AI agents"
+name = "corvia-core"
+description = "Knowledge storage, retrieval, and embedding engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-[[bin]]
-name = "corvia"
-path = "src/main.rs"
-
 [dependencies]
-corvia-core = { path = "../corvia-core" }
-rmcp.workspace = true
-clap.workspace = true
+tantivy.workspace = true
+fastembed.workspace = true
+redb.workspace = true
+uuid.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
-opentelemetry-otlp.workspace = true
-tracing-opentelemetry.workspace = true
+futures-util.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-serde_json.workspace = true
