@@ -227,6 +227,13 @@ impl Config {
         Ok(())
     }
 
+    /// Load config from a discovered project root.
+    /// Looks for `.corvia/corvia.toml` relative to `base_dir`.
+    pub fn load_discovered(base_dir: &Path) -> Result<Self> {
+        let config_path = base_dir.join(".corvia").join("corvia.toml");
+        Self::load(&config_path)
+    }
+
     /// Path to the entries directory (`<data_dir>/entries`).
     pub fn entries_dir(&self) -> PathBuf {
         self.data_dir.join("entries")
@@ -329,6 +336,31 @@ rrf_k = 60
         assert_eq!(cfg.embedding.model, "nomic-embed-text-v1.5");
         assert_eq!(cfg.embedding.reranker_model, "jina-v1-turbo");
         assert!(cfg.embedding.model_path.is_none());
+    }
+
+    #[test]
+    fn load_discovered_from_corvia_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let corvia = dir.path().join(".corvia");
+        std::fs::create_dir_all(&corvia).unwrap();
+        std::fs::write(
+            corvia.join("corvia.toml"),
+            "[embedding]\nmodel = \"test-model\"\nreranker_model = \"test-reranker\"\n",
+        )
+        .unwrap();
+
+        let config = Config::load_discovered(dir.path()).unwrap();
+        assert_eq!(config.embedding.model, "test-model");
+    }
+
+    #[test]
+    fn load_discovered_missing_returns_defaults() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let corvia = dir.path().join(".corvia");
+        std::fs::create_dir_all(&corvia).unwrap();
+        // No corvia.toml — load should return defaults (NotFound -> Default)
+        let config = Config::load_discovered(dir.path()).unwrap();
+        assert_eq!(config.embedding.model, "nomic-embed-text-v1.5");
     }
 
     #[test]
