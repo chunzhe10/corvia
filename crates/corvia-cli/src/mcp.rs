@@ -606,54 +606,61 @@ async fn handle_tools_call_http(
             "corvia_search" => {
                 let p: SearchToolParams = serde_json::from_value(args)
                     .map_err(|e| anyhow::anyhow!("invalid search params: {e}"))?;
-                let redb = &state.handles.redb;
-                let tantivy = &state.handles.tantivy;
                 let kind = match &p.kind {
                     Some(k) => Some(k.parse::<Kind>().map_err(|e| anyhow::anyhow!(e))?),
                     None => None,
                 };
-                corvia_core::search::search_with_handles(
-                    &state.config,
-                    &state.base_dir,
-                    &state.embedder,
-                    &SearchParams {
-                        query: p.query,
-                        limit: p.limit,
-                        max_tokens: p.max_tokens,
-                        min_score: p.min_score,
-                        kind,
-                    },
-                    redb,
-                    tantivy,
-                )
-                .and_then(|r| {
-                    serde_json::to_value(&r)
-                        .map_err(|e| anyhow::anyhow!("serializing search response: {e}"))
+                let search_params = SearchParams {
+                    query: p.query,
+                    limit: p.limit,
+                    max_tokens: p.max_tokens,
+                    min_score: p.min_score,
+                    kind,
+                };
+                // search_with_handles is CPU-bound (embedding + reranker inference).
+                // Use block_in_place so we don't block the tokio worker thread.
+                tokio::task::block_in_place(|| {
+                    corvia_core::search::search_with_handles(
+                        &state.config,
+                        &state.base_dir,
+                        &state.embedder,
+                        &search_params,
+                        &state.handles.redb,
+                        &state.handles.tantivy,
+                    )
+                    .and_then(|r| {
+                        serde_json::to_value(&r)
+                            .map_err(|e| anyhow::anyhow!("serializing search response: {e}"))
+                    })
                 })
             }
             "corvia_write" => {
                 let p: WriteToolParams = serde_json::from_value(args)
                     .map_err(|e| anyhow::anyhow!("invalid write params: {e}"))?;
                 let kind = p.kind.parse::<Kind>().map_err(|e| anyhow::anyhow!(e))?;
+                let write_params = corvia_core::write::WriteParams {
+                    content: p.content,
+                    kind,
+                    tags: p.tags,
+                    supersedes: p.supersedes,
+                };
+                // Acquire write lock (async) before the blocking work.
                 let _lock = state.handles.write_lock.lock().await;
-                let redb = &state.handles.redb;
-                let tantivy = &state.handles.tantivy;
-                corvia_core::write::write_with_handles(
-                    &state.config,
-                    &state.base_dir,
-                    &state.embedder,
-                    corvia_core::write::WriteParams {
-                        content: p.content,
-                        kind,
-                        tags: p.tags,
-                        supersedes: p.supersedes,
-                    },
-                    redb,
-                    tantivy,
-                )
-                .and_then(|r| {
-                    serde_json::to_value(&r)
-                        .map_err(|e| anyhow::anyhow!("serializing write response: {e}"))
+                // write_with_handles is CPU-bound (embedding) + blocking I/O (redb, tantivy).
+                // Use block_in_place so we don't block the tokio worker thread.
+                tokio::task::block_in_place(|| {
+                    corvia_core::write::write_with_handles(
+                        &state.config,
+                        &state.base_dir,
+                        &state.embedder,
+                        write_params,
+                        &state.handles.redb,
+                        &state.handles.tantivy,
+                    )
+                    .and_then(|r| {
+                        serde_json::to_value(&r)
+                            .map_err(|e| anyhow::anyhow!("serializing write response: {e}"))
+                    })
                 })
             }
             "corvia_status" => handle_status_with_handles(
@@ -679,8 +686,9 @@ async fn handle_tools_call_http(
         Ok(value) => Ok(serde_json::json!({
             "content": [{ "type": "text", "text": value.to_string() }]
         })),
+        // Use {e} (not {e:#}) to avoid leaking internal filesystem paths in error chains.
         Err(e) => Ok(serde_json::json!({
-            "content": [{ "type": "text", "text": format!("Error: {e:#}") }],
+            "content": [{ "type": "text", "text": format!("Error: {e}") }],
             "isError": true,
         })),
     }
@@ -696,7 +704,11 @@ fn is_notification_request(req: &serde_json::Value) -> bool {
             .unwrap_or(false)
 }
 
-/// Axum handler for POST /mcp — MCP Streamable HTTP transport (2025-06-18 spec).
+/// Axum handler for POST /mcp — MCP Streamable HTTP transport.
+///
+/// Implements the single-endpoint POST pattern from the MCP spec.
+/// The `protocolVersion` in the initialize response is `"2024-11-05"` (the version
+/// of the MCP protocol, distinct from the Streamable HTTP transport spec revision).
 async fn mcp_post_handler(
     State(state): State<ServeState>,
     Json(req): Json<serde_json::Value>,
@@ -797,11 +809,23 @@ pub async fn serve_http(base_dir_arg: Option<&std::path::Path>, host: &str, port
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .with_state(state);
 
+    // Security note: no authentication is implemented (by design for localhost-only use).
+    // If binding to a non-loopback address, warn explicitly.
+    let is_loopback = host == "127.0.0.1" || host == "::1" || host == "localhost";
+    if !is_loopback {
+        eprintln!(
+            "WARNING: corvia serve is binding to {host} (not localhost). \
+             The MCP server has no authentication — any client on this network \
+             can read and write the knowledge store."
+        );
+    }
+
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("binding to {addr}"))?;
 
+    eprintln!("corvia HTTP MCP server ready at http://{addr}/mcp");
     info!("corvia HTTP MCP server listening on http://{addr}/mcp");
 
     axum::serve(listener, app)
