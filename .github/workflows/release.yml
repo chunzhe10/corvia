@@ -47,15 +47,12 @@ jobs:
             ${{ runner.os }}-cargo-registry-
 
       - name: Build release binaries
-        run: cargo build --release -p corvia-cli -p corvia-inference -p corvia-adapter-basic -p corvia-adapter-git
+        run: cargo build --release -p corvia
 
       - name: Prepare release assets
         run: |
           cp target/release/corvia corvia-cli-linux-amd64
-          cp target/release/corvia-inference corvia-inference-linux-amd64
-          cp target/release/corvia-adapter-basic corvia-adapter-basic-linux-amd64
-          cp target/release/corvia-adapter-git corvia-adapter-git-linux-amd64
-          chmod +x corvia-cli-linux-amd64 corvia-inference-linux-amd64 corvia-adapter-basic-linux-amd64 corvia-adapter-git-linux-amd64
+          chmod +x corvia-cli-linux-amd64
 
           # ORT execution provider shared libraries (cp -L resolves symlinks from ort cache)
           for lib in libonnxruntime_providers_shared libonnxruntime_providers_cuda libonnxruntime_providers_openvino; do
@@ -68,12 +65,8 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          fail_on_unmatched_files: false
           files: |
             corvia-cli-linux-amd64
-            corvia-inference-linux-amd64
-            corvia-adapter-basic-linux-amd64
-            corvia-adapter-git-linux-amd64
-            libonnxruntime_providers_shared-linux-amd64.so
-            libonnxruntime_providers_cuda-linux-amd64.so
-            libonnxruntime_providers_openvino-linux-amd64.so
+            libonnxruntime_providers_*-linux-amd64.so
           generate_release_notes: true
