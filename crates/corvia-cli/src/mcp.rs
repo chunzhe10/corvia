@@ -1,6 +1,7 @@
-//! Stdio MCP server exposing corvia_search, corvia_write, corvia_status, and corvia_traces tools.
+//! HTTP MCP server for corvia, built on axum. Exposes:
+//!   - `POST /mcp`    — JSON-RPC 2.0 MCP endpoint (corvia_search, corvia_write, corvia_status, corvia_traces)
+//!   - `GET /healthz` — deep health check; returns `{"ok":true,"entries":N}` or 503
 //!
-//! Uses the rmcp crate (JSON-RPC 2.0 over stdin/stdout) to serve the MCP protocol.
 //! The Embedder is created once at startup and shared across all tool calls.
 
 use std::path::{Path, PathBuf};
@@ -11,7 +12,7 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use rmcp::handler::server::ServerHandler;
@@ -513,6 +514,28 @@ fn handle_tools_list_http() -> serde_json::Value {
     serde_json::json!({ "tools": tools })
 }
 
+/// `GET /healthz` — deep health check. Queries the live index handles and returns
+/// `{"ok":true,"entries":N}` on success or `{"ok":false,"error":"..."}` with a 503
+/// if the index is unreadable.
+async fn healthz_handler(State(state): State<ServeState>) -> Response {
+    match handle_status_with_handles(
+        &state.config,
+        &state.base_dir,
+        &state.handles.redb,
+        &state.handles.tantivy,
+    ) {
+        Ok(status) => {
+            let entries = status["entry_count"].as_u64().unwrap_or(0);
+            (StatusCode::OK, Json(json!({"ok": true, "entries": entries}))).into_response()
+        }
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ok": false, "error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 /// Status handler using pre-opened index handles.
 fn handle_status_with_handles(
     config: &Config,
@@ -806,6 +829,7 @@ pub async fn serve_http(base_dir_arg: Option<&std::path::Path>, host: &str, port
 
     let app = Router::new()
         .route("/mcp", post(mcp_post_handler))
+        .route("/healthz", get(healthz_handler))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .with_state(state);
 
@@ -986,6 +1010,23 @@ mod http_tests {
         assert!(
             !is_notification_request(&non_notification),
             "initialize without id should not be identified as notification"
+        );
+    }
+
+    #[test]
+    fn healthz_core_logic_returns_entry_count_for_empty_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let redb = RedbIndex::open(&dir.path().join("store.redb")).unwrap();
+        let tantivy = TantivyIndex::open(&dir.path().join("tantivy")).unwrap();
+
+        let result = handle_status_with_handles(&config, dir.path(), &redb, &tantivy);
+        assert!(result.is_ok(), "handle_status_with_handles failed: {:?}", result);
+        let val = result.unwrap();
+        assert_eq!(
+            val["entry_count"].as_u64().unwrap_or(999),
+            0,
+            "expected 0 entries in a fresh index"
         );
     }
 }
