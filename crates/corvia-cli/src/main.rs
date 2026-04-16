@@ -85,6 +85,21 @@ enum Command {
     },
     /// Start stdio MCP server
     Mcp,
+    /// Initialize corvia in the current directory
+    Init {
+        /// Auto-accept all prompts
+        #[arg(long)]
+        yes: bool,
+        /// Force past version checks
+        #[arg(long)]
+        force: bool,
+        /// Path to pre-downloaded embedding models
+        #[arg(long)]
+        model_path: Option<std::path::PathBuf>,
+        /// Output format
+        #[arg(long, value_parser = ["text", "json"])]
+        format: Option<String>,
+    },
 }
 
 /// Resolve the project root and load config.
@@ -128,6 +143,9 @@ async fn main() {
         Command::Status => cmd_status(cli.base_dir.as_deref()),
         Command::Traces { limit, filter } => cmd_traces(cli.base_dir.as_deref(), limit, filter.as_deref()),
         Command::Mcp => mcp::run(cli.base_dir.as_deref()).await,
+        Command::Init { yes, force, model_path, format } => {
+            cmd_init(cli.base_dir, yes, force, model_path, format)
+        }
     };
 
     if let Err(e) = result {
@@ -401,6 +419,57 @@ fn cmd_traces(base_dir_arg: Option<&Path>, limit: usize, filter: Option<&str>) -
                 detail_parts.join(", ")
             );
         }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+
+fn cmd_init(
+    base_dir: Option<std::path::PathBuf>,
+    yes: bool,
+    force: bool,
+    model_path: Option<std::path::PathBuf>,
+    format: Option<String>,
+) -> anyhow::Result<()> {
+    use corvia_core::init::{self, InitOptions};
+
+    let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let opts = InitOptions {
+        yes: yes || !is_tty,
+        base_dir,
+        force,
+        model_path,
+    };
+
+    let result = init::run_init(&opts)?;
+
+    if format.as_deref() == Some("json") {
+        let json = serde_json::json!({
+            "status": "ok",
+            "created": result.created,
+            "config_migrated": result.config_migrated,
+            "version_updated": result.version_updated,
+            "actions": result.actions,
+        });
+        println!("{}", serde_json::to_string_pretty(&json)?);
+    } else {
+        if result.created {
+            println!("corvia initialized (.corvia/)");
+        } else {
+            println!("corvia health check");
+        }
+        for action in &result.actions {
+            println!("  {action}");
+        }
+        if result.actions.is_empty() {
+            println!("  all checks passed");
+        }
+        println!();
+        println!("Try: corvia search \"how does X work?\"");
     }
 
     Ok(())

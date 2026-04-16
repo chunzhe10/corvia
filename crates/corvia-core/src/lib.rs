@@ -15,3 +15,4 @@ pub mod ingest;
 pub mod search;
 pub mod trace;
 pub mod write;
+pub mod init;
