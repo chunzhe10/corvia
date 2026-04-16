@@ -170,41 +170,25 @@ fn deduplicate_by_entry(candidates: &mut Vec<(String, String, f32)>) {
 // Main search function
 // ---------------------------------------------------------------------------
 
-/// Run the hybrid search pipeline.
+/// Run the hybrid search pipeline with pre-opened index handles.
 ///
-/// Steps:
-/// 1. Open RedbIndex and TantivyIndex
-/// 2. Cold start check (no entries indexed)
-/// 3. Drift detection (entry_count vs actual files)
-/// 4. Oversample if kind filter is set
-/// 5. BM25 search via tantivy
-/// 6. Vector search via redb + cosine similarity
-/// 7. RRF fusion
-/// 8. Sort by fused score, take top reranker_candidates
-/// 9. Cross-encoder rerank
-/// 10. Apply min_score filter
-/// 11. Apply max_tokens budget
-/// 12. Build SearchResult for each
-/// 13. Compute quality signal
-#[tracing::instrument(name = "corvia.search", skip(config, base_dir, embedder, params), fields(
+/// Use this when the caller holds persistent index handles (e.g. the HTTP MCP server).
+/// For one-shot callers, use [`search`] which opens handles internally.
+#[tracing::instrument(name = "corvia.search", skip(config, base_dir, embedder, params, redb, tantivy), fields(
     query_len = params.query.len(),
     limit = params.limit,
     kind_filter = ?params.kind,
     result_count = tracing::field::Empty,
     confidence = tracing::field::Empty,
 ))]
-pub fn search(
+pub fn search_with_handles(
     config: &Config,
     base_dir: &Path,
     embedder: &Embedder,
     params: &SearchParams,
+    redb: &RedbIndex,
+    tantivy: &TantivyIndex,
 ) -> Result<SearchResponse> {
-    // Step 1: Open indexes.
-    let redb = RedbIndex::open(&base_dir.join(config.redb_path()))
-        .context("opening redb index for search")?;
-    let tantivy = TantivyIndex::open(&base_dir.join(config.tantivy_dir()))
-        .context("opening tantivy index for search")?;
-
     // Step 2: Cold start check.
     let indexed_count_str = redb
         .get_meta("entry_count")
@@ -247,7 +231,6 @@ pub fn search(
     } else {
         params.limit
     };
-    // Use at least reranker_candidates for retrieval to feed the reranker.
     let retrieval_limit = retrieval_limit.max(config.search.reranker_candidates);
 
     // Step 5: BM25 search.
@@ -274,18 +257,13 @@ pub fn search(
 
         let mut scored: Vec<(String, String, f32)> = Vec::new();
         for (chunk_id, vector) in &all_vectors {
-            // Look up entry_id for this chunk.
             let entry_id = match redb.chunk_entry_id(chunk_id)? {
                 Some(eid) => eid,
                 None => continue,
             };
-
-            // Skip superseded entries.
             if superseded_ids.contains(&entry_id) {
                 continue;
             }
-
-            // Apply kind filter at the vector search level if set.
             if let Some(ref kind_filter) = params.kind {
                 if let Ok(Some(chunk_kind_str)) = redb.get_chunk_kind(chunk_id) {
                     if let Ok(chunk_kind) = chunk_kind_str.parse::<Kind>() {
@@ -295,12 +273,9 @@ pub fn search(
                     }
                 }
             }
-
             let similarity = Embedder::cosine_similarity(&query_vector, vector);
             scored.push((chunk_id.clone(), entry_id, similarity));
         }
-
-        // Sort by descending similarity.
         scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(retrieval_limit);
         Span::current().record("result_count", scored.len());
@@ -317,7 +292,7 @@ pub fn search(
         result
     };
 
-    // Step 8: Sort by fused score, take top reranker_candidates.
+    // Step 8: Take top reranker_candidates.
     let reranker_count = config.search.reranker_candidates.min(fused.len());
     let top_candidates = &fused[..reranker_count];
 
@@ -325,7 +300,6 @@ pub fn search(
     let mut scored_results = {
         let _span = info_span!("corvia.search.rerank", input_count = top_candidates.len(), output_count = tracing::field::Empty).entered();
 
-        // Retrieve chunk text for each candidate from tantivy.
         let mut candidate_texts: Vec<String> = Vec::with_capacity(top_candidates.len());
         let mut candidate_chunk_ids: Vec<String> = Vec::with_capacity(top_candidates.len());
         let mut candidate_entry_ids: Vec<String> = Vec::with_capacity(top_candidates.len());
@@ -346,7 +320,6 @@ pub fn search(
             }
         }
 
-        // Build scored results: (chunk_id, entry_id, score, text).
         let mut results: Vec<(String, String, f32, String)>;
 
         if candidate_texts.is_empty() {
@@ -371,7 +344,6 @@ pub fn search(
                     }
                 }
                 Err(e) => {
-                    // If reranking fails, fall back to RRF scores.
                     warn!(error = %e, "reranker failed, falling back to RRF scores");
                     results = candidate_chunk_ids
                         .iter()
@@ -395,20 +367,18 @@ pub fn search(
         results
     };
 
-    // Deduplicate by entry_id (keep highest-scoring chunk per entry).
+    // Deduplicate by entry_id.
     {
         let mut dedup_input: Vec<(String, String, f32)> = scored_results
             .iter()
             .map(|(cid, eid, score, _)| (cid.clone(), eid.clone(), *score))
             .collect();
         deduplicate_by_entry(&mut dedup_input);
-
         let keep_chunks: std::collections::HashSet<String> =
             dedup_input.iter().map(|(cid, _, _)| cid.clone()).collect();
         scored_results.retain(|(cid, _, _, _)| keep_chunks.contains(cid));
     }
 
-    // Sort by score descending after dedup.
     scored_results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
     // Step 10: Apply min_score filter.
@@ -418,9 +388,6 @@ pub fn search(
     }
 
     // Step 11: Apply max_tokens budget.
-    // Token estimation: multiply word count by 1.33 to approximate subword tokens.
-    // English text averages ~1.33 tokens per whitespace-delimited word due to
-    // subword tokenization (e.g., "programming" -> "program" + "ming").
     if let Some(budget) = params.max_tokens {
         let mut token_count = 0usize;
         let mut keep_count = 0usize;
@@ -436,7 +403,6 @@ pub fn search(
         scored_results.truncate(keep_count);
     }
 
-    // Truncate to requested limit.
     scored_results.truncate(params.limit);
 
     // Step 12: Build SearchResult for each.
@@ -444,13 +410,11 @@ pub fn search(
 
     let mut results: Vec<SearchResult> = Vec::with_capacity(scored_results.len());
     for (chunk_id, entry_id, score, content) in scored_results {
-        // Look up kind from tantivy stored field.
         let kind = tantivy
             .get_chunk_kind(&chunk_id)
             .ok()
             .flatten()
             .unwrap_or_default();
-
         results.push(SearchResult {
             id: entry_id,
             kind,
@@ -463,19 +427,15 @@ pub fn search(
     let quality = {
         let _span = info_span!("corvia.search.quality", confidence = tracing::field::Empty, stale).entered();
         let mut q = compute_quality_signal(&final_scores, stale);
-
-        // Provide a suggestion when min_score filtering removed all candidates.
         if results.is_empty() && pre_min_score_count > 0 && params.min_score.is_some() {
             q.suggestion = Some(
                 "No results above minimum score threshold. Try lowering min_score or broadening your query.".to_string(),
             );
         }
-
         Span::current().record("confidence", tracing::field::debug(q.confidence));
         q
     };
 
-    // Record final metrics on the parent span.
     Span::current().record("result_count", results.len());
     Span::current().record("confidence", tracing::field::debug(quality.confidence));
 
@@ -486,6 +446,22 @@ pub fn search(
     );
 
     Ok(SearchResponse { results, quality })
+}
+
+/// Run the hybrid search pipeline, opening index handles internally.
+///
+/// For callers that hold persistent handles, use [`search_with_handles`] directly.
+pub fn search(
+    config: &Config,
+    base_dir: &Path,
+    embedder: &Embedder,
+    params: &SearchParams,
+) -> Result<SearchResponse> {
+    let redb = RedbIndex::open(&base_dir.join(config.redb_path()))
+        .context("opening redb index for search")?;
+    let tantivy = TantivyIndex::open(&base_dir.join(config.tantivy_dir()))
+        .context("opening tantivy index for search")?;
+    search_with_handles(config, base_dir, embedder, params, &redb, &tantivy)
 }
 
 // ---------------------------------------------------------------------------
@@ -656,5 +632,19 @@ mod tests {
                 .unwrap()
                 .contains("No entries indexed"),
         );
+    }
+
+    #[test]
+    fn search_with_handles_signature_exists() {
+        // Compile-time check: verify search_with_handles is public with the right signature.
+        let _fn: fn(
+            &Config,
+            &std::path::Path,
+            &crate::embed::Embedder,
+            &SearchParams,
+            &crate::index::RedbIndex,
+            &crate::tantivy_index::TantivyIndex,
+        ) -> anyhow::Result<crate::types::SearchResponse> = search_with_handles;
+        let _ = _fn;
     }
 }

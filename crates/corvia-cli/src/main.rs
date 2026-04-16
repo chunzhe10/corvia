@@ -89,6 +89,15 @@ enum Command {
         #[arg(long)]
         test: bool,
     },
+    /// Start HTTP MCP server (multi-client, persistent index handles)
+    Serve {
+        /// HTTP port to listen on
+        #[arg(long, default_value = "8020")]
+        port: u16,
+        /// Host address to bind to (localhost only by default)
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
     /// Initialize corvia in the current directory
     Init {
         /// Auto-accept all prompts
@@ -152,6 +161,9 @@ async fn main() {
             } else {
                 mcp::run(cli.base_dir.as_deref()).await
             }
+        }
+        Command::Serve { port, host } => {
+            mcp::serve_http(cli.base_dir.as_deref(), &host, port).await
         }
         Command::Init { yes, force, model_path, format } => {
             cmd_init(cli.base_dir, yes, force, model_path, format)

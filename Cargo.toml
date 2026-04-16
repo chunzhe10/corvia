@@ -18,6 +18,7 @@ uuid = { version = "1", features = ["v7"] }
 
 # MCP
 rmcp = { version = "0.1", features = ["server", "transport-io"] }
+axum = { version = "0.7", features = ["http1"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
