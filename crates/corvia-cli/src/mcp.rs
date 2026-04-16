@@ -685,6 +685,16 @@ async fn handle_tools_call_http(
     }
 }
 
+/// Returns true if the JSON-RPC request is a notification (no "id") targeting a notifications/ method.
+fn is_notification_request(req: &serde_json::Value) -> bool {
+    req.get("id").is_none()
+        && req
+            .get("method")
+            .and_then(|m| m.as_str())
+            .map(|m| m.starts_with("notifications/"))
+            .unwrap_or(false)
+}
+
 /// Axum handler for POST /mcp — MCP Streamable HTTP transport (2025-06-18 spec).
 async fn mcp_post_handler(
     State(state): State<ServeState>,
@@ -698,7 +708,7 @@ async fn mcp_post_handler(
         .unwrap_or(serde_json::Value::Object(Default::default()));
 
     // Notifications have no id and expect no response body.
-    if id.is_none() && method.starts_with("notifications/") {
+    if is_notification_request(&req) {
         return StatusCode::ACCEPTED.into_response();
     }
 
@@ -917,14 +927,39 @@ mod http_tests {
     }
 
     #[test]
-    fn notification_has_no_id_field() {
-        // Notifications: the client sends messages without an "id".
-        // We verify our parsing logic correctly identifies them.
-        let msg = serde_json::json!({
+    fn notification_detection_identifies_notifications_correctly() {
+        // Verify the notification detection helper correctly identifies notification requests.
+        let notification = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "notifications/initialized",
             "params": {}
         });
-        assert!(msg.get("id").is_none(), "notifications must not have id");
+        assert!(
+            is_notification_request(&notification),
+            "notifications/initialized without id should be identified as notification"
+        );
+
+        // Regular requests with an id are NOT notifications.
+        let regular_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "notifications/initialized",
+            "params": {}
+        });
+        assert!(
+            !is_notification_request(&regular_request),
+            "request with id should not be identified as notification"
+        );
+
+        // Non-notifications/ methods without id are also NOT notifications.
+        let non_notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "initialize",
+            "params": {}
+        });
+        assert!(
+            !is_notification_request(&non_notification),
+            "initialize without id should not be identified as notification"
+        );
     }
 }
