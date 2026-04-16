@@ -1,7 +1,7 @@
 mod mcp;
 mod telemetry;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{Parser, Subcommand};
@@ -22,6 +22,10 @@ struct Cli {
     /// Can also be set via OTEL_EXPORTER_OTLP_ENDPOINT env var.
     #[arg(long, global = true)]
     otlp_endpoint: Option<String>,
+
+    /// Project root directory (default: auto-discover by walking up to find .corvia/)
+    #[arg(long, global = true)]
+    base_dir: Option<std::path::PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -83,6 +87,14 @@ enum Command {
     Mcp,
 }
 
+/// Resolve the project root and load config.
+/// Used by all commands except `Init` (which creates .corvia/).
+fn load_config(base_dir_arg: Option<&Path>) -> anyhow::Result<(PathBuf, Config)> {
+    let base_dir = corvia_core::discover::resolve_base_dir(base_dir_arg)?;
+    let config = Config::load_discovered(&base_dir)?;
+    Ok((base_dir, config))
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -100,22 +112,22 @@ async fn main() {
             path,
             fresh,
             model_path,
-        } => cmd_ingest(path.as_deref(), fresh, model_path),
+        } => cmd_ingest(cli.base_dir.as_deref(), path.as_deref(), fresh, model_path),
         Command::Search {
             query,
             limit,
             kind,
             max_tokens,
-        } => cmd_search(&query, limit, kind.as_deref(), max_tokens),
+        } => cmd_search(cli.base_dir.as_deref(), &query, limit, kind.as_deref(), max_tokens),
         Command::Write {
             content,
             kind,
             tags,
             supersedes,
-        } => cmd_write(&content, &kind, tags.as_deref(), supersedes.as_deref()),
-        Command::Status => cmd_status(),
-        Command::Traces { limit, filter } => cmd_traces(limit, filter.as_deref()),
-        Command::Mcp => mcp::run().await,
+        } => cmd_write(cli.base_dir.as_deref(), &content, &kind, tags.as_deref(), supersedes.as_deref()),
+        Command::Status => cmd_status(cli.base_dir.as_deref()),
+        Command::Traces { limit, filter } => cmd_traces(cli.base_dir.as_deref(), limit, filter.as_deref()),
+        Command::Mcp => mcp::run(cli.base_dir.as_deref()).await,
     };
 
     if let Err(e) = result {
@@ -129,19 +141,20 @@ async fn main() {
 // ---------------------------------------------------------------------------
 
 fn cmd_ingest(
+    base_dir_arg: Option<&Path>,
     path: Option<&Path>,
     fresh: bool,
     model_path: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    let mut config = Config::load(Path::new("corvia.toml"))?;
-    let base_dir = path.unwrap_or(Path::new("."));
+    let (base_dir, mut config) = load_config(base_dir_arg)?;
 
     // Override model_path from CLI flag if provided.
     if let Some(mp) = model_path {
         config.embedding.model_path = Some(mp);
     }
 
-    let result = corvia_core::ingest::ingest(&config, base_dir, fresh)?;
+    let ingest_path = path.unwrap_or(&base_dir);
+    let result = corvia_core::ingest::ingest(&config, ingest_path, fresh)?;
 
     println!(
         "Ingested {} entries ({} chunks). Superseded: {}. Skipped: {}.",
@@ -165,13 +178,13 @@ fn cmd_ingest(
 // ---------------------------------------------------------------------------
 
 fn cmd_search(
+    base_dir_arg: Option<&Path>,
     query: &str,
     limit: usize,
     kind: Option<&str>,
     max_tokens: Option<usize>,
 ) -> anyhow::Result<()> {
-    let config = Config::load(Path::new("corvia.toml"))?;
-    let base_dir = Path::new(".");
+    let (base_dir, config) = load_config(base_dir_arg)?;
 
     let cache_dir = config.embedding.model_path.as_deref();
     let embedder = Embedder::new(cache_dir, &config.embedding.model, &config.embedding.reranker_model)?;
@@ -192,7 +205,7 @@ fn cmd_search(
         kind: kind_filter,
     };
 
-    let response = corvia_core::search::search(&config, base_dir, &embedder, &params)?;
+    let response = corvia_core::search::search(&config, &base_dir, &embedder, &params)?;
 
     for result in &response.results {
         println!("[{:.3}] ({}) {}", result.score, result.kind, result.id);
@@ -213,13 +226,13 @@ fn cmd_search(
 // ---------------------------------------------------------------------------
 
 fn cmd_write(
+    base_dir_arg: Option<&Path>,
     content: &str,
     kind: &str,
     tags: Option<&str>,
     supersedes: Option<&str>,
 ) -> anyhow::Result<()> {
-    let config = Config::load(Path::new("corvia.toml"))?;
-    let base_dir = Path::new(".");
+    let (base_dir, config) = load_config(base_dir_arg)?;
 
     let cache_dir = config.embedding.model_path.as_deref();
     let embedder = Embedder::new(cache_dir, &config.embedding.model, &config.embedding.reranker_model)?;
@@ -245,7 +258,7 @@ fn cmd_write(
         supersedes,
     };
 
-    let response = corvia_core::write::write(&config, base_dir, &embedder, params)?;
+    let response = corvia_core::write::write(&config, &base_dir, &embedder, params)?;
 
     println!("Entry {} {}.", response.id, response.action);
 
@@ -264,9 +277,8 @@ fn cmd_write(
 // Status
 // ---------------------------------------------------------------------------
 
-fn cmd_status() -> anyhow::Result<()> {
-    let config = Config::load(Path::new("corvia.toml"))?;
-    let base_dir = Path::new(".");
+fn cmd_status(base_dir_arg: Option<&Path>) -> anyhow::Result<()> {
+    let (base_dir, config) = load_config(base_dir_arg)?;
 
     let redb_path = base_dir.join(config.redb_path());
     let tantivy_dir = base_dir.join(config.tantivy_dir());
@@ -352,9 +364,8 @@ fn cmd_status() -> anyhow::Result<()> {
 // Traces
 // ---------------------------------------------------------------------------
 
-fn cmd_traces(limit: usize, filter: Option<&str>) -> anyhow::Result<()> {
-    let config = Config::load(Path::new("corvia.toml"))?;
-    let base_dir = Path::new(".");
+fn cmd_traces(base_dir_arg: Option<&Path>, limit: usize, filter: Option<&str>) -> anyhow::Result<()> {
+    let (base_dir, config) = load_config(base_dir_arg)?;
     let trace_path = base_dir.join(&config.data_dir).join("traces.jsonl");
 
     let mut traces = corvia_core::trace::read_recent_traces(&trace_path, limit);

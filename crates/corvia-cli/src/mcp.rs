@@ -463,11 +463,11 @@ impl ServerHandler for CorviaServer {
 ///
 /// Loads config, creates the Embedder (expensive -- model loading), then starts
 /// the rmcp server loop on stdin/stdout. Blocks until the client disconnects.
-pub async fn run() -> Result<()> {
-    let base_dir = PathBuf::from(".");
+pub async fn run(base_dir_arg: Option<&Path>) -> Result<()> {
+    let base_dir = corvia_core::discover::resolve_base_dir(base_dir_arg)?;
 
-    // Load config (corvia.toml in cwd, or defaults).
-    let config = Config::load(&base_dir.join("corvia.toml"))
+    // Load config via project root discovery.
+    let config = Config::load_discovered(&base_dir)
         .context("loading config")?;
 
     // Create embedder once (downloads models on first run).
