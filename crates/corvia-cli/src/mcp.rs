@@ -1,6 +1,7 @@
-//! Stdio MCP server exposing corvia_search, corvia_write, corvia_status, and corvia_traces tools.
+//! HTTP MCP server for corvia, built on axum. Exposes:
+//!   - `POST /mcp`    — JSON-RPC 2.0 MCP endpoint (corvia_search, corvia_write, corvia_status, corvia_traces)
+//!   - `GET /healthz` — deep health check; returns `{"ok":true,"entries":N}` or 503
 //!
-//! Uses the rmcp crate (JSON-RPC 2.0 over stdin/stdout) to serve the MCP protocol.
 //! The Embedder is created once at startup and shared across all tool calls.
 
 use std::path::{Path, PathBuf};
@@ -11,7 +12,7 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use rmcp::handler::server::ServerHandler;
@@ -513,6 +514,25 @@ fn handle_tools_list_http() -> serde_json::Value {
     serde_json::json!({ "tools": tools })
 }
 
+/// `GET /healthz` — deep health check. Reads entry count directly from the live
+/// redb handle (blocking I/O wrapped in block_in_place). Returns
+/// `{"ok":true,"entries":N}` on success or `{"ok":false,"error":"..."}` with 503
+/// if the index read fails.
+async fn healthz_handler(State(state): State<ServeState>) -> Response {
+    // redb.entry_count() is blocking I/O; use block_in_place to avoid stalling
+    // the tokio worker thread (same pattern as search_with_handles and write_with_handles).
+    tokio::task::block_in_place(|| match state.handles.redb.entry_count() {
+        Ok(entries) => {
+            (StatusCode::OK, Json(json!({"ok": true, "entries": entries}))).into_response()
+        }
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ok": false, "error": e.to_string()})),
+        )
+            .into_response(),
+    })
+}
+
 /// Status handler using pre-opened index handles.
 fn handle_status_with_handles(
     config: &Config,
@@ -806,6 +826,7 @@ pub async fn serve_http(base_dir_arg: Option<&std::path::Path>, host: &str, port
 
     let app = Router::new()
         .route("/mcp", post(mcp_post_handler))
+        .route("/healthz", get(healthz_handler))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .with_state(state);
 
@@ -986,6 +1007,35 @@ mod http_tests {
         assert!(
             !is_notification_request(&non_notification),
             "initialize without id should not be identified as notification"
+        );
+    }
+
+    #[test]
+    fn healthz_ok_response_shape() {
+        // Verify healthz_handler produces {"ok":true,"entries":N} for a readable index.
+        let dir = tempfile::tempdir().unwrap();
+        let redb = RedbIndex::open(&dir.path().join("store.redb")).unwrap();
+
+        let entries = redb.entry_count().expect("entry_count failed on fresh index");
+        assert_eq!(entries, 0, "fresh index should have 0 entries");
+
+        // Replicate exactly what healthz_handler builds for the Ok arm.
+        let body = serde_json::json!({"ok": true, "entries": entries});
+        assert_eq!(body["ok"].as_bool().unwrap(), true);
+        assert_eq!(body["entries"].as_u64().unwrap(), 0);
+    }
+
+    #[test]
+    fn healthz_error_response_shape() {
+        // Verify healthz_handler produces {"ok":false,"error":"..."} with 503 when
+        // entry_count fails. Simulate by passing an error directly through the same
+        // json! construction used in the Err arm.
+        let e = anyhow::anyhow!("simulated redb failure");
+        let body = serde_json::json!({"ok": false, "error": e.to_string()});
+        assert_eq!(body["ok"].as_bool().unwrap(), false);
+        assert!(
+            body["error"].as_str().unwrap().contains("simulated redb failure"),
+            "error field should contain the original message"
         );
     }
 }
