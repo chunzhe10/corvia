@@ -54,6 +54,14 @@ fn encode_stage_scores(chunk_ids: &[String], scores: &[f32]) -> (String, String)
     (ids, sc)
 }
 
+/// Record `chunk_ids` and `scores` as JSON-string attrs on the given span.
+/// Both fields must have been declared on the `info_span!` with `tracing::field::Empty`.
+fn record_stage_scores(span: &tracing::Span, chunk_ids: &[String], scores: &[f32]) {
+    let (ids_json, scores_json) = encode_stage_scores(chunk_ids, scores);
+    span.record("chunk_ids", ids_json.as_str());
+    span.record("scores", scores_json.as_str());
+}
+
 // ---------------------------------------------------------------------------
 // RRF fusion
 // ---------------------------------------------------------------------------
@@ -255,18 +263,37 @@ pub fn search_with_handles(
 
     // Step 5: BM25 search.
     let bm25_results = {
-        let _span = info_span!("corvia.search.bm25", query = %params.query, result_count = tracing::field::Empty).entered();
+        let _span = info_span!(
+            "corvia.search.bm25",
+            result_count = tracing::field::Empty,
+            chunk_ids = tracing::field::Empty,
+            scores = tracing::field::Empty,
+        )
+        .entered();
         let results = tantivy
             .search(&params.query, params.kind, retrieval_limit)
             .context("BM25 search")?;
         Span::current().record("result_count", results.len());
+
+        // Record chunk_ids + BM25 raw scores for eval mining.
+        let ids: Vec<String> = results.iter().map(|(cid, _, _)| cid.clone()).collect();
+        let scores: Vec<f32> = results.iter().map(|(_, _, s)| *s).collect();
+        record_stage_scores(&Span::current(), &ids, &scores);
+
         debug!(count = results.len(), "BM25 results");
         results
     };
 
     // Step 6: Vector search.
     let vector_scored = {
-        let _span = info_span!("corvia.search.vector", vector_count = tracing::field::Empty, result_count = tracing::field::Empty).entered();
+        let _span = info_span!(
+            "corvia.search.vector",
+            vector_count = tracing::field::Empty,
+            result_count = tracing::field::Empty,
+            chunk_ids = tracing::field::Empty,
+            scores = tracing::field::Empty,
+        )
+        .entered();
         let query_vector = embedder
             .embed(&params.query)
             .context("embedding search query")?;
@@ -299,15 +326,33 @@ pub fn search_with_handles(
         scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(retrieval_limit);
         Span::current().record("result_count", scored.len());
+
+        // Record chunk_ids + cosine scores for eval mining.
+        let ids: Vec<String> = scored.iter().map(|(cid, _, _)| cid.clone()).collect();
+        let scores_vec: Vec<f32> = scored.iter().map(|(_, _, s)| *s).collect();
+        record_stage_scores(&Span::current(), &ids, &scores_vec);
+
         debug!(count = scored.len(), "vector results");
         scored
     };
 
     // Step 7: RRF fusion.
     let fused = {
-        let _span = info_span!("corvia.search.fusion", candidate_count = tracing::field::Empty).entered();
+        let _span = info_span!(
+            "corvia.search.fusion",
+            candidate_count = tracing::field::Empty,
+            chunk_ids = tracing::field::Empty,
+            scores = tracing::field::Empty,
+        )
+        .entered();
         let result = rrf_fusion(&bm25_results, &vector_scored, config.search.rrf_k);
         Span::current().record("candidate_count", result.len());
+
+        // Record chunk_ids + RRF scores (f64 → f32) for eval mining.
+        let ids: Vec<String> = result.iter().map(|c| c.chunk_id.clone()).collect();
+        let scores_vec: Vec<f32> = result.iter().map(|c| c.rrf_score as f32).collect();
+        record_stage_scores(&Span::current(), &ids, &scores_vec);
+
         debug!(count = result.len(), "fused candidates");
         result
     };
@@ -318,7 +363,14 @@ pub fn search_with_handles(
 
     // Step 9: Cross-encoder rerank.
     let mut scored_results = {
-        let _span = info_span!("corvia.search.rerank", input_count = top_candidates.len(), output_count = tracing::field::Empty).entered();
+        let _span = info_span!(
+            "corvia.search.rerank",
+            input_count = top_candidates.len(),
+            output_count = tracing::field::Empty,
+            chunk_ids = tracing::field::Empty,
+            scores = tracing::field::Empty,
+        )
+        .entered();
 
         let mut candidate_texts: Vec<String> = Vec::with_capacity(top_candidates.len());
         let mut candidate_chunk_ids: Vec<String> = Vec::with_capacity(top_candidates.len());
@@ -382,6 +434,11 @@ pub fn search_with_handles(
                 }
             }
         }
+
+        // Record chunk_ids + reranker (or RRF-fallback) scores for eval mining.
+        let ids: Vec<String> = results.iter().map(|(cid, _, _, _)| cid.clone()).collect();
+        let rerank_scores: Vec<f32> = results.iter().map(|(_, _, s, _)| *s).collect();
+        record_stage_scores(&Span::current(), &ids, &rerank_scores);
 
         Span::current().record("output_count", results.len());
         results
