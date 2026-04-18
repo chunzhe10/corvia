@@ -99,7 +99,10 @@ pub struct Chunk {
 /// A single search result returned by the retrieval pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
+    /// Entry ID (UUIDv7) of the source entry.
     pub id: String,
+    /// Chunk ID of the specific chunk retrieved from the entry. Format `<entry_id>:<chunk_index>`.
+    pub chunk_id: String,
     pub kind: Kind,
     pub score: f32,
     pub content: String,
@@ -265,5 +268,18 @@ mod tests {
             "empty supersedes should be skipped"
         );
         assert!(!json_empty.contains("tags"), "empty tags should be skipped");
+    }
+
+    #[test]
+    fn search_result_carries_chunk_id() {
+        let r = SearchResult {
+            id: "entry-1".to_string(),
+            chunk_id: "entry-1:3".to_string(),
+            kind: Kind::Learning,
+            score: 0.5,
+            content: "body".to_string(),
+        };
+        assert_eq!(r.chunk_id, "entry-1:3");
+        assert_eq!(r.id, "entry-1");
     }
 }

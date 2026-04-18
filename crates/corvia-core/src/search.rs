@@ -417,6 +417,7 @@ pub fn search_with_handles(
             .unwrap_or_default();
         results.push(SearchResult {
             id: entry_id,
+            chunk_id,
             kind,
             score,
             content,
