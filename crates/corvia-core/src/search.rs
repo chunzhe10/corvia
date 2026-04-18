@@ -190,10 +190,12 @@ fn deduplicate_by_entry(candidates: &mut Vec<(String, String, f32)>) {
 /// Use this when the caller holds persistent index handles (e.g. the HTTP MCP server).
 /// For one-shot callers, use [`search`] which opens handles internally.
 #[tracing::instrument(name = "corvia.search", skip(config, base_dir, embedder, params, redb, tantivy), fields(
+    query = tracing::field::Empty,
     query_len = params.query.len(),
     limit = params.limit,
     kind_filter = ?params.kind,
     result_count = tracing::field::Empty,
+    result_chunk_ids = tracing::field::Empty,
     confidence = tracing::field::Empty,
 ))]
 pub fn search_with_handles(
@@ -204,6 +206,9 @@ pub fn search_with_handles(
     redb: &RedbIndex,
     tantivy: &TantivyIndex,
 ) -> Result<SearchResponse> {
+    // Record raw query for eval mining. Design RFC §4.2: no redaction toggle —
+    // corvia is single-user local; raw query is the eval join key.
+    Span::current().record("query", params.query.as_str());
     // Step 2: Cold start check.
     let indexed_count_str = redb
         .get_meta("entry_count")
