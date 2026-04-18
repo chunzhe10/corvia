@@ -49,9 +49,30 @@ struct FusedCandidate {
 /// Returns `("[]", "[]")` on any (impossible-for-these-types) serde error
 /// so that attr presence is preserved even in unreachable edge cases.
 fn encode_stage_scores(chunk_ids: &[String], scores: &[f32]) -> (String, String) {
-    let ids = serde_json::to_string(chunk_ids).unwrap_or_else(|_| "[]".to_string());
-    let sc = serde_json::to_string(scores).unwrap_or_else(|_| "[]".to_string());
+    let ids = serde_json::to_string(chunk_ids).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "encode_stage_scores: chunk_ids serialization failed");
+        "[]".to_string()
+    });
+    let sc = serde_json::to_string(scores).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "encode_stage_scores: scores serialization failed");
+        "[]".to_string()
+    });
     (ids, sc)
+}
+
+/// Truncate a query string to at most `max_bytes` bytes, respecting UTF-8 char boundaries.
+///
+/// Used to bound the `query` trace attribute and prevent pathological inputs from
+/// pushing the trace file past the rotation threshold.
+pub(crate) fn truncate_query(query: &str, max_bytes: usize) -> &str {
+    if query.len() <= max_bytes {
+        return query;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !query.is_char_boundary(end) {
+        end -= 1;
+    }
+    &query[..end]
 }
 
 /// Record `chunk_ids` and `scores` as JSON-string attrs on the current span.
@@ -214,9 +235,11 @@ pub fn search_with_handles(
     redb: &RedbIndex,
     tantivy: &TantivyIndex,
 ) -> Result<SearchResponse> {
-    // Record raw query for eval mining. Design RFC §4.2: no redaction toggle —
-    // corvia is single-user local; raw query is the eval join key.
-    Span::current().record("query", params.query.as_str());
+    // Record raw query for eval mining (bounded to prevent pathological inputs from
+    // pushing the trace file past rotation threshold). Design RFC §4.2: no redaction
+    // toggle — corvia is single-user local; raw query is the eval join key.
+    const MAX_QUERY_TRACE_BYTES: usize = 4096;
+    Span::current().record("query", truncate_query(&params.query, MAX_QUERY_TRACE_BYTES));
     // Step 2: Cold start check.
     let indexed_count_str = redb
         .get_meta("entry_count")
@@ -518,8 +541,10 @@ pub fn search_with_handles(
     };
 
     // Record final (post-truncation) chunk_ids for downstream eval join.
-    let result_chunk_ids_json =
-        serde_json::to_string(&final_chunk_ids).unwrap_or_else(|_| "[]".to_string());
+    let result_chunk_ids_json = serde_json::to_string(&final_chunk_ids).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "result_chunk_ids serialization failed");
+        "[]".to_string()
+    });
     Span::current().record("result_chunk_ids", result_chunk_ids_json.as_str());
 
     Span::current().record("result_count", results.len());
@@ -732,6 +757,32 @@ mod tests {
             &crate::tantivy_index::TantivyIndex,
         ) -> anyhow::Result<crate::types::SearchResponse> = search_with_handles;
         let _ = _fn;
+    }
+
+    #[test]
+    fn records_query_truncates_large_input() {
+        // Short string — returned as-is.
+        assert_eq!(truncate_query("hello", 4096), "hello");
+
+        // Exactly at boundary — returned as-is.
+        let at_limit = "a".repeat(4096);
+        assert_eq!(truncate_query(&at_limit, 4096), at_limit);
+
+        // One byte over — truncated to 4096.
+        let over = "a".repeat(4097);
+        let truncated = truncate_query(&over, 4096);
+        assert_eq!(truncated.len(), 4096);
+
+        // Multi-byte UTF-8 char split: 4096 bytes of ASCII + a 3-byte char.
+        // The truncation must land on a char boundary (at 4096, not in the middle of the char).
+        let mut mixed = "a".repeat(4096);
+        mixed.push('€'); // U+20AC = 3 bytes (0xE2 0x82 0xAC)
+        let truncated = truncate_query(&mixed, 4096);
+        assert_eq!(truncated.len(), 4096, "should truncate at the 4096 byte boundary");
+        assert!(mixed.is_char_boundary(truncated.len()), "truncation must land on char boundary");
+
+        // Empty string.
+        assert_eq!(truncate_query("", 4096), "");
     }
 
     #[test]
