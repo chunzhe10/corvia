@@ -39,6 +39,21 @@ struct FusedCandidate {
     rrf_score: f64,
 }
 
+/// Encode parallel `chunk_ids` and `scores` arrays as JSON strings.
+///
+/// The OTLP file exporter serializes `opentelemetry::Value::Array` via debug
+/// formatting (`trace.rs:72`), producing strings that are not machine-parseable.
+/// Encoding as JSON strings and recording them as `stringValue` attrs lets
+/// downstream consumers parse via `json::parse` cleanly.
+///
+/// Returns `("[]", "[]")` on any (impossible-for-these-types) serde error
+/// so that attr presence is preserved even in unreachable edge cases.
+fn encode_stage_scores(chunk_ids: &[String], scores: &[f32]) -> (String, String) {
+    let ids = serde_json::to_string(chunk_ids).unwrap_or_else(|_| "[]".to_string());
+    let sc = serde_json::to_string(scores).unwrap_or_else(|_| "[]".to_string());
+    (ids, sc)
+}
+
 // ---------------------------------------------------------------------------
 // RRF fusion
 // ---------------------------------------------------------------------------
@@ -647,5 +662,30 @@ mod tests {
             &crate::tantivy_index::TantivyIndex,
         ) -> anyhow::Result<crate::types::SearchResponse> = search_with_handles;
         let _ = _fn;
+    }
+
+    #[test]
+    fn encode_stage_scores_empty() {
+        let (ids, scores) = encode_stage_scores(&[], &[]);
+        assert_eq!(ids, "[]");
+        assert_eq!(scores, "[]");
+    }
+
+    #[test]
+    fn encode_stage_scores_parallel_arrays() {
+        let chunk_ids = vec!["a:0".to_string(), "b:1".to_string(), "c:2".to_string()];
+        let scores = vec![0.9f32, 0.5, 0.1];
+        let (ids_json, scores_json) = encode_stage_scores(&chunk_ids, &scores);
+        assert_eq!(ids_json, r#"["a:0","b:1","c:2"]"#);
+        assert_eq!(scores_json, "[0.9,0.5,0.1]");
+    }
+
+    #[test]
+    fn encode_stage_scores_length_mismatch_still_encodes_both() {
+        let chunk_ids = vec!["a".to_string()];
+        let scores = vec![0.1f32, 0.2, 0.3];
+        let (ids_json, scores_json) = encode_stage_scores(&chunk_ids, &scores);
+        assert_eq!(ids_json, r#"["a"]"#);
+        assert_eq!(scores_json, "[0.1,0.2,0.3]");
     }
 }
