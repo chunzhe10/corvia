@@ -54,12 +54,12 @@ fn encode_stage_scores(chunk_ids: &[String], scores: &[f32]) -> (String, String)
     (ids, sc)
 }
 
-/// Record `chunk_ids` and `scores` as JSON-string attrs on the given span.
+/// Record `chunk_ids` and `scores` as JSON-string attrs on the current span.
 /// Both fields must have been declared on the `info_span!` with `tracing::field::Empty`.
-fn record_stage_scores(span: &tracing::Span, chunk_ids: &[String], scores: &[f32]) {
+fn record_stage_scores(chunk_ids: &[String], scores: &[f32]) {
     let (ids_json, scores_json) = encode_stage_scores(chunk_ids, scores);
-    span.record("chunk_ids", ids_json.as_str());
-    span.record("scores", scores_json.as_str());
+    Span::current().record("chunk_ids", ids_json.as_str());
+    Span::current().record("scores", scores_json.as_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -276,9 +276,9 @@ pub fn search_with_handles(
         Span::current().record("result_count", results.len());
 
         // Record chunk_ids + BM25 raw scores for eval mining.
-        let ids: Vec<String> = results.iter().map(|(cid, _, _)| cid.clone()).collect();
-        let scores_vec: Vec<f32> = results.iter().map(|(_, _, s)| *s).collect();
-        record_stage_scores(&Span::current(), &ids, &scores_vec);
+        let (ids, scores_vec): (Vec<String>, Vec<f32>) =
+            results.iter().map(|(cid, _, s)| (cid.clone(), *s)).unzip();
+        record_stage_scores(&ids, &scores_vec);
 
         debug!(count = results.len(), "BM25 results");
         results
@@ -328,9 +328,9 @@ pub fn search_with_handles(
         Span::current().record("result_count", scored.len());
 
         // Record chunk_ids + cosine scores for eval mining.
-        let ids: Vec<String> = scored.iter().map(|(cid, _, _)| cid.clone()).collect();
-        let scores_vec: Vec<f32> = scored.iter().map(|(_, _, s)| *s).collect();
-        record_stage_scores(&Span::current(), &ids, &scores_vec);
+        let (ids, scores_vec): (Vec<String>, Vec<f32>) =
+            scored.iter().map(|(cid, _, s)| (cid.clone(), *s)).unzip();
+        record_stage_scores(&ids, &scores_vec);
 
         debug!(count = scored.len(), "vector results");
         scored
@@ -348,10 +348,11 @@ pub fn search_with_handles(
         let result = rrf_fusion(&bm25_results, &vector_scored, config.search.rrf_k);
         Span::current().record("candidate_count", result.len());
 
-        // Record chunk_ids + RRF scores (f64 → f32) for eval mining.
-        let ids: Vec<String> = result.iter().map(|c| c.chunk_id.clone()).collect();
-        let scores_vec: Vec<f32> = result.iter().map(|c| c.rrf_score as f32).collect();
-        record_stage_scores(&Span::current(), &ids, &scores_vec);
+        // Record chunk_ids + RRF scores for eval mining.
+        // f64 → f32: RRF scores are bounded well within f32 range; truncation is intentional for telemetry only.
+        let (ids, scores_vec): (Vec<String>, Vec<f32>) =
+            result.iter().map(|c| (c.chunk_id.clone(), c.rrf_score as f32)).unzip();
+        record_stage_scores(&ids, &scores_vec);
 
         debug!(count = result.len(), "fused candidates");
         result
@@ -436,9 +437,9 @@ pub fn search_with_handles(
         }
 
         // Record chunk_ids + reranker (or RRF-fallback) scores for eval mining.
-        let ids: Vec<String> = results.iter().map(|(cid, _, _, _)| cid.clone()).collect();
-        let scores_vec: Vec<f32> = results.iter().map(|(_, _, s, _)| *s).collect();
-        record_stage_scores(&Span::current(), &ids, &scores_vec);
+        let (ids, scores_vec): (Vec<String>, Vec<f32>) =
+            results.iter().map(|(cid, _, s, _)| (cid.clone(), *s)).unzip();
+        record_stage_scores(&ids, &scores_vec);
 
         Span::current().record("output_count", results.len());
         results
