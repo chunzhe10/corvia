@@ -277,8 +277,8 @@ pub fn search_with_handles(
 
         // Record chunk_ids + BM25 raw scores for eval mining.
         let ids: Vec<String> = results.iter().map(|(cid, _, _)| cid.clone()).collect();
-        let scores: Vec<f32> = results.iter().map(|(_, _, s)| *s).collect();
-        record_stage_scores(&Span::current(), &ids, &scores);
+        let scores_vec: Vec<f32> = results.iter().map(|(_, _, s)| *s).collect();
+        record_stage_scores(&Span::current(), &ids, &scores_vec);
 
         debug!(count = results.len(), "BM25 results");
         results
@@ -437,8 +437,8 @@ pub fn search_with_handles(
 
         // Record chunk_ids + reranker (or RRF-fallback) scores for eval mining.
         let ids: Vec<String> = results.iter().map(|(cid, _, _, _)| cid.clone()).collect();
-        let rerank_scores: Vec<f32> = results.iter().map(|(_, _, s, _)| *s).collect();
-        record_stage_scores(&Span::current(), &ids, &rerank_scores);
+        let scores_vec: Vec<f32> = results.iter().map(|(_, _, s, _)| *s).collect();
+        record_stage_scores(&Span::current(), &ids, &scores_vec);
 
         Span::current().record("output_count", results.len());
         results
