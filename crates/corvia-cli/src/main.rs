@@ -248,7 +248,7 @@ fn cmd_search(
     let response = corvia_core::search::search(&config, &base_dir, &embedder, &params)?;
 
     for result in &response.results {
-        println!("[{:.3}] ({}) {}", result.score, result.kind, result.id);
+        println!("[{:.3}] ({}) {} (chunk: {})", result.score, result.kind, result.id, result.chunk_id);
         println!("{}", result.content);
         println!();
     }
