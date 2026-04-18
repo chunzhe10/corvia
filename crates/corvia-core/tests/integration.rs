@@ -771,6 +771,132 @@ fn status_shows_correct_counts() {
 }
 
 // ---------------------------------------------------------------------------
+// Telemetry: #123 [eval 1/7]
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore] // requires embedding model + writes a tempfile
+fn search_emits_eval_telemetry_attributes() {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
+    use tracing_subscriber::layer::SubscriberExt;
+    use corvia_core::trace::{read_recent_traces, OtlpFileExporter};
+
+    let h = common::TestHarness::new();
+    let config = &h.config;
+    let base = h.base_dir();
+    h.copy_fixtures();
+
+    // Ingest fixtures so the search has something to retrieve.
+    let _ingest = corvia_core::ingest::ingest(config, base, false)
+        .expect("ingest failed");
+
+    // Set up a local tracer provider pointing at a tempfile.
+    let trace_dir = tempfile::tempdir().unwrap();
+    let trace_path = trace_dir.path().join("traces.jsonl");
+    let file_exporter = OtlpFileExporter::new(trace_path.clone())
+        .expect("failed to create file exporter");
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(file_exporter)
+        .build();
+    let tracer = provider.tracer("corvia-test");
+
+    // Compose: subscriber with the otel layer so tracing spans reach the provider.
+    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    let subscriber = tracing_subscriber::registry().with(otel_layer);
+
+    let embedder = make_embedder(config);
+
+    // Run search inside the subscriber scope.
+    tracing::subscriber::with_default(subscriber, || {
+        let params = SearchParams {
+            query: "why did we choose Redb".to_string(),
+            limit: 5,
+            max_tokens: None,
+            min_score: None,
+            kind: None,
+        };
+        let response = search(config, base, &embedder, &params).unwrap();
+        assert!(
+            !response.results.is_empty(),
+            "search should return results from fixtures"
+        );
+        assert!(
+            response.results.iter().all(|r| !r.chunk_id.is_empty()),
+            "every SearchResult must carry a non-empty chunk_id"
+        );
+    });
+
+    // Flush: drop the provider to shut down and flush buffered spans.
+    drop(provider);
+
+    // Read back the trace file and locate the corvia.search root span.
+    let traces = read_recent_traces(&trace_path, 200);
+    assert!(
+        !traces.is_empty(),
+        "trace file should contain at least one span; path: {}",
+        trace_path.display()
+    );
+
+    let root = traces
+        .iter()
+        .find(|t| t.name == "corvia.search")
+        .expect("corvia.search root span not found in trace file");
+
+    // Root span: raw query present
+    let query_attr = root
+        .attributes
+        .get("query")
+        .and_then(|v| v.as_str())
+        .expect("corvia.search.query attr missing or wrong type");
+    assert_eq!(query_attr, "why did we choose Redb");
+
+    // Root span: result_chunk_ids is a JSON-array string
+    let ids_attr = root
+        .attributes
+        .get("result_chunk_ids")
+        .and_then(|v| v.as_str())
+        .expect("corvia.search.result_chunk_ids attr missing");
+    let ids: Vec<String> = serde_json::from_str(ids_attr)
+        .expect("result_chunk_ids must parse as JSON string array");
+    assert!(
+        !ids.is_empty(),
+        "result_chunk_ids should be non-empty for a successful search"
+    );
+    assert!(
+        ids.iter().all(|c| c.contains(':')),
+        "chunk_ids should look like '<entry>:<idx>': {ids:?}"
+    );
+
+    // Each sub-span: chunk_ids + scores present as JSON-string arrays of equal length
+    for stage in ["corvia.search.bm25", "corvia.search.vector", "corvia.search.fusion", "corvia.search.rerank"] {
+        let sub = traces
+            .iter()
+            .find(|t| t.name == stage)
+            .unwrap_or_else(|| panic!("sub-span {stage} not found"));
+        let cids_raw = sub
+            .attributes
+            .get("chunk_ids")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("{stage}.chunk_ids missing"));
+        let scores_raw = sub
+            .attributes
+            .get("scores")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("{stage}.scores missing"));
+        let cids: Vec<String> = serde_json::from_str(cids_raw)
+            .unwrap_or_else(|e| panic!("{stage}.chunk_ids bad JSON: {e}"));
+        let scores: Vec<f32> = serde_json::from_str(scores_raw)
+            .unwrap_or_else(|e| panic!("{stage}.scores bad JSON: {e}"));
+        assert_eq!(
+            cids.len(),
+            scores.len(),
+            "{stage}: chunk_ids and scores must be parallel (same length)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 16. full_pipeline_ordering
 // ---------------------------------------------------------------------------
 
