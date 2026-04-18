@@ -39,6 +39,50 @@ struct FusedCandidate {
     rrf_score: f64,
 }
 
+/// Encode parallel `chunk_ids` and `scores` arrays as JSON strings.
+///
+/// The OTLP file exporter serializes `opentelemetry::Value::Array` via debug
+/// formatting (`trace.rs:72`), producing strings that are not machine-parseable.
+/// Encoding as JSON strings and recording them as `stringValue` attrs lets
+/// downstream consumers parse via `json::parse` cleanly.
+///
+/// Returns `("[]", "[]")` on any (impossible-for-these-types) serde error
+/// so that attr presence is preserved even in unreachable edge cases.
+fn encode_stage_scores(chunk_ids: &[String], scores: &[f32]) -> (String, String) {
+    let ids = serde_json::to_string(chunk_ids).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "encode_stage_scores: chunk_ids serialization failed");
+        "[]".to_string()
+    });
+    let sc = serde_json::to_string(scores).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "encode_stage_scores: scores serialization failed");
+        "[]".to_string()
+    });
+    (ids, sc)
+}
+
+/// Truncate a query string to at most `max_bytes` bytes, respecting UTF-8 char boundaries.
+///
+/// Used to bound the `query` trace attribute and prevent pathological inputs from
+/// pushing the trace file past the rotation threshold.
+pub(crate) fn truncate_query(query: &str, max_bytes: usize) -> &str {
+    if query.len() <= max_bytes {
+        return query;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !query.is_char_boundary(end) {
+        end -= 1;
+    }
+    &query[..end]
+}
+
+/// Record `chunk_ids` and `scores` as JSON-string attrs on the current span.
+/// Both fields must have been declared on the `info_span!` with `tracing::field::Empty`.
+fn record_stage_scores(chunk_ids: &[String], scores: &[f32]) {
+    let (ids_json, scores_json) = encode_stage_scores(chunk_ids, scores);
+    Span::current().record("chunk_ids", ids_json.as_str());
+    Span::current().record("scores", scores_json.as_str());
+}
+
 // ---------------------------------------------------------------------------
 // RRF fusion
 // ---------------------------------------------------------------------------
@@ -175,10 +219,12 @@ fn deduplicate_by_entry(candidates: &mut Vec<(String, String, f32)>) {
 /// Use this when the caller holds persistent index handles (e.g. the HTTP MCP server).
 /// For one-shot callers, use [`search`] which opens handles internally.
 #[tracing::instrument(name = "corvia.search", skip(config, base_dir, embedder, params, redb, tantivy), fields(
+    query = tracing::field::Empty,
     query_len = params.query.len(),
     limit = params.limit,
     kind_filter = ?params.kind,
     result_count = tracing::field::Empty,
+    result_chunk_ids = tracing::field::Empty,
     confidence = tracing::field::Empty,
 ))]
 pub fn search_with_handles(
@@ -189,6 +235,11 @@ pub fn search_with_handles(
     redb: &RedbIndex,
     tantivy: &TantivyIndex,
 ) -> Result<SearchResponse> {
+    // Record raw query for eval mining (bounded to prevent pathological inputs from
+    // pushing the trace file past rotation threshold). Design RFC §4.2: no redaction
+    // toggle — corvia is single-user local; raw query is the eval join key.
+    const MAX_QUERY_TRACE_BYTES: usize = 4096;
+    Span::current().record("query", truncate_query(&params.query, MAX_QUERY_TRACE_BYTES));
     // Step 2: Cold start check.
     let indexed_count_str = redb
         .get_meta("entry_count")
@@ -235,18 +286,37 @@ pub fn search_with_handles(
 
     // Step 5: BM25 search.
     let bm25_results = {
-        let _span = info_span!("corvia.search.bm25", query = %params.query, result_count = tracing::field::Empty).entered();
+        let _span = info_span!(
+            "corvia.search.bm25",
+            result_count = tracing::field::Empty,
+            chunk_ids = tracing::field::Empty,
+            scores = tracing::field::Empty,
+        )
+        .entered();
         let results = tantivy
             .search(&params.query, params.kind, retrieval_limit)
             .context("BM25 search")?;
         Span::current().record("result_count", results.len());
+
+        // Record chunk_ids + BM25 raw scores for eval mining.
+        let (ids, scores_vec): (Vec<String>, Vec<f32>) =
+            results.iter().map(|(cid, _, s)| (cid.clone(), *s)).unzip();
+        record_stage_scores(&ids, &scores_vec);
+
         debug!(count = results.len(), "BM25 results");
         results
     };
 
     // Step 6: Vector search.
     let vector_scored = {
-        let _span = info_span!("corvia.search.vector", vector_count = tracing::field::Empty, result_count = tracing::field::Empty).entered();
+        let _span = info_span!(
+            "corvia.search.vector",
+            vector_count = tracing::field::Empty,
+            result_count = tracing::field::Empty,
+            chunk_ids = tracing::field::Empty,
+            scores = tracing::field::Empty,
+        )
+        .entered();
         let query_vector = embedder
             .embed(&params.query)
             .context("embedding search query")?;
@@ -279,15 +349,34 @@ pub fn search_with_handles(
         scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(retrieval_limit);
         Span::current().record("result_count", scored.len());
+
+        // Record chunk_ids + cosine scores for eval mining.
+        let (ids, scores_vec): (Vec<String>, Vec<f32>) =
+            scored.iter().map(|(cid, _, s)| (cid.clone(), *s)).unzip();
+        record_stage_scores(&ids, &scores_vec);
+
         debug!(count = scored.len(), "vector results");
         scored
     };
 
     // Step 7: RRF fusion.
     let fused = {
-        let _span = info_span!("corvia.search.fusion", candidate_count = tracing::field::Empty).entered();
+        let _span = info_span!(
+            "corvia.search.fusion",
+            candidate_count = tracing::field::Empty,
+            chunk_ids = tracing::field::Empty,
+            scores = tracing::field::Empty,
+        )
+        .entered();
         let result = rrf_fusion(&bm25_results, &vector_scored, config.search.rrf_k);
         Span::current().record("candidate_count", result.len());
+
+        // Record chunk_ids + RRF scores for eval mining.
+        // f64 → f32: RRF scores are bounded well within f32 range; truncation is intentional for telemetry only.
+        let (ids, scores_vec): (Vec<String>, Vec<f32>) =
+            result.iter().map(|c| (c.chunk_id.clone(), c.rrf_score as f32)).unzip();
+        record_stage_scores(&ids, &scores_vec);
+
         debug!(count = result.len(), "fused candidates");
         result
     };
@@ -298,7 +387,14 @@ pub fn search_with_handles(
 
     // Step 9: Cross-encoder rerank.
     let mut scored_results = {
-        let _span = info_span!("corvia.search.rerank", input_count = top_candidates.len(), output_count = tracing::field::Empty).entered();
+        let _span = info_span!(
+            "corvia.search.rerank",
+            input_count = top_candidates.len(),
+            output_count = tracing::field::Empty,
+            chunk_ids = tracing::field::Empty,
+            scores = tracing::field::Empty,
+        )
+        .entered();
 
         let mut candidate_texts: Vec<String> = Vec::with_capacity(top_candidates.len());
         let mut candidate_chunk_ids: Vec<String> = Vec::with_capacity(top_candidates.len());
@@ -363,6 +459,11 @@ pub fn search_with_handles(
             }
         }
 
+        // Record chunk_ids + reranker (or RRF-fallback) scores for eval mining.
+        let (ids, scores_vec): (Vec<String>, Vec<f32>) =
+            results.iter().map(|(cid, _, s, _)| (cid.clone(), *s)).unzip();
+        record_stage_scores(&ids, &scores_vec);
+
         Span::current().record("output_count", results.len());
         results
     };
@@ -407,6 +508,8 @@ pub fn search_with_handles(
 
     // Step 12: Build SearchResult for each.
     let final_scores: Vec<f32> = scored_results.iter().map(|(_, _, s, _)| *s).collect();
+    let final_chunk_ids: Vec<String> =
+        scored_results.iter().map(|(cid, _, _, _)| cid.clone()).collect();
 
     let mut results: Vec<SearchResult> = Vec::with_capacity(scored_results.len());
     for (chunk_id, entry_id, score, content) in scored_results {
@@ -417,6 +520,7 @@ pub fn search_with_handles(
             .unwrap_or_default();
         results.push(SearchResult {
             id: entry_id,
+            chunk_id,
             kind,
             score,
             content,
@@ -435,6 +539,13 @@ pub fn search_with_handles(
         Span::current().record("confidence", tracing::field::debug(q.confidence));
         q
     };
+
+    // Record final (post-truncation) chunk_ids for downstream eval join.
+    let result_chunk_ids_json = serde_json::to_string(&final_chunk_ids).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "result_chunk_ids serialization failed");
+        "[]".to_string()
+    });
+    Span::current().record("result_chunk_ids", result_chunk_ids_json.as_str());
 
     Span::current().record("result_count", results.len());
     Span::current().record("confidence", tracing::field::debug(quality.confidence));
@@ -646,5 +757,68 @@ mod tests {
             &crate::tantivy_index::TantivyIndex,
         ) -> anyhow::Result<crate::types::SearchResponse> = search_with_handles;
         let _ = _fn;
+    }
+
+    #[test]
+    fn records_query_truncates_large_input() {
+        // Short string — returned as-is.
+        assert_eq!(truncate_query("hello", 4096), "hello");
+
+        // Exactly at boundary — returned as-is.
+        let at_limit = "a".repeat(4096);
+        assert_eq!(truncate_query(&at_limit, 4096), at_limit);
+
+        // One byte over — truncated to 4096.
+        let over = "a".repeat(4097);
+        let truncated = truncate_query(&over, 4096);
+        assert_eq!(truncated.len(), 4096);
+
+        // Multi-byte UTF-8 char split: 4096 bytes of ASCII + a 3-byte char.
+        // The truncation must land on a char boundary (at 4096, not in the middle of the char).
+        let mut mixed = "a".repeat(4096);
+        mixed.push('€'); // U+20AC = 3 bytes (0xE2 0x82 0xAC)
+        let truncated = truncate_query(&mixed, 4096);
+        assert_eq!(truncated.len(), 4096, "should truncate at the 4096 byte boundary");
+        assert!(mixed.is_char_boundary(truncated.len()), "truncation must land on char boundary");
+
+        // Empty string.
+        assert_eq!(truncate_query("", 4096), "");
+    }
+
+    #[test]
+    fn encode_stage_scores_empty() {
+        let (ids, scores) = encode_stage_scores(&[], &[]);
+        assert_eq!(ids, "[]");
+        assert_eq!(scores, "[]");
+    }
+
+    #[test]
+    fn encode_stage_scores_parallel_arrays() {
+        let chunk_ids = vec!["a:0".to_string(), "b:1".to_string(), "c:2".to_string()];
+        let scores = vec![0.9f32, 0.5, 0.1];
+        let (ids_json, scores_json) = encode_stage_scores(&chunk_ids, &scores);
+        assert_eq!(ids_json, r#"["a:0","b:1","c:2"]"#);
+        // Decode and compare with tolerance — f32 serialization is not guaranteed
+        // to produce exact decimal strings for all values.
+        let parsed_scores: Vec<f32> = serde_json::from_str(&scores_json).unwrap();
+        assert_eq!(parsed_scores.len(), 3);
+        for (got, want) in parsed_scores.iter().zip(&[0.9f32, 0.5, 0.1]) {
+            assert!((got - want).abs() < 1e-6, "score mismatch: {got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn encode_stage_scores_length_mismatch_still_encodes_both() {
+        let chunk_ids = vec!["a".to_string()];
+        let scores = vec![0.1f32, 0.2, 0.3];
+        let (ids_json, scores_json) = encode_stage_scores(&chunk_ids, &scores);
+        assert_eq!(ids_json, r#"["a"]"#);
+        // Decode and compare with tolerance — f32 serialization is not guaranteed
+        // to produce exact decimal strings for all values.
+        let parsed_scores: Vec<f32> = serde_json::from_str(&scores_json).unwrap();
+        assert_eq!(parsed_scores.len(), 3);
+        for (got, want) in parsed_scores.iter().zip(&[0.1f32, 0.2, 0.3]) {
+            assert!((got - want).abs() < 1e-6, "score mismatch: {got} vs {want}");
+        }
     }
 }

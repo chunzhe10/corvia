@@ -26,3 +26,8 @@ fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+# Used only by integration tests to wire a scoped OpenTelemetry subscriber
+# via tracing::subscriber::with_default (see tests/integration.rs). Production
+# integration lives in corvia-cli::telemetry. Do NOT move to [dependencies]
+# unless a non-test corvia-core code path starts using it directly.
+tracing-opentelemetry = { workspace = true }
