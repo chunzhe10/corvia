@@ -808,7 +808,7 @@ fn search_emits_eval_telemetry_attributes() {
     let embedder = make_embedder(config);
 
     // Run search inside the subscriber scope.
-    tracing::subscriber::with_default(subscriber, || {
+    let response = tracing::subscriber::with_default(subscriber, || {
         let params = SearchParams {
             query: "why did we choose Redb".to_string(),
             limit: 5,
@@ -825,9 +825,11 @@ fn search_emits_eval_telemetry_attributes() {
             response.results.iter().all(|r| !r.chunk_id.is_empty()),
             "every SearchResult must carry a non-empty chunk_id"
         );
+        response
     });
 
-    // Flush: drop the provider to shut down and flush buffered spans.
+    // Flush: explicitly flush then drop the provider.
+    provider.force_flush().expect("flush trace provider");
     drop(provider);
 
     // Read back the trace file and locate the corvia.search root span.
@@ -893,7 +895,114 @@ fn search_emits_eval_telemetry_attributes() {
             scores.len(),
             "{stage}: chunk_ids and scores must be parallel (same length)"
         );
+        // FIX F: non-empty assertion for a successful search against the fixture corpus.
+        assert!(
+            !cids.is_empty(),
+            "{stage}: chunk_ids should be non-empty for a successful search against the fixture corpus"
+        );
     }
+
+    // FIX I: Verify span attr matches the chunk_ids returned in response.results.
+    let expected_ids: Vec<String> = response.results.iter().map(|r| r.chunk_id.clone()).collect();
+    assert_eq!(
+        ids, expected_ids,
+        "result_chunk_ids span attr must equal the chunk_ids returned in response.results"
+    );
+
+    // FIX C: Verify the pipeline used by the corvia_traces MCP tool preserves new fields.
+    use corvia_core::types::TraceEntry;
+    let trace_entries: Vec<TraceEntry> = traces
+        .iter()
+        .map(|t| TraceEntry {
+            name: t.name.clone(),
+            elapsed_ms: t.elapsed_ms,
+            timestamp_ns: t.timestamp_ns,
+            attributes: t.attributes.clone(),
+        })
+        .collect();
+    let root_entry = trace_entries
+        .iter()
+        .find(|t| t.name == "corvia.search")
+        .expect("corvia.search TraceEntry not found");
+    let serialized = serde_json::to_string(root_entry).expect("TraceEntry serializes");
+    assert!(
+        serialized.contains("\"query\""),
+        "TraceEntry JSON must preserve query attr; got: {serialized}"
+    );
+    assert!(
+        serialized.contains("\"result_chunk_ids\""),
+        "TraceEntry JSON must preserve result_chunk_ids attr; got: {serialized}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry: #123 [eval 2/7] min_score-drops-all results
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore] // requires embedding model + writes a tempfile
+fn search_with_impossible_min_score_records_empty_result_chunk_ids() {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
+    use tracing_subscriber::layer::SubscriberExt;
+    use corvia_core::trace::{read_recent_traces, OtlpFileExporter};
+
+    let h = common::TestHarness::new();
+    let config = &h.config;
+    let base = h.base_dir();
+    h.copy_fixtures();
+
+    corvia_core::ingest::ingest(config, base, false).expect("ingest failed");
+
+    let trace_dir = tempfile::tempdir().unwrap();
+    let trace_path = trace_dir.path().join("traces.jsonl");
+    let file_exporter = OtlpFileExporter::new(trace_path.clone())
+        .expect("failed to create file exporter");
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(file_exporter)
+        .build();
+    let tracer = provider.tracer("corvia-test");
+    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    let subscriber = tracing_subscriber::registry().with(otel_layer);
+
+    let embedder = make_embedder(config);
+
+    let response = tracing::subscriber::with_default(subscriber, || {
+        let params = SearchParams {
+            query: "why did we choose Redb".to_string(),
+            limit: 5,
+            max_tokens: None,
+            min_score: Some(99.0), // impossibly high
+            kind: None,
+        };
+        search(config, base, &embedder, &params).unwrap()
+    });
+
+    assert!(
+        response.results.is_empty(),
+        "impossible min_score should yield no results"
+    );
+
+    provider.force_flush().expect("flush trace provider");
+    drop(provider);
+
+    let traces = read_recent_traces(&trace_path, 200);
+    assert!(!traces.is_empty(), "trace file should contain spans");
+
+    let root = traces
+        .iter()
+        .find(|t| t.name == "corvia.search")
+        .expect("corvia.search root span not found");
+
+    let ids_attr = root
+        .attributes
+        .get("result_chunk_ids")
+        .and_then(|v| v.as_str())
+        .expect("result_chunk_ids attr missing when min_score filters all");
+    assert_eq!(
+        ids_attr, "[]",
+        "result_chunk_ids must be \"[]\" when all results filtered by min_score"
+    );
 }
 
 // ---------------------------------------------------------------------------
