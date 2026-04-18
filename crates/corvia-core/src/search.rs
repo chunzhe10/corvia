@@ -484,6 +484,8 @@ pub fn search_with_handles(
 
     // Step 12: Build SearchResult for each.
     let final_scores: Vec<f32> = scored_results.iter().map(|(_, _, s, _)| *s).collect();
+    let final_chunk_ids: Vec<String> =
+        scored_results.iter().map(|(cid, _, _, _)| cid.clone()).collect();
 
     let mut results: Vec<SearchResult> = Vec::with_capacity(scored_results.len());
     for (chunk_id, entry_id, score, content) in scored_results {
@@ -513,6 +515,11 @@ pub fn search_with_handles(
         Span::current().record("confidence", tracing::field::debug(q.confidence));
         q
     };
+
+    // Record final (post-truncation) chunk_ids for downstream eval join.
+    let result_chunk_ids_json =
+        serde_json::to_string(&final_chunk_ids).unwrap_or_else(|_| "[]".to_string());
+    Span::current().record("result_chunk_ids", result_chunk_ids_json.as_str());
 
     Span::current().record("result_count", results.len());
     Span::current().record("confidence", tracing::field::debug(quality.confidence));
