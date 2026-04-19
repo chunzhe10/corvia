@@ -123,15 +123,31 @@ fn load_config(base_dir_arg: Option<&Path>) -> anyhow::Result<(PathBuf, Config)>
     Ok((base_dir, config))
 }
 
+/// Compute the absolute traces.jsonl path for the current invocation, or `None`
+/// if telemetry file output should be skipped.
+///
+/// Returns `None` for `Init` (no `.corvia/` exists yet) and when `.corvia/` cannot
+/// be discovered. Never returns a cwd-relative path — this is what used to cause
+/// stray `.corvia/` directories to appear wherever the binary was launched from.
+fn resolve_trace_path(cli: &Cli) -> Option<PathBuf> {
+    if matches!(cli.command, Command::Init { .. }) {
+        return None;
+    }
+    let base_dir = corvia_core::discover::resolve_base_dir(cli.base_dir.as_deref()).ok()?;
+    let config = Config::load_discovered(&base_dir).ok()?;
+    Some(base_dir.join(&config.data_dir).join("traces.jsonl"))
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
 
-    // Initialize telemetry (trace file + OTLP if endpoint provided).
-    let trace_file = Path::new(".corvia/traces.jsonl");
+    // Initialize telemetry (file exporter at the absolute path of the discovered
+    // project's .corvia/traces.jsonl, plus OTLP gRPC if endpoint provided).
+    let trace_path = resolve_trace_path(&cli);
     let _telemetry_guard = telemetry::init_telemetry(
         cli.otlp_endpoint.as_deref(),
-        Some(trace_file),
+        trace_path.as_deref(),
     )
     .expect("failed to initialize telemetry");
 

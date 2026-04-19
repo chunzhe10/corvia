@@ -1,9 +1,13 @@
-//! Telemetry initialization: always-on OpenTelemetry + OTLP file exporter + optional gRPC export.
+//! Telemetry initialization: always-on OpenTelemetry + optional OTLP file exporter + optional gRPC export.
 //!
 //! OpenTelemetry instrumentation is always active. A TracerProvider is created
-//! unconditionally so spans always have trace_id and span_id. The OTLP file
-//! exporter writes spans as OTLP JSON lines to `.corvia/traces.jsonl` for local
-//! observability without an external collector.
+//! unconditionally so spans always have trace_id and span_id.
+//!
+//! When a `trace_file` path is supplied, the OTLP file exporter writes spans
+//! as OTLP JSON lines to that absolute path. When `None`, the file exporter
+//! is disabled — callers are expected to resolve the project root and pass an
+//! absolute path, rather than let the exporter fall back to a cwd-relative
+//! `.corvia/traces.jsonl` (which historically created stray `.corvia/` dirs).
 //!
 //! When `--otlp-endpoint` is provided or `OTEL_EXPORTER_OTLP_ENDPOINT` is set,
 //! spans are additionally exported via gRPC to the given collector.
@@ -68,12 +72,13 @@ pub fn init_telemetry(
             .build(),
     );
 
-    // Always: file exporter (OTLP JSON to .corvia/traces.jsonl).
+    // Optional: file exporter (OTLP JSON). No cwd-relative default — if the
+    // caller doesn't supply a path, the file exporter is simply not attached.
     // Uses simple_exporter (sync) so traces flush immediately on span close.
-    let default_path = Path::new(".corvia/traces.jsonl").to_path_buf();
-    let trace_path = trace_file.unwrap_or(&default_path);
-    if let Ok(file_exporter) = OtlpFileExporter::new(trace_path.to_path_buf()) {
-        provider_builder = provider_builder.with_simple_exporter(file_exporter);
+    if let Some(path) = trace_file {
+        if let Ok(file_exporter) = OtlpFileExporter::new(path.to_path_buf()) {
+            provider_builder = provider_builder.with_simple_exporter(file_exporter);
+        }
     }
 
     // Optional: gRPC exporter for external collectors.
