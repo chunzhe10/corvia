@@ -119,5 +119,7 @@ if errors:
         print(f"  - {e}")
     sys.exit(1)
 else:
-    print(f"VALIDATION OK: 20 queries, types={type_counts}, kinds={kind_counts}")
+    types_sorted = dict(sorted(type_counts.items()))
+    kinds_sorted = dict(sorted(kind_counts.items()))
+    print(f"VALIDATION OK: 20 queries, types={types_sorted}, kinds={kinds_sorted}")
 PY
