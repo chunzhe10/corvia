@@ -33,6 +33,14 @@ snap = data.get("corpus_snapshot_hash", "")
 if not re.match(r"^sha256:[0-9a-f]{64}$", snap):
     errors.append(f"corpus_snapshot_hash malformed: {snap}")
 
+count = data.get("corpus_entry_count")
+if not (isinstance(count, int) and count > 0):
+    errors.append(f"corpus_entry_count must be positive int; got {count!r}")
+
+created = data.get("created_at", "")
+if not re.match(r"^\d{4}-\d{2}-\d{2}$", str(created)):
+    errors.append(f"created_at must be YYYY-MM-DD; got {created!r}")
+
 queries = data.get("query", [])
 if len(queries) != 20:
     errors.append(f"expected 20 queries, got {len(queries)}")
@@ -42,6 +50,7 @@ required_fields = {"id", "query", "expected_entry_ids", "query_type", "target_ki
 valid_types = {"lookup", "multi-hop", "reasoning", "cross-kind"}
 valid_kinds = {"learning", "reference", "decision", "instruction", "mixed"}
 seen_ids = set()
+seen_queries = set()
 type_counts = {t: 0 for t in valid_types}
 kind_counts = {k: 0 for k in valid_kinds}
 
@@ -53,6 +62,10 @@ for i, q in enumerate(queries):
     if q["id"] in seen_ids:
         errors.append(f"duplicate query id: {q['id']}")
     seen_ids.add(q["id"])
+    q_norm = q["query"].strip().lower()
+    if q_norm in seen_queries:
+        errors.append(f"{q['id']}: duplicate query string (case-insensitive match)")
+    seen_queries.add(q_norm)
     if q["query_type"] not in valid_types:
         errors.append(f"{q['id']}: invalid query_type {q['query_type']}")
     else:
@@ -64,6 +77,8 @@ for i, q in enumerate(queries):
     if not isinstance(q["expected_entry_ids"], list) or not q["expected_entry_ids"]:
         errors.append(f"{q['id']}: expected_entry_ids must be non-empty list")
         continue
+    if len(set(q["expected_entry_ids"])) != len(q["expected_entry_ids"]):
+        errors.append(f"{q['id']}: expected_entry_ids contains duplicates")
     for eid in q["expected_entry_ids"]:
         path = os.path.join(entries_dir, f"{eid}.md")
         if not os.path.isfile(path):

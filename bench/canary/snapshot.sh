@@ -11,6 +11,7 @@ ENTRIES_DIR="${WORKSPACE_ROOT}/.corvia/entries"
 
 if [[ ! -d "${ENTRIES_DIR}" ]]; then
   echo "error: entries dir not found: ${ENTRIES_DIR}" >&2
+  echo "hint: set CORVIA_WORKSPACE to the workspace root (directory containing .corvia/)" >&2
   exit 1
 fi
 

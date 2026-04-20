@@ -130,3 +130,78 @@ behavior drifts, that drift is the signal the eval harness measures against the 
 - Expected: `019da398-62f2-7122-b945-f1176f08a3d2` (rank 2, kind=learning), `019d9661-b6f2-7f52-b791-4b1349dd3ec3` (rank 1, kind=decision), `019da02a-7ee8-7ff3-b52d-36444bc09123` (in top-5, kind=reference)
 - Other top-10 (partial): `019d9661-e6ce-7ab0-b8ab-db024a5d0b41`, `019d99c3-a54e-75d1-93ec-fbee046f78cd`
 - Notes: cross-kind spanning learning + decision + reference; the hardest cross-kind query (3 anchors, 3 kinds); all three surfaced in top-5 at authoring time; triple-compound phrasing needed to pull all three simultaneously
+
+## Known limitations
+
+Recorded here so downstream eval work (#126 retrieval harness, #128 bench CLI) can account
+for them when interpreting canary metrics. These cannot be fixed under the frozen-forever
+rule — document, don't mutate.
+
+### 1. Correlated anchor reuse
+
+Several anchors appear in 2+ canaries:
+
+- `019d9661-b6f2-7f52-b791-4b1349dd3ec3` (MCP HTTP transport decision) → canary-007, 016, 017, 020
+- `019d9661-e6ce-7ab0-b8ab-db024a5d0b41` (serve operational gotchas) → canary-002, 007, 017
+- `019da147-8881-7971-89f0-a3157c95e8b4` (subagent workflow instruction) → canary-005, 006
+- `019d99f6-0018-7963-8728-6122f3319e9d` (temporal freshness decision) → canary-012, 015, 019
+- `019d99c3-a54e-75d1-93ec-fbee046f78cd` (devcontainer MCP HTTP default) → canary-008, 018
+- `019da398-62f2-7122-b945-f1176f08a3d2` (stray .corvia dirs) → canary-001, 008, 020
+- `019d99f5-f883-7f32-89cc-638b8bb49be9` (v1→v2 schema) → canary-012 (+ secondary in 015)
+
+Effective distinct anchor count across 20 queries ≈ 13–14, not 20. A retrieval regression
+on a single entry will drop recall across several canaries simultaneously, so aggregate
+`recall@k` and `MRR` mean are correlated statistics. Downstream analyses should report
+per-anchor recall alongside per-query metrics and weight-adjust when summarising. Corpus
+invisibility (7 superseded/hidden entries of 71 on disk — see corvia#132) forced anchor
+reuse; fixing requires broader visible-corpus coverage.
+
+### 2. Cross-kind queries are conjunctive, not semantic bridges
+
+canary-017/018/019/020 are structurally "X and Y (and Z)" conjunctions. Real agentic
+cross-kind retrieval tends to look like a single symptom-first question whose answer
+*happens to* require multiple kinds (e.g., "how do I diagnose foo?" → needs decision
+rationale + learning workaround + reference spec). Current canaries measure **keyword
+union** behavior, not **semantic bridging**. Eval harness should label cross-kind
+metrics as "conjunctive cross-kind" to set correct expectations; genuine semantic
+cross-kind should be covered via the Ragas synthetic testset (#125).
+
+### 3. canary-005 and canary-006 share a single anchor
+
+Both point to `019da147-8881-7971-89f0-a3157c95e8b4` with different query framings.
+The instruction corpus has only 2 entries and one (`019da109-faed-7970-bddd-06e12ef65cbe`)
+is superseded/invisible, forcing anchor reuse. Effective lookup coverage is 5 distinct
+anchors, not 6. Document in eval reports that the lookup / instruction cell has n=1.
+
+### 4. No adversarial query phrasings
+
+All 20 queries are grammatical full-sentence English. Real agent input includes keyword
+fragments ("mcp http lock"), typos, acronym-only, and pure-symptom phrasing with no
+technical term. This canary does not probe robustness to such input. Gap recorded for
+future adversarial canary set (propose `canary-adversarial.toml` in a follow-up — do
+NOT edit this one).
+
+### 5. Ceiling effect on MRR
+
+Every anchor surfaced at rank 1–2 at authoring time. MRR will start near 1.0 and has
+only downward headroom. That's the point (regression detection) but aggregate MRR
+becomes a noisy drift signal. Recommend eval harness track per-query rank histograms
+in addition to MRR means. At launch, report per-query Δrank from the authoring-time
+baseline recorded above; any positive Δ (rank worsens) is the calibration signal.
+
+### 6. All anchors are known-easy
+
+Design §6 anticipated some `notes = "known-hard"` queries to extend regression headroom.
+None were authored — the agent conservatively picked only confirmed-landable anchors
+after the server-storage-path bug (workspace#55) consumed authoring time. A second
+harder canary set is a reasonable follow-up.
+
+### Corpus snapshot drift at review time
+
+Snapshot hash at authoring: `sha256:e4e6596393...` (71 entries).
+Snapshot hash at review: `sha256:21536bb21c...` (72 entries — one new entry written
+between authoring and review).
+
+This is expected and explicitly allowed by design §4.5: the hash is an audit trail,
+not a validation gate. The drift does NOT invalidate any of the 20 canaries — their
+expected_entry_ids are still present on disk.
