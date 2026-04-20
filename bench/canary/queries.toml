@@ -1,0 +1,11 @@
+# Canary query set for corvia RAG eval harness.
+# FROZEN FOREVER. See README.md before touching this file.
+# Issue: https://github.com/chunzhe10/corvia/issues/124
+
+schema_version = 1
+created_at = "2026-04-20"
+corpus_snapshot_hash = "sha256:e4e6596393906e518812a6f3449efe51fd11840dd3edb4657924a409940dfa2d"
+corpus_entry_count = 71
+notes = "Hand-curated (agent-authored) canary set. Expected entry IDs verified via live corvia_search top-10 at authoring time. Do not mutate."
+
+# Query blocks appended in Tasks 3–6.
