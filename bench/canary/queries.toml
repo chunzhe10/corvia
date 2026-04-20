@@ -8,4 +8,170 @@ corpus_snapshot_hash = "sha256:e4e6596393906e518812a6f3449efe51fd11840dd3edb4657
 corpus_entry_count = 71
 notes = "Hand-curated (agent-authored) canary set. Expected entry IDs verified via live corvia_search top-10 at authoring time. Do not mutate."
 
-# Query blocks appended in Tasks 3–6.
+# ── LOOKUP (6) ────────────────────────────────────────────────────────────────
+
+[[query]]
+id = "canary-001"
+query = "why does my devcontainer leave stray .corvia directories inside subdirectories after using corvia"
+expected_entry_ids = ["019da398-62f2-7122-b945-f1176f08a3d2"]
+query_type = "lookup"
+target_kind = "learning"
+notes = "symptom-first query; anchor surfaced at rank 1, high confidence"
+
+[[query]]
+id = "canary-002"
+query = "how do I fix a second corvia serve process failing with database lock already open"
+expected_entry_ids = ["019d9661-e6ce-7ab0-b8ab-db024a5d0b41"]
+query_type = "lookup"
+target_kind = "learning"
+notes = "operational gotcha lookup; anchor surfaced at rank 1 with high confidence"
+
+[[query]]
+id = "canary-003"
+query = "what is the L0 constrained decoding approach and how does it compare to other LLM enforcement techniques"
+expected_entry_ids = ["019d9fa8-0a51-7b13-a0ce-d2a4eff7e0c7"]
+query_type = "lookup"
+target_kind = "reference"
+notes = "reference lookup for LLM enforcement ladder L0 slide; anchor surfaced at rank 1"
+
+[[query]]
+id = "canary-004"
+query = "why was the release.yml workflow deleted from corvia-workspace"
+expected_entry_ids = ["019d99da-d4c3-7581-881b-85dbc7cc9009"]
+query_type = "lookup"
+target_kind = "decision"
+notes = "deletion rationale lookup; anchor surfaced at rank 1, high confidence"
+
+[[query]]
+id = "canary-005"
+query = "when should I use a subagent for carousel edits versus making the change directly in the main context"
+expected_entry_ids = ["019da147-8881-7971-89f0-a3157c95e8b4"]
+query_type = "lookup"
+target_kind = "instruction"
+notes = "workflow instruction lookup; superseding entry 019da147 surfaced at rank 1 as it refines the original rule"
+
+[[query]]
+id = "canary-006"
+query = "what is the rule for when to spin subagents versus doing carousel edits directly and why was the original blanket rule changed"
+expected_entry_ids = ["019da147-8881-7971-89f0-a3157c95e8b4"]
+query_type = "lookup"
+target_kind = "instruction"
+notes = "second instruction lookup with different framing; probes rationale retrieval for refined workflow directive"
+
+# ── MULTI-HOP (6) ─────────────────────────────────────────────────────────────
+
+[[query]]
+id = "canary-007"
+query = "why did corvia switch from stdio MCP to HTTP transport and what operational gotchas should I know about the running server"
+expected_entry_ids = ["019d9661-b6f2-7f52-b791-4b1349dd3ec3", "019d9661-e6ce-7ab0-b8ab-db024a5d0b41"]
+query_type = "multi-hop"
+target_kind = "learning"
+notes = "multi-hop: architecture rationale (decision) + operational gotchas (learning); both surfaced in top-10 for HTTP-transport query"
+
+[[query]]
+id = "canary-008"
+query = "what were the root causes of the corvia-workspace stray .corvia dirs problem and how did the corvia binary become outdated in the devcontainer"
+expected_entry_ids = ["019da398-62f2-7122-b945-f1176f08a3d2", "019d99c3-a54e-75d1-93ec-fbee046f78cd"]
+query_type = "multi-hop"
+target_kind = "learning"
+notes = "multi-hop: stray dirs root cause (learning) + devcontainer HTTP default and minimum binary version (decision); both surface in top-10"
+
+[[query]]
+id = "canary-009"
+query = "why is a ±1% latency acceptance criterion unverifiable on the corvia_search workload and what alternatives work"
+expected_entry_ids = ["019d9fa3-4d75-7c20-a36b-b4cc6e50b579", "019d9f72-cbc3-7eb3-b2d3-94de53569b2a"]
+query_type = "multi-hop"
+target_kind = "learning"
+notes = "multi-hop: perf bench precision floor (learning) + phase 8 E2E validation which identified the same issue (learning); both surface for inference-bound perf query"
+
+[[query]]
+id = "canary-010"
+query = "what are the research findings for LLM enforcement layers L7 policy engines and L8 session sandboxing"
+expected_entry_ids = ["019da02a-7ee8-7ff3-b52d-36444bc09123", "019da02a-f600-7801-af3c-1e88aa764cde"]
+query_type = "multi-hop"
+target_kind = "reference"
+notes = "multi-hop: L7 Policy Engines reference + L8 Session Sandboxing reference; both carousel research entries surface for policy-engine sandbox query"
+
+[[query]]
+id = "canary-011"
+query = "what reference material exists for the LLM enforcement ladder covering levels L5 runtime reminders and L3 skills"
+expected_entry_ids = ["019d9ff3-ce77-75b3-aa18-5f9bf34b79fe", "019d9fe4-2da0-7041-bdc9-7a53fd00b5e7"]
+query_type = "multi-hop"
+target_kind = "reference"
+notes = "multi-hop: L5 Runtime Reminders reference + L3 Skills reference; both surface together on enforcement ladder mid-tier query"
+
+[[query]]
+id = "canary-012"
+query = "what decisions were made about keeping temporal freshness out of the corvia entry schema and how should the v2 schema handle date-awareness"
+expected_entry_ids = ["019d99f6-0018-7963-8728-6122f3319e9d", "019d99f5-f883-7f32-89cc-638b8bb49be9"]
+query_type = "multi-hop"
+target_kind = "decision"
+notes = "multi-hop: temporal freshness decision (decision) + v1-to-v2 schema simplification history (learning) that explains the removal; both surface on schema/date-awareness query"
+
+# ── REASONING (4) ─────────────────────────────────────────────────────────────
+
+[[query]]
+id = "canary-013"
+query = "if my carousel vector PDF is over 40MB, what is causing the bloat and which CSS element should I target first to fix it"
+expected_entry_ids = ["019da124-1786-7fb1-a33f-53bdc4e70818"]
+query_type = "reasoning"
+target_kind = "learning"
+notes = "reasoning: query asks for root cause inference; entry explains grain noise SVG is the dominant contributor, not glows as first suspected"
+
+[[query]]
+id = "canary-014"
+query = "if a UserPromptSubmit hook injects a reminder every turn, can the model reliably be forced to comply with it, or is there a stronger enforcement option"
+expected_entry_ids = ["019da0de-aca2-7d52-a8cd-5eb39ea2113c"]
+query_type = "reasoning"
+target_kind = "learning"
+notes = "reasoning: requires inferring from the soft/hard hook distinction that L5 is bypassable and L6 PreToolUse is the upgrade; entry provides the premises"
+
+[[query]]
+id = "canary-015"
+query = "should I add valid_from and valid_to fields to new corvia entries to help the agent reason about freshness"
+expected_entry_ids = ["019d99f6-0018-7963-8728-6122f3319e9d"]
+query_type = "reasoning"
+target_kind = "decision"
+notes = "reasoning: query proposes a schema change that the decision explicitly rejected; requires reading the decision to infer the correct answer is no"
+
+[[query]]
+id = "canary-016"
+query = "why would running corvia serve in HTTP mode let multiple MCP clients connect without lock contention, when stdio mode could not"
+expected_entry_ids = ["019d9661-b6f2-7f52-b791-4b1349dd3ec3"]
+query_type = "reasoning"
+target_kind = "decision"
+notes = "reasoning: requires inferring from redb/Tantivy lock semantics that HTTP holds handles open for the server lifetime; entry has the premises but not a direct statement"
+
+# ── CROSS-KIND (4) ────────────────────────────────────────────────────────────
+
+[[query]]
+id = "canary-017"
+query = "what decisions were made about how corvia handles its MCP transport and what operational gotchas should a developer know when running the server"
+expected_entry_ids = ["019d9661-b6f2-7f52-b791-4b1349dd3ec3", "019d9661-e6ce-7ab0-b8ab-db024a5d0b41"]
+query_type = "cross-kind"
+target_kind = "mixed"
+notes = "cross-kind: decision (MCP HTTP architecture) + learning (operational gotchas); spans decision and learning kinds; both surface in top-10"
+
+[[query]]
+id = "canary-018"
+query = "how does the corvia devcontainer start the server and what minimum binary version is needed for MCP to work, and what reference documents explain the L5 and L6 enforcement levels"
+expected_entry_ids = ["019d99c3-a54e-75d1-93ec-fbee046f78cd", "019d9ff3-ce77-75b3-aa18-5f9bf34b79fe"]
+query_type = "cross-kind"
+target_kind = "mixed"
+notes = "cross-kind: decision (devcontainer HTTP default, min binary) + reference (L5 Runtime Reminders); spans decision and reference kinds"
+
+[[query]]
+id = "canary-019"
+query = "what is the policy for how corvia_search handles temporal freshness in its response envelope, and what reference material exists for L9 external verification to ensure outputs are grounded"
+expected_entry_ids = ["019d99f6-0018-7963-8728-6122f3319e9d", "019da02b-6e7c-7d30-89d5-b6cbcb66db09"]
+query_type = "cross-kind"
+target_kind = "mixed"
+notes = "cross-kind: decision (temporal freshness in search envelope) + reference (L9 External Verifier); spans decision and reference kinds"
+
+[[query]]
+id = "canary-020"
+query = "what did we learn from fixing the stray .corvia directory bug, what architecture decision was made about the HTTP transport that relates to lock contention, and what reference exists for L7 policy engines that could be applied to corvia"
+expected_entry_ids = ["019da398-62f2-7122-b945-f1176f08a3d2", "019d9661-b6f2-7f52-b791-4b1349dd3ec3", "019da02a-7ee8-7ff3-b52d-36444bc09123"]
+query_type = "cross-kind"
+target_kind = "mixed"
+notes = "cross-kind: learning (stray dirs fix) + decision (HTTP transport) + reference (L7 Policy Engines); spans all three non-instruction kinds"
