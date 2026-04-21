@@ -153,7 +153,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--provider",
-        choices=("gemini", "openai", "anthropic"),
+        choices=("gemini", "groq", "openai", "anthropic"),
         default="gemini",
     )
     p.add_argument(

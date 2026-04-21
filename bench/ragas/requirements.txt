@@ -12,6 +12,14 @@ langchain-google-genai==3.0.5
 # NOT declare it as an install_requires dependency. Pin it explicitly.
 rapidfuzz==3.14.5
 
+# Default provider (Gemini) deps are pinned above.
+
+# Groq (free-tier 14 400 RPD / llama-3.1-8b) + local sentence-transformers embedder.
+# Recommended when Gemini free-tier quota is insufficient for a full run.
+langchain-groq==1.1.2
+langchain-huggingface==1.2.2
+sentence-transformers==5.4.1
+
 # Optional providers — uncomment to use.
 # langchain-openai==1.2.2
 # langchain-anthropic==1.1.2

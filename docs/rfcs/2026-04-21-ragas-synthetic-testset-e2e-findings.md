@@ -83,6 +83,30 @@ Then fill `bench/eval_sets/1.0.0/spotcheck.md` manually, commit, close #125.
 
 `langchain_core.globals.set_llm_cache(SQLiteCache(...))` was set in every run, but the cache file (`.cache/ragas-llm.sqlite`) stayed at 0 rows across attempts. Ragas uses its own `LangchainLLMWrapper` path; the global LLM cache does not intercept. For subsequent retries this is probably fine (an operator running to completion once is enough), but an operator who wants to re-run cheaply after a partial crash will need to either modify Ragas' LLM wrapper or use Ragas' own caching layer. Non-blocking; documented here for future work.
 
+## §5 Groq + local embedder path added (unblocks follow-up run)
+
+Gemini's restricted free tier on this key made it impractical to run the 50-query generation in this session. Groq's free tier (14 400 RPD on `llama-3.1-8b-instant`) is ~720× more generous and easily covers a full run. Groq has no first-party embedder, so we pair it with a **local** `sentence-transformers/all-MiniLM-L6-v2` embedder (~80 MB model weights, one-time download) to keep the pipeline at zero marginal cost.
+
+This PR ships:
+
+- `providers._make_groq` dispatched by `--provider groq`.
+- `langchain-groq`, `langchain-huggingface`, `sentence-transformers` added to `requirements.txt`.
+- CLI: `--provider` choices now include `groq`.
+- README has a "Provider overrides" section documenting the Groq + local embedder path.
+- 3 new provider tests (62 total, all passing).
+
+Follow-up PR to close the 50-query acceptance criterion:
+
+```bash
+export GROQ_API_KEY=...   # free at https://console.groq.com/keys
+cd repos/corvia/bench/ragas
+uv venv --python 3.12 .venv && source .venv/bin/activate
+uv pip install -r requirements.txt   # downloads all-MiniLM-L6-v2 on first run
+python generate.py --n 50 --provider groq
+# Fill bench/eval_sets/1.0.0/spotcheck.md manually (10-of-50 accept/reject)
+git add bench/eval_sets/ bench/ragas/.cache/ && git commit -m "feat(bench): first Ragas testset"
+```
+
 ## State of this branch at session end
 
 - Code: complete, 59 tests passing, dry-run works on full 68-entry visible corpus.

@@ -91,6 +91,34 @@ def _make_openai(generator_model: str | None) -> ProviderBundle:
     )
 
 
+def _make_groq(generator_model: str | None) -> ProviderBundle:
+    # Groq's generous free-tier (14 400 RPD on llama-3.1-8b-instant as of 2026-04)
+    # makes it the default for users without paid LLM API access. Groq has no
+    # first-party embedder, so we run a local sentence-transformers model
+    # instead — keeps the pipeline fully offline for embeddings.
+    if not os.environ.get("GROQ_API_KEY"):
+        _fail(
+            "GROQ_API_KEY is not set. Free keys: https://console.groq.com/keys"
+        )
+    try:
+        from langchain_groq import ChatGroq  # noqa: WPS433
+        from langchain_huggingface import HuggingFaceEmbeddings  # noqa: WPS433
+    except ImportError:
+        _fail(
+            "--provider groq requires `pip install langchain-groq "
+            "langchain-huggingface sentence-transformers`. Uncomment the "
+            "lines in requirements.txt."
+        )
+    gen_model = generator_model or "llama-3.1-8b-instant"
+    emb_model = "sentence-transformers/all-MiniLM-L6-v2"
+    return ProviderBundle(
+        llm=ChatGroq(model=gen_model),
+        embedder=HuggingFaceEmbeddings(model_name=emb_model),
+        generator_model=f"groq:{gen_model}",
+        embedding_model=f"local:{emb_model}",
+    )
+
+
 def _make_anthropic(generator_model: str | None) -> ProviderBundle:
     # --provider anthropic requires BOTH keys because Anthropic ships no
     # first-party embedder. This is documented in README.md.
@@ -129,6 +157,7 @@ def make_provider(name: str, generator_model: str | None) -> ProviderBundle:
     """
     dispatch = {
         "gemini": _make_gemini,
+        "groq": _make_groq,
         "openai": _make_openai,
         "anthropic": _make_anthropic,
     }

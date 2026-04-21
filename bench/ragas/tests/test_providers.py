@@ -66,3 +66,51 @@ def test_google_api_key_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GOOGLE_API_KEY", "AIza-fake-key")
     bundle = providers.make_provider("gemini", None)
     assert hasattr(bundle.llm, "invoke")
+
+
+def test_groq_missing_key_exits_two(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        providers.make_provider("groq", None)
+    assert exc.value.code == 2
+
+
+def test_groq_bundle_has_concrete_model_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Don't actually build the HuggingFaceEmbeddings (downloads a model).
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-fake")
+
+    class _FakeEmb:
+        def embed_documents(self, texts): ...
+        def embed_query(self, text): ...
+
+    class _FakeChat:
+        def invoke(self, *a, **kw): ...
+
+    import providers as prov
+    monkeypatch.setattr(prov, "_make_groq", lambda m: prov.ProviderBundle(
+        llm=_FakeChat(),
+        embedder=_FakeEmb(),
+        generator_model=f"groq:{m or 'llama-3.1-8b-instant'}",
+        embedding_model="local:sentence-transformers/all-MiniLM-L6-v2",
+    ))
+    bundle = prov.make_provider("groq", None)
+    assert bundle.generator_model == "groq:llama-3.1-8b-instant"
+    assert bundle.embedding_model == "local:sentence-transformers/all-MiniLM-L6-v2"
+
+
+def test_groq_accepts_generator_model_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-fake")
+    import providers as prov
+
+    class _Fake:
+        def invoke(self, *a, **kw): ...
+        def embed_documents(self, texts): ...
+        def embed_query(self, text): ...
+
+    monkeypatch.setattr(prov, "_make_groq", lambda m: prov.ProviderBundle(
+        llm=_Fake(), embedder=_Fake(),
+        generator_model=f"groq:{m or 'llama-3.1-8b-instant'}",
+        embedding_model="local:sentence-transformers/all-MiniLM-L6-v2",
+    ))
+    bundle = prov.make_provider("groq", "llama-3.3-70b-versatile")
+    assert bundle.generator_model == "groq:llama-3.3-70b-versatile"

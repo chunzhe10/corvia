@@ -73,7 +73,8 @@ The sidecar `*.meta.json` pairs with the JSONL and records `corvia_version`, `co
 
 ## Provider overrides
 
-- `--provider gemini` (default): needs `GEMINI_API_KEY` (or `GOOGLE_API_KEY`).
+- `--provider gemini` (default): needs `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). Note: some Google free-tier keys are capped at 0–20 RPD/model, insufficient for a 50-query run. If you hit `RESOURCE_EXHAUSTED` errors, use Groq instead.
+- `--provider groq`: needs `GROQ_API_KEY` (free at https://console.groq.com/keys, 14 400 RPD on `llama-3.1-8b-instant`). Uses a **local** `sentence-transformers/all-MiniLM-L6-v2` embedder — no second API key required, but first run downloads ~80 MB of model weights.
 - `--provider openai`: needs `OPENAI_API_KEY`. Uncomment `langchain-openai` in `requirements.txt` first.
 - `--provider anthropic`: needs **BOTH** `ANTHROPIC_API_KEY` (LLM) **and** `OPENAI_API_KEY` (embeddings — Anthropic ships no first-party embedder). Uncomment `langchain-anthropic` + `langchain-openai`.
 
