@@ -1,0 +1,16 @@
+# Ragas synthetic testset generator for corvia RAG eval harness (#125).
+# Pin exact versions verified by 2026-04-21-ragas-synthetic-testset-poc-findings.md.
+# Python 3.12+ required (see README.md).
+
+ragas==0.4.3
+langchain==1.2.15
+langchain-core==1.3.0
+langchain-community==0.4.1
+langchain-google-genai==3.0.5
+
+# Optional providers — uncomment to use.
+# langchain-openai==1.2.2
+# langchain-anthropic==1.1.2
+
+# Dev / test.
+pytest==8.3.5
