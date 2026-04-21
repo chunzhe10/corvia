@@ -36,26 +36,33 @@ def test_anthropic_missing_key_exits_two(monkeypatch: pytest.MonkeyPatch) -> Non
     assert exc.value.code == 2
 
 
-def test_gemini_builds_with_key_set(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_anthropic_needs_openai_key_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Anthropic has no first-party embedder → must fall through to OpenAI.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        providers.make_provider("anthropic", None)
+    assert exc.value.code == 2
+
+
+def test_gemini_bundle_has_concrete_model_names(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GEMINI_API_KEY", "AIza-fake-key")
-    llm, embedder = providers.make_provider("gemini", None)
-    # langchain-compat surface: LLMs expose `invoke` / embedders expose `embed_documents`.
-    assert hasattr(llm, "invoke")
-    assert hasattr(embedder, "embed_documents")
+    bundle = providers.make_provider("gemini", None)
+    assert hasattr(bundle.llm, "invoke")
+    assert hasattr(bundle.embedder, "embed_documents")
+    assert bundle.generator_model == "gemini:gemini-2.0-flash"
+    assert bundle.embedding_model == "gemini:models/text-embedding-004"
 
 
 def test_gemini_accepts_generator_model_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GEMINI_API_KEY", "AIza-fake-key")
-    llm, _ = providers.make_provider("gemini", "gemini-2.0-flash-lite")
-    # Model name is stashed on the LangChain LLM wrapper under `.model` or `.model_name`.
-    model_attr = getattr(llm, "model", None) or getattr(llm, "model_name", None)
-    assert model_attr is not None
-    assert "gemini-2.0-flash-lite" in str(model_attr)
+    bundle = providers.make_provider("gemini", "gemini-2.0-flash-lite")
+    assert bundle.generator_model == "gemini:gemini-2.0-flash-lite"
 
 
 def test_google_api_key_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     # Users may have GOOGLE_API_KEY set instead of GEMINI_API_KEY.
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.setenv("GOOGLE_API_KEY", "AIza-fake-key")
-    llm, _ = providers.make_provider("gemini", None)
-    assert hasattr(llm, "invoke")
+    bundle = providers.make_provider("gemini", None)
+    assert hasattr(bundle.llm, "invoke")

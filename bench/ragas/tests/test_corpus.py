@@ -59,11 +59,12 @@ def test_load_all_rejects_file_without_frontmatter(tmp_path: Path) -> None:
 
 def test_partition_visible_excludes_superseded(fixtures_dir: Path) -> None:
     entries = corpus.load_all(fixtures_dir)
-    visible, superseded_ids = corpus.partition_visible(entries)
-    ids = {e.id for e in visible}
+    p = corpus.partition_visible(entries)
+    ids = {e.id for e in p.visible}
     # fix-a superseded by fix-c; fix-c superseded by fix-e. Visible: b, d, e.
     assert ids == {"fix-b", "fix-d", "fix-e"}
-    assert superseded_ids == {"fix-a", "fix-c"}
+    assert p.superseded_ids == {"fix-a", "fix-c"}
+    assert p.dangling_superseded_refs == set()
 
 
 def test_partition_visible_transitive_chain() -> None:
@@ -71,15 +72,38 @@ def test_partition_visible_transitive_chain() -> None:
     a = corpus.Entry(id="a", created_at="t", kind="x", body="ba")
     b = corpus.Entry(id="b", created_at="t", kind="x", supersedes=["a"], body="bb")
     c = corpus.Entry(id="c", created_at="t", kind="x", supersedes=["b"], body="bc")
-    visible, superseded = corpus.partition_visible([a, b, c])
-    assert [e.id for e in visible] == ["c"]
-    assert superseded == {"a", "b"}
+    p = corpus.partition_visible([a, b, c])
+    assert [e.id for e in p.visible] == ["c"]
+    assert p.superseded_ids == {"a", "b"}
 
 
 def test_partition_visible_empty_corpus() -> None:
-    visible, superseded = corpus.partition_visible([])
-    assert visible == []
-    assert superseded == set()
+    p = corpus.partition_visible([])
+    assert p.visible == []
+    assert p.superseded_ids == set()
+    assert p.dangling_superseded_refs == set()
+
+
+def test_partition_visible_detects_dangling_refs() -> None:
+    # b.supersedes=["does-not-exist"] should be flagged, not silently counted
+    a = corpus.Entry(id="a", created_at="t", kind="x", body="body-a")
+    b = corpus.Entry(
+        id="b", created_at="t", kind="x", supersedes=["ghost"], body="body-b"
+    )
+    p = corpus.partition_visible([a, b])
+    assert [e.id for e in p.visible] == ["a", "b"]  # neither superseded
+    assert p.superseded_ids == set()
+    assert p.dangling_superseded_refs == {"ghost"}
+
+
+def test_load_all_rejects_duplicate_ids(tmp_path: Path) -> None:
+    # Two files with the same frontmatter id → ValueError
+    for name in ("one.md", "two.md"):
+        (tmp_path / name).write_text(
+            "+++\nid = \"dup\"\ncreated_at = \"2026-01-01\"\nkind = \"x\"\n+++\n\nbody\n"
+        )
+    with pytest.raises(ValueError, match="duplicate entry IDs"):
+        corpus.load_all(tmp_path)
 
 
 # ─── corpus_hash ───────────────────────────────────────────────────────────────
@@ -119,3 +143,37 @@ def test_corpus_hash_empty_is_valid_sha256() -> None:
     h = corpus.corpus_hash([])
     assert h.startswith("sha256:")
     assert len(h) == len("sha256:") + 64
+
+
+# ─── normalize_body (EOL / trailing-whitespace drift) ──────────────────────────
+
+
+def test_normalize_body_crlf_to_lf() -> None:
+    assert corpus.normalize_body("a\r\nb\r\n") == "a\nb\n"
+
+
+def test_normalize_body_lone_cr_to_lf() -> None:
+    assert corpus.normalize_body("a\rb\r") == "a\nb\n"
+
+
+def test_normalize_body_strips_trailing_whitespace() -> None:
+    assert corpus.normalize_body("body\n\n\n") == "body\n"
+    assert corpus.normalize_body("body\n  \t\n") == "body\n"
+
+
+def test_normalize_body_empty_stays_empty() -> None:
+    assert corpus.normalize_body("") == ""
+    assert corpus.normalize_body("   \n\n") == ""
+
+
+def test_corpus_hash_insensitive_to_eol_drift() -> None:
+    # Byte-equivalent content saved by LF vs CRLF editors should hash identically.
+    lf = corpus.Entry(id="a", created_at="t", kind="x", body=corpus.normalize_body("line1\nline2\n"))
+    crlf = corpus.Entry(id="a", created_at="t", kind="x", body=corpus.normalize_body("line1\r\nline2\r\n"))
+    assert corpus.corpus_hash([lf]) == corpus.corpus_hash([crlf])
+
+
+def test_corpus_hash_insensitive_to_trailing_newlines() -> None:
+    one = corpus.Entry(id="a", created_at="t", kind="x", body=corpus.normalize_body("body"))
+    three = corpus.Entry(id="a", created_at="t", kind="x", body=corpus.normalize_body("body\n\n\n"))
+    assert corpus.corpus_hash([one]) == corpus.corpus_hash([three])

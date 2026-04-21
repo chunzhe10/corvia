@@ -1,12 +1,12 @@
-"""Shared pytest fixtures for bench/ragas tests."""
+"""Shared pytest fixtures for bench/ragas tests.
 
-import sys
+Module path resolution lives in ../pyproject.toml (pythonpath = ["."])
+rather than a sys.path hack here — so broken packaging fails loudly.
+"""
+
 from pathlib import Path
 
 import pytest
-
-# Make the parent bench/ragas directory importable so tests can `from corpus import ...`.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 @pytest.fixture(scope="session")
