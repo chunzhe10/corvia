@@ -1,0 +1,6 @@
+# Local pytest config so `python -m pytest` resolves the bench/ragas modules
+# without a sys.path hack in conftest.py.
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
