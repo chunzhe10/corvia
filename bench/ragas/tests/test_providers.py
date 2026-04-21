@@ -50,8 +50,8 @@ def test_gemini_bundle_has_concrete_model_names(monkeypatch: pytest.MonkeyPatch)
     bundle = providers.make_provider("gemini", None)
     assert hasattr(bundle.llm, "invoke")
     assert hasattr(bundle.embedder, "embed_documents")
-    assert bundle.generator_model == "gemini:gemini-2.0-flash"
-    assert bundle.embedding_model == "gemini:models/text-embedding-004"
+    assert bundle.generator_model == "gemini:gemini-flash-latest"
+    assert bundle.embedding_model == "gemini:models/gemini-embedding-001"
 
 
 def test_gemini_accepts_generator_model_override(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -56,8 +56,11 @@ def _make_gemini(generator_model: str | None) -> ProviderBundle:
     )
 
     key = _gemini_api_key()
-    gen_model = generator_model or "gemini-2.0-flash"
-    emb_model = "models/text-embedding-004"
+    # Defaults validated against v1beta ListModels 2026-04-21: both in free tier.
+    # gemini-flash-latest rotates to the current Flash; pin a stamp (e.g.
+    # gemini-2.5-flash-lite) via --generator-model for snapshot reproducibility.
+    gen_model = generator_model or "gemini-flash-latest"
+    emb_model = "models/gemini-embedding-001"
     llm = ChatGoogleGenerativeAI(model=gen_model, google_api_key=key)
     embedder = GoogleGenerativeAIEmbeddings(model=emb_model, google_api_key=key)
     return ProviderBundle(

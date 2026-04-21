@@ -326,25 +326,51 @@ def main(argv: list[str] | None = None) -> int:
     ]
 
     from ragas.testset import TestsetGenerator  # noqa: WPS433
+    from ragas.testset.graph import KnowledgeGraph, Node, NodeType  # noqa: WPS433
     from ragas.testset.synthesizers import (  # noqa: WPS433
         MultiHopAbstractQuerySynthesizer,
         MultiHopSpecificQuerySynthesizer,
         SingleHopSpecificQuerySynthesizer,
     )
+    from ragas.testset.transforms import (  # noqa: WPS433
+        apply_transforms,
+        default_transforms_for_prechunked,
+    )
     import ragas  # noqa: WPS433
+
+    generator = TestsetGenerator.from_langchain(bundle.llm, bundle.embedder)
+
+    # We treat each corvia entry as an atomic CHUNK and bypass Ragas'
+    # HeadlineSplitter (unreliable on ~500-token docs with varying
+    # markdown structure — raises "'headlines' property not found"). Our
+    # entries are small and self-contained, so pre-chunked semantics fit.
+    nodes = [
+        Node(
+            type=NodeType.CHUNK,
+            properties={
+                "page_content": doc.page_content,
+                "document_metadata": doc.metadata,
+            },
+        )
+        for doc in documents
+    ]
+    generator.knowledge_graph = KnowledgeGraph(nodes=nodes)
+    transforms = default_transforms_for_prechunked(
+        llm=generator.llm,
+        embedding_model=generator.embedding_model,
+    )
 
     # distribution keys are Ragas names after _parse_distribution normalization.
     synth_map = {
-        "single_hop_specific": SingleHopSpecificQuerySynthesizer(llm=bundle.llm),
-        "multi_hop_specific": MultiHopSpecificQuerySynthesizer(llm=bundle.llm),
-        "multi_hop_abstract": MultiHopAbstractQuerySynthesizer(llm=bundle.llm),
+        "single_hop_specific": SingleHopSpecificQuerySynthesizer(llm=generator.llm),
+        "multi_hop_specific": MultiHopSpecificQuerySynthesizer(llm=generator.llm),
+        "multi_hop_abstract": MultiHopAbstractQuerySynthesizer(llm=generator.llm),
     }
     query_distribution = [(synth_map[k], distribution[k]) for k in distribution]
 
     start = time.monotonic()
-    generator = TestsetGenerator.from_langchain(bundle.llm, bundle.embedder)
-    dataset = generator.generate_with_langchain_docs(
-        documents,
+    apply_transforms(generator.knowledge_graph, transforms)
+    dataset = generator.generate(
         testset_size=args.n,
         query_distribution=query_distribution,
     )
